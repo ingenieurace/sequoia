@@ -64,16 +64,31 @@
 //! text (`city`, `COUNT(*)`, `COUNT(DISTINCT age)`), and a column left over is rejected, as it is
 //! neither grouped nor aggregated. The names are unique: a `GROUP BY`
 //! expression has no aggregate in it, and no other expression prints the same.
+//!
+//! **Subqueries.** A subquery may be used as a value, with `EXISTS` or with
+//! `IN`, in the select list, WHERE, HAVING and ORDER BY, and in UPDATE,
+//! DELETE and INSERT; not in ON or GROUP BY, nor inside an aggregate. Binding
+//! marks the subquery's columns that belong to the query around it, not to
+//! its own tables (whose columns win when names clash), as outer references,
+//! qualified by their table.
+//! For each row, the executor replaces those by the row's values, then plans
+//! and runs the subquery like any SELECT, so a correlated subquery may use an
+//! index on what it compares with them. The subquery is planned once when
+//! the query is, too, so that its mistakes are reported even if it never runs.
+//! A condition with a subquery in it is checked after the joins that bring in
+//! the tables it reads, never inside one. In a grouped query, a subquery's
+//! outer references must be `GROUP BY` expressions, like any column there.
 
 use std::collections::BTreeSet;
 
+use crate::catalog::Catalog;
 use crate::catalog::table::{Access, Table};
 use crate::error::{Result, err};
 use crate::plan::{access, filter};
 use crate::predicate::Predicate;
-use crate::sql::ast::{Aggregate, BinaryOp, ColumnRef, Expr, From, JoinKind, OrderBy, Projection};
+use crate::sql::ast::{Aggregate, BinaryOp, ColumnRef, Expr, From, JoinKind, OrderBy, Projection, Select};
 use crate::sql::eval::{Field, resolve};
-use crate::types::StorageKind;
+use crate::types::{StorageKind, Value};
 
 /// A SELECT's plan: the tree, and the names of the columns it returns.
 pub struct Plan<'a> {
@@ -134,22 +149,13 @@ struct Source<'a> {
     qualifier: String,
 }
 
-/// Plans a SELECT. `tables` are the tables `from` names, in its order.
-#[allow(clippy::too_many_arguments)]
-pub fn select<'a>(
-    tables: Vec<&'a Table>,
-    distinct: bool,
-    from: From,
-    projection: Projection,
-    filter: Option<Expr>,
-    group_by: Vec<Expr>,
-    having: Option<Expr>,
-    order_by: Vec<OrderBy>,
-    limit: Option<usize>,
-) -> Result<Plan<'a>> {
-    let refs = std::iter::once(&from.table).chain(from.joins.iter().map(|j| &j.table));
-    let sources: Vec<Source> =
-        tables.into_iter().zip(refs).map(|(table, r)| Source { table, qualifier: r.qualifier().into() }).collect();
+/// Plans a SELECT on the tables of the catalog.
+pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
+    let Select { distinct, from, projection, filter, group_by, having, order_by, limit } = query;
+    let sources = from
+        .tables()
+        .map(|r| Ok(Source { table: catalog.get(&r.name)?, qualifier: r.qualifier().into() }))
+        .collect::<Result<Vec<_>>>()?;
     for (i, source) in sources.iter().enumerate() {
         if sources[..i].iter().any(|s| s.qualifier == source.qualifier) {
             return err(format!("table name {} appears more than once in FROM", source.qualifier));
@@ -157,9 +163,11 @@ pub fn select<'a>(
     }
     forbid(&filter, "WHERE")?;
     forbid(from.joins.iter().filter_map(|j| j.on.as_ref()), "JOIN ... ON")?;
+    forbid_subqueries(from.joins.iter().filter_map(|j| j.on.as_ref()), "JOIN ... ON")?;
+    forbid_subqueries(&group_by, "GROUP BY")?;
 
     // Bind every column reference to its table.
-    let binder = Binder::new(&sources);
+    let binder = Binder::new(catalog, &sources);
     let bind = |e: &Expr| binder.bind(e);
     let bind_all = |exprs: &[Expr]| exprs.iter().map(bind).collect::<Result<Vec<_>>>();
     let projection = match projection {
@@ -297,6 +305,13 @@ fn joins<'a>(
         }
         for part in pool {
             let tables = binder.tables(&part);
+            if part.has_subquery() {
+                match tables.last() {
+                    Some(&last) if last > 0 => after[last].push(part),
+                    _ => pushed[0].push(part), // a filter step above the first table's scan
+                }
+                continue;
+            }
             match tables.last() {
                 None => pushed[0].push(part), // constant: filters all rows or none
                 Some(&last) if tables.len() == 1 && kinds[last] == JoinKind::Inner => pushed[last].push(part),
@@ -405,16 +420,25 @@ pub fn scan<'a>(table: &'a Table, qualifier: &str, filter: &Option<Expr>, needed
     }
 }
 
+/// Binds an expression of a statement on one table (or on none, for VALUES)
+/// as a SELECT's are bound: its columns are checked and its subqueries'
+/// outer references marked.
+pub fn bind(catalog: &Catalog, table: Option<&Table>, expr: &Expr) -> Result<Expr> {
+    let sources: Vec<Source> = table.into_iter().map(|table| Source { table, qualifier: table.name.clone() }).collect();
+    Binder::new(catalog, &sources).bind(expr)
+}
+
 /// Resolves column references against the tables of FROM.
-struct Binder {
+struct Binder<'c> {
+    catalog: &'c Catalog,
     fields: Vec<Field>,
     /// The position in FROM of the table of each field.
     owners: Vec<usize>,
     single: bool,
 }
 
-impl Binder {
-    fn new(sources: &[Source]) -> Self {
+impl<'c> Binder<'c> {
+    fn new(catalog: &'c Catalog, sources: &[Source]) -> Self {
         let mut fields = Vec::new();
         let mut owners = Vec::new();
         for (i, source) in sources.iter().enumerate() {
@@ -422,7 +446,7 @@ impl Binder {
             owners.extend(std::iter::repeat_n(i, own.len()));
             fields.extend(own);
         }
-        Binder { fields, owners, single: sources.len() == 1 }
+        Binder { catalog, fields, owners, single: sources.len() == 1 }
     }
 
     /// The expression with each column qualified by its table (left as it is
@@ -442,8 +466,68 @@ impl Binder {
             Expr::Binary(left, op, right) => Expr::Binary(bind(left)?, *op, bind(right)?),
             Expr::IsNull(inner, negated) => Expr::IsNull(bind(inner)?, *negated),
             Expr::Aggregate(function, arg, distinct) => {
+                if arg.as_deref().is_some_and(Expr::has_subquery) {
+                    return err("subqueries are not allowed in aggregate functions");
+                }
                 Expr::Aggregate(*function, arg.as_deref().map(bind).transpose()?, *distinct)
             }
+            Expr::InList(left, items, negated) => {
+                Expr::InList(bind(left)?, items.iter().map(|e| self.bind(e)).collect::<Result<_>>()?, *negated)
+            }
+            Expr::Subquery(query) => Expr::Subquery(Box::new(self.subquery(query, true)?)),
+            Expr::Exists(query) => Expr::Exists(Box::new(self.subquery(query, false)?)),
+            Expr::InSubquery(left, query, negated) => {
+                Expr::InSubquery(bind(left)?, Box::new(self.subquery(query, true)?), *negated)
+            }
+            Expr::Outer(_) => expr.clone(),
+        })
+    }
+
+    /// A subquery with its outer references marked, after checking that it
+    /// plans (returning one column, if `one_column`).
+    fn subquery(&self, query: &Select, one_column: bool) -> Result<Select> {
+        let query = self.correlate(query, &mut Vec::new())?;
+        let check = substitute(&query, &mut |_| Ok(Value::Null))?;
+        if select(self.catalog, check)?.columns.len() != 1 && one_column {
+            return err("subquery must return only one column");
+        }
+        Ok(query)
+    }
+
+    /// Marks the outer references of `query`, a subquery of the query this
+    /// binds, and of the subqueries inside it: the columns that none of their
+    /// own tables, nor those of the queries between (`scopes`), have, but
+    /// this query's do.
+    fn correlate(&self, query: &Select, scopes: &mut Vec<Vec<Field>>) -> Result<Select> {
+        let mut own = Vec::new();
+        for table in query.from.tables() {
+            own.extend(Field::of_table(table.qualifier(), &self.catalog.get(&table.name)?.columns));
+        }
+        scopes.push(own);
+        let query = query.try_map(&mut |e| self.correlate_expr(e, scopes));
+        scopes.pop();
+        query
+    }
+
+    fn correlate_expr(&self, expr: &Expr, scopes: &mut Vec<Vec<Field>>) -> Result<Expr> {
+        expr.replace(&mut |e| match e {
+            Expr::Column(column)
+                if !scopes.iter().flatten().any(|f| f.is_named_by(column))
+                    && self.fields.iter().any(|f| f.is_named_by(column)) =>
+            {
+                // Qualified even with a single table, so that it never reads as the subquery's own.
+                Some(resolve(&self.fields, column).map(|i| {
+                    let field = &self.fields[i];
+                    Expr::Outer(ColumnRef { table: field.table.clone(), name: field.name.clone() })
+                }))
+            }
+            Expr::Subquery(query) => Some(self.correlate(query, scopes).map(|q| Expr::Subquery(Box::new(q)))),
+            Expr::Exists(query) => Some(self.correlate(query, scopes).map(|q| Expr::Exists(Box::new(q)))),
+            Expr::InSubquery(left, query, negated) => Some((|| {
+                let left = self.correlate_expr(left, scopes)?;
+                Ok(Expr::InSubquery(Box::new(left), Box::new(self.correlate(query, scopes)?), *negated))
+            })()),
+            _ => None,
         })
     }
 
@@ -457,6 +541,16 @@ impl Binder {
         });
         tables.into_iter().collect()
     }
+}
+
+/// The subquery with each outer reference replaced by the value `value` gives it.
+pub fn substitute(query: &Select, value: &mut dyn FnMut(&ColumnRef) -> Result<Value>) -> Result<Select> {
+    query.try_map(&mut |e| {
+        e.replace(&mut |e| match e {
+            Expr::Outer(column) => Some(value(column).map(Expr::Literal)),
+            _ => None,
+        })
+    })
 }
 
 /// Splits an expression at its ANDs.
@@ -606,6 +700,16 @@ fn rewrite(expr: &Expr, group_by: &[Expr], aggregates: &mut Vec<AggregateCall>) 
         Expr::Unary(op, inner) => Expr::Unary(*op, rewrite(inner)?),
         Expr::Binary(left, op, right) => Expr::Binary(rewrite(left)?, *op, rewrite(right)?),
         Expr::IsNull(inner, negated) => Expr::IsNull(rewrite(inner)?, *negated),
+        Expr::InList(left, items, negated) => {
+            let items = items.iter().map(|e| rewrite(e).map(|e| *e)).collect::<Result<_>>()?;
+            Expr::InList(rewrite(left)?, items, *negated)
+        }
+        Expr::Subquery(query) => Expr::Subquery(Box::new(regroup(query, group_by)?)),
+        Expr::Exists(query) => Expr::Exists(Box::new(regroup(query, group_by)?)),
+        Expr::InSubquery(left, query, negated) => {
+            Expr::InSubquery(rewrite(left)?, Box::new(regroup(query, group_by)?), *negated)
+        }
+        Expr::Outer(_) => unreachable!("outer references are inside subqueries"),
         Expr::Aggregate(function, arg, distinct) => {
             if arg.as_deref().is_some_and(contains_aggregate) {
                 return err("aggregate functions cannot be nested");
@@ -619,6 +723,35 @@ fn rewrite(expr: &Expr, group_by: &[Expr], aggregates: &mut Vec<AggregateCall>) 
     })
 }
 
+/// Rewrites the outer references of a subquery in a grouped query to read
+/// the aggregate's rows: each must be a `GROUP BY` expression.
+fn regroup(query: &Select, group_by: &[Expr]) -> Result<Select> {
+    query.try_map(&mut |e| {
+        e.replace(&mut |e| match e {
+            // With a single table, GROUP BY names the column unqualified.
+            Expr::Outer(column) => Some(
+                match [column.clone(), ColumnRef::bare(&column.name)]
+                    .into_iter()
+                    .map(Expr::Column)
+                    .find(|e| group_by.contains(e))
+                {
+                    Some(grouped) => Ok(Expr::Outer(ColumnRef::bare(grouped.to_string()))),
+                    None => err(format!("column {column} must appear in GROUP BY or be used in an aggregate function")),
+                },
+            ),
+            _ => None,
+        })
+    })
+}
+
+/// Fails if one of the expressions has a subquery in it.
+fn forbid_subqueries<'a>(exprs: impl IntoIterator<Item = &'a Expr>, clause: &str) -> Result<()> {
+    match exprs.into_iter().any(Expr::has_subquery) {
+        true => err(format!("subqueries are not allowed in {clause}")),
+        false => Ok(()),
+    }
+}
+
 /// Fails if one of the expressions uses an aggregate function: rows are only
 /// grouped after WHERE, and never for INSERT, UPDATE or DELETE.
 pub fn forbid<'a>(exprs: impl IntoIterator<Item = &'a Expr>, clause: &str) -> Result<()> {
@@ -628,10 +761,14 @@ pub fn forbid<'a>(exprs: impl IntoIterator<Item = &'a Expr>, clause: &str) -> Re
     }
 }
 
+/// Whether the expression uses an aggregate function, not counting those of
+/// its subqueries, which group the subquery's rows.
 fn contains_aggregate(expr: &Expr) -> bool {
     match expr {
         Expr::Aggregate(..) => true,
-        Expr::Literal(_) | Expr::Column(_) => false,
+        Expr::Literal(_) | Expr::Column(_) | Expr::Outer(_) | Expr::Subquery(_) | Expr::Exists(_) => false,
+        Expr::InList(left, items, _) => contains_aggregate(left) || items.iter().any(contains_aggregate),
+        Expr::InSubquery(left, ..) => contains_aggregate(left),
         Expr::Unary(_, inner) | Expr::IsNull(inner, _) => contains_aggregate(inner),
         Expr::Binary(left, _, right) => contains_aggregate(left) || contains_aggregate(right),
     }

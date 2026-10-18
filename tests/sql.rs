@@ -1259,3 +1259,218 @@ fn join_names_and_conditions_are_checked() {
     // A single table may still be referred to by its name.
     assert_eq!(query(&mut db, "SELECT users.name FROM users WHERE users.id = 2"), vec![vec![text("bo")]]);
 }
+
+fn ints(rows: Vec<Vec<Value>>) -> Vec<Value> {
+    rows.into_iter().map(|mut r| r.remove(0)).collect()
+}
+
+#[test]
+fn subqueries_as_values_with_exists_and_in() {
+    let mut db = setup_shop();
+    // Uncorrelated: the average total is 25 / 5 = 5.
+    assert_eq!(ints(query(&mut db, "SELECT id FROM orders WHERE total > (SELECT AVG(total) FROM orders) ORDER BY id")), [
+        int(11),
+        int(13)
+    ]);
+    // Correlated, in the select list; inner columns win over outer ones of the same name.
+    assert_eq!(
+        query(&mut db, "SELECT name, (SELECT SUM(total) FROM orders WHERE user_id = users.id) FROM users ORDER BY id"),
+        [vec![text("ann"), int(12)], vec![text("bo"), int(3)], vec![text("cy"), Value::Null]]
+    );
+    assert_eq!(
+        ints(query(&mut db, "SELECT (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) FROM users u ORDER BY u.id")),
+        [int(2), int(1), int(0)]
+    );
+    let names = |db: &mut Database, sql: &str| ints(query(db, sql));
+    assert_eq!(
+        names(&mut db, "SELECT name FROM users u WHERE EXISTS (SELECT * FROM orders o WHERE o.user_id = u.id) ORDER BY name"),
+        [text("ann"), text("bo")]
+    );
+    assert_eq!(names(&mut db, "SELECT name FROM users u WHERE NOT EXISTS (SELECT 1 FROM orders WHERE user_id = u.id)"), [
+        text("cy")
+    ]);
+    assert_eq!(names(&mut db, "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders) ORDER BY id"), [
+        text("ann"),
+        text("bo")
+    ]);
+    // NOT IN is never true when the subquery returns a NULL, nor for a NULL value.
+    assert!(query(&mut db, "SELECT name FROM users WHERE id NOT IN (SELECT user_id FROM orders)").is_empty());
+    assert_eq!(
+        names(&mut db, "SELECT name FROM users WHERE id NOT IN (SELECT user_id FROM orders WHERE user_id IS NOT NULL)"),
+        [text("cy")]
+    );
+    assert_eq!(ints(query(&mut db, "SELECT id FROM orders WHERE user_id NOT IN (SELECT id FROM users)")), [int(14)]);
+    // Over no rows: IN is false, even for NULL, and a value is NULL.
+    assert_eq!(
+        query(&mut db, "SELECT COUNT(*) FROM users WHERE NULL NOT IN (SELECT id FROM users WHERE id > 100)"),
+        [vec![int(3)]]
+    );
+    assert_eq!(query(&mut db, "SELECT (SELECT id FROM users WHERE id > 100) FROM users WHERE id = 1"), [vec![
+        Value::Null
+    ]]);
+    // Values of another type match nothing.
+    assert_eq!(query(&mut db, "SELECT COUNT(*) FROM users WHERE name IN (SELECT id FROM users)"), [vec![int(0)]]);
+
+    // IN with a list.
+    assert_eq!(ints(query(&mut db, "SELECT id FROM orders WHERE user_id IN (1, 99) ORDER BY id")), [
+        int(10),
+        int(11),
+        int(14)
+    ]);
+    assert_eq!(ints(query(&mut db, "SELECT id FROM orders WHERE total NOT IN (3, 5 + 4) ORDER BY id")), [
+        int(10),
+        int(11),
+        int(14)
+    ]);
+    assert!(query(&mut db, "SELECT id FROM orders WHERE total NOT IN (3, NULL)").is_empty());
+    assert!(db.execute("SELECT id FROM orders WHERE total IN ('x')").is_err(), "compared like =");
+}
+
+#[test]
+fn nested_correlated_and_grouped_subqueries() {
+    let mut db = setup_shop();
+    // The same table inside and out.
+    assert_eq!(ints(query(&mut db, "SELECT id FROM orders WHERE total = (SELECT MAX(total) FROM orders)")), [int(13)]);
+    assert_eq!(
+        ints(query(
+            &mut db,
+            "SELECT o.id FROM orders o WHERE o.total = (SELECT MAX(total) FROM orders i WHERE i.user_id = o.user_id)
+             ORDER BY o.id"
+        )),
+        [int(11), int(12), int(14)]
+    );
+    // A subquery two levels in may refer to either query around it.
+    assert_eq!(
+        ints(query(
+            &mut db,
+            "SELECT name FROM users u WHERE EXISTS (SELECT * FROM orders o WHERE o.user_id = u.id
+               AND o.total > (SELECT MIN(total) FROM orders p WHERE p.user_id = u.id))"
+        )),
+        [text("ann")]
+    );
+    assert_eq!(
+        ints(query(
+            &mut db,
+            "SELECT name FROM users u WHERE EXISTS (SELECT * FROM orders o WHERE o.user_id = u.id
+               AND EXISTS (SELECT * FROM orders p WHERE p.user_id = o.user_id AND p.total < o.total))"
+        )),
+        [text("ann")]
+    );
+    // In a join's WHERE, reading both tables: checked after the join.
+    let sql = "SELECT u.name, o.id FROM users u JOIN orders o ON o.user_id = u.id
+               WHERE o.total = (SELECT MAX(total) FROM orders x WHERE x.user_id = u.id) ORDER BY o.id";
+    assert_eq!(query(&mut db, sql), [vec![text("ann"), int(11)], vec![text("bo"), int(12)]]);
+    assert!(explain(&mut db, sql).contains(
+        "FILTER o.total = (SELECT MAX(total) FROM orders x WHERE x.user_id = u.id)\n      INDEX JOIN"
+    ));
+    let sql = "SELECT u.name, o.id FROM users u LEFT JOIN orders o ON o.user_id = u.id
+               WHERE NOT EXISTS (SELECT * FROM orders x WHERE x.user_id = u.id AND x.total > 6) ORDER BY u.id";
+    assert_eq!(query(&mut db, sql), [vec![text("bo"), int(12)], vec![text("cy"), Value::Null]]);
+
+    // Grouped: outer references must be grouped columns.
+    assert_eq!(
+        query(
+            &mut db,
+            "SELECT city, COUNT(*) FROM users GROUP BY city HAVING COUNT(*) > (SELECT COUNT(*) FROM users WHERE city = 'lima')"
+        ),
+        [vec![text("oslo"), int(2)]]
+    );
+    assert_eq!(
+        query(
+            &mut db,
+            "SELECT u.city, (SELECT COUNT(*) FROM users v WHERE v.city = u.city) FROM users u GROUP BY u.city
+             ORDER BY u.city"
+        ),
+        [vec![text("lima"), int(1)], vec![text("oslo"), int(2)]]
+    );
+    // Aggregates inside a subquery group its rows, not the outer query's.
+    assert_eq!(query(&mut db, "SELECT name FROM users WHERE id = (SELECT MIN(user_id) FROM orders)"), [vec![text(
+        "ann"
+    )]]);
+    assert_eq!(
+        explain(&mut db, "SELECT name FROM users u WHERE EXISTS (SELECT * FROM orders o WHERE o.user_id = u.id)"),
+        "PROJECT name\n  FILTER EXISTS (SELECT * FROM orders o WHERE o.user_id = u.id)\n    SCAN users u"
+    );
+}
+
+#[test]
+fn subqueries_in_insert_update_and_delete() {
+    let mut db = setup_shop();
+    db.execute(
+        "UPDATE users SET city = (SELECT city FROM users WHERE id = 2) WHERE id IN (SELECT user_id FROM orders WHERE total > 6)",
+    )
+    .unwrap();
+    assert_eq!(ints(query(&mut db, "SELECT city FROM users ORDER BY id")), [text("lima"), text("lima"), text("oslo")]);
+    // Correlated, by a column only the outer table has.
+    db.execute("CREATE TABLE stats (uid INT, n INT); INSERT INTO stats VALUES (1, 0), (2, 0), (3, 0)").unwrap();
+    db.execute("UPDATE stats SET n = (SELECT COUNT(*) FROM orders WHERE user_id = uid)").unwrap();
+    assert_eq!(ints(query(&mut db, "SELECT n FROM stats ORDER BY uid")), [int(2), int(1), int(0)]);
+
+    db.execute("DELETE FROM orders WHERE user_id NOT IN (SELECT id FROM users)").unwrap();
+    assert_eq!(ints(query(&mut db, "SELECT id FROM orders ORDER BY id")), [int(10), int(11), int(12), int(13)]);
+    // The subquery sees the table as it was before the statement: the average is 6.
+    db.execute("DELETE FROM orders WHERE total < (SELECT AVG(total) FROM orders)").unwrap();
+    assert_eq!(ints(query(&mut db, "SELECT id FROM orders ORDER BY id")), [int(11), int(13)]);
+    db.execute("INSERT INTO orders VALUES ((SELECT MAX(id) FROM orders) + 1, 3, (SELECT COUNT(*) FROM users))").unwrap();
+    assert_eq!(query(&mut db, "SELECT * FROM orders WHERE user_id = 3"), [vec![int(14), int(3), int(3)]]);
+    assert_eq!(
+        explain(&mut db, "DELETE FROM orders WHERE id IN (SELECT id FROM orders WHERE total > 5)"),
+        "FILTER id IN (SELECT id FROM orders WHERE total > 5)\n  SCAN orders"
+    );
+    // A failing subquery rolls the statement back.
+    assert!(db.execute("UPDATE orders SET total = (SELECT id FROM users)").is_err());
+    assert_eq!(ints(query(&mut db, "SELECT total FROM orders ORDER BY id")), [int(7), int(9), int(3)]);
+}
+
+#[test]
+fn subquery_mistakes_are_reported() {
+    let mut db = setup_shop();
+    let errors = [
+        ("SELECT (SELECT id FROM users) FROM users", "more than one row"),
+        ("SELECT * FROM users WHERE id IN (SELECT id, name FROM users)", "only one column"),
+        ("SELECT (SELECT * FROM users) FROM users", "only one column"),
+        // Planned even where it would never run.
+        ("SELECT * FROM users WHERE id > 100 AND EXISTS (SELECT nope FROM orders)", "unknown column: nope"),
+        ("SELECT * FROM users WHERE EXISTS (SELECT * FROM missing)", "missing"),
+        ("SELECT * FROM users u JOIN orders o ON o.user_id IN (SELECT id FROM users)", "not allowed in JOIN ... ON"),
+        ("SELECT COUNT(*) FROM users GROUP BY (SELECT 1 FROM orders LIMIT 1)", "not allowed in GROUP BY"),
+        ("SELECT SUM((SELECT 1 FROM orders LIMIT 1)) FROM users", "not allowed in aggregate functions"),
+        (
+            "SELECT city, (SELECT COUNT(*) FROM orders WHERE user_id = users.id) FROM users GROUP BY city",
+            "column users.id must appear in GROUP BY",
+        ),
+        ("SELECT * FROM users WHERE id IN (SELECT id FROM orders", "expected"),
+        ("SELECT * FROM users WHERE EXISTS SELECT 1 FROM users", "expected"),
+    ];
+    for (sql, expected) in errors {
+        let e = db.execute(sql).expect_err(sql);
+        assert!(e.0.contains(expected), "{sql}: {e}");
+    }
+}
+
+#[test]
+fn every_storage_answers_subqueries_alike() {
+    let queries = [
+        "SELECT name, (SELECT SUM(total) FROM orders o WHERE o.user_id = u.id) FROM users u ORDER BY id",
+        "SELECT name FROM users u WHERE EXISTS (SELECT * FROM orders o WHERE o.user_id = u.id) ORDER BY id",
+        "SELECT id FROM orders WHERE user_id NOT IN (SELECT id FROM users WHERE city = 'oslo') ORDER BY id",
+        "SELECT id FROM orders o WHERE total > (SELECT MIN(total) FROM orders i WHERE i.user_id = o.user_id) ORDER BY id",
+    ];
+    let mut results = Vec::new();
+    for storage in ["HEAP", "LSM", "COLUMN"] {
+        let mut db = Database::in_memory();
+        db.execute(&format!(
+            "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, city TEXT) USING {storage};
+             CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, total INT) USING {storage};
+             INSERT INTO users VALUES (1, 'ann', 'oslo'), (2, 'bo', 'lima'), (3, 'cy', 'oslo');
+             INSERT INTO orders VALUES (10, 1, 5), (11, 1, 7), (12, 2, 3), (13, NULL, 9), (14, 99, 1);"
+        ))
+        .unwrap();
+        if storage != "COLUMN" {
+            db.execute("CREATE INDEX orders_user ON orders (user_id)").unwrap();
+        }
+        results.push(queries.iter().map(|sql| query(&mut db, sql)).collect::<Vec<_>>());
+    }
+    assert_eq!(results[0], results[1], "heap and LSM");
+    assert_eq!(results[0], results[2], "heap and column");
+}

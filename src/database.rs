@@ -58,7 +58,7 @@ impl Database {
         if self.broken {
             return err("a failed rollback left the database unusable: open it again");
         }
-        let modifies = !matches!(statement, Statement::Select { .. } | Statement::Explain(_));
+        let modifies = !matches!(statement, Statement::Select(_) | Statement::Explain(_));
         let result = executor::execute(&mut self.catalog, statement, &self.settings);
         if !modifies {
             return result;
@@ -85,9 +85,7 @@ impl Database {
         }
         let mut statements = parse(sql)?;
         match (statements.pop(), statements.is_empty()) {
-            (Some(statement @ Statement::Select { .. }), true) => {
-                executor::select(&self.catalog, statement, &self.settings)
-            }
+            (Some(Statement::Select(query)), true) => executor::select(&self.catalog, query, &self.settings),
             _ => err("query runs a single SELECT; use execute for other statements"),
         }
     }

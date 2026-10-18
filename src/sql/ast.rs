@@ -1,3 +1,4 @@
+use crate::error::Result;
 use crate::types::{Column, StorageKind, Value};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -29,18 +30,7 @@ pub enum Statement {
         columns: Option<Vec<String>>,
         rows: Vec<Vec<Expr>>,
     },
-    Select {
-        /// `SELECT DISTINCT`: drops rows equal to one returned before.
-        distinct: bool,
-        from: From,
-        projection: Projection,
-        filter: Option<Expr>,
-        /// `GROUP BY`: empty for none.
-        group_by: Vec<Expr>,
-        having: Option<Expr>,
-        order_by: Vec<OrderBy>,
-        limit: Option<usize>,
-    },
+    Select(Select),
     Update {
         table: String,
         assignments: Vec<(String, Expr)>,
@@ -52,15 +42,74 @@ pub enum Statement {
     },
 }
 
+/// A query: a SELECT statement, or a subquery in an expression.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Select {
+    /// `SELECT DISTINCT`: drops rows equal to one returned before.
+    pub distinct: bool,
+    pub from: From,
+    pub projection: Projection,
+    pub filter: Option<Expr>,
+    /// `GROUP BY`: empty for none.
+    pub group_by: Vec<Expr>,
+    pub having: Option<Expr>,
+    pub order_by: Vec<OrderBy>,
+    pub limit: Option<usize>,
+}
+
+impl Select {
+    /// Every expression of the query, not looking inside its subqueries.
+    pub fn exprs(&self) -> impl Iterator<Item = &Expr> {
+        let projection = match &self.projection {
+            Projection::All => &[][..],
+            Projection::Exprs(exprs) => exprs,
+        };
+        projection
+            .iter()
+            .chain(self.from.joins.iter().filter_map(|j| j.on.as_ref()))
+            .chain(&self.filter)
+            .chain(&self.group_by)
+            .chain(&self.having)
+            .chain(self.order_by.iter().map(|o| &o.expr))
+    }
+
+    /// The query with each of its expressions (those `exprs` gives) replaced by `f`'s result.
+    pub fn try_map(&self, f: &mut dyn FnMut(&Expr) -> Result<Expr>) -> Result<Select> {
+        let mut query = self.clone();
+        if let Projection::Exprs(exprs) = &mut query.projection {
+            for e in exprs {
+                *e = f(e)?;
+            }
+        }
+        for on in query.from.joins.iter_mut().filter_map(|j| j.on.as_mut()) {
+            *on = f(on)?;
+        }
+        for e in query.filter.iter_mut().chain(&mut query.group_by).chain(&mut query.having) {
+            *e = f(e)?;
+        }
+        for o in &mut query.order_by {
+            o.expr = f(&o.expr)?;
+        }
+        Ok(query)
+    }
+}
+
 /// `FROM t1 [JOIN t2 ON ...]...`: a table, then the tables joined to it in order.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct From {
     pub table: TableRef,
     pub joins: Vec<Join>,
 }
 
+impl From {
+    /// The tables, in order.
+    pub fn tables(&self) -> impl Iterator<Item = &TableRef> {
+        std::iter::once(&self.table).chain(self.joins.iter().map(|j| &j.table))
+    }
+}
+
 /// A table in FROM, and the name it goes by there.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableRef {
     pub name: String,
     pub alias: Option<String>,
@@ -74,14 +123,14 @@ impl TableRef {
 }
 
 /// `[INNER | LEFT] JOIN table ON condition`; `CROSS JOIN` and `,` have no condition.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Join {
     pub kind: JoinKind,
     pub table: TableRef,
     pub on: Option<Expr>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JoinKind {
     /// Pairs of rows the condition holds for.
     Inner,
@@ -112,20 +161,20 @@ impl std::fmt::Display for ColumnRef {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Projection {
     /// `SELECT *`
     All,
     Exprs(Vec<Expr>),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OrderBy {
     pub expr: Expr,
     pub desc: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Expr {
     Literal(Value),
     Column(ColumnRef),
@@ -136,9 +185,80 @@ pub enum Expr {
     /// An aggregate function over a group of rows; no argument is `COUNT(*)`.
     /// The flag is `DISTINCT`: each distinct argument value counts once.
     Aggregate(Aggregate, Option<Box<Expr>>, bool),
+    /// `expr [NOT] IN (expr, ...)`; the flag is NOT.
+    InList(Box<Expr>, Vec<Expr>, bool),
+    /// `(SELECT ...)`: the single value of a query returning one column and at most one row.
+    Subquery(Box<Select>),
+    /// `EXISTS (SELECT ...)`: whether the query returns any row.
+    Exists(Box<Select>),
+    /// `expr [NOT] IN (SELECT ...)`; the flag is NOT.
+    InSubquery(Box<Expr>, Box<Select>, bool),
+    /// A column, inside a subquery, of the query around it. The planner marks
+    /// these, and each is replaced by its value before the subquery runs.
+    Outer(ColumnRef),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl Expr {
+    /// Rebuilds the expression, replacing each part that `f` gives a
+    /// replacement for, without looking inside that part. Other parts are
+    /// kept, with their insides replaced alike, subqueries' included.
+    pub fn replace(&self, f: &mut dyn FnMut(&Expr) -> Option<Result<Expr>>) -> Result<Expr> {
+        if let Some(replacement) = f(self) {
+            return replacement;
+        }
+        let mut sub = |e: &Expr| e.replace(f).map(Box::new);
+        Ok(match self {
+            Expr::Literal(_) | Expr::Column(_) | Expr::Outer(_) => self.clone(),
+            Expr::Unary(op, inner) => Expr::Unary(*op, sub(inner)?),
+            Expr::Binary(left, op, right) => Expr::Binary(sub(left)?, *op, sub(right)?),
+            Expr::IsNull(inner, negated) => Expr::IsNull(sub(inner)?, *negated),
+            Expr::Aggregate(function, arg, distinct) => {
+                Expr::Aggregate(*function, arg.as_deref().map(&mut sub).transpose()?, *distinct)
+            }
+            Expr::InList(left, items, negated) => {
+                let items = items.iter().map(|e| e.replace(f)).collect::<Result<_>>()?;
+                Expr::InList(Box::new(left.replace(f)?), items, *negated)
+            }
+            Expr::Subquery(query) => Expr::Subquery(Box::new(query.try_map(&mut |e| e.replace(f))?)),
+            Expr::Exists(query) => Expr::Exists(Box::new(query.try_map(&mut |e| e.replace(f))?)),
+            Expr::InSubquery(left, query, negated) => {
+                let left = Box::new(left.replace(f)?);
+                Expr::InSubquery(left, Box::new(query.try_map(&mut |e| e.replace(f))?), *negated)
+            }
+        })
+    }
+
+    /// Calls `f` on this expression and every one inside it, subqueries' included.
+    pub fn visit(&self, f: &mut dyn FnMut(&Expr)) {
+        f(self);
+        match self {
+            Expr::Literal(_) | Expr::Column(_) | Expr::Outer(_) | Expr::Aggregate(_, None, _) => {}
+            Expr::Unary(_, inner) | Expr::IsNull(inner, _) | Expr::Aggregate(_, Some(inner), _) => inner.visit(f),
+            Expr::Binary(left, _, right) => {
+                left.visit(f);
+                right.visit(f);
+            }
+            Expr::InList(left, items, _) => {
+                left.visit(f);
+                items.iter().for_each(|e| e.visit(f));
+            }
+            Expr::Subquery(query) | Expr::Exists(query) => query.exprs().for_each(|e| e.visit(f)),
+            Expr::InSubquery(left, query, _) => {
+                left.visit(f);
+                query.exprs().for_each(|e| e.visit(f));
+            }
+        }
+    }
+
+    /// Whether the expression has a subquery in it.
+    pub fn has_subquery(&self) -> bool {
+        let mut found = false;
+        self.visit(&mut |e| found |= matches!(e, Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(..)));
+        found
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Aggregate {
     Count,
     Sum,
@@ -172,13 +292,13 @@ impl Aggregate {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnaryOp {
     Not,
     Neg,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinaryOp {
     Eq,
     NotEq,
@@ -199,12 +319,16 @@ impl std::fmt::Display for Expr {
     /// themselves operations are parenthesized, whatever their precedence.
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let operand = |e: &Expr| match e {
-            Expr::Binary(..) | Expr::IsNull(..) | Expr::Unary(UnaryOp::Not, _) => format!("({e})"),
+            Expr::Binary(..)
+            | Expr::IsNull(..)
+            | Expr::InList(..)
+            | Expr::InSubquery(..)
+            | Expr::Unary(UnaryOp::Not, _) => format!("({e})"),
             e => e.to_string(),
         };
         match self {
             Expr::Literal(value) => f.write_str(&value.to_sql()),
-            Expr::Column(column) => write!(f, "{column}"),
+            Expr::Column(column) | Expr::Outer(column) => write!(f, "{column}"),
             Expr::Unary(UnaryOp::Not, inner) => write!(f, "NOT {}", operand(inner)),
             Expr::Unary(UnaryOp::Neg, inner) => write!(f, "-{}", operand(inner)),
             Expr::Binary(left, op, right) => write!(f, "{} {} {}", operand(left), op.symbol(), operand(right)),
@@ -216,6 +340,66 @@ impl std::fmt::Display for Expr {
                 let distinct = if *distinct { "DISTINCT " } else { "" };
                 write!(f, "{}({distinct}{arg})", function.name().to_uppercase())
             }
+            Expr::InList(left, items, negated) => {
+                let items = items.iter().map(Expr::to_string).collect::<Vec<_>>().join(", ");
+                write!(f, "{} {}IN ({items})", operand(left), if *negated { "NOT " } else { "" })
+            }
+            Expr::Subquery(query) => write!(f, "({query})"),
+            Expr::Exists(query) => write!(f, "EXISTS ({query})"),
+            Expr::InSubquery(left, query, negated) => {
+                write!(f, "{} {}IN ({query})", operand(left), if *negated { "NOT " } else { "" })
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Select {
+    /// Writes the query as SQL that parses back to it.
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let list = |exprs: &mut dyn Iterator<Item = String>| exprs.collect::<Vec<_>>().join(", ");
+        f.write_str(if self.distinct { "SELECT DISTINCT " } else { "SELECT " })?;
+        match &self.projection {
+            Projection::All => f.write_str("*")?,
+            Projection::Exprs(exprs) => f.write_str(&list(&mut exprs.iter().map(Expr::to_string)))?,
+        }
+        write!(f, " FROM {}", self.from.table)?;
+        for join in &self.from.joins {
+            match (join.kind, &join.on) {
+                (JoinKind::Inner, None) => write!(f, " CROSS JOIN {}", join.table)?,
+                (JoinKind::Inner, Some(on)) => write!(f, " JOIN {} ON {on}", join.table)?,
+                (JoinKind::Left, on) => {
+                    write!(f, " LEFT JOIN {}", join.table)?;
+                    if let Some(on) = on {
+                        write!(f, " ON {on}")?;
+                    }
+                }
+            }
+        }
+        if let Some(filter) = &self.filter {
+            write!(f, " WHERE {filter}")?;
+        }
+        if !self.group_by.is_empty() {
+            write!(f, " GROUP BY {}", list(&mut self.group_by.iter().map(Expr::to_string)))?;
+        }
+        if let Some(having) = &self.having {
+            write!(f, " HAVING {having}")?;
+        }
+        if !self.order_by.is_empty() {
+            let keys = self.order_by.iter().map(|o| format!("{}{}", o.expr, if o.desc { " DESC" } else { "" }));
+            write!(f, " ORDER BY {}", list(&mut keys.into_iter()))?;
+        }
+        if let Some(limit) = self.limit {
+            write!(f, " LIMIT {limit}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for TableRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match &self.alias {
+            Some(alias) => write!(f, "{} {alias}", self.name),
+            None => f.write_str(&self.name),
         }
     }
 }
@@ -241,12 +425,12 @@ impl BinaryOp {
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::ast::{Expr, Statement};
+    use crate::sql::ast::{Expr, Select, Statement};
     use crate::sql::parse;
 
     fn where_clause(sql: &str) -> Expr {
         match parse(&format!("SELECT * FROM t WHERE {sql}")).unwrap().pop() {
-            Some(Statement::Select { filter: Some(filter), .. }) => filter,
+            Some(Statement::Select(Select { filter: Some(filter), .. })) => filter,
             other => panic!("{other:?}"),
         }
     }
@@ -260,6 +444,11 @@ mod tests {
             "x - -1 >= 'it''s'",
             "COUNT(*) > 1 AND SUM(a + 1) < MAX(b) / 2",
             "COUNT(DISTINCT a) + SUM(DISTINCT (b * 2))",
+            "a IN (1, 2 + 3) AND NOT b NOT IN ('x') OR (c IN (d)) = TRUE",
+            "EXISTS (SELECT * FROM t2 WHERE t2.a = t.a) AND x > (SELECT MAX(y) FROM u)",
+            "a NOT IN (SELECT DISTINCT b FROM u x JOIN v ON v.c = x.c LEFT JOIN w ON w.d = v.d CROSS JOIN z \
+             WHERE b > 0 GROUP BY b HAVING COUNT(*) > 1 ORDER BY b DESC, 2 LIMIT 3)",
+            "NOT EXISTS (SELECT 1 FROM u WHERE u.a IN (SELECT a FROM v))",
             "-(a - b) IS NULL",
             "NOT (NOT a)",
             "a = NULL OR b = TRUE",

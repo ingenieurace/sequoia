@@ -44,11 +44,16 @@ Shell commands: `.tables`, `.exit`.
   over no values `COUNT` is 0 and the rest NULL. `AVG` truncates toward zero, as
   there is no fractional type. A selected column must be grouped or aggregated
 - Expressions: `+ - * /`, `= != <> < <= > >=`, `AND OR NOT`, `IS [NOT] NULL`,
-  parentheses, with SQL three-valued logic for `NULL`
+  `[NOT] IN (list)`, parentheses, with SQL three-valued logic for `NULL`
+- Subqueries: `(SELECT ...)` as a value (one column, at most one row; NULL for
+  none), `[NOT] EXISTS (SELECT ...)` and `expr [NOT] IN (SELECT ...)`, in the
+  select list, `WHERE`, `HAVING`, `ORDER BY`, `UPDATE`, `DELETE` and `VALUES`.
+  They may be correlated (refer to the columns of the query around them) and
+  nested; each runs once per distinct set of outer values it is given
 
 Every statement is atomic and durable once it returns. Not supported:
-`RIGHT` and `FULL` joins, subqueries, multi-column indexes,
-transactions of several statements.
+`RIGHT` and `FULL` joins, subqueries in `FROM` or `JOIN ... ON`,
+`INSERT ... SELECT`, multi-column indexes, transactions of several statements.
 
 ## Layout
 
@@ -69,6 +74,7 @@ src/
     join.rs       nested loop, hash and index joins; LEFT JOIN padding
     sort.rs       ORDER BY: external merge sort, top-N heap for LIMIT
     aggregate.rs  hash aggregation: one row per group, and the aggregate functions
+    subquery.rs   runs subqueries for each row, with outer references replaced by its values
   types.rs        values, data types, columns
   predicate.rs    `column op literal` conditions, shared by the planner and storage
   result.rs       query results and table printing

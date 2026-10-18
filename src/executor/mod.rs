@@ -1,11 +1,12 @@
 //! Executes parsed statements against the catalog. A SELECT is planned (see
 //! `plan/query.rs`) and run by `operator`s: `sort` orders rows, `aggregate`
-//! groups them.
+//! groups them, and `subquery` runs the subqueries of their expressions.
 
 pub mod aggregate;
 pub mod join;
 pub mod operator;
 pub mod sort;
+pub mod subquery;
 
 use crate::catalog::Catalog;
 use crate::catalog::table::{Row, RowId, Table};
@@ -13,11 +14,12 @@ use crate::error::{Result, err};
 use crate::plan::query::{self, forbid};
 use crate::plan::{access, filter};
 use crate::result::QueryResult;
-use crate::sql::ast::{Expr, Statement};
-use crate::sql::eval::{Field, eval, matches};
+use crate::sql::ast::{Expr, Select, Statement};
+use crate::sql::eval::{Field, eval_with, matches_with};
 use crate::types::Value;
 use operator::Rows;
 use sort::SORT_MEMORY;
+use subquery::Runner;
 
 /// Knobs that change how statements run, not what they return.
 #[derive(Debug, Clone)]
@@ -52,8 +54,8 @@ pub fn execute(catalog: &mut Catalog, statement: Statement, settings: &Settings)
             Ok(message(format!("index {name} dropped")))
         }
         Statement::Explain(statement) => explain(catalog, *statement),
-        statement @ Statement::Select { .. } => {
-            let query = select(catalog, statement, settings)?;
+        Statement::Select(query) => {
+            let query = select(catalog, query, settings)?;
             let columns = query.columns.clone();
             Ok(QueryResult::Rows { columns, rows: query.collect::<Result<_>>()? })
         }
@@ -61,11 +63,9 @@ pub fn execute(catalog: &mut Catalog, statement: Statement, settings: &Settings)
             catalog.checkpoint()?;
             Ok(message("checkpoint done".into()))
         }
-        Statement::Insert { table, columns, rows } => insert(catalog.get_mut(&table)?, columns, rows),
-        Statement::Update { table, assignments, filter } => {
-            update(catalog.get_mut(&table)?, assignments, filter)
-        }
-        Statement::Delete { table, filter } => delete(catalog.get_mut(&table)?, filter),
+        Statement::Insert { table, columns, rows } => insert(catalog, &table, columns, rows, settings),
+        Statement::Update { table, assignments, filter } => update(catalog, &table, assignments, filter, settings),
+        Statement::Delete { table, filter } => delete(catalog, &table, filter, settings),
     }
 }
 
@@ -84,27 +84,19 @@ impl Iterator for Query<'_> {
 }
 
 /// Plans a SELECT and starts running it; no row is read until asked for.
-pub fn select<'a>(catalog: &'a Catalog, statement: Statement, settings: &Settings) -> Result<Query<'a>> {
-    let plan = plan_select(catalog, statement)?;
-    Ok(Query { columns: plan.columns, rows: operator::open(plan.root, settings) })
-}
-
-fn plan_select(catalog: &Catalog, statement: Statement) -> Result<query::Plan<'_>> {
-    let Statement::Select { distinct, from, projection, filter, group_by, having, order_by, limit } = statement else {
-        return err("expected a SELECT");
-    };
-    let names = std::iter::once(&from.table).chain(from.joins.iter().map(|j| &j.table));
-    let tables = names.map(|t| catalog.get(&t.name)).collect::<Result<Vec<_>>>()?;
-    query::select(tables, distinct, from, projection, filter, group_by, having, order_by, limit)
+pub fn select<'a>(catalog: &'a Catalog, query: Select, settings: &Settings) -> Result<Query<'a>> {
+    let plan = query::select(catalog, query)?;
+    Ok(Query { columns: plan.columns, rows: operator::open(plan.root, catalog, settings) })
 }
 
 /// Describes how a statement would run: its plan, one step per line, the
 /// scan (and the index it uses, if any) last.
 fn explain(catalog: &Catalog, statement: Statement) -> Result<QueryResult> {
     let plan = match statement {
-        statement @ Statement::Select { .. } => plan_select(catalog, statement)?.root,
+        Statement::Select(query) => query::select(catalog, query)?.root,
         Statement::Update { table, filter, .. } | Statement::Delete { table, filter } => {
             let table = catalog.get(&table)?;
+            let filter = filter.map(|f| query::bind(catalog, Some(table), &f)).transpose()?;
             query::scan(table, &table.name, &filter, vec![true; table.columns.len()])
         }
         _ => return err("EXPLAIN supports only SELECT, UPDATE and DELETE"),
@@ -112,71 +104,106 @@ fn explain(catalog: &Catalog, statement: Statement) -> Result<QueryResult> {
     Ok(message(plan.explain()))
 }
 
-fn insert(table: &mut Table, columns: Option<Vec<String>>, rows: Vec<Vec<Expr>>) -> Result<QueryResult> {
-    // Which column each supplied value goes to; omitted columns become NULL.
-    let targets: Vec<usize> = match columns {
-        Some(names) => names.iter().map(|n| table.column_index(n)).collect::<Result<_>>()?,
-        None => (0..table.columns.len()).collect(),
+fn insert(
+    catalog: &mut Catalog,
+    table: &str,
+    columns: Option<Vec<String>>,
+    rows: Vec<Vec<Expr>>,
+    settings: &Settings,
+) -> Result<QueryResult> {
+    let new_rows = {
+        let catalog: &Catalog = catalog;
+        let table = catalog.get(table)?;
+        // Which column each supplied value goes to; omitted columns become NULL.
+        let targets: Vec<usize> = match columns {
+            Some(names) => names.iter().map(|n| table.column_index(n)).collect::<Result<_>>()?,
+            None => (0..table.columns.len()).collect(),
+        };
+        let mut subqueries = Runner::new(catalog, settings);
+        let mut new_rows = Vec::new();
+        for exprs in rows {
+            if exprs.len() != targets.len() {
+                return err(format!("expected {} values, got {}", targets.len(), exprs.len()));
+            }
+            let mut row = vec![Value::Null; table.columns.len()];
+            forbid(&exprs, "VALUES")?;
+            for (&i, expr) in targets.iter().zip(&exprs) {
+                row[i] = eval_with(&query::bind(catalog, None, expr)?, &[], &[], &mut subqueries)?;
+            }
+            new_rows.push(row);
+        }
+        new_rows
     };
 
-    let mut new_rows = Vec::new();
-    for exprs in rows {
-        if exprs.len() != targets.len() {
-            return err(format!("expected {} values, got {}", targets.len(), exprs.len()));
-        }
-        let mut row = vec![Value::Null; table.columns.len()];
-        forbid(&exprs, "VALUES")?;
-        for (&i, expr) in targets.iter().zip(&exprs) {
-            row[i] = eval(expr, &[], &[])?;
-        }
-        new_rows.push(row);
-    }
-
     let count = new_rows.len();
-    table.insert(new_rows)?;
+    catalog.get_mut(table)?.insert(new_rows)?;
     Ok(message(format!("{count} row(s) inserted")))
 }
 
-fn update(table: &mut Table, assignments: Vec<(String, Expr)>, filter: Option<Expr>) -> Result<QueryResult> {
+fn update(
+    catalog: &mut Catalog,
+    table: &str,
+    assignments: Vec<(String, Expr)>,
+    filter: Option<Expr>,
+    settings: &Settings,
+) -> Result<QueryResult> {
     forbid(&filter, "WHERE")?;
     forbid(assignments.iter().map(|(_, e)| e), "UPDATE")?;
-    let assignments: Vec<(usize, Expr)> = assignments
-        .into_iter()
-        .map(|(name, expr)| Ok((table.column_index(&name)?, expr)))
-        .collect::<Result<_>>()?;
+    let changes = {
+        let catalog: &Catalog = catalog;
+        let table = catalog.get(table)?;
+        let filter = filter.map(|f| query::bind(catalog, Some(table), &f)).transpose()?;
+        let assignments: Vec<(usize, Expr)> = assignments
+            .into_iter()
+            .map(|(name, expr)| Ok((table.column_index(&name)?, query::bind(catalog, Some(table), &expr)?)))
+            .collect::<Result<_>>()?;
 
-    // Collect every change before writing, so the scan never sees its own updates.
-    let fields = Field::of_table(&table.name, &table.columns);
-    let mut changes = Vec::new();
-    for item in scan(table, &vec![true; table.columns.len()], &filter) {
-        let (rid, mut row) = item?;
-        if !matches(&filter, &fields, &row)? {
-            continue;
+        // Collect every change before writing, so the scan never sees its own
+        // updates, and subqueries see the table as it was.
+        let fields = Field::of_table(&table.name, &table.columns);
+        let mut subqueries = Runner::new(catalog, settings);
+        let mut changes = Vec::new();
+        for item in scan(table, &vec![true; table.columns.len()], &filter) {
+            let (rid, mut row) = item?;
+            if !matches_with(&filter, &fields, &row, &mut subqueries)? {
+                continue;
+            }
+            // All right-hand sides see the old row values.
+            let values: Vec<Value> = assignments
+                .iter()
+                .map(|(_, e)| eval_with(e, &fields, &row, &mut subqueries))
+                .collect::<Result<_>>()?;
+            for ((i, _), value) in assignments.iter().zip(values) {
+                row[*i] = value;
+            }
+            changes.push((rid, row));
         }
-        // All right-hand sides see the old row values.
-        let values: Vec<Value> = assignments.iter().map(|(_, e)| eval(e, &fields, &row)).collect::<Result<_>>()?;
-        for ((i, _), value) in assignments.iter().zip(values) {
-            row[*i] = value;
-        }
-        changes.push((rid, row));
-    }
+        changes
+    };
 
     let count = changes.len();
-    table.update(changes)?;
+    catalog.get_mut(table)?.update(changes)?;
     Ok(message(format!("{count} row(s) updated")))
 }
 
-fn delete(table: &mut Table, filter: Option<Expr>) -> Result<QueryResult> {
+fn delete(catalog: &mut Catalog, table: &str, filter: Option<Expr>, settings: &Settings) -> Result<QueryResult> {
     forbid(&filter, "WHERE")?;
-    let fields = Field::of_table(&table.name, &table.columns);
-    let mut rids = Vec::new();
-    for item in scan(table, &filter::needed_columns(table, &table.name, &filter), &filter) {
-        let (rid, row) = item?;
-        if matches(&filter, &fields, &row)? {
-            rids.push(rid);
+    let rids = {
+        let catalog: &Catalog = catalog;
+        let table = catalog.get(table)?;
+        let filter = filter.map(|f| query::bind(catalog, Some(table), &f)).transpose()?;
+        let fields = Field::of_table(&table.name, &table.columns);
+        let mut subqueries = Runner::new(catalog, settings);
+        let mut rids = Vec::new();
+        for item in scan(table, &filter::needed_columns(table, &table.name, &filter), &filter) {
+            let (rid, row) = item?;
+            if matches_with(&filter, &fields, &row, &mut subqueries)? {
+                rids.push(rid);
+            }
         }
-    }
-    table.delete(&rids)?;
+        rids
+    };
+    catalog.get_mut(table)?.delete(&rids)?;
     Ok(message(format!("{} row(s) deleted", rids.len())))
 }
 

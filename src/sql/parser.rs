@@ -1,12 +1,14 @@
 //! Recursive-descent SQL parser.
 //!
-//! A name followed by `(` is an aggregate function call.
+//! A name followed by `(` is an aggregate function call, and `(SELECT` starts
+//! a subquery.
 //!
 //! Expression precedence, lowest first:
-//! OR, AND, NOT, comparison / IS NULL, + -, * /, unary -, primary.
+//! OR, AND, NOT, comparison / IS NULL / IN, + -, * /, unary -, primary.
 
 use super::ast::{
-    Aggregate, BinaryOp, ColumnRef, Expr, From, Join, JoinKind, OrderBy, Projection, Statement, TableRef, UnaryOp,
+    Aggregate, BinaryOp, ColumnRef, Expr, From, Join, JoinKind, OrderBy, Projection, Select, Statement, TableRef,
+    UnaryOp,
 };
 use crate::error::{Error, Result};
 use super::lexer::{Token, tokenize};
@@ -53,7 +55,7 @@ impl Parser {
                 Ok(Statement::Explain(Box::new(self.statement()?)))
             }
             "INSERT" => self.insert(),
-            "SELECT" => self.select(),
+            "SELECT" => Ok(Statement::Select(self.select()?)),
             "UPDATE" => self.update(),
             "DELETE" => self.delete(),
             _ => Err(self.unexpected("a statement")),
@@ -147,7 +149,7 @@ impl Parser {
         Ok(Statement::Insert { table, columns, rows })
     }
 
-    fn select(&mut self) -> Result<Statement> {
+    fn select(&mut self) -> Result<Select> {
         self.expect_keyword("SELECT")?;
         let distinct = self.eat_keyword("DISTINCT");
         let projection = if self.eat_symbol("*") {
@@ -186,7 +188,7 @@ impl Parser {
             true => Some(self.number()? as usize),
             false => None,
         };
-        Ok(Statement::Select { distinct, from, projection, filter, group_by, having, order_by, limit })
+        Ok(Select { distinct, from, projection, filter, group_by, having, order_by, limit })
     }
 
     /// `table [, table | [INNER | LEFT [OUTER] | CROSS] JOIN table [ON expr]]...`
@@ -293,6 +295,21 @@ impl Parser {
             self.expect_keyword("NULL")?;
             return Ok(Expr::IsNull(Box::new(left), negated));
         }
+        let negated = self.peek() == Some(&Token::Keyword("NOT".into()))
+            && self.tokens.get(self.pos + 1) == Some(&Token::Keyword("IN".into()));
+        if negated {
+            self.pos += 1;
+        }
+        if self.eat_keyword("IN") {
+            self.expect_symbol("(")?;
+            let expr = if self.peek() == Some(&Token::Keyword("SELECT".into())) {
+                Expr::InSubquery(Box::new(left), Box::new(self.select()?), negated)
+            } else {
+                Expr::InList(Box::new(left), self.comma_list(Self::expr)?, negated)
+            };
+            self.expect_symbol(")")?;
+            return Ok(expr);
+        }
         let op = match self.peek() {
             Some(Token::Symbol("=")) => BinaryOp::Eq,
             Some(Token::Symbol("!=")) => BinaryOp::NotEq,
@@ -340,7 +357,18 @@ impl Parser {
     }
 
     fn primary(&mut self) -> Result<Expr> {
+        if self.eat_keyword("EXISTS") {
+            self.expect_symbol("(")?;
+            let query = self.select()?;
+            self.expect_symbol(")")?;
+            return Ok(Expr::Exists(Box::new(query)));
+        }
         if self.eat_symbol("(") {
+            if self.peek() == Some(&Token::Keyword("SELECT".into())) {
+                let query = self.select()?;
+                self.expect_symbol(")")?;
+                return Ok(Expr::Subquery(Box::new(query)));
+            }
             let expr = self.expr()?;
             self.expect_symbol(")")?;
             return Ok(expr);

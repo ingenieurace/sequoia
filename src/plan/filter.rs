@@ -3,7 +3,7 @@
 
 use crate::catalog::table::Table;
 use crate::predicate::{Compare, Predicate};
-use crate::sql::ast::{BinaryOp, ColumnRef, Expr};
+use crate::sql::ast::{BinaryOp, ColumnRef, Expr, Select};
 use crate::sql::eval::eval;
 use crate::types::Value;
 
@@ -22,16 +22,37 @@ pub fn needed_columns<'a>(table: &Table, qualifier: &str, exprs: impl IntoIterat
     needed
 }
 
-/// Calls `f` on every column reference in the expression.
+/// Calls `f` on every column reference in the expression: those of its
+/// subqueries count only if they are outer references, to this expression's row.
 pub fn visit_columns(expr: &Expr, f: &mut impl FnMut(&ColumnRef)) {
     match expr {
         Expr::Literal(_) | Expr::Aggregate(_, None, _) => {}
-        Expr::Column(column) => f(column),
+        Expr::Column(column) | Expr::Outer(column) => f(column),
         Expr::Unary(_, inner) | Expr::IsNull(inner, _) | Expr::Aggregate(_, Some(inner), _) => visit_columns(inner, f),
         Expr::Binary(left, _, right) => {
             visit_columns(left, f);
             visit_columns(right, f);
         }
+        Expr::InList(left, items, _) => {
+            visit_columns(left, f);
+            items.iter().for_each(|e| visit_columns(e, f));
+        }
+        Expr::Subquery(query) | Expr::Exists(query) => visit_outer(query, f),
+        Expr::InSubquery(left, query, _) => {
+            visit_columns(left, f);
+            visit_outer(query, f);
+        }
+    }
+}
+
+/// Calls `f` on every outer reference in the query, its subqueries' included.
+pub fn visit_outer(query: &Select, f: &mut impl FnMut(&ColumnRef)) {
+    for e in query.exprs() {
+        e.visit(&mut |e| {
+            if let Expr::Outer(column) = e {
+                f(column);
+            }
+        });
     }
 }
 
@@ -67,9 +88,10 @@ pub fn predicates(table: &Table, qualifier: &str, filter: &Option<Expr>) -> Vec<
         fn reads_columns(expr: &Expr) -> bool {
             match expr {
                 Expr::Literal(_) => false,
-                Expr::Column(_) => true,
+                Expr::Column(_) | Expr::Outer(_) => true,
                 Expr::Unary(_, inner) | Expr::IsNull(inner, _) => reads_columns(inner),
-                Expr::Aggregate(..) => true,
+                Expr::InList(left, items, _) => reads_columns(left) || items.iter().any(reads_columns),
+                Expr::Aggregate(..) | Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(..) => true,
                 Expr::Binary(left, _, right) => reads_columns(left) || reads_columns(right),
             }
         }
