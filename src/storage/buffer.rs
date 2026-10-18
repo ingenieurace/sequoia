@@ -7,16 +7,14 @@
 //! page table (PageId -> frame)    frames
 //!   7 -> 0                        [0] page 7  pins 1  dirty
 //!   3 -> 2                        [1] (free)
-//!                                 [2] page 3  pins 0  clean   <- clock hand
+//!                                 [2] page 3  pins 0  clean
 //! ```
 //!
 //! - A guard pins its frame, and pinned frames are never evicted. Dropping
 //!   the guard unpins it. A write guard that was written through marks the
 //!   frame dirty.
-//! - When no frame is free, a victim is chosen with CLOCK, an approximation
-//!   of LRU: every access sets a frame's reference bit, and the hand clears
-//!   set bits as it sweeps, evicting the first unpinned frame whose bit is
-//!   already clear.
+//! - When no frame is free, a [`Replacer`] picks an unpinned victim. The
+//!   default is ARC; see `replacer.rs`.
 //! - Write-back: a dirty page reaches disk only when it is evicted or flushed.
 //!
 //! Locking: one mutex (`state`) over all metadata, plus one RwLock per frame
@@ -30,6 +28,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::disk::{DiskManager, PAGE_SIZE, Page, PageId};
+use super::replacer::{ArcReplacer, Replacer};
 use crate::error::{Error, Result, err};
 
 pub struct BufferPool {
@@ -44,7 +43,7 @@ struct State {
     meta: Vec<FrameMeta>,
     /// Frames that hold no page.
     free: Vec<usize>,
-    hand: usize,
+    replacer: Box<dyn Replacer>,
 }
 
 #[derive(Default)]
@@ -52,19 +51,24 @@ struct FrameMeta {
     page: Option<PageId>,
     pins: u32,
     dirty: bool,
-    referenced: bool,
 }
 
 impl BufferPool {
-    /// Creates a pool of `capacity` frames. Callers that pin several pages at
-    /// once (e.g. the table heap pins two) need at least that many.
+    /// Creates a pool of `capacity` frames using ARC. Callers that pin several
+    /// pages at once (e.g. the table heap pins two) need at least that many.
     pub fn new(disk: Arc<DiskManager>, capacity: usize) -> Self {
+        Self::with_replacer(disk, capacity, Box::new(ArcReplacer::new(capacity)))
+    }
+
+    /// Creates a pool with a given replacement policy, which must be able to
+    /// track `capacity` resident pages.
+    pub fn with_replacer(disk: Arc<DiskManager>, capacity: usize, replacer: Box<dyn Replacer>) -> Self {
         assert!(capacity > 0, "a buffer pool needs at least one frame");
         let state = State {
             page_table: HashMap::new(),
             meta: (0..capacity).map(|_| FrameMeta::default()).collect(),
             free: (0..capacity).rev().collect(),
-            hand: 0,
+            replacer,
         };
         let frames = (0..capacity).map(|_| RwLock::new([0; PAGE_SIZE])).collect();
         Self { disk, frames, state: Mutex::new(state) }
@@ -117,8 +121,9 @@ impl BufferPool {
             if state.meta[frame].pins > 0 {
                 return err(format!("cannot delete pinned page {}", id.0));
             }
-            state.evict(frame);
+            state.clear_frame(frame);
             state.free.push(frame);
+            state.replacer.remove(id);
         }
         self.disk.deallocate_page(id)
     }
@@ -159,9 +164,8 @@ impl BufferPool {
     fn pin(&self, id: PageId) -> Result<usize> {
         let mut state = self.state.lock().unwrap();
         if let Some(&frame) = state.page_table.get(&id) {
-            let meta = &mut state.meta[frame];
-            meta.pins += 1;
-            meta.referenced = true;
+            state.meta[frame].pins += 1;
+            state.replacer.record_access(id);
             return Ok(frame);
         }
 
@@ -180,16 +184,17 @@ impl BufferPool {
         if let Some(frame) = state.free.pop() {
             return Ok(frame);
         }
-        let frame = state.find_victim().ok_or_else(|| {
-            Error(format!("buffer pool is full: all {} frames are pinned", self.capacity()))
-        })?;
-        let meta = &state.meta[frame];
-        if meta.dirty {
-            let page = meta.page.expect("a dirty frame holds a page");
+        let State { page_table, meta, replacer, .. } = state;
+        let page = replacer
+            .victim(&|page| meta[page_table[&page]].pins == 0)
+            .ok_or_else(|| Error(format!("buffer pool is full: all {} frames are pinned", self.capacity())))?;
+        let frame = page_table[&page];
+        if meta[frame].dirty {
             // On failure the victim stays cached and dirty.
             self.disk.write_page(page, &self.frames[frame].read().unwrap())?;
         }
-        state.evict(frame);
+        state.clear_frame(frame);
+        state.replacer.evict(page);
         Ok(frame)
     }
 
@@ -221,34 +226,16 @@ impl State {
     /// Puts `id` in a frame taken from `take_frame`, pinned once.
     fn install(&mut self, frame: usize, id: PageId) {
         self.page_table.insert(id, frame);
-        self.meta[frame] = FrameMeta { page: Some(id), pins: 1, dirty: false, referenced: true };
+        self.meta[frame] = FrameMeta { page: Some(id), pins: 1, dirty: false };
+        self.replacer.record_access(id);
     }
 
     /// Forgets the frame's page without writing it.
-    fn evict(&mut self, frame: usize) {
+    fn clear_frame(&mut self, frame: usize) {
         if let Some(page) = self.meta[frame].page.take() {
             self.page_table.remove(&page);
         }
         self.meta[frame] = FrameMeta::default();
-    }
-
-    /// CLOCK: sweeps from the hand, giving referenced frames a second chance.
-    /// Two full turns suffice: the first may only clear reference bits.
-    fn find_victim(&mut self) -> Option<usize> {
-        let n = self.meta.len();
-        for _ in 0..2 * n {
-            let frame = self.hand;
-            self.hand = (self.hand + 1) % n;
-            let meta = &mut self.meta[frame];
-            if meta.pins > 0 || meta.page.is_none() {
-                continue;
-            }
-            if !meta.referenced {
-                return Some(frame);
-            }
-            meta.referenced = false;
-        }
-        None
     }
 }
 
@@ -382,23 +369,6 @@ mod tests {
         for (byte, &id) in (1..=5).zip(&ids) {
             assert_eq!(*pool.fetch_read(id).unwrap(), filled(byte));
         }
-    }
-
-    #[test]
-    fn clock_gives_recently_used_pages_a_second_chance() {
-        let pool = pool(3);
-        let [a, b, c] = [1, 2, 3].map(|byte| new_filled(&pool, byte));
-
-        // Every frame is referenced: one full turn clears all bits, then the
-        // hand evicts the first frame (a) and stops after it.
-        let d = new_filled(&pool, 4);
-        assert!(!pool.is_cached(a));
-
-        // c is used again; b is not, so b is next.
-        drop(pool.fetch_read(c).unwrap());
-        new_filled(&pool, 5);
-        assert!(!pool.is_cached(b));
-        assert!(pool.is_cached(c) && pool.is_cached(d));
     }
 
     #[test]
