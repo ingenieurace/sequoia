@@ -44,12 +44,18 @@
 //!
 //! A migration writes the row group, then rewrites the manifest and syncs, and
 //! only then frees the old delta store, as an LSM flush does.
+//!
+//! A scan may be given [`Predicate`]s (`column op literal`, ANDed). In a row
+//! group it evaluates them on the compressed chunks first (see
+//! [`encoding::filter`]), ANDs the bitmaps they return with the live rows, and
+//! decodes the other columns only for the rows left (late materialization). A
+//! group with no row left is skipped without decoding anything.
 
 use std::sync::Arc;
 
 use super::buffer::BufferPool;
 use super::disk::{PAGE_USABLE, PageId, decode_id, encode_id, read_u32, write_u32};
-use super::encoding;
+use super::encoding::{self, Compare};
 use super::heap::{RecordId, TableHeap};
 use super::tuple;
 use crate::error::{Result, err};
@@ -76,6 +82,23 @@ pub enum Position {
     Delta(RecordId),
     /// Row `row` of the row group with this header page.
     Group { header: PageId, row: u32 },
+}
+
+/// A condition `column op literal` that a scan checks before decoding rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Predicate {
+    /// Index of the column in the schema.
+    pub column: usize,
+    pub op: Compare,
+    /// A non-NULL value of the column's type.
+    pub literal: Value,
+}
+
+impl Predicate {
+    /// Whether a decoded row satisfies the predicate; NULL never does.
+    pub fn matches(&self, row: &[Value]) -> bool {
+        row[self.column].compare(&self.literal).is_some_and(|ord| self.op.holds(ord))
+    }
 }
 
 pub struct ColumnStore {
@@ -174,21 +197,33 @@ impl ColumnStore {
         Ok(())
     }
 
-    /// Iterates over every row: the row groups oldest first, then the delta
-    /// store. Only the columns marked in `needed` are read from row groups;
-    /// the others are NULL. Rows from the delta store are always whole.
-    pub fn scan(&self, needed: Vec<bool>) -> impl Iterator<Item = Result<(Position, Vec<Value>)>> + '_ {
+    /// Iterates over the rows that satisfy every one of `predicates`: the row
+    /// groups oldest first, then the delta store. Only the columns marked in
+    /// `needed` are read from row groups; the others are NULL. Rows from the
+    /// delta store are always whole.
+    pub fn scan(
+        &self,
+        needed: Vec<bool>,
+        predicates: Vec<Predicate>,
+    ) -> impl Iterator<Item = Result<(Position, Vec<Value>)>> + '_ {
+        let delta_predicates = predicates.clone();
         let groups = self.groups.iter().flat_map(move |group| {
-            let rows = group.read(&self.pool, &self.columns, &needed);
+            let rows = group.read(&self.pool, &self.columns, &needed, &predicates);
             let (rows, error) = match rows {
                 Ok(rows) => (rows, None),
                 Err(e) => (Vec::new(), Some(Err(e))),
             };
             rows.into_iter().map(Ok).chain(error)
         });
-        let delta = self.delta.scan().map(|item| {
-            let (rid, bytes) = item?;
-            Ok((Position::Delta(rid), tuple::decode(&self.columns, &bytes)?))
+        let delta = self.delta.scan().filter_map(move |item| {
+            let read = || {
+                let (rid, bytes) = item?;
+                Ok((Position::Delta(rid), tuple::decode(&self.columns, &bytes)?))
+            };
+            match read() {
+                Ok((_, row)) if !delta_predicates.iter().all(|p| p.matches(&row)) => None,
+                result => Some(result),
+            }
         });
         groups.chain(delta)
     }
@@ -277,7 +312,7 @@ impl RowGroup {
     }
 
     fn is_deleted(&self, row: usize) -> bool {
-        self.deleted[row / 8] & (1 << (row % 8)) != 0
+        encoding::bit(&self.deleted, row)
     }
 
     /// Sets a row's bit in the delete bitmap, in memory and in the header page.
@@ -292,27 +327,60 @@ impl RowGroup {
         Ok(())
     }
 
-    /// Decodes the needed columns and returns the rows not deleted.
-    fn read(&self, pool: &BufferPool, columns: &[Column], needed: &[bool]) -> Result<Vec<(Position, Vec<Value>)>> {
+    /// Returns the rows not deleted that satisfy every predicate, with the
+    /// needed columns decoded.
+    fn read(
+        &self,
+        pool: &BufferPool,
+        columns: &[Column],
+        needed: &[bool],
+        predicates: &[Predicate],
+    ) -> Result<Vec<(Position, Vec<Value>)>> {
+        let mut chunks: Vec<Option<Vec<u8>>> = vec![None; columns.len()];
+        let mut selected: Vec<u8> = self.deleted.iter().map(|b| !b).collect();
+        if !self.rows.is_multiple_of(8) {
+            *selected.last_mut().unwrap() &= (1 << (self.rows % 8)) - 1;
+        }
+        // Find the matching rows on the compressed chunks, stopping once none is left.
+        for p in predicates {
+            if selected.iter().all(|&b| b == 0) {
+                break;
+            }
+            if chunks[p.column].is_none() {
+                chunks[p.column] = Some(read_chunk(pool, self.chunks[p.column])?);
+            }
+            let bytes = chunks[p.column].as_deref().unwrap();
+            let matching = encoding::filter(columns[p.column].data_type, bytes, self.rows, p.op, &p.literal)?;
+            selected.iter_mut().zip(matching).for_each(|(s, m)| *s &= m);
+        }
+        let rows: Vec<usize> = (0..self.rows).filter(|&row| encoding::bit(&selected, row)).collect();
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Then decode the needed columns, materializing only those rows.
         let mut values: Vec<Option<std::vec::IntoIter<Value>>> = Vec::with_capacity(columns.len());
         for (i, column) in columns.iter().enumerate() {
             values.push(if needed[i] {
-                Some(encoding::decode(column.data_type, &read_chunk(pool, self.chunks[i])?, self.rows)?.into_iter())
+                let bytes = match chunks[i].take() {
+                    Some(bytes) => bytes,
+                    None => read_chunk(pool, self.chunks[i])?,
+                };
+                Some(encoding::decode_selected(column.data_type, &bytes, self.rows, &selected)?.into_iter())
             } else {
                 None
             });
         }
-        let mut rows = Vec::with_capacity(self.live);
-        for row in 0..self.rows {
-            let values: Vec<Value> = values
-                .iter_mut()
-                .map(|column| column.as_mut().map_or(Value::Null, |c| c.next().expect("one value per row")))
-                .collect();
-            if !self.is_deleted(row) {
-                rows.push((Position::Group { header: self.header, row: row as u32 }, values));
-            }
-        }
-        Ok(rows)
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let values = values
+                    .iter_mut()
+                    .map(|column| column.as_mut().map_or(Value::Null, |c| c.next().expect("one value per row")))
+                    .collect();
+                (Position::Group { header: self.header, row: row as u32 }, values)
+            })
+            .collect())
     }
 
     fn destroy(self, pool: &BufferPool) -> Result<()> {
@@ -397,7 +465,7 @@ mod tests {
     }
 
     fn scan(store: &ColumnStore, needed: &[bool]) -> Vec<(Position, Vec<Value>)> {
-        store.scan(needed.to_vec()).collect::<Result<_>>().unwrap()
+        store.scan(needed.to_vec(), Vec::new()).collect::<Result<_>>().unwrap()
     }
 
     fn ids(store: &ColumnStore) -> Vec<i64> {
@@ -433,6 +501,46 @@ mod tests {
         insert(&mut store, 0..100);
         let rows = scan(&store, &[false, true, false]);
         assert_eq!(rows[4].1, vec![Value::Null, Value::Text("oslo".into()), Value::Null]);
+    }
+
+    #[test]
+    fn scans_evaluate_pushed_down_predicates() {
+        let mut store = ColumnStore::create(pool(), columns(), small()).unwrap();
+        insert(&mut store, 0..250);
+        let all = scan(&store, &[true, true, true]);
+        store.delete(all.iter().find(|(_, r)| r[0] == Value::Int(7)).unwrap().0).unwrap();
+
+        let predicate = |column, op, literal| Predicate { column, op, literal };
+        let cases = vec![
+            vec![predicate(1, Compare::Eq, Value::Text("oslo".into()))],
+            vec![predicate(1, Compare::Lt, Value::Text("m".into())), predicate(0, Compare::GtEq, Value::Int(120))],
+            vec![predicate(2, Compare::NotEq, Value::Bool(false))],
+            vec![predicate(0, Compare::Gt, Value::Int(1000))],
+            vec![predicate(0, Compare::LtEq, Value::Int(10)), predicate(0, Compare::Gt, Value::Int(3))],
+        ];
+        let all = scan(&store, &[true, true, true]);
+        for predicates in cases {
+            let matches = |row: &[Value]| predicates.iter().all(|p| p.matches(row));
+            let expected: Vec<_> = all.iter().filter(|(_, r)| matches(r)).cloned().collect();
+            let found: Vec<_> = store.scan(vec![true; 3], predicates.clone()).collect::<Result<_>>().unwrap();
+            assert_eq!(found, expected, "{predicates:?}");
+        }
+
+        // Rows from row groups and from the delta store, the deleted row left out.
+        let ids = |rows: Vec<(Position, Vec<Value>)>| rows.into_iter().map(|(_, r)| r[0].clone()).collect::<Vec<_>>();
+        let low = predicate(0, Compare::Lt, Value::Int(9));
+        let high = predicate(0, Compare::GtEq, Value::Int(248));
+        let rows = |p: &Predicate| store.scan(vec![true, false, false], vec![p.clone()]).collect::<Result<_>>();
+        let rows = |p: &Predicate| rows(p).unwrap();
+        assert_eq!(ids(rows(&low)), [0, 1, 2, 3, 4, 5, 6, 8].map(Value::Int));
+        assert_eq!(ids(rows(&high)), [248, 249].map(Value::Int));
+
+        // The predicate's column need not be returned (rows from the delta store are whole).
+        let paris = predicate(1, Compare::Eq, Value::Text("paris".into()));
+        let rows = store.scan(vec![true, false, false], vec![paris]).collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(rows.len(), 83);
+        assert!(rows.iter().all(|(_, r)| matches!(r[0], Value::Int(i) if i % 3 == 2)));
+        assert!(rows.iter().all(|(p, r)| matches!(p, Position::Delta(_)) || r[1] == Value::Null));
     }
 
     #[test]

@@ -101,6 +101,13 @@ A database is a single file of 4 KB pages:
   smallest: run-length, bit-packing (relative to the smallest value),
   patching (bit-packing with a few outliers stored apart), delta (then
   encoded again), an order-preserving dictionary, or one bitmap per value.
+  A WHERE clause's conditions of the form `column op literal` (joined by
+  AND) are **pushed down** into the scan and evaluated on the compressed
+  chunks: once per run for run-length encoding, by picking the literal's
+  bitmap, or, for a dictionary, by binary searching the sorted dictionary
+  for the literal and comparing codes instead of values. Only the rows that
+  match are then decoded from the other columns' chunks (late
+  materialization); the full WHERE clause is still checked on them.
   Row groups are never rewritten: a delete sets the row's bit in the group's
   delete bitmap, an update deletes the row and inserts the new value into the
   delta store, and a group whose rows are all deleted is freed. A manifest

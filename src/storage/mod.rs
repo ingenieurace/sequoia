@@ -23,7 +23,8 @@ pub mod sstable;
 pub mod tuple;
 
 pub use buffer::{BufferPool, PageReadGuard, PageWriteGuard, REPLACEMENT_POLICY};
-pub use column::{ColumnConfig, ColumnStore, Position};
+pub use column::{ColumnConfig, ColumnStore, Position, Predicate};
+pub use encoding::Compare;
 pub use disk::{DiskManager, PAGE_SIZE, PAGE_USABLE, Page, PageId};
 pub use heap::{RecordId, TableHeap};
 pub use lsm::{LsmConfig, LsmTree};

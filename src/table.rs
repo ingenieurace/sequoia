@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use crate::error::{Error, Result, err};
 use crate::storage::{
-    BufferPool, ColumnConfig, ColumnStore, LsmConfig, LsmTree, MAX_TUPLE_SIZE, PageId, Position, RecordId, TableHeap,
-    tuple,
+    BufferPool, ColumnConfig, ColumnStore, LsmConfig, LsmTree, MAX_TUPLE_SIZE, PageId, Position, Predicate, RecordId,
+    TableHeap, tuple,
 };
 use crate::types::{Column, StorageKind, Value};
 
@@ -110,6 +110,17 @@ impl Table {
     /// read. Unneeded columns may hold anything, NULL usually: a column store
     /// skips their chunks, while heaps and LSM trees return whole rows.
     pub fn scan_columns(&self, needed: &[bool]) -> Box<dyn Iterator<Item = Result<(RowId, Row)>> + '_> {
+        self.scan_filtered(needed, &[])
+    }
+
+    /// Like [`Table::scan_columns`], but rows that fail one of `predicates`
+    /// may be left out: a column store evaluates them on its compressed
+    /// chunks and skips those rows, while heaps and LSM trees return them all.
+    pub fn scan_filtered(
+        &self,
+        needed: &[bool],
+        predicates: &[Predicate],
+    ) -> Box<dyn Iterator<Item = Result<(RowId, Row)>> + '_> {
         assert_eq!(needed.len(), self.columns.len());
         match &self.storage {
             Storage::Heap(heap) => Box::new(heap.scan().map(|item| {
@@ -121,7 +132,9 @@ impl Table {
                 Ok((RowId::Key(key), tuple::decode(&self.columns, &bytes)?))
             })),
             Storage::Column(store) => Box::new(
-                store.scan(needed.to_vec()).map(|item| item.map(|(position, row)| (RowId::Position(position), row))),
+                store
+                    .scan(needed.to_vec(), predicates.to_vec())
+                    .map(|item| item.map(|(position, row)| (RowId::Position(position), row))),
             ),
         }
     }

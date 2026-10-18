@@ -431,3 +431,70 @@ fn dropped_column_tables_free_their_pages() {
     fill(&mut db);
     assert_eq!(std::fs::metadata(&path.0).unwrap().len(), size, "freed pages are reused");
 }
+
+#[test]
+fn column_tables_filter_compressed_chunks_like_heap_tables() {
+    let mut db = Database::in_memory();
+    let cities = ["lima", "oslo", "paris", "tokyo"];
+    for storage in ["HEAP", "COLUMN"] {
+        let schema = "(id INT PRIMARY KEY, city TEXT, nights INT, paid BOOL)";
+        db.execute(&format!("CREATE TABLE {storage}_t {schema} USING {storage}")).unwrap();
+        // Row groups of sorted ids, runs of cities and few distinct nights, plus rows left in the delta store.
+        for batch in 0..3 {
+            let values: Vec<String> = (0..1000)
+                .map(|i| {
+                    let id = batch * 1000 + i;
+                    let nights = if id % 11 == 0 { "NULL".to_string() } else { (id % 6 - 2).to_string() };
+                    let paid = if id % 13 == 0 { "NULL".to_string() } else { (id % 3 == 0).to_string() };
+                    format!("({id}, '{}', {nights}, {paid})", cities[id as usize / 300 % 4])
+                })
+                .collect();
+            db.execute(&format!("INSERT INTO {storage}_t VALUES {}", values.join(", "))).unwrap();
+        }
+    }
+    let same = |db: &mut Database, sql: &str| {
+        let mut heap = query(db, &sql.replace("{t}", "HEAP_t"));
+        let mut column = query(db, &sql.replace("{t}", "COLUMN_t"));
+        heap.sort_by(|a, b| a[0].sort_cmp(&b[0]));
+        column.sort_by(|a, b| a[0].sort_cmp(&b[0]));
+        assert_eq!(column, heap, "{sql}");
+        heap.len()
+    };
+    let wheres = [
+        "city = 'oslo'",
+        "city != 'oslo'",
+        "city < 'm'",
+        "'paris' <= city",
+        "city > 'rome'",
+        "city = 'rome'",
+        "nights = -1",
+        "nights < 0 AND paid",
+        "nights >= 2 AND city = 'tokyo' AND id < 2500",
+        "-2 = nights",
+        "nights != 1 + 1",
+        "paid = FALSE",
+        "paid != TRUE AND id > 2950",
+        "id >= 1020 AND id < 1030",
+        "id = 2999 OR nights = 3",
+        "nights = NULL",
+        "nights IS NULL AND city = 'lima'",
+        "NOT city = 'lima' AND id <= 10",
+    ];
+    for filter in wheres {
+        same(&mut db, &format!("SELECT * FROM {{t}} WHERE {filter}"));
+        same(&mut db, &format!("SELECT id, nights FROM {{t}} WHERE {filter}"));
+    }
+    assert_eq!(same(&mut db, "SELECT id FROM {t} WHERE city = 'oslo' AND nights = 3"), 136);
+    // Type errors are still reported.
+    assert!(db.execute("SELECT id FROM COLUMN_t WHERE city = 1").is_err());
+
+    let statements =
+        ["UPDATE {t} SET nights = 9 WHERE city = 'paris' AND id < 1500", "DELETE FROM {t} WHERE nights = 0"];
+    for statement in statements {
+        for table in ["HEAP_t", "COLUMN_t"] {
+            db.execute(&statement.replace("{t}", table)).unwrap();
+        }
+        same(&mut db, "SELECT * FROM {t}");
+    }
+    same(&mut db, "SELECT * FROM {t} WHERE nights = 9 AND city > 'lima'");
+}
