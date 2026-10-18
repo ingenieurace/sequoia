@@ -33,7 +33,8 @@ Shell commands: `.tables`, `.exit`.
 - Types: `INT`, `TEXT`, `BOOL`, and `NULL`
 - Constraints: `PRIMARY KEY` (unique, not null), unique indexes (NULLs may repeat);
   values are type-checked
-- `SELECT`: `*` or expressions, `WHERE`, `ORDER BY ... ASC|DESC`, `LIMIT`
+- `SELECT`: `*` or expressions, `WHERE`, `ORDER BY ... ASC|DESC` (any
+  expressions, NULL first, stable), `LIMIT`
 - Expressions: `+ - * /`, `= != <> < <= > >=`, `AND OR NOT`, `IS [NOT] NULL`,
   parentheses, with SQL three-valued logic for `NULL`
 
@@ -53,7 +54,9 @@ src/
   main.rs         interactive shell
   lib.rs          module list and public exports
   database.rs     entry point; runs SQL, commits or rolls back each statement
-  executor.rs     runs statements
+  executor/       runs statements
+    mod.rs        statement execution
+    sort.rs       ORDER BY: external merge sort, top-N heap for LIMIT
   types.rs        values, data types, columns
   predicate.rs    `column op literal` conditions, shared by the planner and storage
   result.rs       query results and table printing
@@ -175,6 +178,17 @@ page in use is pinned and cannot be evicted; when the pool is full, ARC
 it is dirty. ARC balances recently used against frequently used pages, so a
 full table scan does not push frequently used pages out. LRU-K and CLOCK are
 also available: to switch, edit `REPLACEMENT_POLICY` in `src/storage/buffer/pool.rs`.
+
+**Sorting**: `ORDER BY` buffers rows in memory up to a budget (4 MB by
+default; `Database::set_sort_memory` changes it). Past that, it sorts what it
+holds and writes it to a temporary file as a sorted run, and at the end
+merges the runs through a heap, at most 16 at a time, in several passes if
+there are more. The temporary file is removed as soon as it is opened, so it
+vanishes with the sort, and it bypasses the write-ahead log. With `LIMIT n`,
+the buffer is instead a heap of the best `n` rows so far, so sorting `m` rows
+takes O(m log n) time and memory for `n` rows. Rows with equal keys keep the
+order they were read in. Without `ORDER BY`, a `LIMIT` stops reading rows
+once it has enough. The rows a `SELECT` returns are still collected in memory.
 
 **The write-ahead log** (`<file>-wal`) makes every statement atomic. The
 DiskManager never writes the database file directly: each page write, the

@@ -714,3 +714,53 @@ fn indexes_survive_reopening_and_are_dropped_with_their_table() {
     let mut db = Database::open(&path.0).unwrap();
     assert_eq!(query(&mut db, "SELECT id FROM t WHERE tag = 'tag1'").len(), 40);
 }
+
+#[test]
+fn order_by_gives_the_same_rows_when_sorts_spill_to_disk() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, k INT, name TEXT)").unwrap();
+    let values: Vec<String> = (0..3000i64)
+        .map(|id| {
+            let k = if id % 13 == 0 { "NULL".to_string() } else { (id * 7 % 10).to_string() };
+            format!("({id}, {k}, '{}')", ["ann", "bo", "cy", ""][id as usize % 4].repeat(id as usize % 5))
+        })
+        .collect();
+    db.execute(&format!("INSERT INTO t VALUES {}", values.join(", "))).unwrap();
+
+    let queries = [
+        "SELECT * FROM t ORDER BY k",
+        "SELECT * FROM t ORDER BY k DESC, name",
+        "SELECT id, name FROM t ORDER BY name DESC, k * -1",
+        "SELECT * FROM t WHERE k > 3 ORDER BY name, id DESC",
+        "SELECT * FROM t ORDER BY k LIMIT 25",
+        "SELECT * FROM t ORDER BY name DESC LIMIT 2999",
+        "SELECT * FROM t ORDER BY k LIMIT 0",
+        "SELECT id FROM t WHERE id >= 100 ORDER BY k DESC LIMIT 5000",
+    ];
+    let in_memory: Vec<Vec<Vec<Value>>> = queries.iter().map(|sql| query(&mut db, sql)).collect();
+    db.set_sort_memory(1000); // a few rows per run
+    for (sql, expected) in queries.iter().zip(&in_memory) {
+        assert_eq!(&query(&mut db, sql), expected, "{sql}");
+    }
+
+    // Equal keys keep the order the rows are read in, as a stable sort would.
+    let mut expected = query(&mut db, "SELECT k, id FROM t");
+    expected.sort_by(|a, b| a[0].sort_cmp(&b[0]));
+    assert_eq!(query(&mut db, "SELECT k, id FROM t ORDER BY k"), expected);
+    assert!(expected[0][0].is_null(), "NULL sorts first");
+    expected.sort_by(|a, b| b[0].sort_cmp(&a[0]));
+    assert_eq!(query(&mut db, "SELECT k, id FROM t ORDER BY k DESC LIMIT 3"), expected[..3]);
+}
+
+#[test]
+fn limit_without_order_by_stops_reading_rows() {
+    let mut db = setup();
+    assert_eq!(query(&mut db, "SELECT id FROM users LIMIT 2"), vec![vec![int(1)], vec![int(2)]]);
+    assert!(query(&mut db, "SELECT id FROM users LIMIT 0").is_empty());
+    // The third row would divide by zero, but two rows are found before it.
+    let sql = "SELECT id FROM users WHERE 10 / (id - 3) < 0";
+    assert!(db.execute(sql).is_err());
+    assert_eq!(query(&mut db, &format!("{sql} LIMIT 2")), vec![vec![int(1)], vec![int(2)]]);
+    // With an order, every row is read, so the error is still reported.
+    assert!(db.execute(&format!("{sql} ORDER BY id LIMIT 2")).is_err());
+}

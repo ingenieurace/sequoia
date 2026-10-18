@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::catalog::Catalog;
 use crate::error::{Result, err};
-use crate::executor;
+use crate::executor::{self, Settings};
 use crate::sql::ast::Statement;
 use crate::sql::parse;
 use crate::result::QueryResult;
@@ -25,6 +25,7 @@ const BUFFER_POOL_FRAMES: usize = 256;
 pub struct Database {
     pool: Arc<BufferPool>,
     catalog: Catalog,
+    settings: Settings,
     /// Set when a rollback failed, leaving the state in memory unknown.
     broken: bool,
 }
@@ -44,7 +45,7 @@ impl Database {
         let pool = Arc::new(BufferPool::new(Arc::new(disk), BUFFER_POOL_FRAMES));
         let mut catalog = Catalog::open(pool.clone())?;
         catalog.save()?; // a new database's empty catalog
-        Ok(Database { pool, catalog, broken: false })
+        Ok(Database { pool, catalog, settings: Settings::default(), broken: false })
     }
 
     /// Parses and runs every statement in `sql`, stopping at the first error.
@@ -58,7 +59,7 @@ impl Database {
             return err("a failed rollback left the database unusable: open it again");
         }
         let modifies = !matches!(statement, Statement::Select { .. } | Statement::Explain(_));
-        let result = executor::execute(&mut self.catalog, statement);
+        let result = executor::execute(&mut self.catalog, statement, &self.settings);
         if !modifies {
             return result;
         }
@@ -80,6 +81,12 @@ impl Database {
         self.pool.disk().rollback()?;
         self.catalog = Catalog::open(self.pool.clone())?;
         Ok(())
+    }
+
+    /// Sets how many bytes a sort may buffer before it writes sorted runs to
+    /// a temporary file ([`executor::sort::SORT_MEMORY`] by default).
+    pub fn set_sort_memory(&mut self, bytes: usize) {
+        self.settings.sort_memory = bytes;
     }
 
     pub fn table_names(&self) -> Vec<&str> {

@@ -1,4 +1,7 @@
-//! Executes parsed statements against the catalog.
+//! Executes parsed statements against the catalog. `sort` orders the rows
+//! of a SELECT.
+
+pub mod sort;
 
 use crate::catalog::Catalog;
 use crate::catalog::table::{Row, RowId, Table};
@@ -8,8 +11,23 @@ use crate::result::QueryResult;
 use crate::sql::ast::{Expr, OrderBy, Projection, Statement};
 use crate::sql::eval::{eval, matches};
 use crate::types::Value;
+use sort::{SORT_MEMORY, Sorter};
 
-pub fn execute(catalog: &mut Catalog, statement: Statement) -> Result<QueryResult> {
+/// Knobs that change how statements run, not what they return.
+#[derive(Debug, Clone)]
+pub struct Settings {
+    /// Bytes a sort may buffer rows in before it writes sorted runs to a
+    /// temporary file. Like PostgreSQL's `work_mem`.
+    pub sort_memory: usize,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings { sort_memory: SORT_MEMORY }
+    }
+}
+
+pub fn execute(catalog: &mut Catalog, statement: Statement, settings: &Settings) -> Result<QueryResult> {
     match statement {
         Statement::CreateTable { name, columns, storage } => {
             catalog.create_table(name.clone(), columns, storage)?;
@@ -34,7 +52,7 @@ pub fn execute(catalog: &mut Catalog, statement: Statement) -> Result<QueryResul
         }
         Statement::Insert { table, columns, rows } => insert(catalog.get_mut(&table)?, columns, rows),
         Statement::Select { table, projection, filter, order_by, limit } => {
-            select(catalog.get(&table)?, projection, filter, order_by, limit)
+            select(catalog.get(&table)?, projection, filter, order_by, limit, settings)
         }
         Statement::Update { table, assignments, filter } => {
             update(catalog.get_mut(&table)?, assignments, filter)
@@ -85,6 +103,7 @@ fn select(
     filter: Option<Expr>,
     order_by: Vec<OrderBy>,
     limit: Option<usize>,
+    settings: &Settings,
 ) -> Result<QueryResult> {
     let columns = &table.columns;
     let needed = match &projection {
@@ -96,35 +115,32 @@ fn select(
     };
 
     let mut rows: Vec<Row> = Vec::new();
-    for item in scan(table, &needed, &filter) {
-        let (_, row) = item?;
-        if matches(&filter, columns, &row)? {
-            rows.push(row);
+    if order_by.is_empty() {
+        // Without an order, the first rows found will do: stop there.
+        let wanted = limit.unwrap_or(usize::MAX);
+        if wanted > 0 {
+            for item in scan(table, &needed, &filter) {
+                let (_, row) = item?;
+                if matches(&filter, columns, &row)? {
+                    rows.push(row);
+                    if rows.len() == wanted {
+                        break;
+                    }
+                }
+            }
         }
-    }
-
-    if !order_by.is_empty() {
-        // Evaluate sort keys up front so errors surface before sorting.
-        let mut keyed = rows
-            .into_iter()
-            .map(|row| {
-                let keys = order_by.iter().map(|o| eval(&o.expr, columns, &row));
-                Ok((keys.collect::<Result<Vec<_>>>()?, row))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        keyed.sort_by(|(a, _), (b, _)| {
-            order_by
-                .iter()
-                .zip(a.iter().zip(b))
-                .map(|(o, (x, y))| if o.desc { y.sort_cmp(x) } else { x.sort_cmp(y) })
-                .find(|ord| ord.is_ne())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        rows = keyed.into_iter().map(|(_, row)| row).collect();
-    }
-
-    if let Some(n) = limit {
-        rows.truncate(n);
+    } else {
+        let desc = order_by.iter().map(|o| o.desc).collect();
+        let mut sorter = Sorter::new(desc, limit, settings.sort_memory);
+        for item in scan(table, &needed, &filter) {
+            let (_, row) = item?;
+            if matches(&filter, columns, &row)? {
+                // Evaluated for every row, so that errors surface as without a limit.
+                let keys = order_by.iter().map(|o| eval(&o.expr, columns, &row)).collect::<Result<_>>()?;
+                sorter.push(keys, row)?;
+            }
+        }
+        rows = sorter.finish()?.collect::<Result<_>>()?;
     }
 
     let (names, rows) = match projection {
