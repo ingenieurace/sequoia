@@ -20,6 +20,10 @@
 //! keeps those up to the last commit frame and cuts off the rest: a crash
 //! loses exactly the writes that were not committed.
 //!
+//! A savepoint marks a point among the frames written since the last commit;
+//! rolling back to it cuts the frames after it off the log, as a rollback
+//! does those after the last commit.
+//!
 //! A checkpoint copies the newest committed version of each page into the
 //! database file, syncs it, and only then empties the log, so a crash during a
 //! checkpoint leaves the log to be copied again.
@@ -28,7 +32,7 @@ use std::collections::HashMap;
 
 use super::disk::{PAGE_SIZE, Page, PageId};
 use super::medium::Medium;
-use crate::error::Result;
+use crate::error::{Result, err};
 
 const FRAME_HEADER: u64 = 12;
 const PAGE_FRAME: u64 = FRAME_HEADER + PAGE_SIZE as u64;
@@ -49,6 +53,17 @@ pub struct Wal {
     /// End of the last commit frame, and its checksum: where a rollback cuts the log.
     committed_end: u64,
     committed_checksum: u64,
+    /// Commits and checkpoints so far, which a savepoint must not be from before.
+    epoch: u64,
+}
+
+/// A point among the frames written since the last commit, to roll back to.
+#[derive(Clone)]
+pub struct WalSavepoint {
+    pending: HashMap<PageId, u64>,
+    end: u64,
+    checksum: u64,
+    epoch: u64,
 }
 
 impl Wal {
@@ -63,6 +78,7 @@ impl Wal {
             checksum: SEED,
             committed_end: 0,
             committed_checksum: SEED,
+            epoch: 0,
         };
         let mut header = [0; FRAME_HEADER as usize];
         let mut page = [0; PAGE_SIZE];
@@ -162,6 +178,25 @@ impl Wal {
         self.file.sync()
     }
 
+    /// Marks the current end of the log, to roll back to.
+    pub fn savepoint(&self) -> WalSavepoint {
+        WalSavepoint { pending: self.pending.clone(), end: self.end, checksum: self.checksum, epoch: self.epoch }
+    }
+
+    /// Forgets every page written since `savepoint` and cuts them off the log.
+    /// Fails if there was a commit or checkpoint since.
+    pub fn rollback_to(&mut self, savepoint: &WalSavepoint) -> Result<()> {
+        if savepoint.epoch != self.epoch {
+            return err("savepoint is from before the last commit");
+        }
+        self.pending = savepoint.pending.clone();
+        self.end = savepoint.end;
+        self.checksum = savepoint.checksum;
+        // No sync needed: frames left past the end after a crash are not
+        // followed by a commit frame that chains to them, so they are cut off.
+        self.file.set_len(self.end)
+    }
+
     /// Copies the newest committed version of every page into `db` and
     /// empties the log. Must not be called with pages pending.
     pub fn checkpoint(&mut self, db: &dyn Medium) -> Result<()> {
@@ -180,6 +215,7 @@ impl Wal {
         self.committed.clear();
         self.committed_end = 0;
         self.committed_checksum = SEED;
+        self.epoch += 1;
         self.rollback()
     }
 
@@ -187,6 +223,7 @@ impl Wal {
         self.committed.extend(self.pending.drain());
         self.committed_end = self.end;
         self.committed_checksum = self.checksum;
+        self.epoch += 1;
     }
 }
 

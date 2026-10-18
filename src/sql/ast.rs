@@ -25,6 +25,16 @@ pub enum Statement {
     Explain(Box<Statement>),
     /// Copies the committed pages from the write-ahead log into the database file.
     Checkpoint,
+    /// `BEGIN [TRANSACTION]`: the statements up to COMMIT or ROLLBACK form one transaction.
+    Begin,
+    /// `COMMIT [TRANSACTION]`
+    Commit,
+    /// `ROLLBACK [TRANSACTION]`, or with a name, `ROLLBACK [TRANSACTION] TO [SAVEPOINT] name`.
+    Rollback { savepoint: Option<String> },
+    /// `SAVEPOINT name`
+    Savepoint { name: String },
+    /// `RELEASE [SAVEPOINT] name`
+    Release { name: String },
     Insert {
         table: String,
         columns: Option<Vec<String>>,

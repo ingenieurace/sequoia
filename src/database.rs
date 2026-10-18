@@ -1,20 +1,31 @@
 //! Public entry point: owns the catalog and the disk it lives on.
 //!
 //! Every statement that changes data is atomic. When it succeeds, the catalog
-//! is saved, dirty pages are written back from the buffer pool, and the disk
-//! commits them through its write-ahead log, so a statement that returns
+//! is saved, dirty pages are written back from the buffer pool to the disk's
+//! write-ahead log, and the disk commits them, so a statement that returns
 //! successfully is durable. When it fails, its writes are rolled back: the
 //! buffer pool drops its cached pages, the disk drops the uncommitted log
 //! frames, and the catalog is opened again from the committed pages. A crash
 //! in the middle of a statement likewise loses all of it.
+//!
+//! **Transactions.** Between `BEGIN` and `COMMIT`, statements are saved to
+//! the log as they succeed but not committed, so later ones see them and
+//! `COMMIT` makes all of them durable at once. `ROLLBACK`, closing the
+//! database, or a crash undoes all of them. A statement that fails inside a
+//! transaction is undone alone, back to a savepoint of the disk taken before
+//! it (with the pool clean, as the statement before saved everything), and
+//! the transaction goes on. `SAVEPOINT name` takes such a savepoint by name,
+//! for `ROLLBACK TO name` to go back to (keeping it, and dropping the ones
+//! taken after it) and `RELEASE name` to forget (with those after it).
 
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::catalog::Catalog;
-use crate::error::{Result, err};
+use crate::error::{Error, Result, err};
 use crate::executor::{self, Query, Settings};
 use crate::sql::ast::Statement;
+use crate::storage::io::disk::Savepoint;
 use crate::sql::parse;
 use crate::result::QueryResult;
 use crate::storage::{BufferPool, DiskManager};
@@ -26,8 +37,22 @@ pub struct Database {
     pool: Arc<BufferPool>,
     catalog: Catalog,
     settings: Settings,
+    /// The savepoints of the transaction in progress, oldest first, if there is one.
+    transaction: Option<Vec<(String, Savepoint)>>,
     /// Set when a rollback failed, leaving the state in memory unknown.
     broken: bool,
+}
+
+/// The position of the newest savepoint with this name.
+fn find(savepoints: &[(String, Savepoint)], name: &str) -> Result<usize> {
+    match savepoints.iter().rposition(|(n, _)| n == name) {
+        Some(i) => Ok(i),
+        None => err(format!("no such savepoint: {name}")),
+    }
+}
+
+fn message(text: impl Into<String>) -> QueryResult {
+    QueryResult::Message(text.into())
 }
 
 impl Database {
@@ -45,7 +70,8 @@ impl Database {
         let pool = Arc::new(BufferPool::new(Arc::new(disk), BUFFER_POOL_FRAMES));
         let mut catalog = Catalog::open(pool.clone())?;
         catalog.save()?; // a new database's empty catalog
-        Ok(Database { pool, catalog, settings: Settings::default(), broken: false })
+        pool.disk().commit()?;
+        Ok(Database { pool, catalog, settings: Settings::default(), transaction: None, broken: false })
     }
 
     /// Parses and runs every statement in `sql`, stopping at the first error.
@@ -58,20 +84,94 @@ impl Database {
         if self.broken {
             return err("a failed rollback left the database unusable: open it again");
         }
+        match statement {
+            Statement::Begin => {
+                if self.transaction.is_some() {
+                    return err("a transaction is already in progress");
+                }
+                self.transaction = Some(Vec::new());
+                Ok(message("transaction started"))
+            }
+            Statement::Commit => {
+                if self.transaction.take().is_none() {
+                    return err("no transaction is in progress");
+                }
+                match self.pool.disk().commit() {
+                    Ok(()) => Ok(message("transaction committed")),
+                    Err(e) => self.undo(e, None),
+                }
+            }
+            Statement::Rollback { savepoint: None } => {
+                if self.transaction.take().is_none() {
+                    return err("no transaction is in progress");
+                }
+                self.restore(None)?;
+                Ok(message("transaction rolled back"))
+            }
+            Statement::Rollback { savepoint: Some(name) } => {
+                let savepoints = self.savepoints("ROLLBACK TO")?;
+                let i = find(savepoints, &name)?;
+                savepoints.truncate(i + 1);
+                let savepoint = savepoints[i].1.clone();
+                self.restore(Some(&savepoint))?;
+                Ok(message(format!("rolled back to savepoint {name}")))
+            }
+            Statement::Savepoint { name } => {
+                let savepoint = self.pool.disk().savepoint();
+                self.savepoints("SAVEPOINT")?.push((name.clone(), savepoint));
+                Ok(message(format!("savepoint {name} created")))
+            }
+            Statement::Release { name } => {
+                let savepoints = self.savepoints("RELEASE")?;
+                let i = find(savepoints, &name)?;
+                savepoints.truncate(i);
+                Ok(message(format!("savepoint {name} released")))
+            }
+            Statement::Checkpoint if self.transaction.is_some() => err("CHECKPOINT cannot run inside a transaction"),
+            statement => self.statement(statement),
+        }
+    }
+
+    /// Runs a statement other than the transaction ones, atomically: commits
+    /// it, or inside a transaction saves it, or else undoes it.
+    fn statement(&mut self, statement: Statement) -> Result<QueryResult> {
         let modifies = !matches!(statement, Statement::Select(_) | Statement::Explain(_));
+        let savepoint = (modifies && self.transaction.is_some()).then(|| self.pool.disk().savepoint());
         let result = executor::execute(&mut self.catalog, statement, &self.settings);
         if !modifies {
             return result;
         }
-        match result.and_then(|result| self.catalog.save().map(|()| result)) {
+        let saved = result.and_then(|result| {
+            self.catalog.save()?;
+            if self.transaction.is_none() {
+                self.pool.disk().commit()?;
+            }
+            Ok(result)
+        });
+        match saved {
             Ok(result) => Ok(result),
-            Err(e) => match self.rollback() {
-                Ok(()) => Err(e),
-                Err(rollback) => {
-                    self.broken = true;
-                    err(format!("{e}; then the rollback failed: {rollback}"))
-                }
-            },
+            Err(e) => self.undo(e, savepoint.as_ref()),
+        }
+    }
+
+    /// Whether a transaction is in progress.
+    pub fn in_transaction(&self) -> bool {
+        self.transaction.is_some()
+    }
+
+    /// The savepoints of the transaction in progress, for `statement` to use.
+    fn savepoints(&mut self, statement: &str) -> Result<&mut Vec<(String, Savepoint)>> {
+        match &mut self.transaction {
+            Some(savepoints) => Ok(savepoints),
+            None => err(format!("{statement} can only be used in a transaction")),
+        }
+    }
+
+    /// Undoes what failed with `e`: everything since `to`, or since the last commit.
+    fn undo(&mut self, e: Error, to: Option<&Savepoint>) -> Result<QueryResult> {
+        match self.restore(to) {
+            Ok(()) => Err(e),
+            Err(rollback) => err(format!("{e}; then the rollback failed: {rollback}")),
         }
     }
 
@@ -90,12 +190,20 @@ impl Database {
         }
     }
 
-    /// Undoes everything since the last commit, in memory and on disk.
-    fn rollback(&mut self) -> Result<()> {
-        self.pool.discard_all()?;
-        self.pool.disk().rollback()?;
-        self.catalog = Catalog::open(self.pool.clone())?;
-        Ok(())
+    /// Undoes everything since `to`, or since the last commit, in memory and
+    /// on disk. If that fails, the database is unusable.
+    fn restore(&mut self, to: Option<&Savepoint>) -> Result<()> {
+        let result = (|| {
+            self.pool.discard_all()?;
+            match to {
+                Some(savepoint) => self.pool.disk().rollback_to(savepoint)?,
+                None => self.pool.disk().rollback()?,
+            }
+            self.catalog = Catalog::open(self.pool.clone())?;
+            Ok(())
+        })();
+        self.broken |= result.is_err();
+        result
     }
 
     /// Sets how many bytes a sort may buffer before it writes sorted runs to
@@ -273,5 +381,98 @@ mod tests {
         // Everything committed survives a crash.
         let mut db = open(&sim.crashed(0)).unwrap();
         assert!(snapshot(&mut db) == expected);
+    }
+    /// Runs every statement of `statements()` in one transaction.
+    fn transaction(db: &mut Database, end: &str) -> Result<()> {
+        db.execute("BEGIN")?;
+        for statement in statements() {
+            db.execute(&statement)?;
+        }
+        db.execute(end).map(drop)
+    }
+
+    #[test]
+    fn a_crash_loses_all_of_a_transaction_or_none() {
+        let sim = Sim::new(2);
+        let mut db = setup(&sim);
+        let before = snapshot(&mut db);
+        let start = sim.ops();
+        transaction(&mut db, "COMMIT").unwrap();
+        let ops = sim.ops() - start;
+        let after = snapshot(&mut db);
+
+        for crash in (0..ops).step_by(ops.div_ceil(24)).chain([ops - 1]) {
+            let sim = Sim::new(2);
+            let mut db = setup(&sim);
+            sim.crash_after(crash);
+            let result = transaction(&mut db, "COMMIT");
+            for kept in [0, 1, usize::MAX] {
+                let mut db = open(&sim.crashed(kept)).unwrap();
+                let found = snapshot(&mut db);
+                let label = format!("crash after {crash} of {ops} ops, {kept} unsynced kept");
+                match &result {
+                    Ok(()) => assert!(found == after, "{label}"),
+                    Err(_) => assert!(found == before || found == after, "{label}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_rolled_back_transaction_leaves_nothing() {
+        let sim = Sim::new(2);
+        let mut db = setup(&sim);
+        let before = snapshot(&mut db);
+        db.execute("BEGIN").unwrap();
+        // About 2 MB, twice the buffer pool, so dirty pages are evicted into the log.
+        let big = |from: i64| values((from..from + 3000).map(|i| format!("({i}, 'big', {i}, '{}')", "b".repeat(600))));
+        db.execute(&format!("INSERT INTO h VALUES {}", big(10_000))).unwrap();
+        // A statement failing after evictions is undone alone: the last row is a duplicate.
+        let failing = format!("INSERT INTO h VALUES {}, (10000, 'dup', 0, '')", big(20_000));
+        assert!(db.execute(&failing).unwrap_err().0.contains("duplicate"));
+        let count = rows(&mut db, "SELECT COUNT(*) FROM h WHERE tag = 'big'").unwrap();
+        assert_eq!(count, vec![vec![Value::Int(3000)]]);
+        for statement in statements() {
+            db.execute(&statement).unwrap();
+        }
+        db.execute("ROLLBACK").unwrap();
+        assert!(snapshot(&mut db) == before);
+        let mut db = open(&sim.crashed(usize::MAX)).unwrap();
+        assert!(snapshot(&mut db) == before);
+    }
+
+    #[test]
+    fn a_failed_statement_in_a_transaction_is_undone_alone() {
+        let sim = Sim::new(2);
+        let mut db = setup(&sim);
+        let before = snapshot(&mut db);
+        db.execute("BEGIN").unwrap();
+        let mut expected = before.clone();
+        for (i, statement) in statements().iter().enumerate() {
+            let mut done = false;
+            for fail in [0, 3, 40, 200] {
+                sim.fail_once_after(fail);
+                match db.execute(statement) {
+                    Ok(_) => {
+                        done = true;
+                        break;
+                    }
+                    Err(e) => {
+                        assert_eq!(e.0, "simulated I/O error", "statement {i}");
+                        assert!(db.in_transaction(), "statement {i}");
+                        assert!(snapshot(&mut db) == expected, "statement {i} failing after {fail} ops left nothing");
+                    }
+                }
+            }
+            sim.heal();
+            if !done {
+                db.execute(statement).unwrap();
+            }
+            expected = snapshot(&mut db);
+        }
+        // Nothing is durable before COMMIT, and everything after.
+        assert!(snapshot(&mut open(&sim.crashed(usize::MAX)).unwrap()) == before);
+        db.execute("COMMIT").unwrap();
+        assert!(snapshot(&mut open(&sim.crashed(0)).unwrap()) == expected);
     }
 }

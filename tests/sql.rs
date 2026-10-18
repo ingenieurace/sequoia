@@ -1474,3 +1474,131 @@ fn every_storage_answers_subqueries_alike() {
     assert_eq!(results[0], results[1], "heap and LSM");
     assert_eq!(results[0], results[2], "heap and column");
 }
+
+#[test]
+fn transactions_commit_or_roll_back_together() {
+    let mut db = setup();
+    let ids = |db: &mut Database| ints(query(db, "SELECT id FROM users ORDER BY id"));
+    db.execute("BEGIN; INSERT INTO users (id, name) VALUES (4, 'dan'); UPDATE users SET age = 99 WHERE id = 1").unwrap();
+    assert!(db.in_transaction());
+    // Later statements see the earlier ones.
+    assert_eq!(ids(&mut db), [int(1), int(2), int(3), int(4)]);
+    assert_eq!(query(&mut db, "SELECT age FROM users WHERE id = 1"), [vec![int(99)]]);
+    db.execute("ROLLBACK").unwrap();
+    assert!(!db.in_transaction());
+    assert_eq!(ids(&mut db), [int(1), int(2), int(3)]);
+    assert_eq!(query(&mut db, "SELECT age FROM users WHERE id = 1"), [vec![int(30)]]);
+
+    db.execute("BEGIN TRANSACTION; DELETE FROM users WHERE id = 2; INSERT INTO users (id) VALUES (5); COMMIT").unwrap();
+    assert_eq!(ids(&mut db), [int(1), int(3), int(5)]);
+
+    // Tables and indexes of every kind come and go with the transaction.
+    db.execute(
+        "BEGIN;
+         CREATE TABLE l (id INT PRIMARY KEY, v TEXT) USING LSM;
+         CREATE TABLE c (id INT, v TEXT) USING COLUMN;
+         CREATE INDEX users_name ON users (name);
+         DROP TABLE users;",
+    )
+    .unwrap();
+    let rows = (0..1500).map(|i| format!("({i}, '{}')", "x".repeat(i % 40))).collect::<Vec<_>>().join(", ");
+    db.execute(&format!("INSERT INTO l VALUES {rows}; INSERT INTO c VALUES {rows}")).unwrap();
+    assert_eq!(db.table_names(), ["c", "l"]);
+    db.execute("ROLLBACK").unwrap();
+    assert_eq!(db.table_names(), ["users"]);
+    assert_eq!(ids(&mut db), [int(1), int(3), int(5)]);
+    assert!(explain(&mut db, "SELECT * FROM users WHERE name = 'x'").contains("SCAN users"), "no index");
+
+    db.execute("BEGIN; CREATE TABLE l (id INT PRIMARY KEY, v TEXT) USING LSM").unwrap();
+    db.execute(&format!("INSERT INTO l VALUES {rows}; CREATE INDEX users_name ON users (name); COMMIT")).unwrap();
+    assert_eq!(query(&mut db, "SELECT COUNT(*) FROM l"), [vec![int(1500)]]);
+    assert!(explain(&mut db, "SELECT * FROM users WHERE name = 'x'").contains("USING INDEX users_name"));
+}
+
+#[test]
+fn a_failing_statement_in_a_transaction_is_undone_alone() {
+    let mut db = setup();
+    db.execute("BEGIN; INSERT INTO users (id) VALUES (4)").unwrap();
+    // The third row is a duplicate, after two rows went in.
+    assert!(db.execute("INSERT INTO users (id) VALUES (5), (6), (1), (7)").is_err());
+    assert!(db.execute("UPDATE users SET id = 4").is_err());
+    assert!(db.in_transaction(), "the transaction goes on");
+    db.execute("INSERT INTO users (id) VALUES (8); COMMIT").unwrap();
+    assert_eq!(ints(query(&mut db, "SELECT id FROM users ORDER BY id")), [int(1), int(2), int(3), int(4), int(8)]);
+
+    // execute stops at the first error, and the transaction stays open.
+    assert!(db.execute("BEGIN; INSERT INTO users (id) VALUES (9); SELECT nope FROM users; COMMIT").is_err());
+    assert!(db.in_transaction());
+    db.execute("ROLLBACK").unwrap();
+    assert_eq!(query(&mut db, "SELECT COUNT(*) FROM users WHERE id = 9"), [vec![int(0)]]);
+}
+
+#[test]
+fn savepoints_roll_back_part_of_a_transaction() {
+    let mut db = setup();
+    let ids = |db: &mut Database| ints(query(db, "SELECT id FROM users WHERE id > 3 ORDER BY id"));
+    db.execute(
+        "BEGIN;
+         INSERT INTO users (id) VALUES (4);
+         SAVEPOINT a;
+         INSERT INTO users (id) VALUES (5);
+         SAVEPOINT b;
+         INSERT INTO users (id) VALUES (6);
+         CREATE TABLE t (x INT);",
+    )
+    .unwrap();
+    db.execute("ROLLBACK TO SAVEPOINT a").unwrap();
+    assert_eq!(ids(&mut db), [int(4)]);
+    assert_eq!(db.table_names(), ["users"]);
+    // b was taken after a, so it is gone; a stays.
+    assert!(db.execute("ROLLBACK TO b").unwrap_err().0.contains("no such savepoint: b"));
+    db.execute("INSERT INTO users (id) VALUES (7); ROLLBACK TRANSACTION TO a").unwrap();
+    assert_eq!(ids(&mut db), [int(4)]);
+    // The newest savepoint of a name wins; RELEASE forgets it and those after it.
+    db.execute("INSERT INTO users (id) VALUES (8); SAVEPOINT a; INSERT INTO users (id) VALUES (9); SAVEPOINT c").unwrap();
+    db.execute("ROLLBACK TO a").unwrap();
+    assert_eq!(ids(&mut db), [int(4), int(8)]);
+    db.execute("RELEASE SAVEPOINT a").unwrap();
+    db.execute("ROLLBACK TO a").unwrap();
+    assert_eq!(ids(&mut db), [int(4)]);
+    db.execute("RELEASE a").unwrap();
+    assert!(db.execute("ROLLBACK TO a").is_err());
+    db.execute("COMMIT").unwrap();
+    assert_eq!(ids(&mut db), [int(4)]);
+}
+
+#[test]
+fn transaction_statements_are_checked() {
+    let mut db = setup();
+    let errors = [
+        ("COMMIT", "no transaction is in progress"),
+        ("ROLLBACK", "no transaction is in progress"),
+        ("SAVEPOINT a", "SAVEPOINT can only be used in a transaction"),
+        ("RELEASE a", "RELEASE can only be used in a transaction"),
+        ("ROLLBACK TO a", "ROLLBACK TO can only be used in a transaction"),
+        ("BEGIN; BEGIN", "already in progress"),
+        ("CHECKPOINT", "cannot run inside a transaction"),
+        ("RELEASE nope", "no such savepoint: nope"),
+        ("EXPLAIN COMMIT", "EXPLAIN supports only"),
+    ];
+    for (sql, expected) in errors {
+        let e = db.execute(sql).expect_err(sql);
+        assert!(e.0.contains(expected), "{sql}: {e}");
+    }
+    assert!(db.in_transaction());
+    db.execute("COMMIT; CHECKPOINT").unwrap();
+}
+
+#[test]
+fn closing_the_database_rolls_back_an_open_transaction() {
+    let path = TempDb::new("tx");
+    {
+        let mut db = Database::open(&path.0).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY); INSERT INTO t VALUES (1)").unwrap();
+        db.execute("BEGIN; INSERT INTO t VALUES (2); COMMIT").unwrap();
+        db.execute("BEGIN; INSERT INTO t VALUES (3); DELETE FROM t WHERE id = 1").unwrap();
+    }
+    let mut db = Database::open(&path.0).unwrap();
+    assert_eq!(ints(query(&mut db, "SELECT id FROM t ORDER BY id")), [int(1), int(2)]);
+    assert!(!db.in_transaction());
+}

@@ -20,7 +20,13 @@ fn main() {
     let mut lines = io::stdin().lock().lines();
 
     loop {
-        print!("{}", if buffer.is_empty() { "sequoia> " } else { "    ...> " });
+        // The prompt shows a transaction in progress with a `*`, as psql does.
+        let prompt = match (buffer.is_empty(), db.in_transaction()) {
+            (true, false) => "sequoia> ",
+            (true, true) => "sequoia*> ",
+            (false, _) => "    ...> ",
+        };
+        print!("{prompt}");
         io::stdout().flush().ok();
         let Some(Ok(line)) = lines.next() else { break };
         let trimmed = line.trim();

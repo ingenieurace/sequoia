@@ -195,7 +195,7 @@ impl Catalog {
     }
 
     /// Records heaps that grew since the last save, then writes every dirty
-    /// page back and commits, making everything since the last save durable.
+    /// page back to the disk, for it to commit or roll back.
     pub fn save(&mut self) -> Result<()> {
         for entry in self.tables.values_mut() {
             let last_page = entry.table.root_pages().1;
@@ -207,8 +207,7 @@ impl Catalog {
                 entry.saved_last_page = last_page;
             }
         }
-        self.pool.flush_all()?;
-        self.pool.disk().commit()
+        self.pool.flush_all()
     }
 }
 

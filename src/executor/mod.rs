@@ -63,6 +63,11 @@ pub fn execute(catalog: &mut Catalog, statement: Statement, settings: &Settings)
             catalog.checkpoint()?;
             Ok(message("checkpoint done".into()))
         }
+        Statement::Begin
+        | Statement::Commit
+        | Statement::Rollback { .. }
+        | Statement::Savepoint { .. }
+        | Statement::Release { .. } => err("transaction statements are run by the database"),
         Statement::Insert { table, columns, rows } => insert(catalog, &table, columns, rows, settings),
         Statement::Update { table, assignments, filter } => update(catalog, &table, assignments, filter, settings),
         Statement::Delete { table, filter } => delete(catalog, &table, filter, settings),

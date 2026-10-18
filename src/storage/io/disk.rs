@@ -24,7 +24,8 @@
 //! Every page write, the header's included, goes to the write-ahead log (see
 //! `wal.rs`), a second file next to the database named `<file>-wal`. Nothing
 //! is durable until [`DiskManager::commit`], which makes every write since the
-//! last commit durable at once; [`DiskManager::rollback`] undoes them instead.
+//! last commit durable at once; [`DiskManager::rollback`] undoes them instead,
+//! and [`DiskManager::rollback_to`] undoes those since a [`Savepoint`].
 //! So a crash, or a rollback, never leaves a group of writes half done.
 //! Committed pages are copied into the database file by a checkpoint: once
 //! the log reaches [`CHECKPOINT_BYTES`], on [`DiskManager::checkpoint`], when
@@ -35,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use super::medium::{FileMedium, MemMedium, Medium};
-use super::wal::Wal;
+use super::wal::{Wal, WalSavepoint};
 use crate::error::{Error, Result, err};
 
 pub const PAGE_SIZE: usize = 4096;
@@ -62,6 +63,13 @@ pub struct DiskManager {
     /// The log file, removed when the database is closed cleanly.
     wal_path: Option<PathBuf>,
     header: Mutex<Headers>,
+}
+
+/// A point among the writes since the last commit, to roll back to.
+#[derive(Clone)]
+pub struct Savepoint {
+    wal: WalSavepoint,
+    header: Header,
 }
 
 struct Headers {
@@ -217,6 +225,21 @@ impl DiskManager {
         let mut headers = self.header.lock().unwrap();
         self.wal.lock().unwrap().rollback()?;
         headers.current = headers.committed;
+        Ok(())
+    }
+
+    /// Marks the writes so far, for [`DiskManager::rollback_to`] to go back to.
+    pub fn savepoint(&self) -> Savepoint {
+        let headers = self.header.lock().unwrap();
+        Savepoint { wal: self.wal.lock().unwrap().savepoint(), header: headers.current }
+    }
+
+    /// Undoes every page write since `savepoint`, allocations included. Fails
+    /// if there was a commit since. Pages cached above must be dropped too.
+    pub fn rollback_to(&self, savepoint: &Savepoint) -> Result<()> {
+        let mut headers = self.header.lock().unwrap();
+        self.wal.lock().unwrap().rollback_to(&savepoint.wal)?;
+        headers.current = savepoint.header;
         Ok(())
     }
 
@@ -431,6 +454,36 @@ mod tests {
         assert_eq!((disk.page_count(), disk.root_page()), (2, None));
         assert_eq!(read(&disk, a), filled(1));
         assert_eq!(disk.allocate_page().unwrap(), b, "the free list is as it was");
+    }
+
+    #[test]
+    fn rollback_to_a_savepoint_keeps_the_writes_before_it() {
+        let disk = DiskManager::in_memory();
+        let a = disk.allocate_page().unwrap();
+        disk.write_page(a, &filled(1)).unwrap();
+        disk.commit().unwrap();
+
+        disk.write_page(a, &filled(2)).unwrap(); // kept: before the savepoint
+        let savepoint = disk.savepoint();
+        disk.write_page(a, &filled(3)).unwrap();
+        let b = disk.allocate_page().unwrap();
+        disk.set_root_page(Some(b)).unwrap();
+        disk.rollback_to(&savepoint).unwrap();
+        assert_eq!((disk.page_count(), disk.root_page()), (2, None));
+        assert_eq!(read(&disk, a), filled(2));
+        // The log goes on from the savepoint, and can roll back to it again.
+        disk.write_page(a, &filled(4)).unwrap();
+        disk.rollback_to(&savepoint).unwrap();
+        assert_eq!(read(&disk, a), filled(2));
+        // A rollback still goes back to the last commit.
+        disk.rollback().unwrap();
+        assert_eq!(read(&disk, a), filled(1));
+
+        let savepoint = disk.savepoint();
+        disk.write_page(a, &filled(5)).unwrap();
+        disk.commit().unwrap();
+        assert!(disk.rollback_to(&savepoint).is_err(), "from before a commit");
+        assert_eq!(read(&disk, a), filled(5));
     }
 
     #[test]

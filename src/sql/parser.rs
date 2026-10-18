@@ -50,6 +50,7 @@ impl Parser {
                 self.pos += 1;
                 Ok(Statement::Checkpoint)
             }
+            "BEGIN" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" => self.transaction(),
             "EXPLAIN" => {
                 self.pos += 1;
                 Ok(Statement::Explain(Box::new(self.statement()?)))
@@ -60,6 +61,31 @@ impl Parser {
             "DELETE" => self.delete(),
             _ => Err(self.unexpected("a statement")),
         }
+    }
+
+    /// BEGIN, COMMIT, ROLLBACK [TO], SAVEPOINT and RELEASE.
+    fn transaction(&mut self) -> Result<Statement> {
+        let Some(Token::Keyword(keyword)) = self.peek().cloned() else { unreachable!("checked by statement") };
+        self.pos += 1;
+        Ok(match keyword.as_str() {
+            "SAVEPOINT" => Statement::Savepoint { name: self.ident()? },
+            "RELEASE" => {
+                self.eat_keyword("SAVEPOINT");
+                Statement::Release { name: self.ident()? }
+            }
+            keyword => {
+                self.eat_keyword("TRANSACTION");
+                match keyword {
+                    "BEGIN" => Statement::Begin,
+                    "COMMIT" => Statement::Commit,
+                    _ if self.eat_keyword("TO") => {
+                        self.eat_keyword("SAVEPOINT");
+                        Statement::Rollback { savepoint: Some(self.ident()?) }
+                    }
+                    _ => Statement::Rollback { savepoint: None },
+                }
+            }
+        })
     }
 
     fn create(&mut self) -> Result<Statement> {

@@ -30,6 +30,9 @@ Shell commands: `.tables`, `.exit`.
   `CREATE [UNIQUE] INDEX name ON table (column)`, `DROP INDEX`, `INSERT`, `SELECT`,
   `UPDATE`, `DELETE`, `CHECKPOINT`, and `EXPLAIN` before a `SELECT`, `UPDATE` or
   `DELETE` to see its plan
+- Transactions: `BEGIN`, `COMMIT`, `ROLLBACK`, and `SAVEPOINT name`,
+  `ROLLBACK TO name`, `RELEASE name` (each may add `TRANSACTION` or `SAVEPOINT`
+  as in SQL)
 - Types: `INT`, `TEXT`, `BOOL`, and `NULL`
 - Constraints: `PRIMARY KEY` (unique, not null), unique indexes (NULLs may repeat);
   values are type-checked
@@ -51,9 +54,12 @@ Shell commands: `.tables`, `.exit`.
   They may be correlated (refer to the columns of the query around them) and
   nested; each runs once per distinct set of outer values it is given
 
-Every statement is atomic and durable once it returns. Not supported:
-`RIGHT` and `FULL` joins, subqueries in `FROM` or `JOIN ... ON`,
-`INSERT ... SELECT`, multi-column indexes, transactions of several statements.
+Every statement is atomic and, outside a transaction, durable once it returns.
+A transaction is durable once `COMMIT` returns; until then a crash, `ROLLBACK`
+or closing the database undoes all of it. A statement that fails inside one is
+undone alone, and the transaction goes on. There is one connection, so no
+concurrency control. Not supported: `RIGHT` and `FULL` joins, subqueries in
+`FROM` or `JOIN ... ON`, `INSERT ... SELECT`, multi-column indexes.
 
 ## Layout
 
@@ -67,7 +73,7 @@ sql -> executor -> plan -> catalog -> storage        (types, predicate, error: s
 src/
   main.rs         interactive shell
   lib.rs          module list and public exports
-  database.rs     entry point; runs SQL, commits or rolls back each statement
+  database.rs     entry point; runs SQL, commits or rolls back each statement or transaction
   executor/       runs statements
     mod.rs        statement execution; a SELECT's rows as a stream (`Database::query`)
     operator.rs   each plan step as an iterator pulling rows from the one below
@@ -95,7 +101,7 @@ src/
   storage/
     io/           durable pages
       medium.rs   byte-addressed files: on disk, in memory, or crashing (for tests)
-      wal.rs      write-ahead log: page frames, commits, recovery, checkpoints
+      wal.rs      write-ahead log: page frames, commits, savepoints, recovery, checkpoints
       disk.rs     DiskManager: fixed-size pages in one file, free list, via the WAL
     buffer/       pages cached in memory
       pool.rs     buffer pool: cached frames, pin counts, dirty pages
