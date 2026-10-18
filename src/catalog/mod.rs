@@ -21,11 +21,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::ast::Statement;
+pub mod index;
+pub mod table;
+
 use crate::error::{Error, Result, err};
-use crate::parser::parse;
+use crate::sql::ast::Statement;
+use crate::sql::parse;
 use crate::storage::{BufferPool, PageId, RecordId, TableHeap, tuple};
-use crate::table::{Table, primary_key, validate_schema};
+use table::{Table, primary_key, validate_schema};
 use crate::types::{Column, DataType, StorageKind, Value};
 
 pub struct Catalog {

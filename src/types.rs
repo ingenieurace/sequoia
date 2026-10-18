@@ -1,6 +1,8 @@
 use std::cmp::Ordering;
 use std::fmt;
 
+use crate::error::{Error, Result};
+
 /// Column data types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
@@ -15,6 +17,14 @@ pub struct Column {
     pub name: String,
     pub data_type: DataType,
     pub primary_key: bool,
+}
+
+/// The position of the column with this name.
+pub fn column_index(columns: &[Column], name: &str) -> Result<usize> {
+    columns
+        .iter()
+        .position(|c| c.name == name)
+        .ok_or_else(|| Error(format!("unknown column: {name}")))
 }
 
 /// How a table stores its rows: `CREATE TABLE ... USING HEAP | LSM | COLUMN`.

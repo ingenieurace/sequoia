@@ -34,8 +34,8 @@
 
 use std::sync::Arc;
 
-use super::buffer::BufferPool;
-use super::disk::{PAGE_USABLE, Page, PageId, decode_id, encode_id, read_u32, write_u32};
+use crate::storage::buffer::pool::BufferPool;
+use crate::storage::io::disk::{PAGE_USABLE, Page, PageId, decode_id, encode_id, read_u32, write_u32};
 use crate::error::{Result, err};
 
 /// The longest key the tree accepts. Small enough that a full node always

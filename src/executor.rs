@@ -1,12 +1,13 @@
 //! Executes parsed statements against the catalog.
 
-use crate::ast::{BinaryOp, Expr, OrderBy, Projection, Statement, UnaryOp};
-use crate::error::{Error, Result, err};
-use crate::result::QueryResult;
 use crate::catalog::Catalog;
-use crate::storage::{Compare, Predicate};
-use crate::table::{Row, Table, column_index};
-use crate::types::{Column, Value};
+use crate::catalog::table::{Row, RowId, Table};
+use crate::error::{Result, err};
+use crate::plan::{access, filter};
+use crate::result::QueryResult;
+use crate::sql::ast::{Expr, OrderBy, Projection, Statement};
+use crate::sql::eval::{eval, matches};
+use crate::types::Value;
 
 pub fn execute(catalog: &mut Catalog, statement: Statement) -> Result<QueryResult> {
     match statement {
@@ -51,7 +52,7 @@ fn explain(catalog: &Catalog, statement: Statement) -> Result<QueryResult> {
         _ => return err("EXPLAIN supports only SELECT, UPDATE and DELETE"),
     };
     let table = catalog.get(&table)?;
-    Ok(message(table.explain(&predicates(table, &filter))))
+    Ok(message(access::explain(table, &filter::predicates(table, &filter))))
 }
 
 fn insert(table: &mut Table, columns: Option<Vec<String>>, rows: Vec<Vec<Expr>>) -> Result<QueryResult> {
@@ -90,12 +91,12 @@ fn select(
         Projection::All => vec![true; columns.len()],
         Projection::Exprs(exprs) => {
             let order_by = order_by.iter().map(|o| &o.expr);
-            needed_columns(columns, exprs.iter().chain(&filter).chain(order_by))
+            filter::needed_columns(columns, exprs.iter().chain(&filter).chain(order_by))
         }
     };
 
     let mut rows: Vec<Row> = Vec::new();
-    for item in table.scan_filtered(&needed, &predicates(table, &filter)) {
+    for item in scan(table, &needed, &filter) {
         let (_, row) = item?;
         if matches(&filter, columns, &row)? {
             rows.push(row);
@@ -157,7 +158,7 @@ fn update(table: &mut Table, assignments: Vec<(String, Expr)>, filter: Option<Ex
 
     // Collect every change before writing, so the scan never sees its own updates.
     let mut changes = Vec::new();
-    for item in table.scan_filtered(&vec![true; table.columns.len()], &predicates(table, &filter)) {
+    for item in scan(table, &vec![true; table.columns.len()], &filter) {
         let (rid, mut row) = item?;
         if !matches(&filter, &table.columns, &row)? {
             continue;
@@ -178,7 +179,7 @@ fn update(table: &mut Table, assignments: Vec<(String, Expr)>, filter: Option<Ex
 
 fn delete(table: &mut Table, filter: Option<Expr>) -> Result<QueryResult> {
     let mut rids = Vec::new();
-    for item in table.scan_filtered(&needed_columns(&table.columns, &filter), &predicates(table, &filter)) {
+    for item in scan(table, &filter::needed_columns(&table.columns, &filter), &filter) {
         let (rid, row) = item?;
         if matches(&filter, &table.columns, &row)? {
             rids.push(rid);
@@ -188,164 +189,15 @@ fn delete(table: &mut Table, filter: Option<Expr>) -> Result<QueryResult> {
     Ok(message(format!("{} row(s) deleted", rids.len())))
 }
 
-/// Marks the columns the expressions use, so that a scan may skip the others.
-fn needed_columns<'a>(columns: &[Column], exprs: impl IntoIterator<Item = &'a Expr>) -> Vec<bool> {
-    fn visit(expr: &Expr, columns: &[Column], needed: &mut [bool]) {
-        match expr {
-            Expr::Literal(_) => {}
-            // An unknown name is reported when the expression is evaluated.
-            Expr::Column(name) => column_index(columns, name).into_iter().for_each(|i| needed[i] = true),
-            Expr::Unary(_, inner) | Expr::IsNull(inner, _) => visit(inner, columns, needed),
-            Expr::Binary(left, _, right) => {
-                visit(left, columns, needed);
-                visit(right, columns, needed);
-            }
-        }
-    }
-    let mut needed = vec![false; columns.len()];
-    exprs.into_iter().for_each(|expr| visit(expr, columns, &mut needed));
-    needed
-}
-
-/// Pulls the conjuncts `column op literal` (or `literal op column`) out of a
-/// WHERE clause, for a column store to evaluate on its compressed chunks, or
-/// for a heap or LSM table to pick an index with. A row the clause matches
-/// satisfies every conjunct, so the scan may skip rows that fail one; the
-/// whole clause is still evaluated on the rows returned.
-/// A literal that is NULL or of the wrong type is left to that evaluation,
-/// which matches nothing or reports the error. As in any database that
-/// reorders predicates, the rest of the clause is then never evaluated on the
-/// skipped rows, so an error it would raise only there (`1 / 0`) is not raised.
-fn predicates(table: &Table, filter: &Option<Expr>) -> Vec<Predicate> {
-    fn conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
-        match expr {
-            Expr::Binary(left, BinaryOp::And, right) => {
-                conjuncts(left, out);
-                conjuncts(right, out);
-            }
-            expr => out.push(expr),
-        }
-    }
-    /// The value of an expression that reads no column, if it has one.
-    fn constant(expr: &Expr) -> Option<Value> {
-        fn reads_columns(expr: &Expr) -> bool {
-            match expr {
-                Expr::Literal(_) => false,
-                Expr::Column(_) => true,
-                Expr::Unary(_, inner) | Expr::IsNull(inner, _) => reads_columns(inner),
-                Expr::Binary(left, _, right) => reads_columns(left) || reads_columns(right),
-            }
-        }
-        if reads_columns(expr) { None } else { eval(expr, &[], &[]).ok() }
-    }
-
-    let Some(filter) = filter else { return Vec::new() };
-    let mut exprs = Vec::new();
-    conjuncts(filter, &mut exprs);
-    exprs
-        .into_iter()
-        .filter_map(|expr| {
-            let Expr::Binary(left, op, right) = expr else { return None };
-            let op = match op {
-                BinaryOp::Eq => Compare::Eq,
-                BinaryOp::NotEq => Compare::NotEq,
-                BinaryOp::Lt => Compare::Lt,
-                BinaryOp::LtEq => Compare::LtEq,
-                BinaryOp::Gt => Compare::Gt,
-                BinaryOp::GtEq => Compare::GtEq,
-                _ => return None,
-            };
-            let (name, literal, op) = match (&**left, &**right) {
-                (Expr::Column(name), other) => (name, constant(other)?, op),
-                (other, Expr::Column(name)) => (name, constant(other)?, op.flip()),
-                _ => return None,
-            };
-            let column = table.column_index(name).ok()?;
-            (!literal.is_null() && literal.fits(table.columns[column].data_type))
-                .then_some(Predicate { column, op, literal })
-        })
-        .collect()
-}
-
-/// Evaluates a WHERE clause; NULL counts as false.
-fn matches(filter: &Option<Expr>, columns: &[Column], row: &[Value]) -> Result<bool> {
-    let Some(expr) = filter else { return Ok(true) };
-    match eval(expr, columns, row)? {
-        Value::Bool(b) => Ok(b),
-        Value::Null => Ok(false),
-        other => err(format!("WHERE clause must be boolean, got {}", other.to_sql())),
-    }
-}
-
-/// Evaluates an expression against one row.
-fn eval(expr: &Expr, columns: &[Column], row: &[Value]) -> Result<Value> {
-    match expr {
-        Expr::Literal(value) => Ok(value.clone()),
-        Expr::Column(name) => Ok(row[column_index(columns, name)?].clone()),
-        Expr::IsNull(inner, negated) => Ok(Value::Bool(eval(inner, columns, row)?.is_null() != *negated)),
-        Expr::Unary(op, inner) => match (op, eval(inner, columns, row)?) {
-            (_, Value::Null) => Ok(Value::Null),
-            (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
-            (UnaryOp::Neg, Value::Int(n)) => n.checked_neg().map(Value::Int).ok_or_else(overflow),
-            (op, value) => err(format!("cannot apply {op:?} to {}", value.to_sql())),
-        },
-        Expr::Binary(left, op, right) => binary(eval(left, columns, row)?, *op, eval(right, columns, row)?),
-    }
-}
-
-fn binary(left: Value, op: BinaryOp, right: Value) -> Result<Value> {
-    use BinaryOp::*;
-    use Value::{Bool, Int, Null};
-
-    let type_error = |l: &Value, r: &Value| err(format!("cannot apply {op:?} to {} and {}", l.to_sql(), r.to_sql()));
-
-    match op {
-        // Three-valued logic: NULL means "unknown".
-        And => match (&left, &right) {
-            (Bool(false), Bool(_) | Null) | (Null, Bool(false)) => Ok(Bool(false)),
-            (Bool(true), Bool(true)) => Ok(Bool(true)),
-            (Bool(_) | Null, Bool(_) | Null) => Ok(Null),
-            _ => type_error(&left, &right),
-        },
-        Or => match (&left, &right) {
-            (Bool(true), Bool(_) | Null) | (Null, Bool(true)) => Ok(Bool(true)),
-            (Bool(false), Bool(false)) => Ok(Bool(false)),
-            (Bool(_) | Null, Bool(_) | Null) => Ok(Null),
-            _ => type_error(&left, &right),
-        },
-        Eq | NotEq | Lt | LtEq | Gt | GtEq => {
-            if left.is_null() || right.is_null() {
-                return Ok(Null);
-            }
-            let Some(ord) = left.compare(&right) else { return type_error(&left, &right) };
-            Ok(Bool(match op {
-                Eq => ord.is_eq(),
-                NotEq => ord.is_ne(),
-                Lt => ord.is_lt(),
-                LtEq => ord.is_le(),
-                Gt => ord.is_gt(),
-                _ => ord.is_ge(),
-            }))
-        }
-        Add | Sub | Mul | Div => match (&left, &right) {
-            (Null, _) | (_, Null) => Ok(Null),
-            (Int(_), Int(0)) if op == Div => err("division by zero"),
-            (Int(a), Int(b)) => {
-                let result = match op {
-                    Add => a.checked_add(*b),
-                    Sub => a.checked_sub(*b),
-                    Mul => a.checked_mul(*b),
-                    _ => a.checked_div(*b),
-                };
-                result.map(Int).ok_or_else(overflow)
-            }
-            _ => type_error(&left, &right),
-        },
-    }
-}
-
-fn overflow() -> Error {
-    Error("integer overflow".into())
+/// Reads the rows of `table` that `filter` may match, the way the planner chooses.
+fn scan<'a>(
+    table: &'a Table,
+    needed: &[bool],
+    filter: &Option<Expr>,
+) -> Box<dyn Iterator<Item = Result<(RowId, Row)>> + 'a> {
+    let predicates = filter::predicates(table, filter);
+    let access = access::choose(table, &predicates);
+    table.scan_filtered(needed, &predicates, &access)
 }
 
 fn message(text: String) -> QueryResult {

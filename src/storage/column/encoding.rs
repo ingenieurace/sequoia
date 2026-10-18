@@ -53,10 +53,10 @@
 //! others      decoded to integers or strings, then compared
 //! ```
 
-use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 use crate::error::{Result, err};
+use crate::predicate::Compare;
 use crate::types::{DataType, Value};
 
 /// Most distinct values for which Bitmap encoding is tried.
@@ -87,42 +87,6 @@ impl Encoding {
             .get(tag as usize)
             .copied()
             .ok_or_else(|| crate::error::Error(format!("corrupted column chunk: unknown encoding {tag}")))
-    }
-}
-
-/// A comparison that [`filter`] evaluates on encoded values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Compare {
-    Eq,
-    NotEq,
-    Lt,
-    LtEq,
-    Gt,
-    GtEq,
-}
-
-impl Compare {
-    /// Whether `a op b` holds, given how `a` compares with `b`.
-    pub fn holds(self, ord: Ordering) -> bool {
-        match self {
-            Compare::Eq => ord.is_eq(),
-            Compare::NotEq => ord.is_ne(),
-            Compare::Lt => ord.is_lt(),
-            Compare::LtEq => ord.is_le(),
-            Compare::Gt => ord.is_gt(),
-            Compare::GtEq => ord.is_ge(),
-        }
-    }
-
-    /// The comparison with its sides swapped: `a < b` is `b > a`.
-    pub fn flip(self) -> Self {
-        match self {
-            Compare::Lt => Compare::Gt,
-            Compare::LtEq => Compare::GtEq,
-            Compare::Gt => Compare::Lt,
-            Compare::GtEq => Compare::LtEq,
-            op => op,
-        }
     }
 }
 

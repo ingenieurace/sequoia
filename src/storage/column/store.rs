@@ -53,12 +53,13 @@
 
 use std::sync::Arc;
 
-use super::buffer::BufferPool;
-use super::disk::{PAGE_USABLE, PageId, decode_id, encode_id, read_u32, write_u32};
-use super::encoding::{self, Compare};
-use super::heap::{RecordId, TableHeap};
-use super::tuple;
+use crate::storage::buffer::pool::BufferPool;
+use crate::storage::io::disk::{PAGE_USABLE, PageId, decode_id, encode_id, read_u32, write_u32};
+use super::encoding;
+use crate::storage::heap::{RecordId, TableHeap};
+use crate::storage::tuple;
 use crate::error::{Result, err};
+use crate::predicate::Predicate;
 use crate::types::{Column, Value};
 
 const CHUNK_HEADER: usize = 6;
@@ -82,23 +83,6 @@ pub enum Position {
     Delta(RecordId),
     /// Row `row` of the row group with this header page.
     Group { header: PageId, row: u32 },
-}
-
-/// A condition `column op literal` that a scan checks before decoding rows.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Predicate {
-    /// Index of the column in the schema.
-    pub column: usize,
-    pub op: Compare,
-    /// A non-NULL value of the column's type.
-    pub literal: Value,
-}
-
-impl Predicate {
-    /// Whether a decoded row satisfies the predicate; NULL never does.
-    pub fn matches(&self, row: &[Value]) -> bool {
-        row[self.column].compare(&self.literal).is_some_and(|ord| self.op.holds(ord))
-    }
 }
 
 pub struct ColumnStore {
@@ -434,6 +418,7 @@ fn free_chunk(pool: &BufferPool, first: PageId) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::predicate::Compare;
     use crate::storage::DiskManager;
     use crate::types::DataType;
 

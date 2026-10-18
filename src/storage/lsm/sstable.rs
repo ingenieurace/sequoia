@@ -19,9 +19,9 @@
 use std::sync::Arc;
 
 use super::bloom::{self, Bloom};
-use super::buffer::{BufferPool, PageWriteGuard};
-use super::disk::PageId;
-use super::page::SlottedPage;
+use crate::storage::buffer::pool::{BufferPool, PageWriteGuard};
+use crate::storage::io::disk::PageId;
+use crate::storage::page::SlottedPage;
 use crate::error::{Result, err};
 
 /// A key and its value, or `None` if the key was deleted.

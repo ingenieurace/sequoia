@@ -27,7 +27,7 @@
 
 use std::ops::{Deref, DerefMut};
 
-use super::disk::{PAGE_USABLE, Page, PageId, decode_id, encode_id, read_u32, write_u32};
+use crate::storage::io::disk::{PAGE_USABLE, Page, PageId, decode_id, encode_id, read_u32, write_u32};
 
 const HEADER_SIZE: usize = 8;
 const SLOT_SIZE: usize = 4;

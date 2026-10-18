@@ -16,7 +16,7 @@
 //! - When no frame is free, a [`Replacer`] picks an unpinned victim, using
 //!   the policy set by [`REPLACEMENT_POLICY`] (see `replacer.rs`).
 //! - Write-back: a dirty page reaches the disk only when it is evicted or
-//!   flushed, and is durable only once the disk commits (see `disk.rs`).
+//!   flushed, and is durable only once the disk commits (see `storage/io/disk.rs`).
 //!   Dropping the pool writes nothing back.
 //!
 //! Locking: one mutex (`state`) over all metadata, plus one RwLock per frame
@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use super::disk::{DiskManager, PAGE_SIZE, Page, PageId};
+use crate::storage::io::disk::{DiskManager, PAGE_SIZE, Page, PageId};
 use super::replacer::{Policy, Replacer};
 use crate::error::{Error, Result, err};
 

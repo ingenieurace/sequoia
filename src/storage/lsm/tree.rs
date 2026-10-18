@@ -52,20 +52,20 @@
 //!
 //! A flush or compaction writes its new pages, then rewrites the manifest page,
 //! and only then frees the old log or SSTables. The statement doing it commits
-//! all of that at once (see `wal.rs`), so a crash never leaves it half done.
+//! all of that at once (see `storage/io/wal.rs`), so a crash never leaves it half done.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use super::buffer::BufferPool;
-use super::disk::{PAGE_USABLE, PageId, decode_id, encode_id, read_u32, write_u32};
-use super::heap::TableHeap;
-use super::page::MAX_TUPLE_SIZE;
+use crate::storage::buffer::pool::BufferPool;
+use crate::storage::io::disk::{PAGE_USABLE, PageId, decode_id, encode_id, read_u32, write_u32};
+use crate::storage::heap::TableHeap;
+use crate::storage::page::MAX_TUPLE_SIZE;
 use super::sstable::{self, Entry, SsTable};
 use crate::error::{Result, err};
 
 /// The compaction strategy of `LsmConfig::default`, used by every LSM table.
-/// Edit this line to switch, like `REPLACEMENT_POLICY` in `buffer.rs`:
+/// Edit this line to switch, like `REPLACEMENT_POLICY` in `storage/buffer/pool.rs`:
 ///
 /// - `Compaction::Level`: level compaction
 /// - `Compaction::Universal`: universal compaction

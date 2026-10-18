@@ -1,13 +1,14 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use super::index::{Bound, Index};
 use crate::error::{Error, Result, err};
-use crate::index::{Bound, Index};
+use crate::predicate::Predicate;
 use crate::storage::{
-    BufferPool, ColumnConfig, ColumnStore, Compare, LsmConfig, LsmTree, MAX_TUPLE_SIZE, PageId, Position, Predicate,
+    BufferPool, ColumnConfig, ColumnStore, LsmConfig, LsmTree, MAX_TUPLE_SIZE, PageId, Position,
     RecordId, TableHeap, tuple,
 };
-use crate::types::{Column, StorageKind, Value};
+use crate::types::{Column, StorageKind, Value, column_index};
 
 pub type Row = Vec<Value>;
 
@@ -49,8 +50,9 @@ enum Storage {
     Column(ColumnStore),
 }
 
-/// How a scan finds its rows.
-enum Access {
+/// How a scan finds its rows; `plan::access` picks one.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Access {
     /// Read every row.
     Scan,
     /// Look one primary key up in an LSM tree.
@@ -122,6 +124,10 @@ impl Table {
         column_index(&self.columns, name)
     }
 
+    pub fn primary_key(&self) -> Option<usize> {
+        primary_key(&self.columns)
+    }
+
     pub fn indexes(&self) -> &[Index] {
         &self.indexes
     }
@@ -184,21 +190,24 @@ impl Table {
     /// read. Unneeded columns may hold anything, NULL usually: a column store
     /// skips their chunks, while heaps and LSM trees return whole rows.
     pub fn scan_columns(&self, needed: &[bool]) -> Box<dyn Iterator<Item = Result<(RowId, Row)>> + '_> {
-        self.scan_filtered(needed, &[])
+        self.scan_filtered(needed, &[], &Access::Scan)
     }
 
-    /// Like [`Table::scan_columns`], but rows that fail one of `predicates`
-    /// may be left out: a column store evaluates them on its compressed
-    /// chunks and skips those rows, while heaps and LSM trees use them to
-    /// pick an index (or an LSM tree's primary key) to read fewer rows
-    /// through, in index order. See [`Table::explain`].
+    /// Like [`Table::scan_columns`], but reads the rows the way `access`
+    /// says, which for heaps and LSM trees may be through an index (or an LSM
+    /// tree's primary key), in index order. Rows that fail one of
+    /// `predicates` may be left out: a column store evaluates them on its
+    /// compressed chunks and skips those rows, ignoring `access`. An access
+    /// path must come from `predicates`, so that it leaves out only rows they
+    /// rule out.
     pub fn scan_filtered(
         &self,
         needed: &[bool],
         predicates: &[Predicate],
+        access: &Access,
     ) -> Box<dyn Iterator<Item = Result<(RowId, Row)>> + '_> {
         assert_eq!(needed.len(), self.columns.len());
-        match (self.access(predicates), &self.storage) {
+        match (access.clone(), &self.storage) {
             (Access::Scan, Storage::Heap(heap)) => Box::new(heap.scan().map(|item| {
                 let (rid, bytes) = item?;
                 Ok((RowId::Record(rid), tuple::decode(&self.columns, &bytes)?))
@@ -228,82 +237,6 @@ impl Table {
                 }))
             }
         }
-    }
-
-    /// Describes how [`Table::scan_filtered`] reads the table, given `predicates`.
-    pub fn explain(&self, predicates: &[Predicate]) -> String {
-        match self.access(predicates) {
-            Access::Scan if self.storage_kind() == StorageKind::Column && !predicates.is_empty() => {
-                let filters: Vec<String> = predicates
-                    .iter()
-                    .map(|p| format!("{} {} {}", self.columns[p.column].name, symbol(p.op), p.literal.to_sql()))
-                    .collect();
-                format!("SCAN {} FILTERING COMPRESSED CHUNKS ON {}", self.name, filters.join(" AND "))
-            }
-            Access::Scan => format!("SCAN {}", self.name),
-            Access::Key(value) => {
-                let pk = primary_key(&self.columns).expect("a key lookup needs a primary key");
-                format!("SEARCH {} USING PRIMARY KEY ({} = {})", self.name, self.columns[pk].name, value.to_sql())
-            }
-            Access::Index { index, lower, upper } => {
-                let index = &self.indexes[index];
-                let column = &self.columns[index.column].name;
-                let range = match (&lower, &upper) {
-                    (Some(l), Some(u)) if l == u && l.inclusive => format!("{column} = {}", l.value.to_sql()),
-                    _ => {
-                        let describe = |b: Bound, inclusive: Compare, exclusive: Compare| {
-                            let op = if b.inclusive { inclusive } else { exclusive };
-                            format!("{column} {} {}", symbol(op), b.value.to_sql())
-                        };
-                        let lower = lower.map(|b| describe(b, Compare::GtEq, Compare::Gt));
-                        let upper = upper.map(|b| describe(b, Compare::LtEq, Compare::Lt));
-                        lower.into_iter().chain(upper).collect::<Vec<_>>().join(" AND ")
-                    }
-                };
-                format!("SEARCH {} USING INDEX {} ({range})", self.name, index.name)
-            }
-        }
-    }
-
-    /// Picks how to read the rows that may satisfy `predicates`: by primary
-    /// key in an LSM tree if one predicate fixes it, otherwise through the
-    /// index the predicates narrow down most (an equality beats a range with
-    /// two ends, which beats one with one end; the earliest index wins a tie),
-    /// otherwise by reading every row.
-    fn access(&self, predicates: &[Predicate]) -> Access {
-        if let Storage::Column(_) = self.storage {
-            return Access::Scan;
-        }
-        if let (Storage::Lsm { .. }, Some(pk)) = (&self.storage, primary_key(&self.columns))
-            && let Some(p) = predicates.iter().find(|p| p.column == pk && p.op == Compare::Eq)
-        {
-            return Access::Key(p.literal.clone());
-        }
-
-        let mut best: Option<(usize, Access)> = None;
-        for (i, index) in self.indexes.iter().enumerate() {
-            let (mut lower, mut upper, mut equal) = (None, None, false);
-            for p in predicates.iter().filter(|p| p.column == index.column) {
-                let bound = |inclusive| Some(Bound { value: p.literal.clone(), inclusive });
-                match p.op {
-                    Compare::Eq => {
-                        equal = true;
-                        lower = tighter(lower, bound(true), true);
-                        upper = tighter(upper, bound(true), false);
-                    }
-                    Compare::Gt => lower = tighter(lower, bound(false), true),
-                    Compare::GtEq => lower = tighter(lower, bound(true), true),
-                    Compare::Lt => upper = tighter(upper, bound(false), false),
-                    Compare::LtEq => upper = tighter(upper, bound(true), false),
-                    Compare::NotEq => {}
-                }
-            }
-            let score = equal as usize + lower.is_some() as usize + upper.is_some() as usize;
-            if score > best.as_ref().map_or(0, |(s, _)| *s) {
-                best = Some((score, Access::Index { index: i, lower, upper }));
-            }
-        }
-        best.map_or(Access::Scan, |(_, access)| access)
     }
 
     pub fn insert(&mut self, rows: Vec<Row>) -> Result<()> {
@@ -643,26 +576,6 @@ impl RowId {
     }
 }
 
-/// The tighter of two lower bounds (`lower`) or upper bounds: the larger
-/// lower or smaller upper value, and of equal values the exclusive one.
-fn tighter(current: Option<Bound>, new: Option<Bound>, lower: bool) -> Option<Bound> {
-    let (Some(current), Some(new)) = (&current, &new) else { return current.or(new) };
-    let ord = new.value.sort_cmp(&current.value);
-    let better = if lower { ord.is_gt() } else { ord.is_lt() } || (ord.is_eq() && !new.inclusive);
-    Some(if better { new.clone() } else { current.clone() })
-}
-
-fn symbol(op: Compare) -> &'static str {
-    match op {
-        Compare::Eq => "=",
-        Compare::NotEq => "!=",
-        Compare::Lt => "<",
-        Compare::LtEq => "<=",
-        Compare::Gt => ">",
-        Compare::GtEq => ">=",
-    }
-}
-
 fn check_heap_size(bytes: &[u8]) -> Result<()> {
     if bytes.len() > MAX_TUPLE_SIZE {
         return err(format!("row is {} bytes, the maximum is {MAX_TUPLE_SIZE}", bytes.len()));
@@ -685,11 +598,4 @@ pub fn validate_schema(columns: &[Column]) -> Result<()> {
         return err("a table can have only one primary key");
     }
     Ok(())
-}
-
-pub fn column_index(columns: &[Column], name: &str) -> Result<usize> {
-    columns
-        .iter()
-        .position(|c| c.name == name)
-        .ok_or_else(|| Error(format!("unknown column: {name}")))
 }

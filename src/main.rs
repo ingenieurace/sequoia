@@ -3,7 +3,7 @@
 use std::io::{self, BufRead, Write};
 
 use sequoia::Database;
-use sequoia::parser::parse;
+use sequoia::sql::parse;
 
 fn main() {
     let opened = match std::env::args().nth(1) {

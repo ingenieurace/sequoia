@@ -1,18 +1,17 @@
 //! Sequoia: a minimal relational database.
 //!
-//! Pipeline: SQL text -> `lexer` -> `parser` (AST) -> `executor` -> `table` storage.
+//! Pipeline: SQL text -> `sql` (tokens, AST) -> `executor`, which asks `plan`
+//! how to read each table -> `catalog` (tables and their indexes) -> `storage`.
 
-pub mod ast;
 pub mod catalog;
 pub mod database;
 pub mod error;
 pub mod executor;
-pub mod index;
-pub mod lexer;
-pub mod parser;
+pub mod plan;
+pub mod predicate;
 pub mod result;
+pub mod sql;
 pub mod storage;
-pub mod table;
 pub mod types;
 
 pub use database::Database;

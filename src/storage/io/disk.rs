@@ -308,19 +308,19 @@ impl Header {
     }
 }
 
-pub(super) fn read_u32(page: &Page, at: usize) -> u32 {
+pub(crate) fn read_u32(page: &Page, at: usize) -> u32 {
     u32::from_le_bytes(page[at..at + 4].try_into().unwrap())
 }
 
-pub(super) fn write_u32(page: &mut Page, at: usize, value: u32) {
+pub(crate) fn write_u32(page: &mut Page, at: usize, value: u32) {
     page[at..at + 4].copy_from_slice(&value.to_le_bytes());
 }
 
-pub(super) fn encode_id(id: Option<PageId>) -> u32 {
+pub(crate) fn encode_id(id: Option<PageId>) -> u32 {
     id.map_or(NONE, |id| id.0)
 }
 
-pub(super) fn decode_id(raw: u32) -> Option<PageId> {
+pub(crate) fn decode_id(raw: u32) -> Option<PageId> {
     (raw != NONE).then_some(PageId(raw))
 }
 

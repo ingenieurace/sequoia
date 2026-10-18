@@ -21,8 +21,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use super::buffer::BufferPool;
-use super::disk::PageId;
+use crate::storage::buffer::pool::BufferPool;
+use crate::storage::io::disk::PageId;
 use super::page::{MAX_TUPLE_SIZE, SlottedPage};
 use crate::error::{Result, err};
 

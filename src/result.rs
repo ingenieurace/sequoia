@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::table::Row;
+use crate::catalog::table::Row;
 
 /// The outcome of executing one statement.
 #[derive(Debug, Clone, PartialEq)]

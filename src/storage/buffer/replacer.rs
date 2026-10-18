@@ -9,11 +9,11 @@
 //! - [`ClockReplacer`]: CLOCK, an approximation of LRU.
 //!
 //! [`Policy`] names one of them; the buffer pool's default is set by
-//! `REPLACEMENT_POLICY` in `buffer.rs`.
+//! `REPLACEMENT_POLICY` in `pool.rs`.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use super::disk::PageId;
+use crate::storage::io::disk::PageId;
 
 pub trait Replacer: Send {
     /// The page was accessed: loaded into the pool or hit while resident.

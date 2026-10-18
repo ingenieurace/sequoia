@@ -42,37 +42,54 @@ aggregates, multi-column indexes, transactions of several statements.
 
 ## Layout
 
+Each layer uses only the ones below it:
+
+```
+sql -> executor -> plan -> catalog -> storage        (types, predicate, error: shared by all)
+```
+
 ```
 src/
-  main.rs       interactive shell
-  lib.rs        module list and public exports
-  database.rs   entry point; runs SQL, commits or rolls back each statement
-  lexer.rs      SQL text -> tokens
-  parser.rs     tokens -> AST (recursive descent)
-  ast.rs        statement and expression types
-  executor.rs   runs statements, evaluates expressions
-  catalog.rs    table and index schemas and where their pages live
-  table.rs      a table: schema + storage + indexes, constraint checks, index choice
-  index.rs      secondary index: B+ tree entries of (value, row id)
-  types.rs      values, data types, columns
-  result.rs     query results and table printing
-  error.rs      shared error type
+  main.rs         interactive shell
+  lib.rs          module list and public exports
+  database.rs     entry point; runs SQL, commits or rolls back each statement
+  executor.rs     runs statements
+  types.rs        values, data types, columns
+  predicate.rs    `column op literal` conditions, shared by the planner and storage
+  result.rs       query results and table printing
+  error.rs        shared error type
+  sql/            the language
+    lexer.rs      SQL text -> tokens
+    parser.rs     tokens -> AST (recursive descent)
+    ast.rs        statement and expression types
+    eval.rs       evaluates expressions, with three-valued logic for NULL
+  plan/           how to read a table
+    filter.rs     WHERE -> pushed-down predicates; the columns a statement reads
+    access.rs     picks a full scan, an index or a key lookup; EXPLAIN
+  catalog/        tables and indexes
+    mod.rs        Catalog: table and index schemas and where their pages live
+    table.rs      a table: schema + storage + indexes, constraint checks
+    index.rs      secondary index: B+ tree entries of (value, row id)
   storage/
-    medium.rs   byte-addressed files: on disk, in memory, or crashing (for tests)
-    wal.rs      write-ahead log: page frames, commits, recovery, checkpoints
-    disk.rs     DiskManager: fixed-size pages in one file, free list, via the WAL
-    buffer.rs   buffer pool: cached frames, pin counts, dirty pages
-    replacer.rs page replacement policies: ARC (default), LRU-K, CLOCK
-    page.rs     slotted page: many tuples in one page
-    btree.rs    B+ tree: sorted byte-string keys, splits, merges, range scans
-    heap.rs     table heap: linked list of pages, free-space map, RecordId
-    lsm.rs      LSM tree: log + MemTable, SSTables, level/universal compaction
-    sstable.rs  SSTable: sorted entries in pages, in-memory summary
-    bloom.rs    Bloom filter for SSTable lookups
-    column.rs   column store: PAX row groups, delete bitmaps, delta store
-    encoding.rs column compression: RLE, bit-packing, patching, delta, dictionary, bitmap
-    tuple.rs    row <-> bytes (null bitmap + column values)
-tests/sql.rs    end-to-end tests
+    io/           durable pages
+      medium.rs   byte-addressed files: on disk, in memory, or crashing (for tests)
+      wal.rs      write-ahead log: page frames, commits, recovery, checkpoints
+      disk.rs     DiskManager: fixed-size pages in one file, free list, via the WAL
+    buffer/       pages cached in memory
+      pool.rs     buffer pool: cached frames, pin counts, dirty pages
+      replacer.rs page replacement policies: ARC (default), LRU-K, CLOCK
+    page.rs       slotted page: many tuples in one page
+    tuple.rs      row <-> bytes (null bitmap + column values)
+    heap.rs       table heap: linked list of pages, free-space map, RecordId
+    btree.rs      B+ tree: sorted byte-string keys, splits, merges, range scans
+    lsm/          log-structured merge tree
+      tree.rs     log + MemTable, SSTables, level/universal compaction
+      sstable.rs  SSTable: sorted entries in pages, in-memory summary
+      bloom.rs    Bloom filter for SSTable lookups
+    column/       column store
+      store.rs    PAX row groups, delete bitmaps, delta store
+      encoding.rs column compression: RLE, bit-packing, patching, delta, dictionary, bitmap
+tests/sql.rs      end-to-end tests
 ```
 
 ## Storage
@@ -101,7 +118,7 @@ A database is a single file of 4 KB pages:
   once there are 8, it merges runs of similar size, or all of them when the
   newer ones take twice the space of the oldest. It rewrites data less often
   but leaves more SSTables to check. To switch, edit `COMPACTION` in
-  `src/storage/lsm.rs`. Lookups check the MemTable, then SSTables newest first,
+  `src/storage/lsm/tree.rs`. Lookups check the MemTable, then SSTables newest first,
   skipping those whose key range or Bloom filter rules the key out. A
   manifest page lists the log and the SSTables. SSTable summaries are not
   stored: opening a table reads its SSTables once to rebuild them.
@@ -155,7 +172,7 @@ page in use is pinned and cannot be evicted; when the pool is full, ARC
 (Adaptive Replacement Cache) picks an unpinned victim, writing it back first if
 it is dirty. ARC balances recently used against frequently used pages, so a
 full table scan does not push frequently used pages out. LRU-K and CLOCK are
-also available: to switch, edit `REPLACEMENT_POLICY` in `src/storage/buffer.rs`.
+also available: to switch, edit `REPLACEMENT_POLICY` in `src/storage/buffer/pool.rs`.
 
 **The write-ahead log** (`<file>-wal`) makes every statement atomic. The
 DiskManager never writes the database file directly: each page write, the

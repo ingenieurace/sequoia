@@ -3,9 +3,9 @@
 //! Expression precedence, lowest first:
 //! OR, AND, NOT, comparison / IS NULL, + -, * /, unary -, primary.
 
-use crate::ast::{BinaryOp, Expr, OrderBy, Projection, Statement, UnaryOp};
+use super::ast::{BinaryOp, Expr, OrderBy, Projection, Statement, UnaryOp};
 use crate::error::{Error, Result};
-use crate::lexer::{Token, tokenize};
+use super::lexer::{Token, tokenize};
 use crate::types::{Column, DataType, StorageKind, Value};
 
 /// Parses one or more `;`-separated statements.

@@ -204,7 +204,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::storage::medium::sim::Sim;
+    use crate::storage::io::medium::sim::Sim;
 
     fn filled(byte: u8) -> Page {
         [byte; PAGE_SIZE]

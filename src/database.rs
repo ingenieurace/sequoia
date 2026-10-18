@@ -11,11 +11,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::ast::Statement;
 use crate::catalog::Catalog;
 use crate::error::{Result, err};
 use crate::executor;
-use crate::parser::parse;
+use crate::sql::ast::Statement;
+use crate::sql::parse;
 use crate::result::QueryResult;
 use crate::storage::{BufferPool, DiskManager};
 
@@ -92,7 +92,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::storage::medium::sim::Sim;
+    use crate::storage::io::medium::sim::Sim;
     use crate::types::Value;
 
     /// A database on simulated files: 0 is the database file, 1 its log.
