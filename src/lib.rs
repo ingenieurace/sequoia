@@ -9,6 +9,7 @@ pub mod executor;
 pub mod lexer;
 pub mod parser;
 pub mod result;
+pub mod storage;
 pub mod table;
 pub mod types;
 
