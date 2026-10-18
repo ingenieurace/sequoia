@@ -3,9 +3,10 @@ use std::fmt;
 use crate::error::{Result, err};
 
 const KEYWORDS: &[&str] = &[
-    "AND", "ASC", "BOOL", "BOOLEAN", "BY", "CREATE", "DELETE", "DESC", "DROP", "FALSE", "FROM",
-    "INSERT", "INT", "INTEGER", "INTO", "IS", "KEY", "LIMIT", "NOT", "NULL", "OR", "ORDER",
-    "PRIMARY", "SELECT", "SET", "TABLE", "TEXT", "TRUE", "UPDATE", "USING", "VALUES", "WHERE",
+    "AND", "ASC", "BOOL", "BOOLEAN", "BY", "CREATE", "DELETE", "DESC", "DROP", "EXPLAIN", "FALSE",
+    "FROM", "INDEX", "INSERT", "INT", "INTEGER", "INTO", "IS", "KEY", "LIMIT", "NOT", "NULL", "ON",
+    "OR", "ORDER", "PRIMARY", "SELECT", "SET", "TABLE", "TEXT", "TRUE", "UNIQUE", "UPDATE", "USING",
+    "VALUES", "WHERE",
 ];
 
 #[derive(Debug, Clone, PartialEq)]

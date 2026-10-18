@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod database;
 pub mod error;
 pub mod executor;
+pub mod index;
 pub mod lexer;
 pub mod parser;
 pub mod result;

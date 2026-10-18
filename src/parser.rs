@@ -38,8 +38,12 @@ impl Parser {
             _ => String::new(),
         };
         match keyword.as_str() {
-            "CREATE" => self.create_table(),
-            "DROP" => self.drop_table(),
+            "CREATE" => self.create(),
+            "DROP" => self.drop(),
+            "EXPLAIN" => {
+                self.pos += 1;
+                Ok(Statement::Explain(Box::new(self.statement()?)))
+            }
             "INSERT" => self.insert(),
             "SELECT" => self.select(),
             "UPDATE" => self.update(),
@@ -48,8 +52,15 @@ impl Parser {
         }
     }
 
-    fn create_table(&mut self) -> Result<Statement> {
+    fn create(&mut self) -> Result<Statement> {
         self.expect_keyword("CREATE")?;
+        match self.peek() {
+            Some(Token::Keyword(k)) if k == "INDEX" || k == "UNIQUE" => self.create_index(),
+            _ => self.create_table(),
+        }
+    }
+
+    fn create_table(&mut self) -> Result<Statement> {
         self.expect_keyword("TABLE")?;
         let name = self.ident()?;
         self.expect_symbol("(")?;
@@ -86,8 +97,23 @@ impl Parser {
         Ok(Column { name, data_type, primary_key })
     }
 
-    fn drop_table(&mut self) -> Result<Statement> {
+    fn create_index(&mut self) -> Result<Statement> {
+        let unique = self.eat_keyword("UNIQUE");
+        self.expect_keyword("INDEX")?;
+        let name = self.ident()?;
+        self.expect_keyword("ON")?;
+        let table = self.ident()?;
+        self.expect_symbol("(")?;
+        let column = self.ident()?;
+        self.expect_symbol(")")?;
+        Ok(Statement::CreateIndex { name, table, column, unique })
+    }
+
+    fn drop(&mut self) -> Result<Statement> {
         self.expect_keyword("DROP")?;
+        if self.eat_keyword("INDEX") {
+            return Ok(Statement::DropIndex { name: self.ident()? });
+        }
         self.expect_keyword("TABLE")?;
         Ok(Statement::DropTable { name: self.ident()? })
     }

@@ -46,7 +46,7 @@ impl Database {
 
     /// Runs a single parsed statement.
     pub fn run(&mut self, statement: Statement) -> Result<QueryResult> {
-        let modifies = !matches!(statement, Statement::Select { .. });
+        let modifies = !matches!(statement, Statement::Select { .. } | Statement::Explain(_));
         let result = executor::execute(&mut self.catalog, statement);
         if modifies {
             self.catalog.save()?;

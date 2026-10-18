@@ -6,7 +6,7 @@ use crate::result::QueryResult;
 use crate::catalog::Catalog;
 use crate::storage::{Compare, Predicate};
 use crate::table::{Row, Table, column_index};
-use crate::types::{Column, StorageKind, Value};
+use crate::types::{Column, Value};
 
 pub fn execute(catalog: &mut Catalog, statement: Statement) -> Result<QueryResult> {
     match statement {
@@ -18,6 +18,15 @@ pub fn execute(catalog: &mut Catalog, statement: Statement) -> Result<QueryResul
             catalog.drop_table(&name)?;
             Ok(message(format!("table {name} dropped")))
         }
+        Statement::CreateIndex { name, table, column, unique } => {
+            catalog.create_index(name.clone(), table, &column, unique)?;
+            Ok(message(format!("index {name} created")))
+        }
+        Statement::DropIndex { name } => {
+            catalog.drop_index(&name)?;
+            Ok(message(format!("index {name} dropped")))
+        }
+        Statement::Explain(statement) => explain(catalog, *statement),
         Statement::Insert { table, columns, rows } => insert(catalog.get_mut(&table)?, columns, rows),
         Statement::Select { table, projection, filter, order_by, limit } => {
             select(catalog.get(&table)?, projection, filter, order_by, limit)
@@ -27,6 +36,18 @@ pub fn execute(catalog: &mut Catalog, statement: Statement) -> Result<QueryResul
         }
         Statement::Delete { table, filter } => delete(catalog.get_mut(&table)?, filter),
     }
+}
+
+/// Describes how a statement would read its table: through which index, if any.
+fn explain(catalog: &Catalog, statement: Statement) -> Result<QueryResult> {
+    let (table, filter) = match statement {
+        Statement::Select { table, filter, .. }
+        | Statement::Update { table, filter, .. }
+        | Statement::Delete { table, filter } => (table, filter),
+        _ => return err("EXPLAIN supports only SELECT, UPDATE and DELETE"),
+    };
+    let table = catalog.get(&table)?;
+    Ok(message(table.explain(&predicates(table, &filter))))
 }
 
 fn insert(table: &mut Table, columns: Option<Vec<String>>, rows: Vec<Vec<Expr>>) -> Result<QueryResult> {
@@ -70,7 +91,7 @@ fn select(
     };
 
     let mut rows: Vec<Row> = Vec::new();
-    for item in table.scan_filtered(&needed, &pushdown(table, &filter)) {
+    for item in table.scan_filtered(&needed, &predicates(table, &filter)) {
         let (_, row) = item?;
         if matches(&filter, columns, &row)? {
             rows.push(row);
@@ -132,7 +153,7 @@ fn update(table: &mut Table, assignments: Vec<(String, Expr)>, filter: Option<Ex
 
     // Collect every change before writing, so the scan never sees its own updates.
     let mut changes = Vec::new();
-    for item in table.scan_filtered(&vec![true; table.columns.len()], &pushdown(table, &filter)) {
+    for item in table.scan_filtered(&vec![true; table.columns.len()], &predicates(table, &filter)) {
         let (rid, mut row) = item?;
         if !matches(&filter, &table.columns, &row)? {
             continue;
@@ -153,7 +174,7 @@ fn update(table: &mut Table, assignments: Vec<(String, Expr)>, filter: Option<Ex
 
 fn delete(table: &mut Table, filter: Option<Expr>) -> Result<QueryResult> {
     let mut rids = Vec::new();
-    for item in table.scan_filtered(&needed_columns(&table.columns, &filter), &pushdown(table, &filter)) {
+    for item in table.scan_filtered(&needed_columns(&table.columns, &filter), &predicates(table, &filter)) {
         let (rid, row) = item?;
         if matches(&filter, &table.columns, &row)? {
             rids.push(rid);
@@ -183,14 +204,15 @@ fn needed_columns<'a>(columns: &[Column], exprs: impl IntoIterator<Item = &'a Ex
 }
 
 /// Pulls the conjuncts `column op literal` (or `literal op column`) out of a
-/// WHERE clause, for a column store to evaluate on its compressed chunks. A
-/// row the clause matches satisfies every conjunct, so the scan may skip rows
-/// that fail one; the whole clause is still evaluated on the rows returned.
+/// WHERE clause, for a column store to evaluate on its compressed chunks, or
+/// for a heap or LSM table to pick an index with. A row the clause matches
+/// satisfies every conjunct, so the scan may skip rows that fail one; the
+/// whole clause is still evaluated on the rows returned.
 /// A literal that is NULL or of the wrong type is left to that evaluation,
 /// which matches nothing or reports the error. As in any database that
 /// reorders predicates, the rest of the clause is then never evaluated on the
 /// skipped rows, so an error it would raise only there (`1 / 0`) is not raised.
-fn pushdown(table: &Table, filter: &Option<Expr>) -> Vec<Predicate> {
+fn predicates(table: &Table, filter: &Option<Expr>) -> Vec<Predicate> {
     fn conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
         match expr {
             Expr::Binary(left, BinaryOp::And, right) => {
@@ -214,9 +236,6 @@ fn pushdown(table: &Table, filter: &Option<Expr>) -> Vec<Predicate> {
     }
 
     let Some(filter) = filter else { return Vec::new() };
-    if table.storage_kind() != StorageKind::Column {
-        return Vec::new();
-    }
     let mut exprs = Vec::new();
     conjuncts(filter, &mut exprs);
     exprs

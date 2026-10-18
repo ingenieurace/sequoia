@@ -498,3 +498,211 @@ fn column_tables_filter_compressed_chunks_like_heap_tables() {
     }
     same(&mut db, "SELECT * FROM {t} WHERE nights = 9 AND city > 'lima'");
 }
+
+/// Runs EXPLAIN on a statement and returns the plan.
+fn plan(db: &mut Database, sql: &str) -> String {
+    match db.execute(&format!("EXPLAIN {sql}")).unwrap().pop() {
+        Some(QueryResult::Message(plan)) => plan,
+        other => panic!("expected a plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn heap_primary_keys_and_created_indexes_are_used_by_where() {
+    let mut db = setup();
+    assert_eq!(plan(&mut db, "SELECT * FROM users WHERE id = 2"), "SEARCH users USING INDEX users_pkey (id = 2)");
+    assert_eq!(plan(&mut db, "SELECT * FROM users WHERE name = 'bob'"), "SCAN users");
+    assert_eq!(plan(&mut db, "SELECT * FROM users WHERE id != 2 OR id = 3"), "SCAN users", "no conjunct to use");
+
+    db.execute("CREATE INDEX users_name ON users (name)").unwrap();
+    db.execute("CREATE INDEX users_age ON users (age)").unwrap();
+    assert_eq!(
+        plan(&mut db, "UPDATE users SET age = 1 WHERE 'bob' = name"),
+        "SEARCH users USING INDEX users_name (name = 'bob')"
+    );
+    assert_eq!(
+        plan(&mut db, "DELETE FROM users WHERE age > 20 AND age <= 30 AND age >= 21 AND age < 99"),
+        "SEARCH users USING INDEX users_age (age >= 21 AND age <= 30)",
+        "the tightest bounds"
+    );
+    assert_eq!(
+        plan(&mut db, "SELECT * FROM users WHERE age > 20 AND name = 'bob'"),
+        "SEARCH users USING INDEX users_name (name = 'bob')",
+        "an equality beats a range"
+    );
+    assert_eq!(plan(&mut db, "SELECT * FROM users WHERE age = 'x'"), "SCAN users", "a literal of the wrong type");
+
+    assert_eq!(query(&mut db, "SELECT id FROM users WHERE name = 'bob'"), vec![vec![int(2)]]);
+    // Rows come back in index order, and NULL ages are not in the index.
+    assert_eq!(
+        query(&mut db, "SELECT name FROM users WHERE age < 100"),
+        vec![vec![text("bob")], vec![text("alice")]]
+    );
+    assert!(query(&mut db, "SELECT id FROM users WHERE age > 30").is_empty());
+    assert!(db.execute("EXPLAIN INSERT INTO users VALUES (4, 'x', 1, TRUE)").is_err());
+}
+
+#[test]
+fn indexed_tables_answer_like_unindexed_ones() {
+    let mut db = Database::in_memory();
+    for storage in ["HEAP", "LSM"] {
+        for indexed in [false, true] {
+            let t = format!("{storage}_{indexed}");
+            db.execute(&format!("CREATE TABLE {t} (id INT PRIMARY KEY, city TEXT, nights INT) USING {storage}")).unwrap();
+            if indexed {
+                db.execute(&format!("CREATE INDEX {t}_city ON {t} (city)")).unwrap();
+                db.execute(&format!("CREATE INDEX {t}_nights ON {t} (nights)")).unwrap();
+            }
+            let values: Vec<String> = (0..2000i64)
+                .map(|id| {
+                    let nights = if id % 11 == 0 { "NULL".to_string() } else { (id % 7 - 3).to_string() };
+                    format!("({id}, '{}', {nights})", ["lima", "oslo", "paris", "tokyo", "a\0b"][id as usize % 5])
+                })
+                .collect();
+            db.execute(&format!("INSERT INTO {t} VALUES {}", values.join(", "))).unwrap();
+        }
+    }
+    let tables = ["HEAP_false", "HEAP_true", "LSM_false", "LSM_true"];
+    let same = |db: &mut Database, sql: &str| {
+        let results: Vec<Vec<Vec<Value>>> = tables
+            .iter()
+            .map(|t| {
+                let mut rows = query(db, &sql.replace("{t}", t));
+                rows.sort_by(|a, b| a[0].sort_cmp(&b[0]));
+                rows
+            })
+            .collect();
+        for (t, rows) in tables.iter().zip(&results) {
+            assert_eq!(rows, &results[0], "{sql} on {t}");
+        }
+    };
+    let wheres = [
+        "city = 'oslo'",
+        "city = 'a\0b' AND nights > 0",
+        "city > 'lima' AND city < 'tokyo'",
+        "city >= 'oslo'",
+        "city <= 'a'",
+        "nights = -3",
+        "nights >= 2",
+        "nights < 0 AND nights > -3",
+        "nights > 5",
+        "nights = NULL",
+        "nights IS NULL",
+        "id = 1500",
+        "id >= 1990 AND city = 'paris'",
+    ];
+    let changes = [
+        "UPDATE {t} SET city = 'rome' WHERE city = 'lima' AND id < 1000",
+        "UPDATE {t} SET nights = nights + 1 WHERE nights >= 0",
+        // Grown rows move to other heap pages; changed keys move in an LSM tree.
+        &format!("UPDATE {{t}} SET city = '{}' WHERE id / 3 * 3 = id", "z".repeat(300)),
+        "UPDATE {t} SET id = id + 10000 WHERE nights = 2",
+        "DELETE FROM {t} WHERE city = 'tokyo' OR nights IS NULL",
+    ];
+    for change in [""].into_iter().chain(changes) {
+        if !change.is_empty() {
+            for t in tables {
+                db.execute(&change.replace("{t}", t)).unwrap();
+            }
+        }
+        same(&mut db, "SELECT * FROM {t}");
+        for filter in wheres {
+            same(&mut db, &format!("SELECT * FROM {{t}} WHERE {filter}"));
+        }
+    }
+    assert!(plan(&mut db, "SELECT * FROM HEAP_true WHERE city = 'rome'").contains("USING INDEX HEAP_true_city"));
+    assert!(plan(&mut db, "SELECT * FROM LSM_true WHERE nights < 0").contains("USING INDEX LSM_true_nights"));
+    assert_eq!(plan(&mut db, "SELECT * FROM LSM_true WHERE id = 7"), "SEARCH LSM_true USING PRIMARY KEY (id = 7)");
+    assert_eq!(plan(&mut db, "SELECT * FROM LSM_false WHERE city = 'oslo'"), "SCAN LSM_false");
+}
+
+#[test]
+fn unique_indexes_reject_duplicates() {
+    let mut db = setup();
+    db.execute("CREATE UNIQUE INDEX users_name ON users (name)").unwrap();
+    assert!(db.execute("INSERT INTO users VALUES (4, 'bob', 1, TRUE)").is_err());
+    assert!(db.execute("INSERT INTO users VALUES (4, 'dave', 1, TRUE), (5, 'dave', 1, TRUE)").is_err());
+    assert!(db.execute("UPDATE users SET name = 'alice' WHERE id = 2").is_err());
+    // NULLs do not clash, and rows may swap values in one statement.
+    db.execute("INSERT INTO users (id) VALUES (4), (5)").unwrap();
+    db.execute("UPDATE users SET id = id + 1").unwrap();
+    db.execute("UPDATE users SET id = 3 - id WHERE id < 3").unwrap();
+    assert_eq!(query(&mut db, "SELECT id FROM users WHERE name = 'alice'"), vec![vec![int(1)]]);
+    assert_eq!(query(&mut db, "SELECT name FROM users WHERE id = 3"), vec![vec![text("bob")]]);
+    assert_eq!(query(&mut db, "SELECT id FROM users WHERE id >= 1 ORDER BY id").len(), 5);
+
+    // A unique index cannot be built over duplicates, and none is left behind.
+    db.execute("INSERT INTO users VALUES (9, 'zed', 30, TRUE)").unwrap();
+    assert!(db.execute("CREATE UNIQUE INDEX users_age ON users (age)").is_err());
+    assert_eq!(plan(&mut db, "SELECT * FROM users WHERE age = 30"), "SCAN users");
+    db.execute("CREATE INDEX users_age ON users (age)").unwrap();
+    assert_eq!(query(&mut db, "SELECT id FROM users WHERE age = 30").len(), 2);
+}
+
+#[test]
+fn index_statements_are_checked() {
+    let mut db = setup();
+    assert!(db.execute("CREATE INDEX i ON missing (id)").is_err());
+    assert!(db.execute("CREATE INDEX i ON users (missing)").is_err());
+    assert!(db.execute("CREATE INDEX users_pkey ON users (name)").is_err(), "name taken");
+    assert!(db.execute("DROP INDEX users_pkey").is_err(), "the primary key needs it");
+    assert!(db.execute("DROP INDEX missing").is_err());
+    assert!(db.execute("CREATE INDEX i ON users").is_err());
+
+    // Values too long for an index entry are rejected, leaving the table unchanged.
+    db.execute("CREATE INDEX users_name ON users (name)").unwrap();
+    let long = "n".repeat(2000);
+    assert!(db.execute(&format!("INSERT INTO users (id, name) VALUES (9, '{long}')")).is_err());
+    assert!(db.execute(&format!("UPDATE users SET name = '{long}' WHERE id = 1")).is_err());
+    assert_eq!(query(&mut db, "SELECT name FROM users WHERE id = 1"), vec![vec![text("alice")]]);
+    assert_eq!(query(&mut db, "SELECT id FROM users").len(), 3);
+
+    db.execute("DROP INDEX users_name").unwrap();
+    db.execute(&format!("INSERT INTO users (id, name) VALUES (9, '{long}')")).unwrap();
+    assert!(db.execute("CREATE INDEX users_name ON users (name)").is_err());
+
+    db.execute("CREATE TABLE c (id INT PRIMARY KEY, x INT) USING COLUMN").unwrap();
+    assert!(db.execute("CREATE INDEX c_x ON c (x)").is_err());
+    assert_eq!(
+        plan(&mut db, "SELECT * FROM c WHERE x > 1 AND id = 2"),
+        "SCAN c FILTERING COMPRESSED CHUNKS ON x > 1 AND id = 2"
+    );
+}
+
+#[test]
+fn indexes_survive_reopening_and_are_dropped_with_their_table() {
+    let path = TempDb::new("index");
+    let fill = |db: &mut Database| {
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, tag TEXT, n INT)").unwrap();
+        db.execute("CREATE INDEX t_tag ON t (tag)").unwrap();
+        for batch in 0..10 {
+            let values: Vec<String> =
+                (0..200).map(|i| batch * 200 + i).map(|id| format!("({id}, 'tag{}', {id})", id % 50)).collect();
+            db.execute(&format!("INSERT INTO t VALUES {}", values.join(", "))).unwrap();
+        }
+    };
+    {
+        let mut db = Database::open(&path.0).unwrap();
+        fill(&mut db);
+        db.execute("CREATE INDEX t_n ON t (n)").unwrap();
+        db.execute("DELETE FROM t WHERE n >= 1000").unwrap();
+    }
+    let mut db = Database::open(&path.0).unwrap();
+    assert_eq!(plan(&mut db, "SELECT * FROM t WHERE tag = 'tag7'"), "SEARCH t USING INDEX t_tag (tag = 'tag7')");
+    assert_eq!(query(&mut db, "SELECT id FROM t WHERE tag = 'tag7'").len(), 20);
+    assert_eq!(query(&mut db, "SELECT id FROM t WHERE n >= 990").len(), 10);
+    assert!(db.execute("INSERT INTO t VALUES (5, 'dup', 0)").is_err(), "the primary key index was reopened");
+    db.execute("INSERT INTO t VALUES (5000, 'tag7', 5000)").unwrap();
+    assert_eq!(query(&mut db, "SELECT id FROM t WHERE tag = 'tag7'").len(), 21);
+
+    db.execute("DROP INDEX t_n").unwrap();
+    assert_eq!(plan(&mut db, "SELECT * FROM t WHERE n = 3"), "SCAN t");
+    db.execute("DROP TABLE t").unwrap();
+    let size = std::fs::metadata(&path.0).unwrap().len();
+    fill(&mut db);
+    assert_eq!(std::fs::metadata(&path.0).unwrap().len(), size, "the indexes' pages were freed and reused");
+    drop(db);
+
+    let mut db = Database::open(&path.0).unwrap();
+    assert_eq!(query(&mut db, "SELECT id FROM t WHERE tag = 'tag1'").len(), 40);
+}

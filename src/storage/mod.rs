@@ -8,9 +8,11 @@
 //! - `column`: row groups stored column by column, compressed by `encoding`,
 //!   with a heap as the delta store for new rows.
 //!
+//! `btree` is a B+ tree of byte-string keys, which indexes are built on.
 //! `tuple` converts rows to and from bytes.
 
 mod bloom;
+pub mod btree;
 pub mod buffer;
 pub mod column;
 pub mod disk;
@@ -22,6 +24,7 @@ pub mod replacer;
 pub mod sstable;
 pub mod tuple;
 
+pub use btree::BPlusTree;
 pub use buffer::{BufferPool, PageReadGuard, PageWriteGuard, REPLACEMENT_POLICY};
 pub use column::{ColumnConfig, ColumnStore, Position, Predicate};
 pub use encoding::Compare;

@@ -10,6 +10,18 @@ pub enum Statement {
     DropTable {
         name: String,
     },
+    /// `CREATE [UNIQUE] INDEX name ON table (column)`
+    CreateIndex {
+        name: String,
+        table: String,
+        column: String,
+        unique: bool,
+    },
+    DropIndex {
+        name: String,
+    },
+    /// `EXPLAIN statement`: describes how the statement would read its table.
+    Explain(Box<Statement>),
     Insert {
         table: String,
         columns: Option<Vec<String>>,

@@ -16,6 +16,9 @@ INSERT INTO users VALUES (1, 'alice', TRUE), (2, 'bob', FALSE);
 SELECT name FROM users WHERE active AND id > 0 ORDER BY name DESC LIMIT 10;
 UPDATE users SET active = NOT active WHERE id = 2;
 DELETE FROM users WHERE name = 'alice';
+CREATE INDEX users_name ON users (name);
+EXPLAIN SELECT * FROM users WHERE name = 'bob';  -- SEARCH users USING INDEX users_name (name = 'bob')
+DROP INDEX users_name;
 DROP TABLE users;
 ```
 
@@ -23,15 +26,18 @@ Shell commands: `.tables`, `.exit`.
 
 ## Supported SQL
 
-- Statements: `CREATE TABLE ... [USING HEAP | LSM | COLUMN]`, `DROP TABLE`, `INSERT`,
-  `SELECT`, `UPDATE`, `DELETE`
+- Statements: `CREATE TABLE ... [USING HEAP | LSM | COLUMN]`, `DROP TABLE`,
+  `CREATE [UNIQUE] INDEX name ON table (column)`, `DROP INDEX`, `INSERT`, `SELECT`,
+  `UPDATE`, `DELETE`, and `EXPLAIN` before a `SELECT`, `UPDATE` or `DELETE` to see
+  how it finds its rows
 - Types: `INT`, `TEXT`, `BOOL`, and `NULL`
-- Constraints: `PRIMARY KEY` (unique, not null); values are type-checked
+- Constraints: `PRIMARY KEY` (unique, not null), unique indexes (NULLs may repeat);
+  values are type-checked
 - `SELECT`: `*` or expressions, `WHERE`, `ORDER BY ... ASC|DESC`, `LIMIT`
 - Expressions: `+ - * /`, `= != <> < <= > >=`, `AND OR NOT`, `IS [NOT] NULL`,
   parentheses, with SQL three-valued logic for `NULL`
 
-Not supported: joins, aggregates, indexes, transactions.
+Not supported: joins, aggregates, multi-column indexes, transactions.
 
 ## Layout
 
@@ -44,8 +50,9 @@ src/
   parser.rs     tokens -> AST (recursive descent)
   ast.rs        statement and expression types
   executor.rs   runs statements, evaluates expressions
-  catalog.rs    table schemas and where each table's pages live
-  table.rs      a table: schema + heap, constraint checks
+  catalog.rs    table and index schemas and where their pages live
+  table.rs      a table: schema + storage + indexes, constraint checks, index choice
+  index.rs      secondary index: B+ tree entries of (value, row id)
   types.rs      values, data types, columns
   result.rs     query results and table printing
   error.rs      shared error type
@@ -54,6 +61,7 @@ src/
     buffer.rs   buffer pool: cached frames, pin counts, dirty pages
     replacer.rs page replacement policies: ARC (default), LRU-K, CLOCK
     page.rs     slotted page: many tuples in one page
+    btree.rs    B+ tree: sorted byte-string keys, splits, merges, range scans
     heap.rs     table heap: linked list of pages, free-space map, RecordId
     lsm.rs      LSM tree: log + MemTable, SSTables, level/universal compaction
     sstable.rs  SSTable: sorted entries in pages, in-memory summary
@@ -71,7 +79,8 @@ A database is a single file of 4 KB pages:
 - **Page 0** is the file header: magic, format version, page size, page count,
   free list head, and the root page.
 - **The catalog** is a table heap starting at the root page. Each row holds a
-  table's `CREATE TABLE` statement plus its first and last page.
+  table's `CREATE TABLE` statement plus its first and last page, or an index's
+  `CREATE INDEX` statement plus its root page.
 - **A heap table** (the default) is a linked list of slotted pages. A row is identified by its
   `RecordId` (page, slot) and stored as a null bitmap followed by its columns.
   An in-memory free-space map (rebuilt from the pages after opening) sends
@@ -113,8 +122,30 @@ A database is a single file of 4 KB pages:
   delta store, and a group whose rows are all deleted is freed. A manifest
   page lists the delta store and the row groups, which limits a column table
   to about a thousand row groups.
-- **Freed pages** (from `DROP TABLE`, an LSM flush or compaction, or a
-  column store migration) go on a free list and are reused.
+- **An index** is a B+ tree over one column of a heap or LSM table. Each entry
+  is a key of the tree: the value, encoded so that bytes sort like values and
+  no value's encoding is a prefix of another's, followed by the row's id (a
+  heap row's page and slot, or an LSM row's key). The entries of one value
+  are therefore adjacent, and a lookup is a range scan of the leaves, which
+  are linked in key order. NULLs are not indexed. A node that overflows its
+  page splits; a delete that leaves a node under a quarter full merges it
+  with a neighbour, or moves keys over from it. The root page never moves, so
+  the catalog row stays valid. Every insert, update and delete updates every
+  index of the table. A heap table with a primary key gets a unique index
+  `<table>_pkey` on it, which enforces the key and is dropped only with the
+  table. Column tables cannot have indexes: migrating rows into a row group
+  moves them, which would change their ids.
+- **Finding rows**: a WHERE clause's conditions of the form `column op literal`
+  (joined by AND) choose how a statement reads its table. A heap or LSM table
+  uses the index those conditions narrow down most, an equality before a range
+  with two ends before one with one end, and reads only the rows the index
+  lists, in index order. An LSM table whose primary key is fixed by an
+  equality looks that key up. Otherwise every row is read, a column table's
+  with its conditions pushed down (above). The full WHERE clause is always
+  checked on the rows read. `EXPLAIN` shows the choice.
+- **Freed pages** (from `DROP TABLE`, `DROP INDEX`, B+ tree merges, an LSM
+  flush or compaction, or a column store migration) go on a free list and
+  are reused.
 
 Pages are read and written through a **buffer pool** of 256 frames (1 MB). A
 page in use is pinned and cannot be evicted; when the pool is full, ARC
@@ -124,7 +155,9 @@ full table scan does not push frequently used pages out. LRU-K and CLOCK are
 also available: to switch, edit `REPLACEMENT_POLICY` in `src/storage/buffer.rs`.
 
 Every statement that changes data has its dirty pages written back and synced
-before it returns. There is no WAL for the whole database or index yet: a
-crash in the middle of a statement may leave it half applied, and primary key
-checks on heap tables scan the whole table (LSM tables look the key up). A
-row must fit in one page (about 4 KB).
+before it returns. There is no WAL yet: a crash in the middle of a
+statement may leave it half applied, or a table and its indexes out of step.
+Primary key checks use the key's index on heap tables, look the key up on LSM
+tables and read the key column on column tables (heap tables in files written
+before indexes existed have no key index and scan the table). A row must fit
+in one page (about 4 KB), and an index entry in 1 KB.
