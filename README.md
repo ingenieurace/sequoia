@@ -17,7 +17,7 @@ SELECT name FROM users WHERE active AND id > 0 ORDER BY name DESC LIMIT 10;
 UPDATE users SET active = NOT active WHERE id = 2;
 DELETE FROM users WHERE name = 'alice';
 CREATE INDEX users_name ON users (name);
-EXPLAIN SELECT * FROM users WHERE name = 'bob';  -- SEARCH users USING INDEX users_name (name = 'bob')
+EXPLAIN SELECT * FROM users WHERE name = 'bob';  -- the plan, ending in SEARCH users USING INDEX users_name
 DROP INDEX users_name;
 DROP TABLE users;
 ```
@@ -29,7 +29,7 @@ Shell commands: `.tables`, `.exit`.
 - Statements: `CREATE TABLE ... [USING HEAP | LSM | COLUMN]`, `DROP TABLE`,
   `CREATE [UNIQUE] INDEX name ON table (column)`, `DROP INDEX`, `INSERT`, `SELECT`,
   `UPDATE`, `DELETE`, `CHECKPOINT`, and `EXPLAIN` before a `SELECT`, `UPDATE` or
-  `DELETE` to see how it finds its rows
+  `DELETE` to see its plan
 - Types: `INT`, `TEXT`, `BOOL`, and `NULL`
 - Constraints: `PRIMARY KEY` (unique, not null), unique indexes (NULLs may repeat);
   values are type-checked
@@ -58,9 +58,10 @@ src/
   lib.rs          module list and public exports
   database.rs     entry point; runs SQL, commits or rolls back each statement
   executor/       runs statements
-    mod.rs        statement execution
+    mod.rs        statement execution; a SELECT's rows as a stream (`Database::query`)
+    operator.rs   each plan step as an iterator pulling rows from the one below
     sort.rs       ORDER BY: external merge sort, top-N heap for LIMIT
-    aggregate.rs  GROUP BY, HAVING and aggregates, by hash aggregation
+    aggregate.rs  hash aggregation: one row per group, and the aggregate functions
   types.rs        values, data types, columns
   predicate.rs    `column op literal` conditions, shared by the planner and storage
   result.rs       query results and table printing
@@ -72,7 +73,8 @@ src/
     eval.rs       evaluates expressions, with three-valued logic for NULL
   plan/           how to read a table
     filter.rs     WHERE -> pushed-down predicates; the columns a statement reads
-    access.rs     picks a full scan, an index or a key lookup; EXPLAIN
+    access.rs     picks a full scan, an index or a key lookup
+    query.rs      a SELECT as a tree of steps: scan, filter, aggregate, sort, limit, project
   catalog/        tables and indexes
     mod.rs        Catalog: table and index schemas and where their pages live
     table.rs      a table: schema + storage + indexes, constraint checks
@@ -171,7 +173,7 @@ A database is a single file of 4 KB pages:
   lists, in index order. An LSM table whose primary key is fixed by an
   equality looks that key up. Otherwise every row is read, a column table's
   with its conditions pushed down (above). The full WHERE clause is always
-  checked on the rows read. `EXPLAIN` shows the choice.
+  checked on the rows read. `EXPLAIN` shows the choice on its last line.
 - **Freed pages** (from `DROP TABLE`, `DROP INDEX`, B+ tree merges, an LSM
   flush or compaction, or a column store migration) go on a free list and
   are reused. A rolled-back statement's allocations are undone with it.
@@ -183,16 +185,36 @@ it is dirty. ARC balances recently used against frequently used pages, so a
 full table scan does not push frequently used pages out. LRU-K and CLOCK are
 also available: to switch, edit `REPLACEMENT_POLICY` in `src/storage/buffer/pool.rs`.
 
-**Grouping**: a `SELECT` with `GROUP BY`, `HAVING` or an aggregate is
-answered by hash aggregation. Each expression of its select list, `HAVING`
-and `ORDER BY` is first rewritten to read a group's row: a `GROUP BY`
-expression becomes one column of it and each distinct aggregate another, and
-any column left over is an error, since it is neither grouped nor aggregated.
-The scan then folds each matching row into its group's accumulators, in a
-hash table with one entry per group, held in memory. `HAVING` filters the
-groups, and `ORDER BY` sorts them with the same sorter as other rows. Groups
-come out in the order their first row was read; without `GROUP BY` all rows
-form one group, even when there are none.
+**Plans**: a `SELECT` is planned as a tree of steps, each reading rows from
+the one below it, and run in the Volcano style: each step is an iterator
+that pulls rows from its input. For example:
+
+```
+EXPLAIN SELECT city, COUNT(*) FROM users WHERE active GROUP BY city HAVING COUNT(*) > 1 ORDER BY city LIMIT 5;
+
+PROJECT city, COUNT(*)
+  SORT BY city (TOP 5)
+    FILTER COUNT(*) > 1
+      AGGREGATE COUNT(*) BY city
+        FILTER active
+          SCAN users
+```
+
+Scans, filters, limits and projections hand rows on one at a time, so a
+`LIMIT` without `ORDER BY` stops the scan once it has enough, and
+`Database::query` returns a `SELECT`'s rows as they are made instead of
+collecting them (`execute` collects them). Sorts and aggregates need all of
+their input before their first row.
+
+**Grouping**: a `SELECT` with `GROUP BY`, `HAVING` or an aggregate gets an
+aggregate step, which works by hash aggregation. Each expression of its
+select list, `HAVING` and `ORDER BY` is first rewritten to read the
+aggregate's rows: a `GROUP BY` expression and each distinct aggregate become
+columns named by their SQL text (`city`, `COUNT(*)`), and any column left
+over is an error, since it is neither grouped nor aggregated. The step folds
+each row into its group's accumulators, in a hash table with one entry per
+group, held in memory. Groups come out in the order their first row was
+read; without `GROUP BY` all rows form one group, even when there are none.
 
 **Sorting**: `ORDER BY` buffers rows in memory up to a budget (4 MB by
 default; `Database::set_sort_memory` changes it). Past that, it sorts what it
@@ -202,8 +224,7 @@ there are more. The temporary file is removed as soon as it is opened, so it
 vanishes with the sort, and it bypasses the write-ahead log. With `LIMIT n`,
 the buffer is instead a heap of the best `n` rows so far, so sorting `m` rows
 takes O(m log n) time and memory for `n` rows. Rows with equal keys keep the
-order they were read in. Without `ORDER BY`, a `LIMIT` stops reading rows
-once it has enough. The rows a `SELECT` returns are still collected in memory.
+order they were read in.
 
 **The write-ahead log** (`<file>-wal`) makes every statement atomic. The
 DiskManager never writes the database file directly: each page write, the

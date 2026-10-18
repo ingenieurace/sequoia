@@ -506,12 +506,17 @@ fn column_tables_filter_compressed_chunks_like_heap_tables() {
     same(&mut db, "SELECT * FROM {t} WHERE nights = 9 AND city > 'lima'");
 }
 
-/// Runs EXPLAIN on a statement and returns the plan.
-fn plan(db: &mut Database, sql: &str) -> String {
+/// Runs EXPLAIN on a statement and returns its whole plan.
+fn explain(db: &mut Database, sql: &str) -> String {
     match db.execute(&format!("EXPLAIN {sql}")).unwrap().pop() {
         Some(QueryResult::Message(plan)) => plan,
         other => panic!("expected a plan, got {other:?}"),
     }
+}
+
+/// How a statement reads its table: the last line of its plan.
+fn plan(db: &mut Database, sql: &str) -> String {
+    explain(db, sql).lines().last().unwrap().trim().to_string()
 }
 
 #[test]
@@ -889,4 +894,57 @@ fn misplaced_aggregates_and_ungrouped_columns_are_rejected() {
     db.execute(&format!("INSERT INTO p VALUES (8, 'x', {}, TRUE), (9, 'x', 1, TRUE)", i64::MAX)).unwrap();
     assert!(db.execute("SELECT SUM(age) FROM p WHERE city = 'x'").unwrap_err().0.contains("overflow"));
     assert_eq!(query(&mut db, "SELECT AVG(age) FROM p WHERE city = 'x'"), vec![vec![int(i64::MAX / 2 + 1)]]);
+}
+
+#[test]
+fn explain_shows_every_step_of_the_plan() {
+    let mut db = setup_people("HEAP");
+    db.execute("CREATE INDEX p_city ON p (city)").unwrap();
+    let sql = "SELECT city, COUNT(*), MAX(age) + 1 FROM p WHERE vip AND id > 1
+               GROUP BY city HAVING COUNT(*) > 1 ORDER BY COUNT(*) DESC LIMIT 5";
+    assert_eq!(
+        explain(&mut db, sql),
+        "PROJECT city, COUNT(*), MAX(age) + 1
+  SORT BY COUNT(*) DESC (TOP 5)
+    FILTER COUNT(*) > 1
+      AGGREGATE COUNT(*), MAX(age) BY city
+        FILTER vip AND (id > 1)
+          SEARCH p USING INDEX p_pkey (id > 1)"
+    );
+    assert_eq!(
+        explain(&mut db, "SELECT * FROM p WHERE city = 'oslo' LIMIT 3"),
+        "LIMIT 3\n  FILTER city = 'oslo'\n    SEARCH p USING INDEX p_city (city = 'oslo')"
+    );
+    assert_eq!(explain(&mut db, "SELECT COUNT(*) FROM p"), "PROJECT COUNT(*)\n  AGGREGATE COUNT(*)\n    SCAN p");
+    assert_eq!(explain(&mut db, "UPDATE p SET age = 1 WHERE age IS NULL"), "FILTER age IS NULL\n  SCAN p");
+    assert_eq!(explain(&mut db, "DELETE FROM p"), "SCAN p");
+}
+
+#[test]
+fn query_streams_rows_as_they_are_produced() {
+    let mut db = setup();
+    {
+        let mut rows = db.query("SELECT name, id * 10 FROM users WHERE id >= 2").unwrap();
+        assert_eq!(rows.columns, ["name", "?column?"]);
+        assert_eq!(rows.next().unwrap().unwrap(), vec![text("bob"), int(20)]);
+        assert_eq!(rows.next().unwrap().unwrap(), vec![text("carol"), int(30)]);
+        assert!(rows.next().is_none());
+    }
+    {
+        // Rows are made only when asked for: the third would divide by zero.
+        let sql = "SELECT id FROM users WHERE 10 / (id - 3) < 0";
+        let mut rows = db.query(sql).unwrap();
+        assert_eq!(rows.next().unwrap().unwrap(), vec![int(1)]);
+        assert_eq!(rows.next().unwrap().unwrap(), vec![int(2)]);
+        assert!(rows.next().unwrap().is_err());
+        // A sort needs every row before its first one.
+        assert!(db.query(&format!("{sql} ORDER BY id")).unwrap().next().unwrap().is_err());
+    }
+    assert!(db.query("DELETE FROM users").is_err(), "only a SELECT");
+    assert!(db.query("SELECT * FROM users; SELECT * FROM users").is_err(), "only one");
+    assert!(db.query("SELECT nope FROM missing").is_err());
+    // The same rows as execute gives.
+    let sql = "SELECT * FROM users ORDER BY name DESC";
+    let streamed: Vec<Vec<Value>> = db.query(sql).unwrap().map(|row| row.unwrap()).collect();
+    assert_eq!(streamed, query(&mut db, sql));
 }

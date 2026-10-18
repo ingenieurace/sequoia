@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::catalog::Catalog;
 use crate::error::{Result, err};
-use crate::executor::{self, Settings};
+use crate::executor::{self, Query, Settings};
 use crate::sql::ast::Statement;
 use crate::sql::parse;
 use crate::result::QueryResult;
@@ -72,6 +72,23 @@ impl Database {
                     err(format!("{e}; then the rollback failed: {rollback}"))
                 }
             },
+        }
+    }
+
+    /// Runs one SELECT and returns its rows as they are produced, without
+    /// collecting them: a scan with a filter and a limit reads only as far as
+    /// it must, and a sort or aggregate holds only what it needs. The
+    /// database cannot change while the rows are being read.
+    pub fn query(&self, sql: &str) -> Result<Query<'_>> {
+        if self.broken {
+            return err("a failed rollback left the database unusable: open it again");
+        }
+        let mut statements = parse(sql)?;
+        match (statements.pop(), statements.is_empty()) {
+            (Some(statement @ Statement::Select { .. }), true) => {
+                executor::select(&self.catalog, statement, &self.settings)
+            }
+            _ => err("query runs a single SELECT; use execute for other statements"),
         }
     }
 

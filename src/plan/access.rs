@@ -51,10 +51,10 @@ pub fn choose(table: &Table, predicates: &[Predicate]) -> Access {
     best.map_or(Access::Scan, |(_, access)| access)
 }
 
-/// Describes the access path [`choose`] picks, as `EXPLAIN` prints it.
-pub fn explain(table: &Table, predicates: &[Predicate]) -> String {
+/// Describes an access path for `predicates`, as `EXPLAIN` prints it.
+pub fn describe(table: &Table, predicates: &[Predicate], access: &Access) -> String {
     let name = &table.name;
-    match choose(table, predicates) {
+    match access.clone() {
         Access::Scan if table.storage_kind() == StorageKind::Column && !predicates.is_empty() => {
             let filters: Vec<String> = predicates
                 .iter()

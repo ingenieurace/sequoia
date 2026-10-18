@@ -130,3 +130,77 @@ pub enum BinaryOp {
     Mul,
     Div,
 }
+
+impl std::fmt::Display for Expr {
+    /// Writes the expression as SQL that parses back to it. Operands that are
+    /// themselves operations are parenthesized, whatever their precedence.
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let operand = |e: &Expr| match e {
+            Expr::Binary(..) | Expr::IsNull(..) | Expr::Unary(UnaryOp::Not, _) => format!("({e})"),
+            e => e.to_string(),
+        };
+        match self {
+            Expr::Literal(value) => f.write_str(&value.to_sql()),
+            Expr::Column(name) => f.write_str(name),
+            Expr::Unary(UnaryOp::Not, inner) => write!(f, "NOT {}", operand(inner)),
+            Expr::Unary(UnaryOp::Neg, inner) => write!(f, "-{}", operand(inner)),
+            Expr::Binary(left, op, right) => write!(f, "{} {} {}", operand(left), op.symbol(), operand(right)),
+            Expr::IsNull(inner, negated) => {
+                write!(f, "{} IS {}NULL", operand(inner), if *negated { "NOT " } else { "" })
+            }
+            Expr::Aggregate(function, None) => write!(f, "{}(*)", function.name().to_uppercase()),
+            Expr::Aggregate(function, Some(arg)) => write!(f, "{}({arg})", function.name().to_uppercase()),
+        }
+    }
+}
+
+impl BinaryOp {
+    pub fn symbol(self) -> &'static str {
+        match self {
+            BinaryOp::Eq => "=",
+            BinaryOp::NotEq => "!=",
+            BinaryOp::Lt => "<",
+            BinaryOp::LtEq => "<=",
+            BinaryOp::Gt => ">",
+            BinaryOp::GtEq => ">=",
+            BinaryOp::And => "AND",
+            BinaryOp::Or => "OR",
+            BinaryOp::Add => "+",
+            BinaryOp::Sub => "-",
+            BinaryOp::Mul => "*",
+            BinaryOp::Div => "/",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::sql::ast::{Expr, Statement};
+    use crate::sql::parse;
+
+    fn where_clause(sql: &str) -> Expr {
+        match parse(&format!("SELECT * FROM t WHERE {sql}")).unwrap().pop() {
+            Some(Statement::Select { filter: Some(filter), .. }) => filter,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn expressions_print_as_sql_that_parses_back() {
+        for sql in [
+            "a + b * c",
+            "(a + b) * -c",
+            "NOT a = 1 OR b IS NOT NULL AND c",
+            "x - -1 >= 'it''s'",
+            "COUNT(*) > 1 AND SUM(a + 1) < MAX(b) / 2",
+            "-(a - b) IS NULL",
+            "NOT (NOT a)",
+            "a = NULL OR b = TRUE",
+        ] {
+            let expr = where_clause(sql);
+            assert_eq!(where_clause(&expr.to_string()), expr, "{sql} printed as {expr}");
+        }
+        assert_eq!(where_clause("a + b * c").to_string(), "a + (b * c)");
+        assert_eq!(where_clause("count(*) + sum(x)").to_string(), "COUNT(*) + SUM(x)");
+    }
+}

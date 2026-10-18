@@ -1,18 +1,22 @@
-//! Executes parsed statements against the catalog. `sort` orders the rows
-//! of a SELECT, and `aggregate` runs the ones with GROUP BY or aggregates.
+//! Executes parsed statements against the catalog. A SELECT is planned (see
+//! `plan/query.rs`) and run by `operator`s: `sort` orders rows, `aggregate`
+//! groups them.
 
 pub mod aggregate;
+pub mod operator;
 pub mod sort;
 
 use crate::catalog::Catalog;
 use crate::catalog::table::{Row, RowId, Table};
 use crate::error::{Result, err};
+use crate::plan::query::{self, forbid};
 use crate::plan::{access, filter};
 use crate::result::QueryResult;
-use crate::sql::ast::{Expr, OrderBy, Projection, Statement};
+use crate::sql::ast::{Expr, Statement};
 use crate::sql::eval::{eval, matches};
 use crate::types::Value;
-use sort::{SORT_MEMORY, Sorter};
+use operator::Rows;
+use sort::SORT_MEMORY;
 
 /// Knobs that change how statements run, not what they return.
 #[derive(Debug, Clone)]
@@ -47,19 +51,16 @@ pub fn execute(catalog: &mut Catalog, statement: Statement, settings: &Settings)
             Ok(message(format!("index {name} dropped")))
         }
         Statement::Explain(statement) => explain(catalog, *statement),
+        statement @ Statement::Select { .. } => {
+            let query = select(catalog, statement, settings)?;
+            let columns = query.columns.clone();
+            Ok(QueryResult::Rows { columns, rows: query.collect::<Result<_>>()? })
+        }
         Statement::Checkpoint => {
             catalog.checkpoint()?;
             Ok(message("checkpoint done".into()))
         }
         Statement::Insert { table, columns, rows } => insert(catalog.get_mut(&table)?, columns, rows),
-        Statement::Select { table, projection, filter, group_by, having, order_by, limit } => {
-            let table = catalog.get(&table)?;
-            if aggregate::is_grouped(&projection, &group_by, &having, &order_by) {
-                aggregate::select(table, projection, filter, group_by, having, order_by, limit, settings)
-            } else {
-                select(table, projection, filter, order_by, limit, settings)
-            }
-        }
         Statement::Update { table, assignments, filter } => {
             update(catalog.get_mut(&table)?, assignments, filter)
         }
@@ -67,16 +68,45 @@ pub fn execute(catalog: &mut Catalog, statement: Statement, settings: &Settings)
     }
 }
 
-/// Describes how a statement would read its table: through which index, if any.
+/// A running SELECT: the names of its columns, and its rows, read one at a time.
+pub struct Query<'a> {
+    pub columns: Vec<String>,
+    rows: Rows<'a>,
+}
+
+impl Iterator for Query<'_> {
+    type Item = Result<Row>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.rows.next()
+    }
+}
+
+/// Plans a SELECT and starts running it; no row is read until asked for.
+pub fn select<'a>(catalog: &'a Catalog, statement: Statement, settings: &Settings) -> Result<Query<'a>> {
+    let plan = plan_select(catalog, statement)?;
+    Ok(Query { columns: plan.columns, rows: operator::open(plan.root, settings) })
+}
+
+fn plan_select(catalog: &Catalog, statement: Statement) -> Result<query::Plan<'_>> {
+    let Statement::Select { table, projection, filter, group_by, having, order_by, limit } = statement else {
+        return err("expected a SELECT");
+    };
+    query::select(catalog.get(&table)?, projection, filter, group_by, having, order_by, limit)
+}
+
+/// Describes how a statement would run: its plan, one step per line, the
+/// scan (and the index it uses, if any) last.
 fn explain(catalog: &Catalog, statement: Statement) -> Result<QueryResult> {
-    let (table, filter) = match statement {
-        Statement::Select { table, filter, .. }
-        | Statement::Update { table, filter, .. }
-        | Statement::Delete { table, filter } => (table, filter),
+    let plan = match statement {
+        statement @ Statement::Select { .. } => plan_select(catalog, statement)?.root,
+        Statement::Update { table, filter, .. } | Statement::Delete { table, filter } => {
+            let table = catalog.get(&table)?;
+            query::scan(table, &filter, vec![true; table.columns.len()])
+        }
         _ => return err("EXPLAIN supports only SELECT, UPDATE and DELETE"),
     };
-    let table = catalog.get(&table)?;
-    Ok(message(access::explain(table, &filter::predicates(table, &filter))))
+    Ok(message(plan.explain()))
 }
 
 fn insert(table: &mut Table, columns: Option<Vec<String>>, rows: Vec<Vec<Expr>>) -> Result<QueryResult> {
@@ -92,7 +122,7 @@ fn insert(table: &mut Table, columns: Option<Vec<String>>, rows: Vec<Vec<Expr>>)
             return err(format!("expected {} values, got {}", targets.len(), exprs.len()));
         }
         let mut row = vec![Value::Null; table.columns.len()];
-        aggregate::forbid(&exprs, "VALUES")?;
+        forbid(&exprs, "VALUES")?;
         for (&i, expr) in targets.iter().zip(&exprs) {
             row[i] = eval(expr, &[], &[])?;
         }
@@ -104,79 +134,9 @@ fn insert(table: &mut Table, columns: Option<Vec<String>>, rows: Vec<Vec<Expr>>)
     Ok(message(format!("{count} row(s) inserted")))
 }
 
-fn select(
-    table: &Table,
-    projection: Projection,
-    filter: Option<Expr>,
-    order_by: Vec<OrderBy>,
-    limit: Option<usize>,
-    settings: &Settings,
-) -> Result<QueryResult> {
-    aggregate::forbid(&filter, "WHERE")?;
-    let columns = &table.columns;
-    let needed = match &projection {
-        Projection::All => vec![true; columns.len()],
-        Projection::Exprs(exprs) => {
-            let order_by = order_by.iter().map(|o| &o.expr);
-            filter::needed_columns(columns, exprs.iter().chain(&filter).chain(order_by))
-        }
-    };
-
-    let mut rows: Vec<Row> = Vec::new();
-    if order_by.is_empty() {
-        // Without an order, the first rows found will do: stop there.
-        let wanted = limit.unwrap_or(usize::MAX);
-        if wanted > 0 {
-            for item in scan(table, &needed, &filter) {
-                let (_, row) = item?;
-                if matches(&filter, columns, &row)? {
-                    rows.push(row);
-                    if rows.len() == wanted {
-                        break;
-                    }
-                }
-            }
-        }
-    } else {
-        let desc = order_by.iter().map(|o| o.desc).collect();
-        let mut sorter = Sorter::new(desc, limit, settings.sort_memory);
-        for item in scan(table, &needed, &filter) {
-            let (_, row) = item?;
-            if matches(&filter, columns, &row)? {
-                // Evaluated for every row, so that errors surface as without a limit.
-                let keys = order_by.iter().map(|o| eval(&o.expr, columns, &row)).collect::<Result<_>>()?;
-                sorter.push(keys, row)?;
-            }
-        }
-        rows = sorter.finish()?.collect::<Result<_>>()?;
-    }
-
-    let (names, rows) = match projection {
-        Projection::All => (
-            columns.iter().map(|c| c.name.clone()).collect(),
-            rows,
-        ),
-        Projection::Exprs(exprs) => {
-            let names = exprs
-                .iter()
-                .map(|e| match e {
-                    Expr::Column(name) => name.clone(),
-                    _ => "?column?".into(),
-                })
-                .collect();
-            let rows = rows
-                .into_iter()
-                .map(|row| exprs.iter().map(|e| eval(e, columns, &row)).collect())
-                .collect::<Result<_>>()?;
-            (names, rows)
-        }
-    };
-    Ok(QueryResult::Rows { columns: names, rows })
-}
-
 fn update(table: &mut Table, assignments: Vec<(String, Expr)>, filter: Option<Expr>) -> Result<QueryResult> {
-    aggregate::forbid(&filter, "WHERE")?;
-    aggregate::forbid(assignments.iter().map(|(_, e)| e), "UPDATE")?;
+    forbid(&filter, "WHERE")?;
+    forbid(assignments.iter().map(|(_, e)| e), "UPDATE")?;
     let assignments: Vec<(usize, Expr)> = assignments
         .into_iter()
         .map(|(name, expr)| Ok((table.column_index(&name)?, expr)))
@@ -204,7 +164,7 @@ fn update(table: &mut Table, assignments: Vec<(String, Expr)>, filter: Option<Ex
 }
 
 fn delete(table: &mut Table, filter: Option<Expr>) -> Result<QueryResult> {
-    aggregate::forbid(&filter, "WHERE")?;
+    forbid(&filter, "WHERE")?;
     let mut rids = Vec::new();
     for item in scan(table, &filter::needed_columns(&table.columns, &filter), &filter) {
         let (rid, row) = item?;
