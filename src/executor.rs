@@ -9,8 +9,8 @@ use crate::types::{Column, Value};
 
 pub fn execute(catalog: &mut Catalog, statement: Statement) -> Result<QueryResult> {
     match statement {
-        Statement::CreateTable { name, columns } => {
-            catalog.create_table(name.clone(), columns)?;
+        Statement::CreateTable { name, columns, storage } => {
+            catalog.create_table(name.clone(), columns, storage)?;
             Ok(message(format!("table {name} created")))
         }
         Statement::DropTable { name } => {

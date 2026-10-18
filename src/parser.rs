@@ -6,7 +6,7 @@
 use crate::ast::{BinaryOp, Expr, OrderBy, Projection, Statement, UnaryOp};
 use crate::error::{Error, Result};
 use crate::lexer::{Token, tokenize};
-use crate::types::{Column, DataType, Value};
+use crate::types::{Column, DataType, StorageKind, Value};
 
 /// Parses one or more `;`-separated statements.
 pub fn parse(sql: &str) -> Result<Vec<Statement>> {
@@ -55,7 +55,16 @@ impl Parser {
         self.expect_symbol("(")?;
         let columns = self.comma_list(Self::column_def)?;
         self.expect_symbol(")")?;
-        Ok(Statement::CreateTable { name, columns })
+        let mut storage = StorageKind::default();
+        if self.eat_keyword("USING") {
+            // HEAP and LSM are not keywords, so they stay usable as names.
+            storage = match self.ident()?.to_uppercase().as_str() {
+                "HEAP" => StorageKind::Heap,
+                "LSM" => StorageKind::Lsm,
+                other => return Err(Error(format!("unknown storage: {other}, expected HEAP or LSM"))),
+            };
+        }
+        Ok(Statement::CreateTable { name, columns, storage })
     }
 
     fn column_def(&mut self) -> Result<Column> {

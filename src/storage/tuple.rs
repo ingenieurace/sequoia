@@ -75,6 +75,27 @@ pub fn decode(columns: &[Column], bytes: &[u8]) -> Result<Vec<Value>> {
     Ok(row)
 }
 
+/// Encodes a key value so that comparing the bytes orders keys like the values.
+///
+/// INT is 8 bytes big-endian with the sign bit flipped, TEXT its UTF-8 bytes,
+/// BOOL one byte. All keys of a table have the same type, so no tag is needed.
+pub fn encode_key(value: &Value) -> Vec<u8> {
+    match value {
+        Value::Int(n) => ((*n as u64) ^ (1 << 63)).to_be_bytes().to_vec(),
+        Value::Text(s) => s.as_bytes().to_vec(),
+        Value::Bool(b) => vec![*b as u8],
+        Value::Null => panic!("NULL cannot be a key"),
+    }
+}
+
+/// Decodes an INT key made by [`encode_key`].
+pub fn decode_int_key(bytes: &[u8]) -> Result<i64> {
+    match <[u8; 8]>::try_from(bytes) {
+        Ok(bytes) => Ok((u64::from_be_bytes(bytes) ^ (1 << 63)) as i64),
+        Err(_) => err("corrupted INT key"),
+    }
+}
+
 /// Reads bytes sequentially, failing instead of panicking on truncated data.
 struct Reader<'a> {
     bytes: &'a [u8],
@@ -159,6 +180,22 @@ mod tests {
         assert!(encode(&columns, &[text("x"), text("y")]).is_err(), "wrong type");
         let long = text(&"x".repeat(u16::MAX as usize + 1));
         assert!(encode(&columns, &[Value::Int(1), long]).is_err(), "text too long");
+    }
+
+    #[test]
+    fn keys_sort_like_their_values() {
+        let ints = [i64::MIN, -300, -1, 0, 1, 255, 256, i64::MAX].map(Value::Int);
+        let texts = ["", "a", "ab", "b", "é"].map(text);
+        let bools = [false, true].map(Value::Bool);
+        for values in [&ints[..], &texts, &bools] {
+            for pair in values.windows(2) {
+                assert!(encode_key(&pair[0]) < encode_key(&pair[1]), "{pair:?}");
+            }
+        }
+        for n in [i64::MIN, -1, 0, 42, i64::MAX] {
+            assert_eq!(decode_int_key(&encode_key(&Value::Int(n))).unwrap(), n);
+        }
+        assert!(decode_int_key(b"short").is_err());
     }
 
     #[test]

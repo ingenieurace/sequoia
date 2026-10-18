@@ -2,17 +2,25 @@
 //!
 //! Layers, bottom up: `disk` (pages in a file) -> `buffer` (pages cached in
 //! memory, evicted by a `replacer` policy) -> `page` (tuples in a page) ->
-//! `heap` (tuples in a table). `tuple` converts rows to and from bytes.
+//! a table's rows, stored in one of two ways:
+//! - `heap`: tuples in a linked list of pages, updated in place.
+//! - `lsm`: a log-structured merge tree of `sstable`s, never updated in place.
+//!
+//! `tuple` converts rows to and from bytes.
 
+mod bloom;
 pub mod buffer;
 pub mod disk;
 pub mod heap;
+pub mod lsm;
 pub mod page;
 pub mod replacer;
+pub mod sstable;
 pub mod tuple;
 
 pub use buffer::{BufferPool, PageReadGuard, PageWriteGuard, REPLACEMENT_POLICY};
 pub use disk::{DiskManager, PAGE_SIZE, PAGE_USABLE, Page, PageId};
 pub use heap::{RecordId, TableHeap};
+pub use lsm::{LsmConfig, LsmTree};
 pub use page::{MAX_TUPLE_SIZE, SlottedPage};
 pub use replacer::{ArcReplacer, ClockReplacer, LruKReplacer, Policy, Replacer};

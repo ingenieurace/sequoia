@@ -23,7 +23,8 @@ Shell commands: `.tables`, `.exit`.
 
 ## Supported SQL
 
-- Statements: `CREATE TABLE`, `DROP TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`
+- Statements: `CREATE TABLE ... [USING HEAP | LSM]`, `DROP TABLE`, `INSERT`,
+  `SELECT`, `UPDATE`, `DELETE`
 - Types: `INT`, `TEXT`, `BOOL`, and `NULL`
 - Constraints: `PRIMARY KEY` (unique, not null); values are type-checked
 - `SELECT`: `*` or expressions, `WHERE`, `ORDER BY ... ASC|DESC`, `LIMIT`
@@ -54,6 +55,9 @@ src/
     replacer.rs page replacement policies: ARC (default), LRU-K, CLOCK
     page.rs     slotted page: many tuples in one page
     heap.rs     table heap: linked list of pages, free-space map, RecordId
+    lsm.rs      LSM tree: log + MemTable, levels of SSTables, compaction
+    sstable.rs  SSTable: sorted entries in pages, in-memory summary
+    bloom.rs    Bloom filter for SSTable lookups
     tuple.rs    row <-> bytes (null bitmap + column values)
 tests/sql.rs    end-to-end tests
 ```
@@ -66,13 +70,24 @@ A database is a single file of 4 KB pages:
   free list head, and the root page.
 - **The catalog** is a table heap starting at the root page. Each row holds a
   table's `CREATE TABLE` statement plus its first and last page.
-- **Each table** is a linked list of slotted pages. A row is identified by its
+- **A heap table** (the default) is a linked list of slotted pages. A row is identified by its
   `RecordId` (page, slot) and stored as a null bitmap followed by its columns.
   An in-memory free-space map (rebuilt from the pages after opening) sends
   each insert to the first page with room, so space freed by deletes is
   reused. An update keeps a row in its page when the page has room for the
   new value, and only otherwise deletes it and inserts it again.
-- **Freed pages** (from `DROP TABLE`) go on a free list and are reused.
+- **An LSM table** (`USING LSM`) is a log-structured merge tree keyed by the
+  primary key, or by a hidden rowid if there is none. Writes, deletes
+  included, go to an in-memory MemTable and are appended to a log. When the
+  log reaches 64 KB the MemTable is written out sorted as a level-0 SSTable.
+  Four level-0 SSTables are merged into level 1; each deeper level is a
+  single SSTable up to 10 times bigger than the one above, merged down when
+  it outgrows that. Lookups check the MemTable, then SSTables newest first,
+  skipping those whose key range or Bloom filter rules the key out. A
+  manifest page lists the log and the SSTables. SSTable summaries are not
+  stored: opening a table reads its SSTables once to rebuild them.
+- **Freed pages** (from `DROP TABLE`, an LSM flush or compaction) go on a free
+  list and are reused.
 
 Pages are read and written through a **buffer pool** of 256 frames (1 MB). A
 page in use is pinned and cannot be evicted; when the pool is full, ARC
@@ -82,6 +97,7 @@ full table scan does not push frequently used pages out. LRU-K and CLOCK are
 also available: to switch, edit `REPLACEMENT_POLICY` in `src/storage/buffer.rs`.
 
 Every statement that changes data has its dirty pages written back and synced
-before it returns. There is no WAL or index yet: a crash in the middle of a
-statement may leave it half applied, and primary key checks scan the whole
-table. A row must fit in one page (about 4 KB).
+before it returns. There is no WAL for the whole database or index yet: a
+crash in the middle of a statement may leave it half applied, and primary key
+checks on heap tables scan the whole table (LSM tables look the key up). A
+row must fit in one page (about 4 KB).

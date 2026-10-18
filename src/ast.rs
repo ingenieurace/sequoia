@@ -1,10 +1,11 @@
-use crate::types::{Column, Value};
+use crate::types::{Column, StorageKind, Value};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     CreateTable {
         name: String,
         columns: Vec<Column>,
+        storage: StorageKind,
     },
     DropTable {
         name: String,

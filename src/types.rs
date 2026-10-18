@@ -17,6 +17,16 @@ pub struct Column {
     pub primary_key: bool,
 }
 
+/// How a table stores its rows: `CREATE TABLE ... USING HEAP | LSM`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StorageKind {
+    /// Slotted pages, updated in place. The default.
+    #[default]
+    Heap,
+    /// A log-structured merge tree.
+    Lsm,
+}
+
 /// A single SQL value.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Value {
@@ -80,6 +90,15 @@ impl fmt::Display for Value {
             Value::Text(s) => f.write_str(s),
             other => f.write_str(&other.to_sql()),
         }
+    }
+}
+
+impl fmt::Display for StorageKind {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            StorageKind::Heap => "HEAP",
+            StorageKind::Lsm => "LSM",
+        })
     }
 }
 

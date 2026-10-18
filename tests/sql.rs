@@ -204,3 +204,122 @@ fn updates_that_grow_rows_keep_every_row() {
     assert_eq!(query(&mut db, "SELECT id FROM t WHERE body = 'y'").len(), 50);
     assert_eq!(query(&mut db, &format!("SELECT id FROM t WHERE body = '{}'", "z".repeat(500))).len(), 50);
 }
+
+fn setup_lsm() -> Database {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT, active BOOL) USING LSM;
+         INSERT INTO users VALUES (1, 'alice', 30, TRUE), (2, 'bob', 25, FALSE);
+         INSERT INTO users (id, name) VALUES (3, 'carol');",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn lsm_tables_run_every_statement() {
+    let mut db = setup_lsm();
+    assert_eq!(query(&mut db, "SELECT name FROM users WHERE age IS NULL"), vec![vec![text("carol")]]);
+
+    db.execute("UPDATE users SET age = age * 2, active = NOT active WHERE name = 'bob'").unwrap();
+    assert_eq!(
+        query(&mut db, "SELECT age, active FROM users WHERE id = 2"),
+        vec![vec![int(50), Value::Bool(true)]]
+    );
+
+    // Changing the primary key moves the row to its new key.
+    db.execute("UPDATE users SET id = id + 10 WHERE id >= 2").unwrap();
+    assert_eq!(query(&mut db, "SELECT id FROM users"), vec![vec![int(1)], vec![int(12)], vec![int(13)]]);
+
+    db.execute("DELETE FROM users WHERE id != 12").unwrap();
+    assert_eq!(query(&mut db, "SELECT name FROM users"), vec![vec![text("bob")]]);
+    db.execute("INSERT INTO users (id, name) VALUES (1, 'alice again')").unwrap();
+    assert_eq!(query(&mut db, "SELECT id FROM users").len(), 2);
+}
+
+#[test]
+fn lsm_tables_enforce_constraints() {
+    let mut db = setup_lsm();
+    assert!(db.execute("INSERT INTO users VALUES (1, 'dup', 1, TRUE)").is_err());
+    assert!(db.execute("INSERT INTO users VALUES (9, 'x', 1, TRUE), (9, 'y', 1, TRUE)").is_err());
+    assert!(db.execute("INSERT INTO users (name) VALUES ('no id')").is_err());
+    assert!(db.execute("UPDATE users SET id = 1").is_err());
+    assert!(db.execute(&format!("INSERT INTO users (id, name) VALUES (9, '{}')", "z".repeat(5000))).is_err());
+    assert_eq!(query(&mut db, "SELECT id FROM users").len(), 3, "failed statements change nothing");
+
+    // Swapping two keys in one statement is fine.
+    db.execute("UPDATE users SET id = 3 - id WHERE id <= 2").unwrap();
+    assert_eq!(query(&mut db, "SELECT name FROM users WHERE id = 1"), vec![vec![text("bob")]]);
+    assert_eq!(query(&mut db, "SELECT name FROM users WHERE id = 2"), vec![vec![text("alice")]]);
+}
+
+#[test]
+fn storage_clause_is_parsed_and_checked() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE a (x INT) using lsm").unwrap();
+    db.execute("CREATE TABLE b (x INT) USING heap").unwrap();
+    assert!(db.execute("CREATE TABLE c (x INT) USING btree").is_err());
+    // HEAP and LSM are not reserved words.
+    db.execute("CREATE TABLE lsm (heap INT)").unwrap();
+}
+
+#[test]
+fn lsm_tables_survive_flushes_compactions_and_reopening() {
+    let path = TempDb::new("lsm");
+    let row = |i: i64, tag: &str| vec![int(i), text(&format!("{tag}{}", "x".repeat(100)))];
+    {
+        let mut db = Database::open(&path.0).unwrap();
+        db.execute("CREATE TABLE logs (id INT PRIMARY KEY, msg TEXT) USING LSM").unwrap();
+        // About 1 MB of writes: many MemTable flushes and several compactions.
+        for batch in 0..30 {
+            let values: Vec<String> =
+                (0..250).map(|i| format!("({}, 'v{batch}{}')", batch * 250 + i, "x".repeat(100))).collect();
+            db.execute(&format!("INSERT INTO logs VALUES {}", values.join(", "))).unwrap();
+        }
+        db.execute(&format!("UPDATE logs SET msg = 'new{}' WHERE id < 1000", "x".repeat(100))).unwrap();
+        db.execute("DELETE FROM logs WHERE id >= 7000").unwrap();
+    }
+
+    let mut db = Database::open(&path.0).unwrap();
+    assert_eq!(query(&mut db, "SELECT id FROM logs").len(), 7000);
+    assert_eq!(query(&mut db, "SELECT * FROM logs WHERE id = 5"), vec![row(5, "new")]);
+    assert_eq!(query(&mut db, "SELECT * FROM logs WHERE id = 6999"), vec![row(6999, "v27")]);
+    assert!(query(&mut db, "SELECT id FROM logs WHERE id = 7000").is_empty());
+    assert!(db.execute("INSERT INTO logs VALUES (6999, 'dup')").is_err());
+    db.execute("INSERT INTO logs VALUES (7000, 'back')").unwrap();
+}
+
+#[test]
+fn lsm_tables_without_a_primary_key_use_rowids() {
+    let path = TempDb::new("rowid");
+    {
+        let mut db = Database::open(&path.0).unwrap();
+        db.execute("CREATE TABLE events (name TEXT) USING LSM").unwrap();
+        db.execute("INSERT INTO events VALUES ('a'), ('a'), ('b')").unwrap();
+        db.execute("UPDATE events SET name = 'c' WHERE name = 'b'").unwrap();
+    }
+    let mut db = Database::open(&path.0).unwrap();
+    // New rows after reopening must not overwrite old ones.
+    db.execute("INSERT INTO events VALUES ('d')").unwrap();
+    assert_eq!(
+        query(&mut db, "SELECT name FROM events"),
+        vec![vec![text("a")], vec![text("a")], vec![text("c")], vec![text("d")]]
+    );
+}
+
+#[test]
+fn dropped_lsm_tables_free_their_pages() {
+    let path = TempDb::new("lsm-drop");
+    let mut db = Database::open(&path.0).unwrap();
+    let fill = |db: &mut Database| {
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, body TEXT) USING LSM").unwrap();
+        for i in 0..1000 {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, '{}')", "y".repeat(200))).unwrap();
+        }
+    };
+    fill(&mut db);
+    let size = std::fs::metadata(&path.0).unwrap().len();
+    db.execute("DROP TABLE t").unwrap();
+    fill(&mut db);
+    assert_eq!(std::fs::metadata(&path.0).unwrap().len(), size, "freed pages are reused");
+}

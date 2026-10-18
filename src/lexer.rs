@@ -5,7 +5,7 @@ use crate::error::{Result, err};
 const KEYWORDS: &[&str] = &[
     "AND", "ASC", "BOOL", "BOOLEAN", "BY", "CREATE", "DELETE", "DESC", "DROP", "FALSE", "FROM",
     "INSERT", "INT", "INTEGER", "INTO", "IS", "KEY", "LIMIT", "NOT", "NULL", "OR", "ORDER",
-    "PRIMARY", "SELECT", "SET", "TABLE", "TEXT", "TRUE", "UPDATE", "VALUES", "WHERE",
+    "PRIMARY", "SELECT", "SET", "TABLE", "TEXT", "TRUE", "UPDATE", "USING", "VALUES", "WHERE",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
