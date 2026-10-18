@@ -53,7 +53,7 @@ src/
     buffer.rs   buffer pool: cached frames, pin counts, dirty pages
     replacer.rs page replacement policies: ARC (default), LRU-K, CLOCK
     page.rs     slotted page: many tuples in one page
-    heap.rs     table heap: linked list of pages, RecordId
+    heap.rs     table heap: linked list of pages, free-space map, RecordId
     tuple.rs    row <-> bytes (null bitmap + column values)
 tests/sql.rs    end-to-end tests
 ```
@@ -68,6 +68,10 @@ A database is a single file of 4 KB pages:
   table's `CREATE TABLE` statement plus its first and last page.
 - **Each table** is a linked list of slotted pages. A row is identified by its
   `RecordId` (page, slot) and stored as a null bitmap followed by its columns.
+  An in-memory free-space map (rebuilt from the pages after opening) sends
+  each insert to the first page with room, so space freed by deletes is
+  reused. An update keeps a row in its page when the page has room for the
+  new value, and only otherwise deletes it and inserts it again.
 - **Freed pages** (from `DROP TABLE`) go on a free list and are reused.
 
 Pages are read and written through a **buffer pool** of 256 frames (1 MB). A

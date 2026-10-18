@@ -4,9 +4,13 @@
 //! first_page --next--> page --next--> last_page --next--> (none)
 //! ```
 //!
-//! Inserts go to the last page; a new page is appended when it is full.
-//! Space freed by deletes in earlier pages is not reused, and pages are
-//! never unlinked, even when empty.
+//! A free-space map in memory records how big a tuple each page can still
+//! take. Inserts go to the first page with room, so space freed by deletes is
+//! reused; a new page is appended only when no page has room. Pages are never
+//! unlinked, even when empty: they stay in the map and fill up again.
+//!
+//! The map is not stored on disk. It is built by reading every page the first
+//! time the heap is changed after opening, and kept up to date from then on.
 //!
 //! The heap stores raw bytes and does not persist its own `first_page` /
 //! `last_page`; the catalog is responsible for saving them after changes.
@@ -14,6 +18,7 @@
 //! All page access goes through the buffer pool. The heap pins at most two
 //! pages at a time.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::buffer::BufferPool;
@@ -32,22 +37,24 @@ pub struct TableHeap {
     pool: Arc<BufferPool>,
     first_page: PageId,
     last_page: PageId,
+    /// Each page's [`SlottedPage::room`]. `None` until first needed.
+    free_space: Option<BTreeMap<PageId, usize>>,
 }
 
 impl TableHeap {
     /// Creates an empty heap with one page.
     pub fn create(pool: Arc<BufferPool>) -> Result<Self> {
         let mut page = pool.new_page()?;
-        SlottedPage::init(&mut *page);
+        let room = SlottedPage::init(&mut *page).room();
         let id = page.id();
         drop(page);
-        Ok(Self { pool, first_page: id, last_page: id })
+        Ok(Self { pool, first_page: id, last_page: id, free_space: Some(BTreeMap::from([(id, room)])) })
     }
 
     /// Opens an existing heap. `last_page` is a hint: the chain is followed from
     /// there to the real end, in case pages were appended after it was recorded.
     pub fn open(pool: Arc<BufferPool>, first_page: PageId, last_page: PageId) -> Result<Self> {
-        let mut heap = Self { pool, first_page, last_page };
+        let mut heap = Self { pool, first_page, last_page, free_space: None };
         while let Some(next) = heap.next_page(heap.last_page)? {
             heap.last_page = next;
         }
@@ -62,20 +69,30 @@ impl TableHeap {
         self.last_page
     }
 
-    /// Appends a tuple and returns its location. May change `last_page`.
+    /// Stores a tuple in the first page with room and returns its location.
+    /// Appends a page, changing `last_page`, if none has room.
     pub fn insert(&mut self, tuple: &[u8]) -> Result<RecordId> {
         if tuple.len() > MAX_TUPLE_SIZE {
             return err(format!("row is {} bytes, the maximum is {MAX_TUPLE_SIZE}", tuple.len()));
         }
 
-        let mut last = self.pool.fetch_write(self.last_page)?;
-        if let Some(slot) = SlottedPage::new(&mut *last).insert(tuple) {
-            return Ok(RecordId { page_id: self.last_page, slot });
+        let target = self.free_space()?.iter().find(|&(_, &room)| room >= tuple.len()).map(|(&id, _)| id);
+        if let Some(page_id) = target {
+            let mut guard = self.pool.fetch_write(page_id)?;
+            let mut page = SlottedPage::new(&mut *guard);
+            let slot = page.insert(tuple).expect("the free-space map is exact");
+            let room = page.room();
+            drop(guard);
+            self.set_room(page_id, room);
+            return Ok(RecordId { page_id, slot });
         }
 
-        // The last page is full: start a new one.
+        // No page has room: start a new one.
+        let mut last = self.pool.fetch_write(self.last_page)?;
         let mut new = self.pool.new_page()?;
-        let slot = SlottedPage::init(&mut *new).insert(tuple).expect("a tuple fits in an empty page");
+        let mut page = SlottedPage::init(&mut *new);
+        let slot = page.insert(tuple).expect("a tuple fits in an empty page");
+        let room = page.room();
         let new_id = new.id();
         drop(new);
         // Write the new page before linking it, so a crash leaks a page instead of breaking the chain.
@@ -84,6 +101,7 @@ impl TableHeap {
         drop(last);
 
         self.last_page = new_id;
+        self.set_room(new_id, room);
         Ok(RecordId { page_id: new_id, slot })
     }
 
@@ -95,18 +113,27 @@ impl TableHeap {
     }
 
     /// Deletes the tuple at `rid`. Returns false if there was none.
-    pub fn delete(&self, rid: RecordId) -> Result<bool> {
-        let mut page = self.pool.fetch_write(rid.page_id)?;
-        Ok(SlottedPage::new(&mut *page).delete(rid.slot))
+    pub fn delete(&mut self, rid: RecordId) -> Result<bool> {
+        let mut guard = self.pool.fetch_write(rid.page_id)?;
+        let mut page = SlottedPage::new(&mut *guard);
+        let deleted = page.delete(rid.slot);
+        let room = page.room();
+        drop(guard);
+        self.set_room(rid.page_id, room);
+        Ok(deleted)
     }
 
-    /// Replaces a tuple in place with one of the same length. Touches a single page.
-    pub fn overwrite(&self, rid: RecordId, tuple: &[u8]) -> Result<()> {
-        let mut page = self.pool.fetch_write(rid.page_id)?;
-        if !SlottedPage::new(&mut *page).overwrite(rid.slot, tuple) {
-            return err("cannot overwrite tuple: missing or different length");
-        }
-        Ok(())
+    /// Replaces the tuple at `rid` without moving it to another page, so `rid`
+    /// stays valid. Returns false if there is no tuple at `rid` or its page has
+    /// no room for the new one; the caller can then delete and re-insert it.
+    pub fn update(&mut self, rid: RecordId, tuple: &[u8]) -> Result<bool> {
+        let mut guard = self.pool.fetch_write(rid.page_id)?;
+        let mut page = SlottedPage::new(&mut *guard);
+        let updated = page.update(rid.slot, tuple);
+        let room = page.room();
+        drop(guard);
+        self.set_room(rid.page_id, room);
+        Ok(updated)
     }
 
     /// Iterates over all live tuples, page by page.
@@ -129,6 +156,29 @@ impl TableHeap {
 
     fn next_page(&self, id: PageId) -> Result<Option<PageId>> {
         Ok(SlottedPage::new(&*self.pool.fetch_read(id)?).next_page())
+    }
+
+    /// Returns the free-space map, building it from every page if needed.
+    fn free_space(&mut self) -> Result<&BTreeMap<PageId, usize>> {
+        if self.free_space.is_none() {
+            let mut map = BTreeMap::new();
+            let mut next = Some(self.first_page);
+            while let Some(id) = next {
+                let guard = self.pool.fetch_read(id)?;
+                let page = SlottedPage::new(&*guard);
+                map.insert(id, page.room());
+                next = page.next_page();
+            }
+            self.free_space = Some(map);
+        }
+        Ok(self.free_space.as_ref().expect("built above"))
+    }
+
+    /// Records a page's room, if the map has been built; otherwise building it reads the page.
+    fn set_room(&mut self, id: PageId, room: usize) {
+        if let Some(map) = &mut self.free_space {
+            map.insert(id, room);
+        }
     }
 }
 
@@ -226,14 +276,53 @@ mod tests {
     }
 
     #[test]
-    fn overwrite_requires_same_length() {
+    fn update_stays_in_the_page_or_reports_no_room() {
         let mut heap = heap();
-        let rid = heap.insert(b"abc").unwrap();
-        heap.overwrite(rid, b"xyz").unwrap();
-        assert_eq!(heap.get(rid).unwrap(), Some(b"xyz".to_vec()));
-        assert!(heap.overwrite(rid, b"too long").is_err());
-        heap.delete(rid).unwrap();
-        assert!(heap.overwrite(rid, b"abc").is_err(), "deleted");
+        let rids: Vec<RecordId> = (0..20).map(|i| heap.insert(&row(i)).unwrap()).collect();
+        assert_eq!(rids[0].page_id, rids[1].page_id);
+
+        assert!(heap.update(rids[0], b"short").unwrap());
+        assert_eq!(heap.get(rids[0]).unwrap(), Some(b"short".to_vec()));
+        // The first page is full of other rows, so a page-sized tuple cannot stay.
+        assert!(!heap.update(rids[1], &vec![0; MAX_TUPLE_SIZE]).unwrap());
+        assert_eq!(heap.get(rids[1]).unwrap(), Some(row(1)), "unchanged");
+
+        heap.delete(rids[2]).unwrap();
+        assert!(!heap.update(rids[2], b"gone").unwrap());
+    }
+
+    #[test]
+    fn inserts_reuse_space_freed_in_earlier_pages() {
+        let mut heap = heap();
+        let rids: Vec<RecordId> = (0..100).map(|i| heap.insert(&row(i)).unwrap()).collect();
+        let pages = heap.pool.disk().page_count();
+        for &rid in &rids[..10] {
+            heap.delete(rid).unwrap();
+        }
+        for i in 0..10 {
+            let rid = heap.insert(&row(1000 + i)).unwrap();
+            assert_eq!(rid.page_id, heap.first_page(), "first page with room");
+        }
+        assert_eq!(heap.pool.disk().page_count(), pages, "no page appended");
+        assert_eq!(scan_all(&heap).len(), 100);
+    }
+
+    #[test]
+    fn free_space_is_found_after_reopening() {
+        let pool = pool(DiskManager::in_memory(), 16);
+        let mut heap = TableHeap::create(pool.clone()).unwrap();
+        let rids: Vec<RecordId> = (0..100).map(|i| heap.insert(&row(i)).unwrap()).collect();
+        let (first, last) = (heap.first_page(), heap.last_page());
+        for &rid in &rids[..5] {
+            heap.delete(rid).unwrap();
+        }
+
+        let mut heap = TableHeap::open(pool.clone(), first, last).unwrap();
+        let pages = pool.disk().page_count();
+        for i in 0..5 {
+            assert_eq!(heap.insert(&row(i)).unwrap().page_id, first);
+        }
+        assert_eq!(pool.disk().page_count(), pages);
     }
 
     #[test]

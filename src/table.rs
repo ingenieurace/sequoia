@@ -47,15 +47,25 @@ impl Table {
     }
 
     /// Replaces each row at the given location with a new value.
+    ///
+    /// A row stays where it is if its page has room for the new value;
+    /// otherwise it is deleted and inserted again, possibly in another page.
     pub fn update(&mut self, changes: Vec<(RecordId, Row)>) -> Result<()> {
-        let (rids, rows): (HashSet<RecordId>, Vec<Row>) = changes.into_iter().unzip();
+        let (rids, rows): (Vec<RecordId>, Vec<Row>) = changes.into_iter().unzip();
         let encoded = self.encode_all(&rows)?;
-        self.check_primary_key(&rids, &rows)?;
-        // Delete everything first, so a reused slot can't be mistaken for a pending one.
-        for &rid in &rids {
-            self.heap.delete(rid)?;
+        self.check_primary_key(&rids.iter().copied().collect(), &rows)?;
+
+        let mut moved = Vec::new();
+        for (rid, bytes) in rids.into_iter().zip(encoded) {
+            if !self.heap.update(rid, &bytes)? {
+                moved.push((rid, bytes));
+            }
         }
-        for bytes in encoded {
+        // Delete every moved row first, so a reused slot can't be mistaken for a pending one.
+        for (rid, _) in &moved {
+            self.heap.delete(*rid)?;
+        }
+        for (_, bytes) in moved {
             self.heap.insert(&bytes)?;
         }
         Ok(())

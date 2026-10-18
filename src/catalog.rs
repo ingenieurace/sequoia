@@ -105,7 +105,9 @@ impl Catalog {
             let last_page = entry.table.heap().last_page();
             if last_page != entry.saved_last_page {
                 // Same length as before, so this rewrites one page in place.
-                self.heap.overwrite(entry.rid, &encode_entry(&entry.table)?)?;
+                if !self.heap.update(entry.rid, &encode_entry(&entry.table)?)? {
+                    return err("cannot update catalog row");
+                }
                 entry.saved_last_page = last_page;
             }
         }

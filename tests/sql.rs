@@ -127,7 +127,7 @@ fn large_tables_span_pages_and_survive_reopen() {
     let mut db = Database::open(&path.0).unwrap();
     assert_eq!(query(&mut db, "SELECT id FROM logs").len(), 400);
     assert_eq!(query(&mut db, "SELECT msg FROM logs WHERE id = 5"), vec![vec![text("short")]]);
-    // Rows keep going to the end of the heap after reopening.
+    // Inserts and key checks still work after reopening.
     db.execute("INSERT INTO logs VALUES (1000, 'new')").unwrap();
     assert!(db.execute("INSERT INTO logs VALUES (1, 'dup')").is_err());
 }
@@ -160,4 +160,47 @@ fn rows_larger_than_a_page_are_rejected() {
     let huge = "z".repeat(5000);
     assert!(db.execute(&format!("INSERT INTO users (id, name) VALUES (9, '{huge}')")).is_err());
     assert_eq!(query(&mut db, "SELECT id FROM users").len(), 3);
+}
+
+#[test]
+fn deleted_space_is_reused_after_reopening() {
+    let path = TempDb::new("reuse");
+    let size = {
+        let mut db = Database::open(&path.0).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, body TEXT)").unwrap();
+        for i in 0..200 {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, '{}')", "x".repeat(100))).unwrap();
+        }
+        db.execute("DELETE FROM t WHERE id < 100").unwrap();
+        std::fs::metadata(&path.0).unwrap().len()
+    };
+
+    let mut db = Database::open(&path.0).unwrap();
+    for i in 0..100 {
+        db.execute(&format!("INSERT INTO t VALUES ({i}, '{}')", "y".repeat(100))).unwrap();
+    }
+    assert_eq!(std::fs::metadata(&path.0).unwrap().len(), size, "the file did not grow");
+    assert_eq!(query(&mut db, "SELECT id FROM t").len(), 200);
+}
+
+#[test]
+fn updates_that_grow_rows_keep_every_row() {
+    let path = TempDb::new("grow");
+    let mut db = Database::open(&path.0).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, body TEXT)").unwrap();
+    for i in 0..100 {
+        db.execute(&format!("INSERT INTO t VALUES ({i}, 'x')")).unwrap();
+    }
+    let size = std::fs::metadata(&path.0).unwrap().len();
+    // Shrinking or same-size updates stay in place.
+    db.execute("UPDATE t SET body = 'y'").unwrap();
+    assert_eq!(std::fs::metadata(&path.0).unwrap().len(), size);
+
+    // Rows too big for their page move elsewhere.
+    db.execute(&format!("UPDATE t SET body = '{}' WHERE id < 50", "z".repeat(500))).unwrap();
+    drop(db);
+    let mut db = Database::open(&path.0).unwrap();
+    assert_eq!(query(&mut db, "SELECT id FROM t").len(), 100);
+    assert_eq!(query(&mut db, "SELECT id FROM t WHERE body = 'y'").len(), 50);
+    assert_eq!(query(&mut db, &format!("SELECT id FROM t WHERE body = '{}'", "z".repeat(500))).len(), 50);
 }

@@ -72,6 +72,13 @@ impl<P: Deref<Target = Page>> SlottedPage<P> {
         self.free_end() - self.slots_end()
     }
 
+    /// Size of the largest tuple [`SlottedPage::insert`] will accept, counting
+    /// holes left by deleted tuples and the slot a new tuple may need.
+    pub fn room(&self) -> usize {
+        let slot_cost = if self.unused_slot().is_some() { 0 } else { SLOT_SIZE };
+        self.total_free_space().saturating_sub(slot_cost)
+    }
+
     /// Free bytes including holes left by deleted tuples.
     fn total_free_space(&self) -> usize {
         let live: usize = self.iter().map(|(_, tuple)| tuple.len()).sum();
@@ -84,6 +91,10 @@ impl<P: Deref<Target = Page>> SlottedPage<P> {
 
     fn slots_end(&self) -> usize {
         HEADER_SIZE + self.slot_count() as usize * SLOT_SIZE
+    }
+
+    fn unused_slot(&self) -> Option<u16> {
+        (0..self.slot_count()).find(|&slot| self.slot(slot) == UNUSED)
     }
 
     fn slot(&self, slot: u16) -> (usize, usize) {
@@ -114,7 +125,7 @@ impl<P: DerefMut<Target = Page>> SlottedPage<P> {
     /// Reuses the lowest unused slot, compacting the page if needed.
     pub fn insert(&mut self, tuple: &[u8]) -> Option<u16> {
         assert!(!tuple.is_empty(), "a tuple must not be empty");
-        let reuse = (0..self.slot_count()).find(|&slot| self.slot(slot) == UNUSED);
+        let reuse = self.unused_slot();
         let needed = tuple.len() + if reuse.is_some() { 0 } else { SLOT_SIZE };
 
         if self.free_space() < needed {
@@ -153,13 +164,36 @@ impl<P: DerefMut<Target = Page>> SlottedPage<P> {
         true
     }
 
-    /// Overwrites a live tuple with one of the same length. Returns false otherwise.
-    pub fn overwrite(&mut self, slot: u16, tuple: &[u8]) -> bool {
-        if self.get(slot).map(<[u8]>::len) != Some(tuple.len()) {
+    /// Replaces a live tuple, keeping its slot number. Returns false if the slot
+    /// holds no tuple or the new tuple does not fit in this page.
+    ///
+    /// A tuple that is not longer is written over the old bytes; a longer one
+    /// moves within the page, compacting it if needed.
+    pub fn update(&mut self, slot: u16, tuple: &[u8]) -> bool {
+        assert!(!tuple.is_empty(), "a tuple must not be empty");
+        let Some(old_len) = self.get(slot).map(<[u8]>::len) else {
+            return false;
+        };
+        let (offset, _) = self.slot(slot);
+        if tuple.len() <= old_len {
+            // The unused tail of the old tuple becomes a hole.
+            self.0[offset..offset + tuple.len()].copy_from_slice(tuple);
+            self.set_slot(slot, offset, tuple.len());
+            return true;
+        }
+
+        if self.total_free_space() + old_len < tuple.len() {
             return false;
         }
-        let (offset, len) = self.slot(slot);
-        self.0[offset..offset + len].copy_from_slice(tuple);
+        // Free the old bytes but keep the slot, so compaction can reclaim them.
+        self.set_slot(slot, UNUSED.0, UNUSED.1);
+        if self.free_space() < tuple.len() {
+            self.compact();
+        }
+        let offset = self.free_end() - tuple.len();
+        self.0[offset..offset + tuple.len()].copy_from_slice(tuple);
+        self.set_u16(6, offset as u16);
+        self.set_slot(slot, offset, tuple.len());
         true
     }
 
@@ -291,6 +325,63 @@ mod tests {
         for &slot in slots.iter().skip(1).step_by(2) {
             assert_eq!(page.get(slot), Some(&[slot as u8; 100][..]));
         }
+    }
+
+    #[test]
+    fn room_is_exactly_the_largest_insertable_tuple() {
+        let mut buf = empty();
+        let mut page = SlottedPage::new(&mut buf);
+        assert_eq!(page.room(), MAX_TUPLE_SIZE);
+        for i in 0..10u8 {
+            page.insert(&[i; 300]).unwrap();
+        }
+        page.delete(3);
+        page.delete(6);
+        // Slot 3 is unused, so the next tuple needs no new slot.
+        let room = page.room();
+        assert_eq!(page.insert(&vec![1; room + 1]), None);
+        assert_eq!(page.insert(&vec![1; room]), Some(3));
+        assert_eq!(page.room(), 0);
+    }
+
+    #[test]
+    fn update_keeps_the_slot() {
+        let mut buf = empty();
+        let mut page = SlottedPage::new(&mut buf);
+        let a = page.insert(b"alice").unwrap();
+        let b = page.insert(b"bob").unwrap();
+
+        assert!(page.update(a, b"al"), "shrink");
+        assert_eq!(page.get(a), Some(&b"al"[..]));
+        assert!(page.update(a, b"alexandra"), "grow");
+        assert_eq!(page.get(a), Some(&b"alexandra"[..]));
+        assert_eq!(page.get(b), Some(&b"bob"[..]));
+        assert_eq!(page.slot_count(), 2);
+
+        page.delete(b);
+        assert!(!page.update(b, b"x"), "no tuple there");
+    }
+
+    #[test]
+    fn update_compacts_to_grow_and_fails_without_room() {
+        let mut buf = empty();
+        let mut page = SlottedPage::new(&mut buf);
+        let slots: Vec<u16> = (0..30u8).map(|i| page.insert(&[i; 100]).unwrap()).collect();
+        for &slot in slots.iter().skip(1).step_by(2) {
+            page.delete(slot);
+        }
+        // Only fits once the holes are squeezed out.
+        let big = [0xEE; 1500];
+        assert!(page.free_space() < big.len());
+        assert!(page.update(slots[0], &big));
+        assert_eq!(page.get(slots[0]), Some(&big[..]));
+        for &slot in slots.iter().step_by(2).skip(1) {
+            assert_eq!(page.get(slot), Some(&[slot as u8; 100][..]));
+        }
+
+        let too_big = vec![0xAA; page.room() + big.len() + 1];
+        assert!(!page.update(slots[0], &too_big));
+        assert_eq!(page.get(slots[0]), Some(&big[..]), "unchanged");
     }
 
     #[test]
