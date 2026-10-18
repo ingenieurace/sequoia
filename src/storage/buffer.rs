@@ -13,8 +13,8 @@
 //! - A guard pins its frame, and pinned frames are never evicted. Dropping
 //!   the guard unpins it. A write guard that was written through marks the
 //!   frame dirty.
-//! - When no frame is free, a [`Replacer`] picks an unpinned victim. The
-//!   default is ARC; see `replacer.rs`.
+//! - When no frame is free, a [`Replacer`] picks an unpinned victim, using
+//!   the policy set by [`REPLACEMENT_POLICY`] (see `replacer.rs`).
 //! - Write-back: a dirty page reaches disk only when it is evicted or flushed.
 //!
 //! Locking: one mutex (`state`) over all metadata, plus one RwLock per frame
@@ -28,8 +28,16 @@ use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::disk::{DiskManager, PAGE_SIZE, Page, PageId};
-use super::replacer::{ArcReplacer, Replacer};
+use super::replacer::{Policy, Replacer};
 use crate::error::{Error, Result, err};
+
+/// The page replacement policy of `BufferPool::new`. Edit this line to switch,
+/// like a `#define` in C:
+///
+/// - `Policy::Arc`: Adaptive Replacement Cache
+/// - `Policy::LruK(2)`: LRU-K, here K = 2 (K = 1 is plain LRU)
+/// - `Policy::Clock`: CLOCK
+pub const REPLACEMENT_POLICY: Policy = Policy::Arc;
 
 pub struct BufferPool {
     disk: Arc<DiskManager>,
@@ -54,10 +62,11 @@ struct FrameMeta {
 }
 
 impl BufferPool {
-    /// Creates a pool of `capacity` frames using ARC. Callers that pin several
-    /// pages at once (e.g. the table heap pins two) need at least that many.
+    /// Creates a pool of `capacity` frames using [`REPLACEMENT_POLICY`].
+    /// Callers that pin several pages at once (e.g. the table heap pins two)
+    /// need at least that many.
     pub fn new(disk: Arc<DiskManager>, capacity: usize) -> Self {
-        Self::with_replacer(disk, capacity, Box::new(ArcReplacer::new(capacity)))
+        Self::with_replacer(disk, capacity, REPLACEMENT_POLICY.replacer(capacity))
     }
 
     /// Creates a pool with a given replacement policy, which must be able to

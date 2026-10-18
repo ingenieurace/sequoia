@@ -11,8 +11,8 @@ pub mod page;
 pub mod replacer;
 pub mod tuple;
 
-pub use buffer::{BufferPool, PageReadGuard, PageWriteGuard};
+pub use buffer::{BufferPool, PageReadGuard, PageWriteGuard, REPLACEMENT_POLICY};
 pub use disk::{DiskManager, PAGE_SIZE, PAGE_USABLE, Page, PageId};
 pub use heap::{RecordId, TableHeap};
 pub use page::{MAX_TUPLE_SIZE, SlottedPage};
-pub use replacer::{ArcReplacer, ClockReplacer, Replacer};
+pub use replacer::{ArcReplacer, ClockReplacer, LruKReplacer, Policy, Replacer};

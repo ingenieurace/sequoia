@@ -4,10 +4,14 @@
 //! the pool needs a frame. It knows nothing about frames or pins: the pool
 //! passes a predicate saying which pages may be evicted right now.
 //!
-//! - [`ArcReplacer`]: Adaptive Replacement Cache, the default.
+//! - [`ArcReplacer`]: Adaptive Replacement Cache.
+//! - [`LruKReplacer`]: LRU-K, by backward K-distance.
 //! - [`ClockReplacer`]: CLOCK, an approximation of LRU.
+//!
+//! [`Policy`] names one of them; the buffer pool's default is set by
+//! `REPLACEMENT_POLICY` in `buffer.rs`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use super::disk::PageId;
 
@@ -25,6 +29,26 @@ pub trait Replacer: Send {
 
     /// The page left the pool for good (it was deleted); forget all about it.
     fn remove(&mut self, page: PageId);
+}
+
+/// A replacement policy, for choosing one by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Policy {
+    Arc,
+    /// LRU-K with the given K (at least 1; K = 1 is plain LRU).
+    LruK(usize),
+    Clock,
+}
+
+impl Policy {
+    /// Creates a replacer of this policy for a pool of `capacity` frames.
+    pub fn replacer(self, capacity: usize) -> Box<dyn Replacer> {
+        match self {
+            Policy::Arc => Box::new(ArcReplacer::new(capacity)),
+            Policy::LruK(k) => Box::new(LruKReplacer::new(capacity, k)),
+            Policy::Clock => Box::new(ClockReplacer::new(capacity)),
+        }
+    }
 }
 
 // ---- ARC ----
@@ -148,6 +172,92 @@ impl Replacer for ArcReplacer {
     }
 }
 
+// ---- LRU-K ----
+
+/// LRU-K (O'Neil, O'Neil and Weikum, SIGMOD 1993).
+///
+/// Each page keeps the times of its last K accesses. The victim is the page
+/// whose K-th most recent access is oldest, i.e. with the largest backward
+/// K-distance. A page with fewer than K accesses has an infinite distance
+/// and goes first, so pages touched once by a scan are evicted before pages
+/// that have proven they are reused. Among those, the least recently used
+/// goes first (plain LRU).
+///
+/// When a page is evicted its history is kept for a while, without the
+/// data, so a page that comes back soon is not mistaken for a new one. Up to
+/// `capacity` such histories are kept, dropping the least recently used.
+///
+/// Choosing a victim scans every resident page: O(capacity).
+pub struct LruKReplacer {
+    k: usize,
+    capacity: usize,
+    now: u64,
+    /// Last K access times of each resident page, oldest first.
+    resident: HashMap<PageId, VecDeque<u64>>,
+    /// Histories of recently evicted pages.
+    ghosts: HashMap<PageId, VecDeque<u64>>,
+    /// Ghosts by last access time, oldest first.
+    ghost_order: BTreeMap<u64, PageId>,
+}
+
+impl LruKReplacer {
+    pub fn new(capacity: usize, k: usize) -> Self {
+        assert!(k > 0, "LRU-K needs K >= 1");
+        Self {
+            k,
+            capacity,
+            now: 0,
+            resident: HashMap::new(),
+            ghosts: HashMap::new(),
+            ghost_order: BTreeMap::new(),
+        }
+    }
+
+    fn take_ghost(&mut self, page: PageId) -> Option<VecDeque<u64>> {
+        let history = self.ghosts.remove(&page)?;
+        self.ghost_order.remove(history.back().expect("histories are never empty"));
+        Some(history)
+    }
+}
+
+impl Replacer for LruKReplacer {
+    fn record_access(&mut self, page: PageId) {
+        self.now += 1;
+        let mut history = self.resident.remove(&page).or_else(|| self.take_ghost(page)).unwrap_or_default();
+        history.push_back(self.now);
+        if history.len() > self.k {
+            history.pop_front();
+        }
+        self.resident.insert(page, history);
+    }
+
+    fn victim(&mut self, evictable: &dyn Fn(PageId) -> bool) -> Option<PageId> {
+        // Smallest key wins: (false, _) for an infinite distance sorts first;
+        // then the oldest relevant access.
+        let key = |history: &VecDeque<u64>| match history.len() >= self.k {
+            true => (true, history[0]),
+            false => (false, *history.back().unwrap()),
+        };
+        self.resident.iter().filter(|&(&page, _)| evictable(page)).min_by_key(|(_, h)| key(h)).map(|(&page, _)| page)
+    }
+
+    fn evict(&mut self, page: PageId) {
+        let Some(history) = self.resident.remove(&page) else { return };
+        self.ghost_order.insert(*history.back().unwrap(), page);
+        self.ghosts.insert(page, history);
+        if self.ghosts.len() > self.capacity
+            && let Some((_, oldest)) = self.ghost_order.pop_first()
+        {
+            self.ghosts.remove(&oldest);
+        }
+    }
+
+    fn remove(&mut self, page: PageId) {
+        self.resident.remove(&page);
+        self.take_ghost(page);
+    }
+}
+
 // ---- CLOCK ----
 
 /// CLOCK: resident pages sit on a ring, each with a reference bit that every
@@ -252,13 +362,16 @@ mod tests {
     }
 
     #[test]
-    fn arc_resists_scans_better_than_clock() {
+    fn arc_and_lru_k_resist_scans_but_clock_does_not() {
         let accesses = hot_set_with_scans();
         let arc = simulate(&mut ArcReplacer::new(4), 4, &accesses);
+        let lru_2 = simulate(&mut LruKReplacer::new(4, 2), 4, &accesses);
         let clock = simulate(&mut ClockReplacer::new(4), 4, &accesses);
 
-        // From the second round on, ARC keeps the hot set in T2 and only churns T1.
+        // From the second round on, ARC keeps the hot set in T2 and only
+        // churns T1; LRU-2 evicts the once-used scan pages first.
         assert_eq!(arc, 3 + 6 * 49);
+        assert_eq!(lru_2, 3 + 6 * 49);
         // Each scan flushes CLOCK's hot set, leaving only the repeat within a round.
         assert_eq!(clock, 3 * 50);
     }
@@ -325,6 +438,52 @@ mod tests {
     }
 
     #[test]
+    fn lru_1_is_plain_lru() {
+        let mut lru = LruKReplacer::new(3, 1);
+        simulate(&mut lru, 3, &[1, 2, 3, 1]);
+        assert_eq!(lru.victim(&|_| true), Some(p(2)));
+    }
+
+    #[test]
+    fn lru_k_evicts_pages_with_fewer_than_k_accesses_first() {
+        let mut lru_2 = LruKReplacer::new(3, 2);
+        // 1 is the least recently used, but 2 and 3 were used only once.
+        simulate(&mut lru_2, 3, &[1, 1, 2, 3]);
+        assert_eq!(lru_2.victim(&|_| true), Some(p(2)), "LRU among infinite distances");
+        assert_eq!(lru_2.victim(&|page| page == p(1)), Some(p(1)));
+    }
+
+    #[test]
+    fn lru_k_evicts_the_largest_backward_k_distance() {
+        let mut lru_2 = LruKReplacer::new(2, 2);
+        // Times: 1 at [1, 4], 2 at [2, 3]. 1 was used last, but its second
+        // most recent access is the oldest.
+        simulate(&mut lru_2, 2, &[1, 2, 2, 1]);
+        assert_eq!(lru_2.victim(&|_| true), Some(p(1)));
+    }
+
+    #[test]
+    fn lru_k_remembers_evicted_pages() {
+        let mut lru_2 = LruKReplacer::new(2, 2);
+        // 3 evicts 1, then 1 comes back (evicting 2) with its old access.
+        simulate(&mut lru_2, 2, &[1, 2, 3, 1]);
+        assert_eq!(lru_2.resident[&p(1)].len(), 2, "history from before the eviction");
+        assert_eq!(lru_2.ghosts.keys().collect::<Vec<_>>(), [&p(2)]);
+
+        let mut lru_2 = LruKReplacer::new(2, 2);
+        let accesses: Vec<u32> = (0..100).collect();
+        simulate(&mut lru_2, 2, &accesses);
+        assert_eq!(lru_2.ghosts.len(), 2, "bounded by capacity");
+        assert_eq!(lru_2.ghost_order.len(), 2);
+
+        let tracked: Vec<PageId> = lru_2.resident.keys().chain(lru_2.ghosts.keys()).copied().collect();
+        for page in tracked {
+            lru_2.remove(page);
+        }
+        assert!(lru_2.resident.is_empty() && lru_2.ghosts.is_empty() && lru_2.ghost_order.is_empty());
+    }
+
+    #[test]
     fn clock_gives_recently_used_pages_a_second_chance() {
         let mut clock = ClockReplacer::new(3);
         // When 4 arrives every page is referenced: one full turn clears all
@@ -337,7 +496,8 @@ mod tests {
 
     #[test]
     fn victims_must_be_evictable() {
-        for replacer in [&mut ArcReplacer::new(2) as &mut dyn Replacer, &mut ClockReplacer::new(2)] {
+        for policy in [Policy::Arc, Policy::LruK(2), Policy::Clock] {
+            let replacer = &mut *policy.replacer(2);
             replacer.record_access(p(1));
             replacer.record_access(p(2));
             assert_eq!(replacer.victim(&|page| page == p(2)), Some(p(2)));

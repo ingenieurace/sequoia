@@ -51,7 +51,7 @@ src/
   storage/
     disk.rs     DiskManager: fixed-size pages in one file, free list
     buffer.rs   buffer pool: cached frames, pin counts, dirty pages
-    replacer.rs page replacement policies: ARC (default) and CLOCK
+    replacer.rs page replacement policies: ARC (default), LRU-K, CLOCK
     page.rs     slotted page: many tuples in one page
     heap.rs     table heap: linked list of pages, RecordId
     tuple.rs    row <-> bytes (null bitmap + column values)
@@ -74,8 +74,8 @@ Pages are read and written through a **buffer pool** of 256 frames (1 MB). A
 page in use is pinned and cannot be evicted; when the pool is full, ARC
 (Adaptive Replacement Cache) picks an unpinned victim, writing it back first if
 it is dirty. ARC balances recently used against frequently used pages, so a
-full table scan does not push frequently used pages out. CLOCK is available
-as an alternative.
+full table scan does not push frequently used pages out. LRU-K and CLOCK are
+also available: to switch, edit `REPLACEMENT_POLICY` in `src/storage/buffer.rs`.
 
 Every statement that changes data has its dirty pages written back and synced
 before it returns. There is no WAL or index yet: a crash in the middle of a
