@@ -42,6 +42,27 @@ fn null_handling() {
     assert_eq!(query(&mut db, "SELECT id FROM users WHERE age > 0 OR age <= 0").len(), 2);
     // NULL sorts first.
     assert_eq!(query(&mut db, "SELECT id FROM users ORDER BY age")[0], vec![int(3)]);
+    assert_eq!(query(&mut db, "SELECT id FROM users WHERE id = 1 OR id = 2").len(), 2);
+}
+
+#[test]
+fn and_or_follow_three_valued_logic() {
+    let mut db = setup();
+    let (t, f, n) = (Value::Bool(true), Value::Bool(false), Value::Null);
+    for (a, b, and, or) in [
+        ("TRUE", "TRUE", &t, &t),
+        ("TRUE", "FALSE", &f, &t),
+        ("FALSE", "TRUE", &f, &t),
+        ("FALSE", "FALSE", &f, &f),
+        ("TRUE", "NULL", &n, &t),
+        ("NULL", "TRUE", &n, &t),
+        ("FALSE", "NULL", &f, &n),
+        ("NULL", "FALSE", &f, &n),
+        ("NULL", "NULL", &n, &n),
+    ] {
+        let sql = format!("SELECT {a} AND {b}, {a} OR {b} FROM users WHERE id = 1");
+        assert_eq!(query(&mut db, &sql), [vec![and.clone(), or.clone()]], "{a}, {b}");
+    }
 }
 
 #[test]

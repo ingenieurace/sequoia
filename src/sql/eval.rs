@@ -76,13 +76,13 @@ fn binary(left: Value, op: BinaryOp, right: Value) -> Result<Value> {
     match op {
         // Three-valued logic: NULL means "unknown".
         And => match (&left, &right) {
-            (Bool(false), Bool(_) | Null) | (Null, Bool(false)) => Ok(Bool(false)),
+            (Bool(false), Bool(_) | Null) | (Bool(_) | Null, Bool(false)) => Ok(Bool(false)),
             (Bool(true), Bool(true)) => Ok(Bool(true)),
             (Bool(_) | Null, Bool(_) | Null) => Ok(Null),
             _ => type_error(&left, &right),
         },
         Or => match (&left, &right) {
-            (Bool(true), Bool(_) | Null) | (Null, Bool(true)) => Ok(Bool(true)),
+            (Bool(true), Bool(_) | Null) | (Bool(_) | Null, Bool(true)) => Ok(Bool(true)),
             (Bool(false), Bool(false)) => Ok(Bool(false)),
             (Bool(_) | Null, Bool(_) | Null) => Ok(Null),
             _ => type_error(&left, &right),
