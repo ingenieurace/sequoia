@@ -13,7 +13,7 @@
 //! level 2:   one SSTable, up to `fanout` times bigger ... and so on
 //! ```
 //!
-//! Every write goes to the MemTable, a sorted map in memory, and is appended to
+//! Every write goes to the MemTable, a skip list in memory, and is appended to
 //! the log, so it survives a crash: opening the tree replays the log into the
 //! MemTable. A deletion is a write too, of a tombstone. When the log reaches
 //! `log_bytes`, the MemTable is written out as a new level-0 SSTable and the
@@ -54,13 +54,13 @@
 //! and only then frees the old log or SSTables. The statement doing it commits
 //! all of that at once (see `storage/io/wal.rs`), so a crash never leaves it half done.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::storage::buffer::pool::BufferPool;
 use crate::storage::io::disk::{PAGE_USABLE, PageId, decode_id, encode_id, read_u32, write_u32};
 use crate::storage::heap::TableHeap;
 use crate::storage::page::MAX_TUPLE_SIZE;
+use super::skiplist::SkipList;
 use super::sstable::{self, Entry, SsTable};
 use crate::error::{Result, err};
 
@@ -116,7 +116,8 @@ pub struct LsmTree {
     pool: Arc<BufferPool>,
     config: LsmConfig,
     manifest: PageId,
-    memtable: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    /// Each key's latest value since the last flush; `None` is a tombstone.
+    memtable: SkipList<Vec<u8>, Option<Vec<u8>>>,
     /// Holds the MemTable's writes as records `(seq, entry)`.
     log: TableHeap,
     log_bytes: usize,
@@ -140,7 +141,7 @@ impl LsmTree {
             pool,
             config,
             manifest,
-            memtable: BTreeMap::new(),
+            memtable: SkipList::new(),
             log,
             log_bytes: 0,
             next_seq: 0,
@@ -172,7 +173,7 @@ impl LsmTree {
             pool: pool.clone(),
             config,
             manifest,
-            memtable: BTreeMap::new(),
+            memtable: SkipList::new(),
             log: TableHeap::open(pool.clone(), log_page, log_page)?,
             log_bytes: 0,
             next_seq: 0,
@@ -258,7 +259,7 @@ impl LsmTree {
     /// The largest key ever written that may still be stored, deleted or not.
     pub fn max_key(&self) -> Option<Vec<u8>> {
         let stored = self.tables().map(SsTable::max_key);
-        self.memtable.keys().next_back().map(Vec::as_slice).into_iter().chain(stored).max().map(<[u8]>::to_vec)
+        self.memtable.last_key().map(Vec::as_slice).into_iter().chain(stored).max().map(<[u8]>::to_vec)
     }
 
     /// Frees every page of the tree.

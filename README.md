@@ -84,6 +84,7 @@ src/
     btree.rs      B+ tree: sorted byte-string keys, splits, merges, range scans
     lsm/          log-structured merge tree
       tree.rs     log + MemTable, SSTables, level/universal compaction
+      skiplist.rs skip list: the MemTable, nodes in a Vec linked by index
       sstable.rs  SSTable: sorted entries in pages, in-memory summary
       bloom.rs    Bloom filter for SSTable lookups
     column/       column store
@@ -109,7 +110,8 @@ A database is a single file of 4 KB pages:
   new value, and only otherwise deletes it and inserts it again.
 - **An LSM table** (`USING LSM`) is a log-structured merge tree keyed by the
   primary key, or by a hidden rowid if there is none. Writes, deletes
-  included, go to an in-memory MemTable and are appended to a log. When the
+  included, go to an in-memory MemTable, a skip list, and are appended to a
+  log. When the
   log reaches 64 KB the MemTable is written out sorted as an SSTable.
   SSTables are merged by **level compaction** (default): four level-0
   SSTables are merged into level 1, and each deeper level is a single SSTable
