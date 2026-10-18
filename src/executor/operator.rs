@@ -1,13 +1,13 @@
 //! Operators: each step of a query plan, as an iterator over its rows that
 //! pulls rows from the step below it (the Volcano model).
 //!
-//! A scan, filter, limit and projection hand rows on one at a time, so a
+//! A scan, filter, limit, projection and distinct hand rows on one at a time, so a
 //! `LIMIT` stops the scan once it has enough, and a query's rows can be read
 //! without holding them all. A sort and an aggregate are blocking: they read
 //! all of their input when their first row is asked for. So is the right side
 //! of a hash or nested loop join (see `join.rs`); the left side streams.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::Settings;
 use super::aggregate;
@@ -65,6 +65,13 @@ pub fn open<'a>(node: Node<'a>, settings: &Settings) -> Rows<'a> {
                     Ok((false, _)) => None,
                     Err(e) => Some(Err(e)),
                 }
+            }))
+        }
+        Node::Distinct { input } => {
+            let mut seen = HashSet::new();
+            Box::new(open(*input, settings).filter(move |item| match item {
+                Ok(row) => seen.insert(row.clone()),
+                Err(_) => true,
             }))
         }
         Node::Limit { input, count } => Box::new(open(*input, settings).take(count)),

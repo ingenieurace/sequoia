@@ -7,11 +7,12 @@
 //! keys included, and groups come out in the order their first row was read.
 //! Without `GROUP BY`, all rows form one group, which exists even when there
 //! are none. Aggregates skip NULLs, except `COUNT(*)`; over no values, `COUNT`
-//! is 0 and the others NULL. There is no fractional type, so `AVG` truncates
+//! is 0 and the others NULL. With `DISTINCT`, an aggregate remembers the
+//! values it has added in each group and adds each only once. There is no fractional type, so `AVG` truncates
 //! toward zero like `/`.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::operator::Rows;
 use crate::catalog::table::Row;
@@ -24,8 +25,8 @@ use crate::types::Value;
 /// Reads every row of `input` (whose columns are `columns`) and returns one
 /// row per group: its `group_by` values, then the result of each aggregate.
 pub fn fold(input: Rows, columns: &[Field], group_by: &[Expr], aggregates: &[AggregateCall]) -> Result<Vec<Row>> {
-    let fresh = || aggregates.iter().map(|(function, _)| Accumulator::new(*function)).collect::<Vec<_>>();
-    let mut groups: Vec<(Row, Vec<Accumulator>)> = Vec::new();
+    let fresh = || aggregates.iter().map(|(function, _, distinct)| State::new(*function, *distinct)).collect::<Vec<_>>();
+    let mut groups: Vec<(Row, Vec<State>)> = Vec::new();
     let mut index: HashMap<Row, usize> = HashMap::new();
     for row in input {
         let row = row?;
@@ -38,9 +39,14 @@ pub fn fold(input: Rows, columns: &[Field], group_by: &[Expr], aggregates: &[Agg
                 groups.len() - 1
             }
         };
-        for ((_, arg), accumulator) in aggregates.iter().zip(&mut groups[i].1) {
+        for ((_, arg, _), state) in aggregates.iter().zip(&mut groups[i].1) {
             let value = arg.as_ref().map(|arg| eval(arg, columns, &row)).transpose()?;
-            accumulator.add(value)?;
+            if let (Some(seen), Some(value)) = (&mut state.seen, &value)
+                && !seen.insert(value.clone())
+            {
+                continue;
+            }
+            state.accumulator.add(value)?;
         }
     }
     if group_by.is_empty() && groups.is_empty() {
@@ -48,11 +54,26 @@ pub fn fold(input: Rows, columns: &[Field], group_by: &[Expr], aggregates: &[Agg
     }
     Ok(groups
         .into_iter()
-        .map(|(mut row, accumulators)| {
-            row.extend(accumulators.iter().map(Accumulator::result));
+        .map(|(mut row, states)| {
+            row.extend(states.iter().map(|state| state.accumulator.result()));
             row
         })
         .collect())
+}
+
+/// One aggregate in one group: its accumulator, and for `DISTINCT` the
+/// argument values already added (not kept for MIN and MAX, which repeats
+/// cannot change).
+struct State {
+    accumulator: Accumulator,
+    seen: Option<HashSet<Value>>,
+}
+
+impl State {
+    fn new(function: Aggregate, distinct: bool) -> Self {
+        let tracks = distinct && !matches!(function, Aggregate::Min | Aggregate::Max);
+        State { accumulator: Accumulator::new(function), seen: tracks.then(HashSet::new) }
+    }
 }
 
 /// The running state of one aggregate in one group.

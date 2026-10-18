@@ -30,6 +30,8 @@ pub enum Statement {
         rows: Vec<Vec<Expr>>,
     },
     Select {
+        /// `SELECT DISTINCT`: drops rows equal to one returned before.
+        distinct: bool,
         from: From,
         projection: Projection,
         filter: Option<Expr>,
@@ -132,7 +134,8 @@ pub enum Expr {
     /// `expr IS NULL`, or `expr IS NOT NULL` when the flag is true.
     IsNull(Box<Expr>, bool),
     /// An aggregate function over a group of rows; no argument is `COUNT(*)`.
-    Aggregate(Aggregate, Option<Box<Expr>>),
+    /// The flag is `DISTINCT`: each distinct argument value counts once.
+    Aggregate(Aggregate, Option<Box<Expr>>, bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,8 +211,11 @@ impl std::fmt::Display for Expr {
             Expr::IsNull(inner, negated) => {
                 write!(f, "{} IS {}NULL", operand(inner), if *negated { "NOT " } else { "" })
             }
-            Expr::Aggregate(function, None) => write!(f, "{}(*)", function.name().to_uppercase()),
-            Expr::Aggregate(function, Some(arg)) => write!(f, "{}({arg})", function.name().to_uppercase()),
+            Expr::Aggregate(function, None, _) => write!(f, "{}(*)", function.name().to_uppercase()),
+            Expr::Aggregate(function, Some(arg), distinct) => {
+                let distinct = if *distinct { "DISTINCT " } else { "" };
+                write!(f, "{}({distinct}{arg})", function.name().to_uppercase())
+            }
         }
     }
 }
@@ -253,6 +259,7 @@ mod tests {
             "NOT a = 1 OR b IS NOT NULL AND c",
             "x - -1 >= 'it''s'",
             "COUNT(*) > 1 AND SUM(a + 1) < MAX(b) / 2",
+            "COUNT(DISTINCT a) + SUM(DISTINCT (b * 2))",
             "-(a - b) IS NULL",
             "NOT (NOT a)",
             "a = NULL OR b = TRUE",

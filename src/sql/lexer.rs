@@ -4,8 +4,8 @@ use crate::error::{Result, err};
 
 const KEYWORDS: &[&str] = &[
     "AND", "AS", "ASC", "BOOL", "BOOLEAN", "BY", "CHECKPOINT", "CREATE", "CROSS", "DELETE", "DESC",
-    "DROP", "EXPLAIN", "FALSE", "FROM", "GROUP", "HAVING", "INDEX", "INNER", "INSERT", "INT", "INTEGER",
-    "INTO", "IS", "JOIN", "KEY", "LEFT", "LIMIT", "OUTER",
+    "DISTINCT", "DROP", "EXPLAIN", "FALSE", "FROM", "GROUP", "HAVING", "INDEX", "INNER", "INSERT", "INT",
+    "INTEGER", "INTO", "IS", "JOIN", "KEY", "LEFT", "LIMIT", "OUTER",
     "NOT", "NULL", "ON", "OR", "ORDER", "PRIMARY", "SELECT", "SET", "TABLE", "TEXT", "TRUE",
     "UNIQUE", "UPDATE", "USING", "VALUES", "WHERE",
 ];

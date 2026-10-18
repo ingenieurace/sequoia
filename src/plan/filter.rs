@@ -25,9 +25,9 @@ pub fn needed_columns<'a>(table: &Table, qualifier: &str, exprs: impl IntoIterat
 /// Calls `f` on every column reference in the expression.
 pub fn visit_columns(expr: &Expr, f: &mut impl FnMut(&ColumnRef)) {
     match expr {
-        Expr::Literal(_) | Expr::Aggregate(_, None) => {}
+        Expr::Literal(_) | Expr::Aggregate(_, None, _) => {}
         Expr::Column(column) => f(column),
-        Expr::Unary(_, inner) | Expr::IsNull(inner, _) | Expr::Aggregate(_, Some(inner)) => visit_columns(inner, f),
+        Expr::Unary(_, inner) | Expr::IsNull(inner, _) | Expr::Aggregate(_, Some(inner), _) => visit_columns(inner, f),
         Expr::Binary(left, _, right) => {
             visit_columns(left, f);
             visit_columns(right, f);

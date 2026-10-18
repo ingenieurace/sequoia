@@ -56,7 +56,7 @@ pub fn eval(expr: &Expr, fields: &[Field], row: &[Value]) -> Result<Value> {
         Expr::Column(column) => Ok(row[resolve(fields, column)?].clone()),
         Expr::IsNull(inner, negated) => Ok(Value::Bool(eval(inner, fields, row)?.is_null() != *negated)),
         // Grouped queries replace aggregates by their results before evaluating.
-        Expr::Aggregate(function, _) => err(format!("{} is not allowed here", function.name().to_uppercase())),
+        Expr::Aggregate(function, ..) => err(format!("{} is not allowed here", function.name().to_uppercase())),
         Expr::Unary(op, inner) => match (op, eval(inner, fields, row)?) {
             (_, Value::Null) => Ok(Value::Null),
             (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),

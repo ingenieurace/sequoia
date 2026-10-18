@@ -36,16 +36,18 @@ Shell commands: `.tables`, `.exit`.
 - `FROM`: one table, or several joined: `[INNER] JOIN ... ON`, `LEFT [OUTER]
   JOIN ... ON`, `CROSS JOIN` or commas, with aliases (`users u`, `users AS u`)
   and qualified columns (`u.id`)
-- `SELECT`: `*` or expressions, `WHERE`, `GROUP BY` (expressions), `HAVING`,
-  `ORDER BY ... ASC|DESC` (any expressions, NULL first, stable), `LIMIT`
-- Aggregates: `COUNT(*)`, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`. They skip NULLs;
+- `SELECT [DISTINCT]`: `*` or expressions, `WHERE`, `GROUP BY` (expressions), `HAVING`,
+  `ORDER BY ... ASC|DESC` (any expressions, NULL first, stable; with `DISTINCT`, only
+  ones in the select list), `LIMIT`
+- Aggregates: `COUNT(*)`, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, each also as
+  `f(DISTINCT expr)`, which counts each distinct value once. They skip NULLs;
   over no values `COUNT` is 0 and the rest NULL. `AVG` truncates toward zero, as
   there is no fractional type. A selected column must be grouped or aggregated
 - Expressions: `+ - * /`, `= != <> < <= > >=`, `AND OR NOT`, `IS [NOT] NULL`,
   parentheses, with SQL three-valued logic for `NULL`
 
 Every statement is atomic and durable once it returns. Not supported:
-`RIGHT` and `FULL` joins, subqueries, `DISTINCT`, multi-column indexes,
+`RIGHT` and `FULL` joins, subqueries, multi-column indexes,
 transactions of several statements.
 
 ## Layout

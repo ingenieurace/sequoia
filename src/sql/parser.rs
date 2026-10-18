@@ -149,6 +149,7 @@ impl Parser {
 
     fn select(&mut self) -> Result<Statement> {
         self.expect_keyword("SELECT")?;
+        let distinct = self.eat_keyword("DISTINCT");
         let projection = if self.eat_symbol("*") {
             Projection::All
         } else {
@@ -185,7 +186,7 @@ impl Parser {
             true => Some(self.number()? as usize),
             false => None,
         };
-        Ok(Statement::Select { from, projection, filter, group_by, having, order_by, limit })
+        Ok(Statement::Select { distinct, from, projection, filter, group_by, having, order_by, limit })
     }
 
     /// `table [, table | [INNER | LEFT [OUTER] | CROSS] JOIN table [ON expr]]...`
@@ -372,13 +373,14 @@ impl Parser {
         let Some(function) = Aggregate::from_name(name) else {
             return Err(Error(format!("unknown function: {name}")));
         };
-        let arg = if function == Aggregate::Count && self.eat_symbol("*") {
+        let distinct = self.eat_keyword("DISTINCT");
+        let arg = if function == Aggregate::Count && !distinct && self.eat_symbol("*") {
             None
         } else {
             Some(Box::new(self.expr()?))
         };
         self.expect_symbol(")")?;
-        Ok(Expr::Aggregate(function, arg))
+        Ok(Expr::Aggregate(function, arg, distinct))
     }
 
     // ---- token helpers ----

@@ -90,12 +90,12 @@ pub fn select<'a>(catalog: &'a Catalog, statement: Statement, settings: &Setting
 }
 
 fn plan_select(catalog: &Catalog, statement: Statement) -> Result<query::Plan<'_>> {
-    let Statement::Select { from, projection, filter, group_by, having, order_by, limit } = statement else {
+    let Statement::Select { distinct, from, projection, filter, group_by, having, order_by, limit } = statement else {
         return err("expected a SELECT");
     };
     let names = std::iter::once(&from.table).chain(from.joins.iter().map(|j| &j.table));
     let tables = names.map(|t| catalog.get(&t.name)).collect::<Result<Vec<_>>>()?;
-    query::select(tables, from, projection, filter, group_by, having, order_by, limit)
+    query::select(tables, distinct, from, projection, filter, group_by, having, order_by, limit)
 }
 
 /// Describes how a statement would run: its plan, one step per line, the

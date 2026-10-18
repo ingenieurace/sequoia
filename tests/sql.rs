@@ -854,6 +854,9 @@ fn every_storage_and_access_path_aggregates_alike() {
         "SELECT COUNT(*), SUM(id) FROM p WHERE id >= 3 AND id < 7",
         "SELECT city, COUNT(*) FROM p WHERE city = 'oslo' GROUP BY city",
         "SELECT age, COUNT(*) FROM p WHERE age > 22 GROUP BY age ORDER BY COUNT(*) DESC, age LIMIT 3",
+        "SELECT DISTINCT city, vip FROM p ORDER BY city, vip",
+        "SELECT DISTINCT city FROM p WHERE city = 'oslo'",
+        "SELECT vip, COUNT(DISTINCT city), SUM(DISTINCT age) FROM p GROUP BY vip ORDER BY vip",
     ];
     let mut results = Vec::new();
     for storage in ["HEAP", "LSM", "COLUMN"] {
@@ -918,6 +921,92 @@ fn explain_shows_every_step_of_the_plan() {
     assert_eq!(explain(&mut db, "SELECT COUNT(*) FROM p"), "PROJECT COUNT(*)\n  AGGREGATE COUNT(*)\n    SCAN p");
     assert_eq!(explain(&mut db, "UPDATE p SET age = 1 WHERE age IS NULL"), "FILTER age IS NULL\n  SCAN p");
     assert_eq!(explain(&mut db, "DELETE FROM p"), "SCAN p");
+}
+
+#[test]
+fn select_distinct_drops_repeated_rows() {
+    let mut db = setup_people("HEAP");
+    let column = |rows: Vec<Vec<Value>>| rows.into_iter().map(|mut r| r.remove(0)).collect::<Vec<_>>();
+    // NULLs are equal to each other here; rows come out in the order first seen.
+    assert_eq!(column(query(&mut db, "SELECT DISTINCT city FROM p")), [text("oslo"), text("lima"), Value::Null]);
+    assert_eq!(column(query(&mut db, "SELECT DISTINCT city FROM p ORDER BY city")), [
+        Value::Null,
+        text("lima"),
+        text("oslo")
+    ]);
+    // LIMIT counts distinct rows, with or without ORDER BY.
+    assert_eq!(column(query(&mut db, "SELECT DISTINCT city FROM p ORDER BY city DESC LIMIT 2")), [
+        text("oslo"),
+        text("lima")
+    ]);
+    assert_eq!(column(query(&mut db, "SELECT DISTINCT city FROM p LIMIT 2")), [text("oslo"), text("lima")]);
+    // Rows are distinct as a whole.
+    let pairs = query(&mut db, "SELECT DISTINCT city, vip FROM p ORDER BY city, vip");
+    let (t, f) = (Value::Bool(true), Value::Bool(false));
+    assert_eq!(pairs, [
+        vec![Value::Null, f.clone()],
+        vec![Value::Null, t.clone()],
+        vec![text("lima"), Value::Null],
+        vec![text("lima"), f.clone()],
+        vec![text("oslo"), f],
+        vec![text("oslo"), t],
+    ]);
+    assert_eq!(query(&mut db, "SELECT DISTINCT * FROM p").len(), 7);
+    assert_eq!(column(query(&mut db, "SELECT DISTINCT age / 10 FROM p WHERE age > 0 ORDER BY age / 10")), [
+        int(2),
+        int(3),
+        int(4)
+    ]);
+    // After grouping: the groups' counts are 3, 2 and 2.
+    assert_eq!(column(query(&mut db, "SELECT DISTINCT COUNT(*) FROM p GROUP BY city")), [int(3), int(2)]);
+
+    let mut shop = setup_shop();
+    let sql = "SELECT DISTINCT u.city FROM users u JOIN orders o ON o.user_id = u.id ORDER BY city";
+    assert_eq!(column(query(&mut shop, sql)), [text("lima"), text("oslo")]);
+
+    let e = db.execute("SELECT DISTINCT city FROM p ORDER BY age").unwrap_err();
+    assert!(e.0.contains("ORDER BY age must appear in the select list"), "{e}");
+    assert_eq!(
+        explain(&mut db, "SELECT DISTINCT city FROM p ORDER BY city LIMIT 2"),
+        "LIMIT 2\n  DISTINCT\n    PROJECT city\n      SORT BY city\n        SCAN p"
+    );
+}
+
+#[test]
+fn aggregates_over_distinct_values() {
+    let mut db = setup_people("HEAP");
+    // age / 10 is 3, 2, 4, 2, 4 (and NULL twice): distinct, 2, 3 and 4.
+    assert_eq!(
+        query(
+            &mut db,
+            "SELECT COUNT(DISTINCT city), COUNT(vip), COUNT(DISTINCT vip), SUM(age / 10), SUM(DISTINCT age / 10),
+                    AVG(DISTINCT age / 10), MIN(DISTINCT age) FROM p"
+        ),
+        vec![vec![int(2), int(6), int(2), int(15), int(9), int(3), int(21)]]
+    );
+    assert_eq!(query(&mut db, "SELECT city, COUNT(DISTINCT vip) FROM p GROUP BY city ORDER BY city"), [
+        vec![Value::Null, int(2)],
+        vec![text("lima"), int(1)],
+        vec![text("oslo"), int(2)],
+    ]);
+    // In HAVING and ORDER BY too, and over no rows.
+    assert_eq!(
+        query(&mut db, "SELECT city FROM p GROUP BY city HAVING COUNT(DISTINCT vip) > 1 ORDER BY COUNT(DISTINCT age), city"),
+        [vec![Value::Null], vec![text("oslo")]]
+    );
+    assert_eq!(query(&mut db, "SELECT COUNT(DISTINCT age), SUM(DISTINCT age) FROM p WHERE id > 100"), [vec![
+        int(0),
+        Value::Null
+    ]]);
+    match db.execute("SELECT COUNT(DISTINCT city) FROM p").unwrap().pop() {
+        Some(QueryResult::Rows { columns, .. }) => assert_eq!(columns, ["count"]),
+        other => panic!("expected rows, got {other:?}"),
+    }
+    assert_eq!(
+        explain(&mut db, "SELECT COUNT(DISTINCT city), COUNT(city) FROM p"),
+        "PROJECT COUNT(DISTINCT city), COUNT(city)\n  AGGREGATE COUNT(DISTINCT city), COUNT(city)\n    SCAN p"
+    );
+    assert!(db.execute("SELECT COUNT(DISTINCT *) FROM p").is_err());
 }
 
 #[test]

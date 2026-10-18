@@ -48,14 +48,20 @@
 //! **Steps.** On top of the scans and joins, a SELECT has an aggregate (and a
 //! filter for HAVING) if it groups, a sort if it has ORDER BY (which applies
 //! the LIMIT itself, as a top-N sort) or else a limit, and a projection unless
-//! it is `SELECT *`. The executor pulls rows through the tree one at a time;
+//! it is `SELECT *`. `SELECT DISTINCT` adds a distinct step above the
+//! projection, which drops each row equal to one it has already returned, and
+//! the limit moves above it, as rows the sort keeps may still be dropped. Its
+//! ORDER BY may only use expressions of the select list: rows that differ in
+//! anything else become one, which would have no single place in the order.
+//! The executor pulls rows through the tree one at a time;
 //! sorts, aggregates and the right sides of hash and nested loop joins read
-//! all of their input first.
+//! all of their input first. A distinct step streams, but remembers every row
+//! it has returned.
 //!
 //! **Groups.** An aggregate's rows hold its group keys, then its aggregates.
 //! Expressions above it are rewritten to read those: each `GROUP BY`
 //! expression and each distinct aggregate becomes the column named by its SQL
-//! text (`city`, `COUNT(*)`), and a column left over is rejected, as it is
+//! text (`city`, `COUNT(*)`, `COUNT(DISTINCT age)`), and a column left over is rejected, as it is
 //! neither grouped nor aggregated. The names are unique: a `GROUP BY`
 //! expression has no aggregate in it, and no other expression prints the same.
 
@@ -91,6 +97,8 @@ pub enum Node<'a> {
     Aggregate { input: Box<Node<'a>>, group_by: Vec<Expr>, aggregates: Vec<AggregateCall> },
     /// Orders the rows, keeping the first `limit` if given.
     Sort { input: Box<Node<'a>>, keys: Vec<OrderBy>, limit: Option<usize> },
+    /// Drops each row equal to one already returned, NULLs included.
+    Distinct { input: Box<Node<'a>> },
     /// Keeps the first `count` rows.
     Limit { input: Box<Node<'a>>, count: usize },
     /// Evaluates the select list on each row.
@@ -116,9 +124,9 @@ pub enum LookupKey {
     PrimaryKey,
 }
 
-/// One aggregate an `Aggregate` step computes per group: the function and
-/// its argument (none for `COUNT(*)`).
-pub type AggregateCall = (Aggregate, Option<Expr>);
+/// One aggregate an `Aggregate` step computes per group: the function, its
+/// argument (none for `COUNT(*)`), and whether it is over distinct values.
+pub type AggregateCall = (Aggregate, Option<Expr>, bool);
 
 /// A table in FROM: the table, and what the query calls it.
 struct Source<'a> {
@@ -130,6 +138,7 @@ struct Source<'a> {
 #[allow(clippy::too_many_arguments)]
 pub fn select<'a>(
     tables: Vec<&'a Table>,
+    distinct: bool,
     from: From,
     projection: Projection,
     filter: Option<Expr>,
@@ -184,6 +193,11 @@ pub fn select<'a>(
             (Some(exprs), names)
         }
     };
+    if let (true, Some(exprs)) = (distinct, &exprs)
+        && let Some(key) = order_by.iter().find(|o| !exprs.contains(&o.expr))
+    {
+        return err(format!("for SELECT DISTINCT, ORDER BY {} must appear in the select list", key.expr));
+    }
 
     // The columns each table must read: those any expression uses.
     let used: Vec<&Expr> = exprs
@@ -227,12 +241,18 @@ pub fn select<'a>(
         node = Node::Filter { input: Box::new(node), predicate };
     }
     node = match (order_by.is_empty(), limit) {
-        (false, _) => Node::Sort { input: Box::new(node), keys: order_by, limit },
-        (true, Some(count)) => Node::Limit { input: Box::new(node), count },
-        (true, None) => node,
+        (false, _) => Node::Sort { input: Box::new(node), keys: order_by, limit: limit.filter(|_| !distinct) },
+        (true, Some(count)) if !distinct => Node::Limit { input: Box::new(node), count },
+        _ => node,
     };
     if let Some(exprs) = exprs {
         node = Node::Project { input: Box::new(node), exprs };
+    }
+    if distinct {
+        node = Node::Distinct { input: Box::new(node) };
+        if let Some(count) = limit {
+            node = Node::Limit { input: Box::new(node), count };
+        }
     }
     Ok(Plan { root: node, columns })
 }
@@ -421,7 +441,9 @@ impl Binder {
             Expr::Unary(op, inner) => Expr::Unary(*op, bind(inner)?),
             Expr::Binary(left, op, right) => Expr::Binary(bind(left)?, *op, bind(right)?),
             Expr::IsNull(inner, negated) => Expr::IsNull(bind(inner)?, *negated),
-            Expr::Aggregate(function, arg) => Expr::Aggregate(*function, arg.as_deref().map(bind).transpose()?),
+            Expr::Aggregate(function, arg, distinct) => {
+                Expr::Aggregate(*function, arg.as_deref().map(bind).transpose()?, *distinct)
+            }
         })
     }
 
@@ -461,7 +483,10 @@ impl Node<'_> {
             Node::Scan { table, qualifier, .. } | Node::Lookup { table, qualifier, .. } => {
                 Field::of_table(qualifier, &table.columns)
             }
-            Node::Filter { input, .. } | Node::Sort { input, .. } | Node::Limit { input, .. } => input.columns(),
+            Node::Filter { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Distinct { input }
+            | Node::Limit { input, .. } => input.columns(),
             Node::Join { left, right, .. } => [left.columns(), right.columns()].concat(),
             Node::Aggregate { group_by, aggregates, .. } => group_by
                 .iter()
@@ -521,6 +546,7 @@ impl Node<'_> {
                 let top = limit.map_or(String::new(), |n| format!(" (TOP {n})"));
                 (format!("SORT BY {keys}{top}"), vec![input])
             }
+            Node::Distinct { input } => ("DISTINCT".into(), vec![input]),
             Node::Limit { input, count } => (format!("LIMIT {count}"), vec![input]),
             Node::Project { input, exprs } => {
                 (format!("PROJECT {}", list(&mut exprs.iter().map(Expr::to_string))), vec![input])
@@ -556,14 +582,14 @@ fn is_grouped(projection: &Projection, group_by: &[Expr], having: &Option<Expr>,
 fn output_name(expr: &Expr) -> String {
     match expr {
         Expr::Column(column) => column.name.clone(),
-        Expr::Aggregate(function, _) => function.name().into(),
+        Expr::Aggregate(function, ..) => function.name().into(),
         _ => "?column?".into(),
     }
 }
 
 /// The column an aggregate's result is in: its SQL text.
-fn aggregate_name((function, arg): &AggregateCall) -> String {
-    Expr::Aggregate(*function, arg.clone().map(Box::new)).to_string()
+fn aggregate_name((function, arg, distinct): &AggregateCall) -> String {
+    Expr::Aggregate(*function, arg.clone().map(Box::new), *distinct).to_string()
 }
 
 /// Rewrites a bound expression to read an aggregate's rows, as the module docs describe.
@@ -580,11 +606,11 @@ fn rewrite(expr: &Expr, group_by: &[Expr], aggregates: &mut Vec<AggregateCall>) 
         Expr::Unary(op, inner) => Expr::Unary(*op, rewrite(inner)?),
         Expr::Binary(left, op, right) => Expr::Binary(rewrite(left)?, *op, rewrite(right)?),
         Expr::IsNull(inner, negated) => Expr::IsNull(rewrite(inner)?, *negated),
-        Expr::Aggregate(function, arg) => {
+        Expr::Aggregate(function, arg, distinct) => {
             if arg.as_deref().is_some_and(contains_aggregate) {
                 return err("aggregate functions cannot be nested");
             }
-            let call = (*function, arg.as_deref().cloned());
+            let call = (*function, arg.as_deref().cloned(), *distinct);
             if !aggregates.contains(&call) {
                 aggregates.push(call.clone());
             }
