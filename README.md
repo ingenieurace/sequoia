@@ -55,7 +55,7 @@ src/
     replacer.rs page replacement policies: ARC (default), LRU-K, CLOCK
     page.rs     slotted page: many tuples in one page
     heap.rs     table heap: linked list of pages, free-space map, RecordId
-    lsm.rs      LSM tree: log + MemTable, levels of SSTables, compaction
+    lsm.rs      LSM tree: log + MemTable, SSTables, level/universal compaction
     sstable.rs  SSTable: sorted entries in pages, in-memory summary
     bloom.rs    Bloom filter for SSTable lookups
     tuple.rs    row <-> bytes (null bitmap + column values)
@@ -79,10 +79,15 @@ A database is a single file of 4 KB pages:
 - **An LSM table** (`USING LSM`) is a log-structured merge tree keyed by the
   primary key, or by a hidden rowid if there is none. Writes, deletes
   included, go to an in-memory MemTable and are appended to a log. When the
-  log reaches 64 KB the MemTable is written out sorted as a level-0 SSTable.
-  Four level-0 SSTables are merged into level 1; each deeper level is a
-  single SSTable up to 10 times bigger than the one above, merged down when
-  it outgrows that. Lookups check the MemTable, then SSTables newest first,
+  log reaches 64 KB the MemTable is written out sorted as an SSTable.
+  SSTables are merged by **level compaction** (default): four level-0
+  SSTables are merged into level 1, and each deeper level is a single SSTable
+  up to 10 times bigger than the one above, merged down when it outgrows
+  that. **Universal compaction** keeps every SSTable in one level instead;
+  once there are 8, it merges runs of similar size, or all of them when the
+  newer ones take twice the space of the oldest. It rewrites data less often
+  but leaves more SSTables to check. To switch, edit `COMPACTION` in
+  `src/storage/lsm.rs`. Lookups check the MemTable, then SSTables newest first,
   skipping those whose key range or Bloom filter rules the key out. A
   manifest page lists the log and the SSTables. SSTable summaries are not
   stored: opening a table reads its SSTables once to rebuild them.

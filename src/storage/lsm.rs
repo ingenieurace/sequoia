@@ -23,11 +23,24 @@
 //! one that knows the key has its latest value. Each SSTable's summary (key
 //! range and Bloom filter) skips most SSTables without reading them.
 //!
-//! Compaction is level compaction. Level 0 is merged into level 1 once it has
-//! `level0_tables` SSTables; a deeper level is merged into the next once it
-//! outgrows its limit. Below level 0 a level is a single SSTable, so its key
-//! ranges never overlap. Merging keeps only the newest entry for each key, and
-//! drops tombstones once nothing older lies below them.
+//! Compaction sort-merges SSTables into one, keeping only the newest entry for
+//! each key and dropping tombstones once nothing older lies below them. The
+//! strategy is set by [`COMPACTION`]:
+//!
+//! - Level (the picture above): level 0 is merged into level 1 once it has
+//!   `level0_tables` SSTables; a deeper level is merged into the next once it
+//!   outgrows its limit. Below level 0 a level is a single SSTable, so its key
+//!   ranges never overlap. Suits read-heavy workloads: few SSTables to check.
+//! - Universal: every SSTable is a sorted run in one level (stored as level
+//!   0), newest first, with overlapping key ranges. Once there are `max_runs`
+//!   of them, the newest adjacent runs of similar size are merged, or every
+//!   run if the newer ones take `max_space_amp` percent of the oldest's space
+//!   or more. Suits insert-heavy workloads: each entry is rewritten fewer
+//!   times (see `pages_written`), but reads may check more SSTables.
+//!
+//! A tree written with one strategy opens fine with the other: universal
+//! treats the deeper levels as older runs, and level merges an oversized
+//! level 0 into level 1.
 //!
 //! Where everything lives is recorded in the manifest page:
 //!
@@ -51,24 +64,51 @@ use super::page::MAX_TUPLE_SIZE;
 use super::sstable::{self, Entry, SsTable};
 use crate::error::{Result, err};
 
+/// The compaction strategy of `LsmConfig::default`, used by every LSM table.
+/// Edit this line to switch, like `REPLACEMENT_POLICY` in `buffer.rs`:
+///
+/// - `Compaction::Level`: level compaction
+/// - `Compaction::Universal`: universal compaction
+pub const COMPACTION: Compaction = Compaction::Level;
+
 /// Bytes before each log record's entry: its sequence number.
 const SEQ_SIZE: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compaction {
+    Level,
+    Universal,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct LsmConfig {
     /// Log size, in bytes, at which the MemTable is written out.
     pub log_bytes: usize,
-    /// Level-0 SSTables that trigger a merge into level 1.
+    pub compaction: Compaction,
+    /// Level: level-0 SSTables that trigger a merge into level 1.
     pub level0_tables: usize,
-    /// Largest level 1, in pages, before it is merged into level 2.
+    /// Level: largest level 1, in pages, before it is merged into level 2.
     pub level1_pages: usize,
-    /// How many times bigger each level may be than the one above.
+    /// Level: how many times bigger each level may be than the one above.
     pub fanout: usize,
+    /// Universal: sorted runs that trigger a compaction.
+    pub max_runs: usize,
+    /// Universal: merge every run once the newer runs take this many percent
+    /// of the oldest run's pages.
+    pub max_space_amp: usize,
 }
 
 impl Default for LsmConfig {
     fn default() -> Self {
-        LsmConfig { log_bytes: 64 * 1024, level0_tables: 4, level1_pages: 64, fanout: 10 }
+        LsmConfig {
+            log_bytes: 64 * 1024,
+            compaction: COMPACTION,
+            level0_tables: 4,
+            level1_pages: 64,
+            fanout: 10,
+            max_runs: 8,
+            max_space_amp: 200,
+        }
     }
 }
 
@@ -85,6 +125,9 @@ pub struct LsmTree {
     level0: Vec<SsTable>,
     /// `levels[i]` is level `i + 1`.
     levels: Vec<Option<SsTable>>,
+    /// SSTable pages written by flushes and compactions since the tree was
+    /// opened. Compared with the data written, this is the write amplification.
+    pages_written: usize,
 }
 
 impl LsmTree {
@@ -103,6 +146,7 @@ impl LsmTree {
             next_seq: 0,
             level0: Vec::new(),
             levels: Vec::new(),
+            pages_written: 0,
         };
         tree.write_manifest()?;
         Ok(tree)
@@ -137,6 +181,7 @@ impl LsmTree {
                 .into_iter()
                 .map(|id| id.map(|id| SsTable::open(pool.clone(), id)).transpose())
                 .collect::<Result<_>>()?,
+            pages_written: 0,
         };
 
         // Records may sit out of order in the log's pages; the sequence numbers restore it.
@@ -160,6 +205,10 @@ impl LsmTree {
 
     pub fn manifest_page(&self) -> PageId {
         self.manifest
+    }
+
+    pub fn pages_written(&self) -> usize {
+        self.pages_written
     }
 
     /// Fails if a key and value are too big to store together.
@@ -245,6 +294,7 @@ impl LsmTree {
     fn flush(&mut self) -> Result<()> {
         let entries = self.memtable.iter().map(|(k, v)| Ok((k.clone(), v.clone())));
         let table = SsTable::write(self.pool.clone(), entries)?;
+        self.pages_written += table.as_ref().map_or(0, SsTable::page_count);
         let new_log = TableHeap::create(self.pool.clone())?;
         self.pool.flush_page(new_log.first_page())?;
 
@@ -259,8 +309,22 @@ impl LsmTree {
         old_log.destroy()
     }
 
-    /// Merges levels that are over their limits, from the top down.
+    /// Merges SSTables as the compaction strategy decides, then frees the old ones.
     fn compact(&mut self) -> Result<()> {
+        let garbage = match self.config.compaction {
+            Compaction::Level => self.compact_levels()?,
+            Compaction::Universal => self.compact_universal()?,
+        };
+        if garbage.is_empty() {
+            return Ok(());
+        }
+        self.write_manifest()?;
+        garbage.into_iter().try_for_each(SsTable::destroy)
+    }
+
+    /// Merges levels that are over their limits, from the top down. Returns the
+    /// SSTables merged away.
+    fn compact_levels(&mut self) -> Result<Vec<SsTable>> {
         let mut garbage = Vec::new();
 
         if self.level0.len() >= self.config.level0_tables {
@@ -269,6 +333,7 @@ impl LsmTree {
             }
             let inputs: Vec<&SsTable> = self.level0.iter().chain(&self.levels[0]).collect();
             let merged = self.merge(&inputs, self.is_bottom(0))?;
+            self.pages_written += merged.as_ref().map_or(0, SsTable::page_count);
             garbage.append(&mut self.level0);
             garbage.extend(std::mem::replace(&mut self.levels[0], merged));
         }
@@ -282,17 +347,51 @@ impl LsmTree {
                 }
                 let inputs: Vec<&SsTable> = self.levels[i].iter().chain(&self.levels[i + 1]).collect();
                 let merged = self.merge(&inputs, self.is_bottom(i + 1))?;
+                self.pages_written += merged.as_ref().map_or(0, SsTable::page_count);
                 garbage.extend(self.levels[i].take());
                 garbage.extend(std::mem::replace(&mut self.levels[i + 1], merged));
             }
             i += 1;
         }
+        Ok(garbage)
+    }
 
-        if garbage.is_empty() {
-            return Ok(());
+    /// Merges the newest sorted runs once there are too many. Returns the
+    /// SSTables merged away.
+    fn compact_universal(&mut self) -> Result<Vec<SsTable>> {
+        // Runs from level compaction: deeper levels are older.
+        self.level0.extend(self.levels.drain(..).flatten());
+        let runs = self.level0.len();
+        if runs < self.config.max_runs {
+            return Ok(Vec::new());
         }
-        self.write_manifest()?;
-        garbage.into_iter().try_for_each(SsTable::destroy)
+
+        let sizes: Vec<usize> = self.level0.iter().map(SsTable::page_count).collect();
+        let newer: usize = sizes[..runs - 1].iter().sum();
+        let range = if newer * 100 >= sizes[runs - 1] * self.config.max_space_amp {
+            // Space amplification: much of the data may be stale copies.
+            0..runs
+        } else {
+            // Size ratio: the newest stretch of at least two runs where each is no
+            // bigger than the newer ones before it together. Runs of similar
+            // size are merged, so each entry is rewritten only a few times.
+            let similar = (0..runs).find_map(|start| {
+                let (mut end, mut total) = (start + 1, sizes[start]);
+                while end < runs && sizes[end] <= total {
+                    total += sizes[end];
+                    end += 1;
+                }
+                (end - start >= 2).then_some(start..end)
+            });
+            // Otherwise the newest runs, just enough to get below `max_runs`.
+            similar.unwrap_or(0..runs + 2 - self.config.max_runs)
+        };
+
+        // Merged runs are adjacent, so the result keeps its place in the newest-first order.
+        let inputs: Vec<&SsTable> = self.level0[range.clone()].iter().collect();
+        let merged = self.merge(&inputs, range.end == runs)?;
+        self.pages_written += merged.as_ref().map_or(0, SsTable::page_count);
+        Ok(self.level0.splice(range, merged).collect())
     }
 
     /// Whether no level below `levels[i]` holds anything.
@@ -388,7 +487,19 @@ mod tests {
 
     /// Flushes after about 20 writes, and keeps level 1 to 4 pages.
     fn small() -> LsmConfig {
-        LsmConfig { log_bytes: 2000, level0_tables: 3, level1_pages: 4, fanout: 2 }
+        LsmConfig {
+            log_bytes: 2000,
+            compaction: Compaction::Level,
+            level0_tables: 3,
+            level1_pages: 4,
+            fanout: 2,
+            max_runs: 4,
+            max_space_amp: 200,
+        }
+    }
+
+    fn small_universal() -> LsmConfig {
+        LsmConfig { compaction: Compaction::Universal, ..small() }
     }
 
     fn key(i: u32) -> Vec<u8> {
@@ -418,8 +529,21 @@ mod tests {
     }
 
     #[test]
-    fn newest_version_wins_across_flushes_and_compactions() {
-        let mut tree = LsmTree::create(pool(), small()).unwrap();
+    fn newest_version_wins_with_level_compaction() {
+        let tree = check_newest_version_wins(small());
+        assert!(tree.levels.len() >= 2, "compacted down at least two levels");
+    }
+
+    #[test]
+    fn newest_version_wins_with_universal_compaction() {
+        let tree = check_newest_version_wins(small_universal());
+        assert!(tree.levels.is_empty() && tree.level0.len() < 4);
+    }
+
+    /// Writes several versions of each key with flushes and compactions in
+    /// between, checks that reads see the latest, and returns the tree.
+    fn check_newest_version_wins(config: LsmConfig) -> LsmTree {
+        let mut tree = LsmTree::create(pool(), config).unwrap();
         for version in 0..3u8 {
             for i in 0..600 {
                 tree.put(key(i), value(i, version)).unwrap();
@@ -433,7 +557,6 @@ mod tests {
             tree.put(key(i), value(i, 9)).unwrap();
         }
 
-        assert!(tree.levels.len() >= 2, "compacted down at least two levels");
         let expected: Vec<(Vec<u8>, Vec<u8>)> = (0..600)
             .filter_map(|i| match (i % 3, i % 9) {
                 (_, 0) => Some((key(i), value(i, 9))),
@@ -446,6 +569,7 @@ mod tests {
             let want = expected.iter().find(|(k, _)| *k == key(i)).map(|(_, v)| v.clone());
             assert_eq!(tree.get(&key(i)).unwrap(), want, "key {i}");
         }
+        tree
     }
 
     #[test]
@@ -460,6 +584,73 @@ mod tests {
             assert!(level.as_ref().is_none_or(|t| t.page_count() <= limit), "level {} is too big", i + 1);
         }
         assert_eq!(scan(&tree).len(), 2000);
+    }
+
+    #[test]
+    fn universal_keeps_runs_below_the_limit_and_rewrites_less() {
+        // Default ratios (4 level-0 tables, fanout 10, 8 runs) on a small scale.
+        let level = LsmConfig { log_bytes: 2000, compaction: Compaction::Level, level1_pages: 16, ..Default::default() };
+        let universal = LsmConfig { log_bytes: 2000, compaction: Compaction::Universal, ..Default::default() };
+        let mut level = LsmTree::create(pool(), level).unwrap();
+        let mut universal = LsmTree::create(pool(), universal).unwrap();
+        for i in 0..3000u32 {
+            // Scattered keys, so key ranges overlap.
+            let k = i.wrapping_mul(2_654_435_761).to_be_bytes().to_vec();
+            level.put(k.clone(), value(i, 1)).unwrap();
+            universal.put(k, value(i, 1)).unwrap();
+            assert!(universal.level0.len() < 8, "universal merges as soon as there are 8 runs");
+            assert!(universal.levels.is_empty());
+        }
+        assert_eq!(scan(&universal), scan(&level));
+        assert!(
+            universal.pages_written() < level.pages_written(),
+            "universal {} pages, level {} pages",
+            universal.pages_written(),
+            level.pages_written()
+        );
+    }
+
+    #[test]
+    fn universal_full_merge_drops_tombstones() {
+        let mut tree = LsmTree::create(pool(), small_universal()).unwrap();
+        for i in 0..100 {
+            tree.put(key(i), value(i, 1)).unwrap();
+        }
+        for i in 0..100 {
+            tree.delete(key(i)).unwrap();
+        }
+        for i in 1000..1400 {
+            tree.put(key(i), value(i, 1)).unwrap();
+        }
+        let stored: usize = tree.tables().map(|t| t.iter().count()).sum();
+        assert_eq!(scan(&tree).len(), 400);
+        assert!(stored < 500, "most of the 100 tombstones are gone: {stored} entries stored");
+    }
+
+    #[test]
+    fn switching_strategies_keeps_the_data() {
+        let pool = pool();
+        let fill = |tree: &mut LsmTree, from: u32| {
+            for i in from..from + 1000 {
+                tree.put(key(i), value(i, 1)).unwrap();
+            }
+            pool.flush_all().unwrap();
+        };
+
+        let mut tree = LsmTree::create(pool.clone(), small()).unwrap();
+        fill(&mut tree, 0);
+        assert!(!tree.levels.is_empty());
+        let manifest = tree.manifest_page();
+
+        let mut tree = LsmTree::open(pool.clone(), manifest, small_universal()).unwrap();
+        fill(&mut tree, 1000);
+        assert!(tree.levels.is_empty(), "levels became runs");
+
+        let mut tree = LsmTree::open(pool.clone(), manifest, small()).unwrap();
+        fill(&mut tree, 2000);
+        assert!(tree.level0.len() < 3);
+        let keys: Vec<Vec<u8>> = scan(&tree).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, (0..3000).map(key).collect::<Vec<_>>());
     }
 
     #[test]
@@ -528,3 +719,4 @@ mod tests {
         tree.put(key(1), vec![0; max]).unwrap();
     }
 }
+
