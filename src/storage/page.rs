@@ -153,6 +153,16 @@ impl<P: DerefMut<Target = Page>> SlottedPage<P> {
         true
     }
 
+    /// Overwrites a live tuple with one of the same length. Returns false otherwise.
+    pub fn overwrite(&mut self, slot: u16, tuple: &[u8]) -> bool {
+        if self.get(slot).map(<[u8]>::len) != Some(tuple.len()) {
+            return false;
+        }
+        let (offset, len) = self.slot(slot);
+        self.0[offset..offset + len].copy_from_slice(tuple);
+        true
+    }
+
     /// Moves live tuples to the end of the page, squeezing out holes.
     fn compact(&mut self) {
         let mut packed = [0u8; PAGE_USABLE];

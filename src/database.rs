@@ -1,42 +1,37 @@
-//! Public entry point: owns the catalog and persists it to disk.
+//! Public entry point: owns the catalog and the disk it lives on.
 //!
-//! Persistence is deliberately simple: after every change the whole database
-//! is written out as a SQL script (CREATE TABLE + INSERT statements), and
-//! opening a file replays that script.
+//! After every statement that changes data, the catalog is saved and the
+//! file is synced, so a statement that returns successfully is on disk.
+//! Without a WAL, a crash in the middle of a statement may leave it half applied.
 
-use std::fmt::Write as _;
-use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
+use std::sync::Arc;
 
 use crate::ast::Statement;
+use crate::catalog::Catalog;
 use crate::error::Result;
 use crate::executor;
 use crate::parser::parse;
 use crate::result::QueryResult;
-use crate::table::Catalog;
-use crate::types::Value;
+use crate::storage::DiskManager;
 
-#[derive(Default)]
 pub struct Database {
     catalog: Catalog,
-    /// File to persist to; `None` means in-memory only.
-    path: Option<PathBuf>,
 }
 
 impl Database {
+    /// Creates a database that lives only in memory.
     pub fn in_memory() -> Self {
-        Self::default()
+        Self::with_disk(DiskManager::in_memory()).expect("in-memory storage cannot fail")
     }
 
     /// Opens (or creates) a database stored in the given file.
-    pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
-        let path = path.into();
-        let mut db = Self::in_memory();
-        if path.exists() {
-            db.execute(&fs::read_to_string(&path)?)?;
-        }
-        db.path = Some(path);
-        Ok(db)
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::with_disk(DiskManager::open(path)?)
+    }
+
+    fn with_disk(disk: DiskManager) -> Result<Self> {
+        Ok(Database { catalog: Catalog::open(Arc::new(disk))? })
     }
 
     /// Parses and runs every statement in `sql`, stopping at the first error.
@@ -47,44 +42,14 @@ impl Database {
     /// Runs a single parsed statement.
     pub fn run(&mut self, statement: Statement) -> Result<QueryResult> {
         let modifies = !matches!(statement, Statement::Select { .. });
-        let result = executor::execute(&mut self.catalog, statement)?;
+        let result = executor::execute(&mut self.catalog, statement);
         if modifies {
-            self.save()?;
+            self.catalog.save()?;
         }
-        Ok(result)
+        result
     }
 
     pub fn table_names(&self) -> Vec<&str> {
-        self.catalog.keys().map(String::as_str).collect()
-    }
-
-    fn save(&self) -> Result<()> {
-        let Some(path) = &self.path else { return Ok(()) };
-        // Write to a temp file first so a crash never leaves a half-written database.
-        let tmp = path.with_extension("tmp");
-        fs::write(&tmp, self.dump())?;
-        fs::rename(&tmp, path)?;
-        Ok(())
-    }
-
-    /// Serializes the whole database as a SQL script.
-    fn dump(&self) -> String {
-        let mut out = String::new();
-        for table in self.catalog.values() {
-            let columns: Vec<String> = table
-                .columns
-                .iter()
-                .map(|c| {
-                    let pk = if c.primary_key { " PRIMARY KEY" } else { "" };
-                    format!("{} {}{pk}", c.name, c.data_type)
-                })
-                .collect();
-            let _ = writeln!(out, "CREATE TABLE {} ({});", table.name, columns.join(", "));
-            for row in &table.rows {
-                let values: Vec<String> = row.iter().map(Value::to_sql).collect();
-                let _ = writeln!(out, "INSERT INTO {} VALUES ({});", table.name, values.join(", "));
-            }
-        }
-        out
+        self.catalog.table_names()
     }
 }

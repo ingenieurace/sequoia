@@ -94,3 +94,70 @@ fn persists_to_disk() {
     );
     std::fs::remove_file(&path).unwrap();
 }
+
+/// A temp database path that is removed when dropped.
+struct TempDb(std::path::PathBuf);
+
+impl TempDb {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("sequoia-sql-{name}-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        TempDb(path)
+    }
+}
+
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[test]
+fn large_tables_span_pages_and_survive_reopen() {
+    let path = TempDb::new("large");
+    {
+        let mut db = Database::open(&path.0).unwrap();
+        db.execute("CREATE TABLE logs (id INT PRIMARY KEY, msg TEXT)").unwrap();
+        for i in 0..500 {
+            db.execute(&format!("INSERT INTO logs VALUES ({i}, '{}')", "x".repeat(100))).unwrap();
+        }
+        db.execute("DELETE FROM logs WHERE id >= 400").unwrap();
+        db.execute("UPDATE logs SET msg = 'short' WHERE id < 10").unwrap();
+    }
+    let mut db = Database::open(&path.0).unwrap();
+    assert_eq!(query(&mut db, "SELECT id FROM logs").len(), 400);
+    assert_eq!(query(&mut db, "SELECT msg FROM logs WHERE id = 5"), vec![vec![text("short")]]);
+    // Rows keep going to the end of the heap after reopening.
+    db.execute("INSERT INTO logs VALUES (1000, 'new')").unwrap();
+    assert!(db.execute("INSERT INTO logs VALUES (1, 'dup')").is_err());
+}
+
+#[test]
+fn dropped_tables_free_their_pages() {
+    let path = TempDb::new("drop");
+    let mut db = Database::open(&path.0).unwrap();
+    let fill = |db: &mut Database| {
+        db.execute("CREATE TABLE t (body TEXT)").unwrap();
+        for _ in 0..100 {
+            db.execute(&format!("INSERT INTO t VALUES ('{}')", "y".repeat(200))).unwrap();
+        }
+    };
+    fill(&mut db);
+    let size = std::fs::metadata(&path.0).unwrap().len();
+    db.execute("DROP TABLE t").unwrap();
+    fill(&mut db);
+    assert_eq!(std::fs::metadata(&path.0).unwrap().len(), size, "freed pages are reused");
+
+    drop(db);
+    let mut db = Database::open(&path.0).unwrap();
+    assert_eq!(db.table_names(), vec!["t"]);
+    assert_eq!(query(&mut db, "SELECT * FROM t").len(), 100);
+}
+
+#[test]
+fn rows_larger_than_a_page_are_rejected() {
+    let mut db = setup();
+    let huge = "z".repeat(5000);
+    assert!(db.execute(&format!("INSERT INTO users (id, name) VALUES (9, '{huge}')")).is_err());
+    assert_eq!(query(&mut db, "SELECT id FROM users").len(), 3);
+}

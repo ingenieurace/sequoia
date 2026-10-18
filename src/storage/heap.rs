@@ -40,9 +40,14 @@ impl TableHeap {
         Ok(Self { disk, first_page: id, last_page: id })
     }
 
-    /// Opens an existing heap from the page ids recorded in the catalog.
-    pub fn open(disk: Arc<DiskManager>, first_page: PageId, last_page: PageId) -> Self {
-        Self { disk, first_page, last_page }
+    /// Opens an existing heap. `last_page` is a hint: the chain is followed from
+    /// there to the real end, in case pages were appended after it was recorded.
+    pub fn open(disk: Arc<DiskManager>, first_page: PageId, last_page: PageId) -> Result<Self> {
+        let mut heap = Self { disk, first_page, last_page };
+        while let Some(next) = SlottedPage::new(&heap.read(heap.last_page)?).next_page() {
+            heap.last_page = next;
+        }
+        Ok(heap)
     }
 
     pub fn first_page(&self) -> PageId {
@@ -93,6 +98,15 @@ impl TableHeap {
             self.disk.write_page(rid.page_id, &buf)?;
         }
         Ok(deleted)
+    }
+
+    /// Replaces a tuple in place with one of the same length. Touches a single page.
+    pub fn overwrite(&self, rid: RecordId, tuple: &[u8]) -> Result<()> {
+        let mut buf = self.read(rid.page_id)?;
+        if !SlottedPage::new(&mut buf).overwrite(rid.slot, tuple) {
+            return err("cannot overwrite tuple: missing or different length");
+        }
+        self.disk.write_page(rid.page_id, &buf)
     }
 
     /// Iterates over all live tuples, page by page.
@@ -199,6 +213,17 @@ mod tests {
     }
 
     #[test]
+    fn overwrite_requires_same_length() {
+        let mut heap = heap();
+        let rid = heap.insert(b"abc").unwrap();
+        heap.overwrite(rid, b"xyz").unwrap();
+        assert_eq!(heap.get(rid).unwrap(), Some(b"xyz".to_vec()));
+        assert!(heap.overwrite(rid, b"too long").is_err());
+        heap.delete(rid).unwrap();
+        assert!(heap.overwrite(rid, b"abc").is_err(), "deleted");
+    }
+
+    #[test]
     fn rejects_rows_larger_than_a_page() {
         let mut heap = heap();
         assert!(heap.insert(&vec![0; MAX_TUPLE_SIZE + 1]).is_err());
@@ -219,7 +244,11 @@ mod tests {
             (heap.first_page(), heap.last_page())
         };
 
-        let heap = TableHeap::open(Arc::new(DiskManager::open(&path).unwrap()), first, last);
+        let disk = Arc::new(DiskManager::open(&path).unwrap());
+        // A stale last_page hint still finds the real end of the chain.
+        assert_eq!(TableHeap::open(disk.clone(), first, first).unwrap().last_page(), last);
+
+        let heap = TableHeap::open(disk, first, last).unwrap();
         let tuples: Vec<Vec<u8>> = scan_all(&heap).into_iter().map(|(_, t)| t).collect();
         assert_eq!(tuples, (0..50).map(row).collect::<Vec<_>>());
         std::fs::remove_file(&path).unwrap();

@@ -3,6 +3,7 @@
 //! Pipeline: SQL text -> `lexer` -> `parser` (AST) -> `executor` -> `table` storage.
 
 pub mod ast;
+pub mod catalog;
 pub mod database;
 pub mod error;
 pub mod executor;

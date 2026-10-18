@@ -3,30 +3,28 @@
 use crate::ast::{BinaryOp, Expr, OrderBy, Projection, Statement, UnaryOp};
 use crate::error::{Error, Result, err};
 use crate::result::QueryResult;
-use crate::table::{Catalog, Row, Table, column_index};
+use crate::catalog::Catalog;
+use crate::table::{Row, Table, column_index};
 use crate::types::{Column, Value};
 
 pub fn execute(catalog: &mut Catalog, statement: Statement) -> Result<QueryResult> {
     match statement {
         Statement::CreateTable { name, columns } => {
-            if catalog.contains_key(&name) {
-                return err(format!("table already exists: {name}"));
-            }
-            catalog.insert(name.clone(), Table::new(name.clone(), columns)?);
+            catalog.create_table(name.clone(), columns)?;
             Ok(message(format!("table {name} created")))
         }
-        Statement::DropTable { name } => match catalog.remove(&name) {
-            Some(_) => Ok(message(format!("table {name} dropped"))),
-            None => err(format!("unknown table: {name}")),
-        },
-        Statement::Insert { table, columns, rows } => insert(get_mut(catalog, &table)?, columns, rows),
+        Statement::DropTable { name } => {
+            catalog.drop_table(&name)?;
+            Ok(message(format!("table {name} dropped")))
+        }
+        Statement::Insert { table, columns, rows } => insert(catalog.get_mut(&table)?, columns, rows),
         Statement::Select { table, projection, filter, order_by, limit } => {
-            select(get(catalog, &table)?, projection, filter, order_by, limit)
+            select(catalog.get(&table)?, projection, filter, order_by, limit)
         }
         Statement::Update { table, assignments, filter } => {
-            update(get_mut(catalog, &table)?, assignments, filter)
+            update(catalog.get_mut(&table)?, assignments, filter)
         }
-        Statement::Delete { table, filter } => delete(get_mut(catalog, &table)?, filter),
+        Statement::Delete { table, filter } => delete(catalog.get_mut(&table)?, filter),
     }
 }
 
@@ -63,9 +61,10 @@ fn select(
 ) -> Result<QueryResult> {
     let columns = &table.columns;
 
-    let mut rows: Vec<&Row> = Vec::new();
-    for row in &table.rows {
-        if matches(&filter, columns, row)? {
+    let mut rows: Vec<Row> = Vec::new();
+    for item in table.scan() {
+        let (_, row) = item?;
+        if matches(&filter, columns, &row)? {
             rows.push(row);
         }
     }
@@ -75,7 +74,7 @@ fn select(
         let mut keyed = rows
             .into_iter()
             .map(|row| {
-                let keys = order_by.iter().map(|o| eval(&o.expr, columns, row));
+                let keys = order_by.iter().map(|o| eval(&o.expr, columns, &row));
                 Ok((keys.collect::<Result<Vec<_>>>()?, row))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -97,7 +96,7 @@ fn select(
     let (names, rows) = match projection {
         Projection::All => (
             columns.iter().map(|c| c.name.clone()).collect(),
-            rows.into_iter().cloned().collect(),
+            rows,
         ),
         Projection::Exprs(exprs) => {
             let names = exprs
@@ -109,7 +108,7 @@ fn select(
                 .collect();
             let rows = rows
                 .into_iter()
-                .map(|row| exprs.iter().map(|e| eval(e, columns, row)).collect())
+                .map(|row| exprs.iter().map(|e| eval(e, columns, &row)).collect())
                 .collect::<Result<_>>()?;
             (names, rows)
         }
@@ -123,36 +122,37 @@ fn update(table: &mut Table, assignments: Vec<(String, Expr)>, filter: Option<Ex
         .map(|(name, expr)| Ok((table.column_index(&name)?, expr)))
         .collect::<Result<_>>()?;
 
-    // Work on a copy so a failure leaves the table untouched.
-    let mut new_rows = table.rows.clone();
-    let mut count = 0;
-    for row in &mut new_rows {
-        if !matches(&filter, &table.columns, row)? {
+    // Collect every change before writing, so the scan never sees its own updates.
+    let mut changes = Vec::new();
+    for item in table.scan() {
+        let (rid, mut row) = item?;
+        if !matches(&filter, &table.columns, &row)? {
             continue;
         }
         // All right-hand sides see the old row values.
         let values: Vec<Value> =
-            assignments.iter().map(|(_, e)| eval(e, &table.columns, row)).collect::<Result<_>>()?;
+            assignments.iter().map(|(_, e)| eval(e, &table.columns, &row)).collect::<Result<_>>()?;
         for ((i, _), value) in assignments.iter().zip(values) {
             row[*i] = value;
         }
-        count += 1;
+        changes.push((rid, row));
     }
 
-    table.replace(new_rows)?;
+    let count = changes.len();
+    table.update(changes)?;
     Ok(message(format!("{count} row(s) updated")))
 }
 
 fn delete(table: &mut Table, filter: Option<Expr>) -> Result<QueryResult> {
-    let keep: Vec<bool> = table
-        .rows
-        .iter()
-        .map(|row| matches(&filter, &table.columns, row).map(|m| !m))
-        .collect::<Result<_>>()?;
-    let before = table.rows.len();
-    let mut keep = keep.into_iter();
-    table.rows.retain(|_| keep.next().unwrap_or(true));
-    Ok(message(format!("{} row(s) deleted", before - table.rows.len())))
+    let mut rids = Vec::new();
+    for item in table.scan() {
+        let (rid, row) = item?;
+        if matches(&filter, &table.columns, &row)? {
+            rids.push(rid);
+        }
+    }
+    table.delete(&rids)?;
+    Ok(message(format!("{} row(s) deleted", rids.len())))
 }
 
 /// Evaluates a WHERE clause; NULL counts as false.
@@ -238,12 +238,4 @@ fn overflow() -> Error {
 
 fn message(text: String) -> QueryResult {
     QueryResult::Message(text)
-}
-
-fn get<'a>(catalog: &'a Catalog, name: &str) -> Result<&'a Table> {
-    catalog.get(name).ok_or_else(|| Error(format!("unknown table: {name}")))
-}
-
-fn get_mut<'a>(catalog: &'a mut Catalog, name: &str) -> Result<&'a mut Table> {
-    catalog.get_mut(name).ok_or_else(|| Error(format!("unknown table: {name}")))
 }

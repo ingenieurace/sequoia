@@ -1,6 +1,6 @@
 # Sequoia
 
-A minimal relational database written in Rust with zero dependencies.
+A minimal disk-based relational database written in Rust with zero dependencies.
 It is meant to be small and easy to read, not fast.
 
 ## Usage
@@ -36,22 +36,39 @@ Not supported: joins, aggregates, indexes, transactions.
 
 ```
 src/
-  main.rs      interactive shell
-  lib.rs       module list and public exports
-  database.rs  entry point; runs SQL and persists to disk
-  lexer.rs     SQL text -> tokens
-  parser.rs    tokens -> AST (recursive descent)
-  ast.rs       statement and expression types
-  executor.rs  runs statements, evaluates expressions
-  table.rs     table storage and constraint checks
-  types.rs     values, data types, columns
-  result.rs    query results and table printing
-  error.rs     shared error type
-tests/sql.rs   end-to-end tests
+  main.rs       interactive shell
+  lib.rs        module list and public exports
+  database.rs   entry point; runs SQL, saves and syncs after changes
+  lexer.rs      SQL text -> tokens
+  parser.rs     tokens -> AST (recursive descent)
+  ast.rs        statement and expression types
+  executor.rs   runs statements, evaluates expressions
+  catalog.rs    table schemas and where each table's pages live
+  table.rs      a table: schema + heap, constraint checks
+  types.rs      values, data types, columns
+  result.rs     query results and table printing
+  error.rs      shared error type
+  storage/
+    disk.rs     DiskManager: fixed-size pages in one file, free list
+    page.rs     slotted page: many tuples in one page
+    heap.rs     table heap: linked list of pages, RecordId
+    tuple.rs    row <-> bytes (null bitmap + column values)
+tests/sql.rs    end-to-end tests
 ```
 
 ## Storage
 
-Tables live in memory. When a file is given, the whole database is rewritten
-after each change as a plain SQL script (`CREATE TABLE` + `INSERT`), and
-opening the file replays that script. The file is human-readable.
+A database is a single file of 4 KB pages:
+
+- **Page 0** is the file header: magic, format version, page size, page count,
+  free list head, and the root page.
+- **The catalog** is a table heap starting at the root page. Each row holds a
+  table's `CREATE TABLE` statement plus its first and last page.
+- **Each table** is a linked list of slotted pages. A row is identified by its
+  `RecordId` (page, slot) and stored as a null bitmap followed by its columns.
+- **Freed pages** (from `DROP TABLE`) go on a free list and are reused.
+
+Every statement that changes data is synced to disk before it returns. There is
+no buffer pool, WAL, or index yet: every page access is a disk read, a crash in
+the middle of a statement may leave it half applied, and primary key checks scan
+the whole table. A row must fit in one page (about 4 KB).
