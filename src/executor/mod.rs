@@ -1,6 +1,7 @@
 //! Executes parsed statements against the catalog. `sort` orders the rows
-//! of a SELECT.
+//! of a SELECT, and `aggregate` runs the ones with GROUP BY or aggregates.
 
+pub mod aggregate;
 pub mod sort;
 
 use crate::catalog::Catalog;
@@ -51,8 +52,13 @@ pub fn execute(catalog: &mut Catalog, statement: Statement, settings: &Settings)
             Ok(message("checkpoint done".into()))
         }
         Statement::Insert { table, columns, rows } => insert(catalog.get_mut(&table)?, columns, rows),
-        Statement::Select { table, projection, filter, order_by, limit } => {
-            select(catalog.get(&table)?, projection, filter, order_by, limit, settings)
+        Statement::Select { table, projection, filter, group_by, having, order_by, limit } => {
+            let table = catalog.get(&table)?;
+            if aggregate::is_grouped(&projection, &group_by, &having, &order_by) {
+                aggregate::select(table, projection, filter, group_by, having, order_by, limit, settings)
+            } else {
+                select(table, projection, filter, order_by, limit, settings)
+            }
         }
         Statement::Update { table, assignments, filter } => {
             update(catalog.get_mut(&table)?, assignments, filter)
@@ -86,6 +92,7 @@ fn insert(table: &mut Table, columns: Option<Vec<String>>, rows: Vec<Vec<Expr>>)
             return err(format!("expected {} values, got {}", targets.len(), exprs.len()));
         }
         let mut row = vec![Value::Null; table.columns.len()];
+        aggregate::forbid(&exprs, "VALUES")?;
         for (&i, expr) in targets.iter().zip(&exprs) {
             row[i] = eval(expr, &[], &[])?;
         }
@@ -105,6 +112,7 @@ fn select(
     limit: Option<usize>,
     settings: &Settings,
 ) -> Result<QueryResult> {
+    aggregate::forbid(&filter, "WHERE")?;
     let columns = &table.columns;
     let needed = match &projection {
         Projection::All => vec![true; columns.len()],
@@ -167,6 +175,8 @@ fn select(
 }
 
 fn update(table: &mut Table, assignments: Vec<(String, Expr)>, filter: Option<Expr>) -> Result<QueryResult> {
+    aggregate::forbid(&filter, "WHERE")?;
+    aggregate::forbid(assignments.iter().map(|(_, e)| e), "UPDATE")?;
     let assignments: Vec<(usize, Expr)> = assignments
         .into_iter()
         .map(|(name, expr)| Ok((table.column_index(&name)?, expr)))
@@ -194,6 +204,7 @@ fn update(table: &mut Table, assignments: Vec<(String, Expr)>, filter: Option<Ex
 }
 
 fn delete(table: &mut Table, filter: Option<Expr>) -> Result<QueryResult> {
+    aggregate::forbid(&filter, "WHERE")?;
     let mut rids = Vec::new();
     for item in scan(table, &filter::needed_columns(&table.columns, &filter), &filter) {
         let (rid, row) = item?;

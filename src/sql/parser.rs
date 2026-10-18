@@ -1,9 +1,11 @@
 //! Recursive-descent SQL parser.
 //!
+//! A name followed by `(` is an aggregate function call.
+//!
 //! Expression precedence, lowest first:
 //! OR, AND, NOT, comparison / IS NULL, + -, * /, unary -, primary.
 
-use super::ast::{BinaryOp, Expr, OrderBy, Projection, Statement, UnaryOp};
+use super::ast::{Aggregate, BinaryOp, Expr, OrderBy, Projection, Statement, UnaryOp};
 use crate::error::{Error, Result};
 use super::lexer::{Token, tokenize};
 use crate::types::{Column, DataType, StorageKind, Value};
@@ -154,6 +156,16 @@ impl Parser {
         let table = self.ident()?;
         let filter = self.where_clause()?;
 
+        let mut group_by = Vec::new();
+        if self.eat_keyword("GROUP") {
+            self.expect_keyword("BY")?;
+            group_by = self.comma_list(Self::expr)?;
+        }
+        let having = match self.eat_keyword("HAVING") {
+            true => Some(self.expr()?),
+            false => None,
+        };
+
         let mut order_by = Vec::new();
         if self.eat_keyword("ORDER") {
             self.expect_keyword("BY")?;
@@ -171,7 +183,7 @@ impl Parser {
             true => Some(self.number()? as usize),
             false => None,
         };
-        Ok(Statement::Select { table, projection, filter, order_by, limit })
+        Ok(Statement::Select { table, projection, filter, group_by, having, order_by, limit })
     }
 
     fn update(&mut self) -> Result<Statement> {
@@ -293,6 +305,11 @@ impl Parser {
         let expr = match self.peek() {
             Some(Token::Number(n)) => Expr::Literal(Value::Int(*n)),
             Some(Token::Str(s)) => Expr::Literal(Value::Text(s.clone())),
+            Some(Token::Ident(name)) if self.tokens.get(self.pos + 1) == Some(&Token::Symbol("(")) => {
+                let name = name.clone();
+                self.pos += 2;
+                return self.aggregate(&name);
+            }
             Some(Token::Ident(name)) => Expr::Column(name.clone()),
             Some(Token::Keyword(k)) if k == "NULL" => Expr::Literal(Value::Null),
             Some(Token::Keyword(k)) if k == "TRUE" => Expr::Literal(Value::Bool(true)),
@@ -301,6 +318,20 @@ impl Parser {
         };
         self.pos += 1;
         Ok(expr)
+    }
+
+    /// The rest of `name(...)` after its opening parenthesis.
+    fn aggregate(&mut self, name: &str) -> Result<Expr> {
+        let Some(function) = Aggregate::from_name(name) else {
+            return Err(Error(format!("unknown function: {name}")));
+        };
+        let arg = if function == Aggregate::Count && self.eat_symbol("*") {
+            None
+        } else {
+            Some(Box::new(self.expr()?))
+        };
+        self.expect_symbol(")")?;
+        Ok(Expr::Aggregate(function, arg))
     }
 
     // ---- token helpers ----

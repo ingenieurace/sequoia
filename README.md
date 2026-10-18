@@ -33,13 +33,16 @@ Shell commands: `.tables`, `.exit`.
 - Types: `INT`, `TEXT`, `BOOL`, and `NULL`
 - Constraints: `PRIMARY KEY` (unique, not null), unique indexes (NULLs may repeat);
   values are type-checked
-- `SELECT`: `*` or expressions, `WHERE`, `ORDER BY ... ASC|DESC` (any
-  expressions, NULL first, stable), `LIMIT`
+- `SELECT`: `*` or expressions, `WHERE`, `GROUP BY` (expressions), `HAVING`,
+  `ORDER BY ... ASC|DESC` (any expressions, NULL first, stable), `LIMIT`
+- Aggregates: `COUNT(*)`, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`. They skip NULLs;
+  over no values `COUNT` is 0 and the rest NULL. `AVG` truncates toward zero, as
+  there is no fractional type. A selected column must be grouped or aggregated
 - Expressions: `+ - * /`, `= != <> < <= > >=`, `AND OR NOT`, `IS [NOT] NULL`,
   parentheses, with SQL three-valued logic for `NULL`
 
 Every statement is atomic and durable once it returns. Not supported: joins,
-aggregates, multi-column indexes, transactions of several statements.
+`DISTINCT`, multi-column indexes, transactions of several statements.
 
 ## Layout
 
@@ -57,6 +60,7 @@ src/
   executor/       runs statements
     mod.rs        statement execution
     sort.rs       ORDER BY: external merge sort, top-N heap for LIMIT
+    aggregate.rs  GROUP BY, HAVING and aggregates, by hash aggregation
   types.rs        values, data types, columns
   predicate.rs    `column op literal` conditions, shared by the planner and storage
   result.rs       query results and table printing
@@ -178,6 +182,17 @@ page in use is pinned and cannot be evicted; when the pool is full, ARC
 it is dirty. ARC balances recently used against frequently used pages, so a
 full table scan does not push frequently used pages out. LRU-K and CLOCK are
 also available: to switch, edit `REPLACEMENT_POLICY` in `src/storage/buffer/pool.rs`.
+
+**Grouping**: a `SELECT` with `GROUP BY`, `HAVING` or an aggregate is
+answered by hash aggregation. Each expression of its select list, `HAVING`
+and `ORDER BY` is first rewritten to read a group's row: a `GROUP BY`
+expression becomes one column of it and each distinct aggregate another, and
+any column left over is an error, since it is neither grouped nor aggregated.
+The scan then folds each matching row into its group's accumulators, in a
+hash table with one entry per group, held in memory. `HAVING` filters the
+groups, and `ORDER BY` sorts them with the same sorter as other rows. Groups
+come out in the order their first row was read; without `GROUP BY` all rows
+form one group, even when there are none.
 
 **Sorting**: `ORDER BY` buffers rows in memory up to a budget (4 MB by
 default; `Database::set_sort_memory` changes it). Past that, it sorts what it

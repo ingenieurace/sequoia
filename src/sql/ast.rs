@@ -33,6 +33,9 @@ pub enum Statement {
         table: String,
         projection: Projection,
         filter: Option<Expr>,
+        /// `GROUP BY`: empty for none.
+        group_by: Vec<Expr>,
+        having: Option<Expr>,
         order_by: Vec<OrderBy>,
         limit: Option<usize>,
     },
@@ -68,6 +71,42 @@ pub enum Expr {
     Binary(Box<Expr>, BinaryOp, Box<Expr>),
     /// `expr IS NULL`, or `expr IS NOT NULL` when the flag is true.
     IsNull(Box<Expr>, bool),
+    /// An aggregate function over a group of rows; no argument is `COUNT(*)`.
+    Aggregate(Aggregate, Option<Box<Expr>>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Aggregate {
+    Count,
+    Sum,
+    Min,
+    Max,
+    Avg,
+}
+
+impl Aggregate {
+    /// The function with this name, in any case.
+    pub fn from_name(name: &str) -> Option<Aggregate> {
+        Some(match name.to_uppercase().as_str() {
+            "COUNT" => Aggregate::Count,
+            "SUM" => Aggregate::Sum,
+            "MIN" => Aggregate::Min,
+            "MAX" => Aggregate::Max,
+            "AVG" => Aggregate::Avg,
+            _ => return None,
+        })
+    }
+
+    /// The name as a result column, lower-case like PostgreSQL's.
+    pub fn name(self) -> &'static str {
+        match self {
+            Aggregate::Count => "count",
+            Aggregate::Sum => "sum",
+            Aggregate::Min => "min",
+            Aggregate::Max => "max",
+            Aggregate::Avg => "avg",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

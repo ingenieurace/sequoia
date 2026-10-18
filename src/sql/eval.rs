@@ -21,6 +21,8 @@ pub fn eval(expr: &Expr, columns: &[Column], row: &[Value]) -> Result<Value> {
         Expr::Literal(value) => Ok(value.clone()),
         Expr::Column(name) => Ok(row[column_index(columns, name)?].clone()),
         Expr::IsNull(inner, negated) => Ok(Value::Bool(eval(inner, columns, row)?.is_null() != *negated)),
+        // Grouped queries replace aggregates by their results before evaluating.
+        Expr::Aggregate(function, _) => err(format!("{} is not allowed here", function.name().to_uppercase())),
         Expr::Unary(op, inner) => match (op, eval(inner, columns, row)?) {
             (_, Value::Null) => Ok(Value::Null),
             (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),

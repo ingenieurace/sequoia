@@ -14,7 +14,10 @@ pub fn needed_columns<'a>(columns: &[Column], exprs: impl IntoIterator<Item = &'
             Expr::Literal(_) => {}
             // An unknown name is reported when the expression is evaluated.
             Expr::Column(name) => column_index(columns, name).into_iter().for_each(|i| needed[i] = true),
-            Expr::Unary(_, inner) | Expr::IsNull(inner, _) => visit(inner, columns, needed),
+            Expr::Unary(_, inner) | Expr::IsNull(inner, _) | Expr::Aggregate(_, Some(inner)) => {
+                visit(inner, columns, needed)
+            }
+            Expr::Aggregate(_, None) => {}
             Expr::Binary(left, _, right) => {
                 visit(left, columns, needed);
                 visit(right, columns, needed);
@@ -52,6 +55,7 @@ pub fn predicates(table: &Table, filter: &Option<Expr>) -> Vec<Predicate> {
                 Expr::Literal(_) => false,
                 Expr::Column(_) => true,
                 Expr::Unary(_, inner) | Expr::IsNull(inner, _) => reads_columns(inner),
+                Expr::Aggregate(..) => true,
                 Expr::Binary(left, _, right) => reads_columns(left) || reads_columns(right),
             }
         }

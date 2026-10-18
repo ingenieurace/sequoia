@@ -764,3 +764,129 @@ fn limit_without_order_by_stops_reading_rows() {
     // With an order, every row is read, so the error is still reported.
     assert!(db.execute(&format!("{sql} ORDER BY id LIMIT 2")).is_err());
 }
+
+fn setup_people(storage: &str) -> Database {
+    let mut db = Database::in_memory();
+    db.execute(&format!("CREATE TABLE p (id INT PRIMARY KEY, city TEXT, age INT, vip BOOL) USING {storage}")).unwrap();
+    db.execute(
+        "INSERT INTO p VALUES (1, 'oslo', 30, TRUE), (2, 'lima', NULL, FALSE), (3, 'oslo', 21, FALSE),
+         (4, NULL, 40, TRUE), (5, 'lima', 25, NULL), (6, 'oslo', 45, TRUE), (7, NULL, NULL, FALSE)",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn aggregates_over_the_whole_table() {
+    let mut db = setup_people("HEAP");
+    assert_eq!(
+        query(&mut db, "SELECT COUNT(*), COUNT(age), COUNT(city), SUM(age), MIN(age), MAX(age), AVG(age) FROM p"),
+        vec![vec![int(7), int(5), int(5), int(161), int(21), int(45), int(32)]]
+    );
+    // Over no rows there is still one row: COUNT is 0, the others NULL.
+    assert_eq!(
+        query(&mut db, "SELECT COUNT(*), SUM(age), MIN(city), AVG(age) FROM p WHERE id > 100"),
+        vec![vec![int(0), Value::Null, Value::Null, Value::Null]]
+    );
+    assert_eq!(query(&mut db, "SELECT MIN(city), MAX(city), MAX(vip) FROM p"), vec![vec![
+        text("lima"),
+        text("oslo"),
+        Value::Bool(true)
+    ]]);
+    // Expressions over aggregates, and the same aggregate twice.
+    assert_eq!(
+        query(&mut db, "SELECT SUM(age) - MIN(age) * 2, COUNT(*) + COUNT(*) FROM p WHERE vip"),
+        vec![vec![int(115 - 60), int(6)]]
+    );
+    // AVG truncates toward zero, as / does: there is no fractional type.
+    db.execute("CREATE TABLE n (x INT); INSERT INTO n VALUES (-3), (-4), (NULL)").unwrap();
+    assert_eq!(query(&mut db, "SELECT AVG(x), SUM(x) / COUNT(x) FROM n"), vec![vec![int(-3), int(-3)]]);
+}
+
+#[test]
+fn group_by_with_having_order_by_and_limit() {
+    let mut db = setup_people("HEAP");
+    // NULL keys form one group; groups come out in the order they were first seen.
+    assert_eq!(
+        query(&mut db, "SELECT city, COUNT(*), MAX(age) FROM p GROUP BY city"),
+        vec![
+            vec![text("oslo"), int(3), int(45)],
+            vec![text("lima"), int(2), int(25)],
+            vec![Value::Null, int(2), int(40)],
+        ]
+    );
+    assert_eq!(
+        query(&mut db, "SELECT city FROM p GROUP BY city HAVING MIN(age) < 25 OR COUNT(age) = 0 ORDER BY city"),
+        vec![vec![text("oslo")]]
+    );
+    assert_eq!(
+        query(&mut db, "SELECT city, SUM(age) FROM p WHERE age > 0 GROUP BY city ORDER BY SUM(age) DESC LIMIT 2"),
+        vec![vec![text("oslo"), int(96)], vec![Value::Null, int(40)]]
+    );
+    // Grouping by an expression, and using it in the select list and ORDER BY.
+    assert_eq!(
+        query(&mut db, "SELECT age / 10 * 10, COUNT(*) FROM p WHERE age > 0 GROUP BY age / 10 ORDER BY age / 10"),
+        vec![vec![int(20), int(2)], vec![int(30), int(1)], vec![int(40), int(2)]]
+    );
+    assert_eq!(
+        query(&mut db, "SELECT city, vip, COUNT(*) FROM p GROUP BY city, vip HAVING COUNT(*) > 1"),
+        vec![vec![text("oslo"), Value::Bool(true), int(2)]]
+    );
+    // HAVING without GROUP BY makes one group, which it may filter out.
+    assert_eq!(query(&mut db, "SELECT COUNT(*) FROM p HAVING COUNT(*) > 100"), Vec::<Vec<Value>>::new());
+    assert!(query(&mut db, "SELECT city FROM p WHERE id > 100 GROUP BY city").is_empty(), "no rows, no groups");
+    match db.execute("SELECT city, COUNT(*), SUM(age) * 2 FROM p GROUP BY city").unwrap().pop() {
+        Some(QueryResult::Rows { columns, .. }) => assert_eq!(columns, ["city", "count", "?column?"]),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn every_storage_and_access_path_aggregates_alike() {
+    let queries = [
+        "SELECT city, COUNT(*), COUNT(age), SUM(age), MIN(age), MAX(age), AVG(age) FROM p GROUP BY city ORDER BY city",
+        "SELECT vip, MIN(city), MAX(id) FROM p GROUP BY vip ORDER BY vip",
+        "SELECT COUNT(*), SUM(id) FROM p WHERE id >= 3 AND id < 7",
+        "SELECT city, COUNT(*) FROM p WHERE city = 'oslo' GROUP BY city",
+        "SELECT age, COUNT(*) FROM p WHERE age > 22 GROUP BY age ORDER BY COUNT(*) DESC, age LIMIT 3",
+    ];
+    let mut results = Vec::new();
+    for storage in ["HEAP", "LSM", "COLUMN"] {
+        let mut db = setup_people(storage);
+        if storage != "COLUMN" {
+            db.execute("CREATE INDEX p_city ON p (city); CREATE INDEX p_age ON p (age)").unwrap();
+        }
+        results.push(queries.iter().map(|sql| query(&mut db, sql)).collect::<Vec<_>>());
+    }
+    assert_eq!(results[0], results[1], "heap and LSM");
+    assert_eq!(results[0], results[2], "heap and column");
+}
+
+#[test]
+fn misplaced_aggregates_and_ungrouped_columns_are_rejected() {
+    let mut db = setup_people("HEAP");
+    let errors = [
+        ("SELECT * FROM p GROUP BY city", "SELECT *"),
+        ("SELECT age FROM p GROUP BY city", "column age must appear in GROUP BY"),
+        ("SELECT COUNT(*), age FROM p", "column age must appear in GROUP BY"),
+        ("SELECT city FROM p GROUP BY city ORDER BY age", "column age must appear in GROUP BY"),
+        ("SELECT COUNT(SUM(age)) FROM p", "cannot be nested"),
+        ("SELECT city FROM p WHERE COUNT(*) > 1", "not allowed in WHERE"),
+        ("SELECT COUNT(*) FROM p GROUP BY COUNT(*)", "not allowed in GROUP BY"),
+        ("UPDATE p SET age = MAX(age)", "not allowed in UPDATE"),
+        ("DELETE FROM p WHERE age = MIN(age)", "not allowed in WHERE"),
+        ("INSERT INTO p (id) VALUES (COUNT(*))", "not allowed in VALUES"),
+        ("SELECT SUM(city) FROM p", "SUM expects INT"),
+        ("SELECT AVG(vip) FROM p", "AVG expects INT"),
+        ("SELECT MEDIAN(age) FROM p", "unknown function: MEDIAN"),
+        ("SELECT COUNT(*) FROM p GROUP BY nope", "unknown column: nope"),
+        ("SELECT nope FROM p GROUP BY city", "unknown column: nope"),
+    ];
+    for (sql, expected) in errors {
+        let e = db.execute(sql).expect_err(sql);
+        assert!(e.0.contains(expected), "{sql}: {e}");
+    }
+    db.execute(&format!("INSERT INTO p VALUES (8, 'x', {}, TRUE), (9, 'x', 1, TRUE)", i64::MAX)).unwrap();
+    assert!(db.execute("SELECT SUM(age) FROM p WHERE city = 'x'").unwrap_err().0.contains("overflow"));
+    assert_eq!(query(&mut db, "SELECT AVG(age) FROM p WHERE city = 'x'"), vec![vec![int(i64::MAX / 2 + 1)]]);
+}
