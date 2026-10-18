@@ -30,7 +30,7 @@ pub enum Statement {
         rows: Vec<Vec<Expr>>,
     },
     Select {
-        table: String,
+        from: From,
         projection: Projection,
         filter: Option<Expr>,
         /// `GROUP BY`: empty for none.
@@ -50,6 +50,66 @@ pub enum Statement {
     },
 }
 
+/// `FROM t1 [JOIN t2 ON ...]...`: a table, then the tables joined to it in order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct From {
+    pub table: TableRef,
+    pub joins: Vec<Join>,
+}
+
+/// A table in FROM, and the name it goes by there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableRef {
+    pub name: String,
+    pub alias: Option<String>,
+}
+
+impl TableRef {
+    /// What its columns are qualified by: the alias, or else the table's name.
+    pub fn qualifier(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.name)
+    }
+}
+
+/// `[INNER | LEFT] JOIN table ON condition`; `CROSS JOIN` and `,` have no condition.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Join {
+    pub kind: JoinKind,
+    pub table: TableRef,
+    pub on: Option<Expr>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    /// Pairs of rows the condition holds for.
+    Inner,
+    /// Those, plus each left row no right row matches, with NULLs for the right columns.
+    Left,
+}
+
+/// A column, `name` or `table.name`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ColumnRef {
+    pub table: Option<String>,
+    pub name: String,
+}
+
+impl ColumnRef {
+    /// A column referred to by name alone.
+    pub fn bare(name: impl Into<String>) -> Self {
+        ColumnRef { table: None, name: name.into() }
+    }
+}
+
+impl std::fmt::Display for ColumnRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match &self.table {
+            Some(table) => write!(f, "{table}.{}", self.name),
+            None => f.write_str(&self.name),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Projection {
     /// `SELECT *`
@@ -66,7 +126,7 @@ pub struct OrderBy {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Literal(Value),
-    Column(String),
+    Column(ColumnRef),
     Unary(UnaryOp, Box<Expr>),
     Binary(Box<Expr>, BinaryOp, Box<Expr>),
     /// `expr IS NULL`, or `expr IS NOT NULL` when the flag is true.
@@ -141,7 +201,7 @@ impl std::fmt::Display for Expr {
         };
         match self {
             Expr::Literal(value) => f.write_str(&value.to_sql()),
-            Expr::Column(name) => f.write_str(name),
+            Expr::Column(column) => write!(f, "{column}"),
             Expr::Unary(UnaryOp::Not, inner) => write!(f, "NOT {}", operand(inner)),
             Expr::Unary(UnaryOp::Neg, inner) => write!(f, "-{}", operand(inner)),
             Expr::Binary(left, op, right) => write!(f, "{} {} {}", operand(left), op.symbol(), operand(right)),

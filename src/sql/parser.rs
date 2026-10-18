@@ -5,7 +5,9 @@
 //! Expression precedence, lowest first:
 //! OR, AND, NOT, comparison / IS NULL, + -, * /, unary -, primary.
 
-use super::ast::{Aggregate, BinaryOp, Expr, OrderBy, Projection, Statement, UnaryOp};
+use super::ast::{
+    Aggregate, BinaryOp, ColumnRef, Expr, From, Join, JoinKind, OrderBy, Projection, Statement, TableRef, UnaryOp,
+};
 use crate::error::{Error, Result};
 use super::lexer::{Token, tokenize};
 use crate::types::{Column, DataType, StorageKind, Value};
@@ -153,7 +155,7 @@ impl Parser {
             Projection::Exprs(self.comma_list(Self::expr)?)
         };
         self.expect_keyword("FROM")?;
-        let table = self.ident()?;
+        let from = self.from()?;
         let filter = self.where_clause()?;
 
         let mut group_by = Vec::new();
@@ -183,7 +185,47 @@ impl Parser {
             true => Some(self.number()? as usize),
             false => None,
         };
-        Ok(Statement::Select { table, projection, filter, group_by, having, order_by, limit })
+        Ok(Statement::Select { from, projection, filter, group_by, having, order_by, limit })
+    }
+
+    /// `table [, table | [INNER | LEFT [OUTER] | CROSS] JOIN table [ON expr]]...`
+    fn from(&mut self) -> Result<From> {
+        let table = self.table_ref()?;
+        let mut joins = Vec::new();
+        loop {
+            let kind = if self.eat_symbol(",") {
+                joins.push(Join { kind: JoinKind::Inner, table: self.table_ref()?, on: None });
+                continue;
+            } else if self.eat_keyword("CROSS") {
+                self.expect_keyword("JOIN")?;
+                joins.push(Join { kind: JoinKind::Inner, table: self.table_ref()?, on: None });
+                continue;
+            } else if self.eat_keyword("LEFT") {
+                self.eat_keyword("OUTER");
+                self.expect_keyword("JOIN")?;
+                JoinKind::Left
+            } else if self.eat_keyword("INNER") {
+                self.expect_keyword("JOIN")?;
+                JoinKind::Inner
+            } else if self.eat_keyword("JOIN") {
+                JoinKind::Inner
+            } else {
+                return Ok(From { table, joins });
+            };
+            let table = self.table_ref()?;
+            self.expect_keyword("ON")?;
+            joins.push(Join { kind, table, on: Some(self.expr()?) });
+        }
+    }
+
+    /// `name [[AS] alias]`
+    fn table_ref(&mut self) -> Result<TableRef> {
+        let name = self.ident()?;
+        let alias = match (self.eat_keyword("AS"), self.peek()) {
+            (true, _) | (false, Some(Token::Ident(_))) => Some(self.ident()?),
+            _ => None,
+        };
+        Ok(TableRef { name, alias })
     }
 
     fn update(&mut self) -> Result<Statement> {
@@ -310,7 +352,12 @@ impl Parser {
                 self.pos += 2;
                 return self.aggregate(&name);
             }
-            Some(Token::Ident(name)) => Expr::Column(name.clone()),
+            Some(Token::Ident(table)) if self.tokens.get(self.pos + 1) == Some(&Token::Symbol(".")) => {
+                let table = table.clone();
+                self.pos += 2;
+                return Ok(Expr::Column(ColumnRef { table: Some(table), name: self.ident()? }));
+            }
+            Some(Token::Ident(name)) => Expr::Column(ColumnRef::bare(name.clone())),
             Some(Token::Keyword(k)) if k == "NULL" => Expr::Literal(Value::Null),
             Some(Token::Keyword(k)) if k == "TRUE" => Expr::Literal(Value::Bool(true)),
             Some(Token::Keyword(k)) if k == "FALSE" => Expr::Literal(Value::Bool(false)),

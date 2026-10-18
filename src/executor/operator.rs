@@ -4,15 +4,19 @@
 //! A scan, filter, limit and projection hand rows on one at a time, so a
 //! `LIMIT` stops the scan once it has enough, and a query's rows can be read
 //! without holding them all. A sort and an aggregate are blocking: they read
-//! all of their input when their first row is asked for.
+//! all of their input when their first row is asked for. So is the right side
+//! of a hash or nested loop join (see `join.rs`); the left side streams.
+
+use std::collections::HashMap;
 
 use super::Settings;
 use super::aggregate;
+use super::join::{Join, Lookup, Right};
 use super::sort::Sorter;
 use crate::catalog::table::Row;
 use crate::error::Result;
-use crate::plan::query::Node;
-use crate::sql::eval::{eval, matches};
+use crate::plan::query::{JoinMethod, Node};
+use crate::sql::eval::{Field, eval, matches};
 
 /// Rows produced by an operator, or the error that stopped it.
 pub type Rows<'a> = Box<dyn Iterator<Item = Result<Row>> + 'a>;
@@ -20,8 +24,37 @@ pub type Rows<'a> = Box<dyn Iterator<Item = Result<Row>> + 'a>;
 /// Opens a plan step and everything below it. No row is read until asked for.
 pub fn open<'a>(node: Node<'a>, settings: &Settings) -> Rows<'a> {
     match node {
-        Node::Scan { table, needed, predicates, access } => {
+        Node::Scan { table, needed, predicates, access, .. } => {
             Box::new(table.scan_filtered(&needed, &predicates, &access).map(|item| item.map(|(_, row)| row)))
+        }
+        Node::Lookup { .. } => unreachable!("a lookup is only an index join's right side"),
+        Node::Join { left, right, kind, method, condition } => {
+            let (left_fields, right_fields) = (left.columns(), right.columns());
+            let left = open(*left, settings);
+            let right = match method {
+                JoinMethod::NestedLoop => Right::Loop { source: Some(open(*right, settings)), rows: Vec::new() },
+                JoinMethod::Hash { left_keys, right_keys } => Right::Hash {
+                    source: Some(open(*right, settings)),
+                    rows: Vec::new(),
+                    buckets: HashMap::new(),
+                    left_keys,
+                    right_keys,
+                    right_fields: right_fields.clone(),
+                },
+                JoinMethod::Index => {
+                    let (filter, lookup) = match *right {
+                        Node::Filter { input, predicate } => (Some(predicate), *input),
+                        node => (None, node),
+                    };
+                    let Node::Lookup { table, qualifier, needed, column, key, left_key } = lookup else {
+                        unreachable!("an index join reads its right side through a lookup");
+                    };
+                    let fields = Field::of_table(&qualifier, &table.columns);
+                    let lookup = Lookup { table, needed, column, key, left_key, filter, fields };
+                    Right::Index { lookup, rows: Vec::new() }
+                }
+            };
+            Box::new(Join::new(left, left_fields, right, right_fields, kind, condition))
         }
         Node::Filter { input, predicate } => {
             let columns = input.columns();

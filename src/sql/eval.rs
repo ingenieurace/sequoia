@@ -2,34 +2,68 @@
 //! three-valued logic for NULL.
 
 use crate::error::{Error, Result, err};
-use crate::sql::ast::{BinaryOp, Expr, UnaryOp};
-use crate::types::{Column, Value, column_index};
+use crate::sql::ast::{BinaryOp, ColumnRef, Expr, UnaryOp};
+use crate::types::{Column, Value};
+
+/// A column of the rows an expression is evaluated on: its name, and the
+/// table it comes from, if any, which `table.name` refers to it by.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Field {
+    pub table: Option<String>,
+    pub name: String,
+}
+
+impl Field {
+    /// The fields of a table's rows, qualified by `qualifier` (its name or alias).
+    pub fn of_table(qualifier: &str, columns: &[Column]) -> Vec<Field> {
+        columns.iter().map(|c| Field { table: Some(qualifier.into()), name: c.name.clone() }).collect()
+    }
+
+    /// A field that only its name refers to.
+    pub fn named(name: impl Into<String>) -> Field {
+        Field { table: None, name: name.into() }
+    }
+}
+
+/// Finds the field a column reference names: the one with its name, and
+/// from its table if it names one. Fails if there is none, or more than one.
+pub fn resolve(fields: &[Field], column: &ColumnRef) -> Result<usize> {
+    let mut found = fields
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.name == column.name && (column.table.is_none() || f.table == column.table));
+    match (found.next(), found.next()) {
+        (Some((i, _)), None) => Ok(i),
+        (None, _) => err(format!("unknown column: {column}")),
+        (Some(_), Some(_)) => err(format!("column reference {column} is ambiguous")),
+    }
+}
 
 /// Evaluates a WHERE clause; NULL counts as false.
-pub fn matches(filter: &Option<Expr>, columns: &[Column], row: &[Value]) -> Result<bool> {
+pub fn matches(filter: &Option<Expr>, fields: &[Field], row: &[Value]) -> Result<bool> {
     let Some(expr) = filter else { return Ok(true) };
-    match eval(expr, columns, row)? {
+    match eval(expr, fields, row)? {
         Value::Bool(b) => Ok(b),
         Value::Null => Ok(false),
         other => err(format!("WHERE clause must be boolean, got {}", other.to_sql())),
     }
 }
 
-/// Evaluates an expression against one row.
-pub fn eval(expr: &Expr, columns: &[Column], row: &[Value]) -> Result<Value> {
+/// Evaluates an expression against one row, whose columns are `fields`.
+pub fn eval(expr: &Expr, fields: &[Field], row: &[Value]) -> Result<Value> {
     match expr {
         Expr::Literal(value) => Ok(value.clone()),
-        Expr::Column(name) => Ok(row[column_index(columns, name)?].clone()),
-        Expr::IsNull(inner, negated) => Ok(Value::Bool(eval(inner, columns, row)?.is_null() != *negated)),
+        Expr::Column(column) => Ok(row[resolve(fields, column)?].clone()),
+        Expr::IsNull(inner, negated) => Ok(Value::Bool(eval(inner, fields, row)?.is_null() != *negated)),
         // Grouped queries replace aggregates by their results before evaluating.
         Expr::Aggregate(function, _) => err(format!("{} is not allowed here", function.name().to_uppercase())),
-        Expr::Unary(op, inner) => match (op, eval(inner, columns, row)?) {
+        Expr::Unary(op, inner) => match (op, eval(inner, fields, row)?) {
             (_, Value::Null) => Ok(Value::Null),
             (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
             (UnaryOp::Neg, Value::Int(n)) => n.checked_neg().map(Value::Int).ok_or_else(overflow),
             (op, value) => err(format!("cannot apply {op:?} to {}", value.to_sql())),
         },
-        Expr::Binary(left, op, right) => binary(eval(left, columns, row)?, *op, eval(right, columns, row)?),
+        Expr::Binary(left, op, right) => binary(eval(left, fields, row)?, *op, eval(right, fields, row)?),
     }
 }
 

@@ -33,6 +33,9 @@ Shell commands: `.tables`, `.exit`.
 - Types: `INT`, `TEXT`, `BOOL`, and `NULL`
 - Constraints: `PRIMARY KEY` (unique, not null), unique indexes (NULLs may repeat);
   values are type-checked
+- `FROM`: one table, or several joined: `[INNER] JOIN ... ON`, `LEFT [OUTER]
+  JOIN ... ON`, `CROSS JOIN` or commas, with aliases (`users u`, `users AS u`)
+  and qualified columns (`u.id`)
 - `SELECT`: `*` or expressions, `WHERE`, `GROUP BY` (expressions), `HAVING`,
   `ORDER BY ... ASC|DESC` (any expressions, NULL first, stable), `LIMIT`
 - Aggregates: `COUNT(*)`, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`. They skip NULLs;
@@ -41,8 +44,9 @@ Shell commands: `.tables`, `.exit`.
 - Expressions: `+ - * /`, `= != <> < <= > >=`, `AND OR NOT`, `IS [NOT] NULL`,
   parentheses, with SQL three-valued logic for `NULL`
 
-Every statement is atomic and durable once it returns. Not supported: joins,
-`DISTINCT`, multi-column indexes, transactions of several statements.
+Every statement is atomic and durable once it returns. Not supported:
+`RIGHT` and `FULL` joins, subqueries, `DISTINCT`, multi-column indexes,
+transactions of several statements.
 
 ## Layout
 
@@ -60,6 +64,7 @@ src/
   executor/       runs statements
     mod.rs        statement execution; a SELECT's rows as a stream (`Database::query`)
     operator.rs   each plan step as an iterator pulling rows from the one below
+    join.rs       nested loop, hash and index joins; LEFT JOIN padding
     sort.rs       ORDER BY: external merge sort, top-N heap for LIMIT
     aggregate.rs  hash aggregation: one row per group, and the aggregate functions
   types.rs        values, data types, columns
@@ -74,7 +79,7 @@ src/
   plan/           how to read a table
     filter.rs     WHERE -> pushed-down predicates; the columns a statement reads
     access.rs     picks a full scan, an index or a key lookup
-    query.rs      a SELECT as a tree of steps: scan, filter, aggregate, sort, limit, project
+    query.rs      a SELECT as a tree of steps: binds names, pushes filters down, picks joins
   catalog/        tables and indexes
     mod.rs        Catalog: table and index schemas and where their pages live
     table.rs      a table: schema + storage + indexes, constraint checks
@@ -205,6 +210,24 @@ Scans, filters, limits and projections hand rows on one at a time, so a
 `Database::query` returns a `SELECT`'s rows as they are made instead of
 collecting them (`execute` collects them). Sorts and aggregates need all of
 their input before their first row.
+
+**Joins**: the tables of `FROM` are joined left to right. Every column
+reference is first bound to its table; an unqualified name that several
+tables have is an error. `WHERE`, and the `ON` of inner joins, are split at
+their `AND`s: a condition on one table is pushed down to that table's scan,
+where it may pick an index, and one on several tables goes to the join that
+brings in the last of them. A `LEFT JOIN` keeps every left row, so only the
+parts of its `ON` about the right table alone are pushed down, and `WHERE`
+conditions on its right table are checked after it, on the NULL-padded rows
+too. Each join then finds the right rows that may match a left row from its
+equalities `left = right column`: an **index join** looks them up in an
+index of the right table on that column (or an LSM primary key), once per
+left row; failing that, a **hash join** reads the right table once into a
+hash table keyed by the equalities; failing that, a **nested loop join**
+reads it once and tries every pair. The rest of the condition is checked on
+each pair. Keys are compared as values, so a NULL key matches nothing, and
+neither do keys of different types, where `=` would report an error. The
+right side of a hash or nested loop join is held in memory.
 
 **Grouping**: a `SELECT` with `GROUP BY`, `HAVING` or an aggregate gets an
 aggregate step, which works by hash aggregation. Each expression of its

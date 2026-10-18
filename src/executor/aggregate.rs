@@ -18,12 +18,12 @@ use crate::catalog::table::Row;
 use crate::error::{Error, Result, err};
 use crate::plan::query::AggregateCall;
 use crate::sql::ast::{Aggregate, Expr};
-use crate::sql::eval::eval;
-use crate::types::{Column, Value};
+use crate::sql::eval::{Field, eval};
+use crate::types::Value;
 
 /// Reads every row of `input` (whose columns are `columns`) and returns one
 /// row per group: its `group_by` values, then the result of each aggregate.
-pub fn fold(input: Rows, columns: &[Column], group_by: &[Expr], aggregates: &[AggregateCall]) -> Result<Vec<Row>> {
+pub fn fold(input: Rows, columns: &[Field], group_by: &[Expr], aggregates: &[AggregateCall]) -> Result<Vec<Row>> {
     let fresh = || aggregates.iter().map(|(function, _)| Accumulator::new(*function)).collect::<Vec<_>>();
     let mut groups: Vec<(Row, Vec<Accumulator>)> = Vec::new();
     let mut index: HashMap<Row, usize> = HashMap::new();

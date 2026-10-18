@@ -3,30 +3,44 @@
 
 use crate::catalog::table::Table;
 use crate::predicate::{Compare, Predicate};
-use crate::sql::ast::{BinaryOp, Expr};
+use crate::sql::ast::{BinaryOp, ColumnRef, Expr};
 use crate::sql::eval::eval;
-use crate::types::{Column, Value, column_index};
+use crate::types::Value;
 
-/// Marks the columns the expressions use, so that a scan may skip the others.
-pub fn needed_columns<'a>(columns: &[Column], exprs: impl IntoIterator<Item = &'a Expr>) -> Vec<bool> {
-    fn visit(expr: &Expr, columns: &[Column], needed: &mut [bool]) {
-        match expr {
-            Expr::Literal(_) => {}
+/// Marks the columns of `table`, which goes by `qualifier`, that the
+/// expressions use, so that a scan may skip the others.
+pub fn needed_columns<'a>(table: &Table, qualifier: &str, exprs: impl IntoIterator<Item = &'a Expr>) -> Vec<bool> {
+    let mut needed = vec![false; table.columns.len()];
+    for expr in exprs {
+        visit_columns(expr, &mut |column| {
             // An unknown name is reported when the expression is evaluated.
-            Expr::Column(name) => column_index(columns, name).into_iter().for_each(|i| needed[i] = true),
-            Expr::Unary(_, inner) | Expr::IsNull(inner, _) | Expr::Aggregate(_, Some(inner)) => {
-                visit(inner, columns, needed)
+            if let Some(i) = own_column(table, qualifier, column) {
+                needed[i] = true;
             }
-            Expr::Aggregate(_, None) => {}
-            Expr::Binary(left, _, right) => {
-                visit(left, columns, needed);
-                visit(right, columns, needed);
-            }
+        });
+    }
+    needed
+}
+
+/// Calls `f` on every column reference in the expression.
+pub fn visit_columns(expr: &Expr, f: &mut impl FnMut(&ColumnRef)) {
+    match expr {
+        Expr::Literal(_) | Expr::Aggregate(_, None) => {}
+        Expr::Column(column) => f(column),
+        Expr::Unary(_, inner) | Expr::IsNull(inner, _) | Expr::Aggregate(_, Some(inner)) => visit_columns(inner, f),
+        Expr::Binary(left, _, right) => {
+            visit_columns(left, f);
+            visit_columns(right, f);
         }
     }
-    let mut needed = vec![false; columns.len()];
-    exprs.into_iter().for_each(|expr| visit(expr, columns, &mut needed));
-    needed
+}
+
+/// The index of the column of `table`, which goes by `qualifier`, that a reference names, if it names one.
+fn own_column(table: &Table, qualifier: &str, column: &ColumnRef) -> Option<usize> {
+    match &column.table {
+        Some(t) if t != qualifier => None,
+        _ => table.column_index(&column.name).ok(),
+    }
 }
 
 /// Pulls the conjuncts `column op literal` (or `literal op column`) out of a
@@ -38,7 +52,7 @@ pub fn needed_columns<'a>(columns: &[Column], exprs: impl IntoIterator<Item = &'
 /// which matches nothing or reports the error. As in any database that
 /// reorders predicates, the rest of the clause is then never evaluated on the
 /// skipped rows, so an error it would raise only there (`1 / 0`) is not raised.
-pub fn predicates(table: &Table, filter: &Option<Expr>) -> Vec<Predicate> {
+pub fn predicates(table: &Table, qualifier: &str, filter: &Option<Expr>) -> Vec<Predicate> {
     fn conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
         match expr {
             Expr::Binary(left, BinaryOp::And, right) => {
@@ -78,12 +92,12 @@ pub fn predicates(table: &Table, filter: &Option<Expr>) -> Vec<Predicate> {
                 BinaryOp::GtEq => Compare::GtEq,
                 _ => return None,
             };
-            let (name, literal, op) = match (&**left, &**right) {
-                (Expr::Column(name), other) => (name, constant(other)?, op),
-                (other, Expr::Column(name)) => (name, constant(other)?, op.flip()),
+            let (column, literal, op) = match (&**left, &**right) {
+                (Expr::Column(column), other) => (column, constant(other)?, op),
+                (other, Expr::Column(column)) => (column, constant(other)?, op.flip()),
                 _ => return None,
             };
-            let column = table.column_index(name).ok()?;
+            let column = own_column(table, qualifier, column)?;
             (!literal.is_null() && literal.fits(table.columns[column].data_type))
                 .then_some(Predicate { column, op, literal })
         })

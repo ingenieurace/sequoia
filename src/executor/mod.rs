@@ -3,6 +3,7 @@
 //! groups them.
 
 pub mod aggregate;
+pub mod join;
 pub mod operator;
 pub mod sort;
 
@@ -13,7 +14,7 @@ use crate::plan::query::{self, forbid};
 use crate::plan::{access, filter};
 use crate::result::QueryResult;
 use crate::sql::ast::{Expr, Statement};
-use crate::sql::eval::{eval, matches};
+use crate::sql::eval::{Field, eval, matches};
 use crate::types::Value;
 use operator::Rows;
 use sort::SORT_MEMORY;
@@ -89,10 +90,12 @@ pub fn select<'a>(catalog: &'a Catalog, statement: Statement, settings: &Setting
 }
 
 fn plan_select(catalog: &Catalog, statement: Statement) -> Result<query::Plan<'_>> {
-    let Statement::Select { table, projection, filter, group_by, having, order_by, limit } = statement else {
+    let Statement::Select { from, projection, filter, group_by, having, order_by, limit } = statement else {
         return err("expected a SELECT");
     };
-    query::select(catalog.get(&table)?, projection, filter, group_by, having, order_by, limit)
+    let names = std::iter::once(&from.table).chain(from.joins.iter().map(|j| &j.table));
+    let tables = names.map(|t| catalog.get(&t.name)).collect::<Result<Vec<_>>>()?;
+    query::select(tables, from, projection, filter, group_by, having, order_by, limit)
 }
 
 /// Describes how a statement would run: its plan, one step per line, the
@@ -102,7 +105,7 @@ fn explain(catalog: &Catalog, statement: Statement) -> Result<QueryResult> {
         statement @ Statement::Select { .. } => plan_select(catalog, statement)?.root,
         Statement::Update { table, filter, .. } | Statement::Delete { table, filter } => {
             let table = catalog.get(&table)?;
-            query::scan(table, &filter, vec![true; table.columns.len()])
+            query::scan(table, &table.name, &filter, vec![true; table.columns.len()])
         }
         _ => return err("EXPLAIN supports only SELECT, UPDATE and DELETE"),
     };
@@ -143,15 +146,15 @@ fn update(table: &mut Table, assignments: Vec<(String, Expr)>, filter: Option<Ex
         .collect::<Result<_>>()?;
 
     // Collect every change before writing, so the scan never sees its own updates.
+    let fields = Field::of_table(&table.name, &table.columns);
     let mut changes = Vec::new();
     for item in scan(table, &vec![true; table.columns.len()], &filter) {
         let (rid, mut row) = item?;
-        if !matches(&filter, &table.columns, &row)? {
+        if !matches(&filter, &fields, &row)? {
             continue;
         }
         // All right-hand sides see the old row values.
-        let values: Vec<Value> =
-            assignments.iter().map(|(_, e)| eval(e, &table.columns, &row)).collect::<Result<_>>()?;
+        let values: Vec<Value> = assignments.iter().map(|(_, e)| eval(e, &fields, &row)).collect::<Result<_>>()?;
         for ((i, _), value) in assignments.iter().zip(values) {
             row[*i] = value;
         }
@@ -165,10 +168,11 @@ fn update(table: &mut Table, assignments: Vec<(String, Expr)>, filter: Option<Ex
 
 fn delete(table: &mut Table, filter: Option<Expr>) -> Result<QueryResult> {
     forbid(&filter, "WHERE")?;
+    let fields = Field::of_table(&table.name, &table.columns);
     let mut rids = Vec::new();
-    for item in scan(table, &filter::needed_columns(&table.columns, &filter), &filter) {
+    for item in scan(table, &filter::needed_columns(table, &table.name, &filter), &filter) {
         let (rid, row) = item?;
-        if matches(&filter, &table.columns, &row)? {
+        if matches(&filter, &fields, &row)? {
             rids.push(rid);
         }
     }
@@ -182,7 +186,7 @@ fn scan<'a>(
     needed: &[bool],
     filter: &Option<Expr>,
 ) -> Box<dyn Iterator<Item = Result<(RowId, Row)>> + 'a> {
-    let predicates = filter::predicates(table, filter);
+    let predicates = filter::predicates(table, &table.name, filter);
     let access = access::choose(table, &predicates);
     table.scan_filtered(needed, &predicates, &access)
 }

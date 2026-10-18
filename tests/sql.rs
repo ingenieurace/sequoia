@@ -948,3 +948,204 @@ fn query_streams_rows_as_they_are_produced() {
     let streamed: Vec<Vec<Value>> = db.query(sql).unwrap().map(|row| row.unwrap()).collect();
     assert_eq!(streamed, query(&mut db, sql));
 }
+
+fn setup_shop() -> Database {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, city TEXT);
+         CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, total INT);
+         CREATE INDEX orders_user ON orders (user_id);
+         INSERT INTO users VALUES (1, 'ann', 'oslo'), (2, 'bo', 'lima'), (3, 'cy', 'oslo');
+         INSERT INTO orders VALUES (10, 1, 5), (11, 1, 7), (12, 2, 3), (13, NULL, 9), (14, 99, 1);",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn inner_and_left_joins() {
+    let mut db = setup_shop();
+    let mut pairs = |sql: &str| {
+        let rows = query(&mut db, sql);
+        rows.into_iter().map(|r| (r[0].clone(), r[1].clone())).collect::<Vec<_>>()
+    };
+    let join = "FROM users u LEFT JOIN orders o ON o.user_id = u.id";
+    assert_eq!(
+        pairs("SELECT u.name, o.id FROM users u JOIN orders o ON o.user_id = u.id ORDER BY o.id"),
+        [(text("ann"), int(10)), (text("ann"), int(11)), (text("bo"), int(12))]
+    );
+    // Every user, with NULLs where there is no order.
+    assert_eq!(
+        pairs(&format!("SELECT u.name, o.id {join} ORDER BY u.id, o.id")),
+        [(text("ann"), int(10)), (text("ann"), int(11)), (text("bo"), int(12)), (text("cy"), Value::Null)]
+    );
+    // Every order; NULL and dangling user ids match no user.
+    assert_eq!(
+        pairs("SELECT o.id, u.name FROM orders o LEFT OUTER JOIN users u ON u.id = o.user_id ORDER BY o.id"),
+        [
+            (int(10), text("ann")),
+            (int(11), text("ann")),
+            (int(12), text("bo")),
+            (int(13), Value::Null),
+            (int(14), Value::Null)
+        ]
+    );
+    // ON filters which rows match; WHERE filters the result, padded rows included.
+    assert_eq!(
+        pairs(&format!("SELECT u.name, o.id {join} AND o.total > 6 ORDER BY u.id")),
+        [(text("ann"), int(11)), (text("bo"), Value::Null), (text("cy"), Value::Null)]
+    );
+    assert_eq!(
+        pairs(&format!("SELECT u.name, o.id {join} WHERE o.id IS NULL")),
+        [(text("cy"), Value::Null)],
+        "users without orders"
+    );
+    // Commas and CROSS JOIN pair every row, and WHERE can join them.
+    assert_eq!(pairs("SELECT COUNT(*), 0 FROM users, orders"), [(int(15), int(0))]);
+    let sql = "SELECT COUNT(*), 0 FROM users CROSS JOIN orders WHERE orders.user_id = users.id";
+    assert_eq!(pairs(sql), [(int(3), int(0))]);
+    // Without aliases, tables qualify their own columns; unambiguous names need no table.
+    assert_eq!(
+        pairs("SELECT name, total FROM users INNER JOIN orders ON user_id = users.id WHERE total < 6 ORDER BY total"),
+        [(text("bo"), int(3)), (text("ann"), int(5))]
+    );
+    // SELECT * gives every column of every table, in FROM order.
+    match db.execute("SELECT * FROM users u JOIN orders o ON o.user_id = u.id WHERE o.id = 12").unwrap().pop() {
+        Some(QueryResult::Rows { columns, rows }) => {
+            assert_eq!(columns, ["id", "name", "city", "id", "user_id", "total"]);
+            assert_eq!(rows, vec![vec![int(2), text("bo"), text("lima"), int(12), int(2), int(3)]]);
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn joins_of_three_tables_self_joins_and_grouping() {
+    let mut db = setup_shop();
+    db.execute(
+        "CREATE TABLE cities (name TEXT PRIMARY KEY, country TEXT);
+         INSERT INTO cities VALUES ('oslo', 'no'), ('lima', 'pe');",
+    )
+    .unwrap();
+    assert_eq!(
+        query(
+            &mut db,
+            "SELECT c.country, COUNT(o.id), SUM(o.total) FROM cities c JOIN users u ON u.city = c.name
+             LEFT JOIN orders o ON o.user_id = u.id GROUP BY c.country ORDER BY c.country"
+        ),
+        vec![vec![text("no"), int(2), int(12)], vec![text("pe"), int(1), int(3)]]
+    );
+    // A table joined to itself, under two aliases.
+    assert_eq!(
+        query(&mut db, "SELECT a.name, b.name FROM users AS a JOIN users AS b ON a.city = b.city AND a.id < b.id"),
+        vec![vec![text("ann"), text("cy")]]
+    );
+    // GROUP BY a qualified column, selected unqualified or qualified.
+    assert_eq!(
+        query(
+            &mut db,
+            "SELECT city, COUNT(*) FROM users u JOIN orders o ON o.user_id = u.id GROUP BY u.city ORDER BY city"
+        ),
+        vec![vec![text("lima"), int(1)], vec![text("oslo"), int(2)]]
+    );
+    assert_eq!(
+        explain(
+            &mut db,
+            "SELECT u.name, c.country FROM users u JOIN cities c ON c.name = u.city
+             LEFT JOIN orders o ON o.user_id = u.id AND o.total > 4 WHERE c.country = 'no' AND o.id IS NULL"
+        ),
+        "PROJECT u.name, c.country
+  FILTER o.id IS NULL
+    LEFT INDEX JOIN
+      INDEX JOIN
+        SCAN users u
+        FILTER c.country = 'no'
+          LOOKUP cities c USING INDEX cities_pkey (c.name = u.city)
+      FILTER o.total > 4
+        LOOKUP orders o USING INDEX orders_user (o.user_id = u.id)"
+    );
+}
+
+#[test]
+fn every_join_method_and_storage_agrees_with_a_nested_loop() {
+    // Conditions, each tried as written and as `(c) OR FALSE`: the same, but
+    // hiding its equalities and single-table parts from the planner.
+    let conditions = [
+        ("b.a_k = a.k", "JOIN"),
+        ("b.id = a.k", "JOIN"),
+        ("b.a_k = a.k AND b.v > a.id", "JOIN"),
+        ("a.k + 1 = b.v AND a.tag = 'x'", "JOIN"),
+        ("b.v < a.k", "NESTED LOOP JOIN"),
+        ("b.a_k = a.k AND b.v > 5", "JOIN"),
+    ];
+    for storage in ["HEAP", "LSM", "COLUMN"] {
+        for indexed in [false, true] {
+            let mut db = Database::in_memory();
+            db.execute(&format!("CREATE TABLE a (id INT PRIMARY KEY, k INT, tag TEXT) USING {storage}")).unwrap();
+            db.execute(&format!("CREATE TABLE b (id INT PRIMARY KEY, a_k INT, v INT) USING {storage}")).unwrap();
+            if indexed && storage != "COLUMN" {
+                db.execute("CREATE INDEX b_a_k ON b (a_k)").unwrap();
+            }
+            let a: Vec<String> = (0..60i64)
+                .map(|i| {
+                    let k = if i % 9 == 0 { "NULL".into() } else { (i % 13).to_string() };
+                    format!("({i}, {k}, '{}')", ["x", "y"][i as usize % 2])
+                })
+                .collect();
+            let b: Vec<String> = (0..80i64)
+                .map(|i| {
+                    let a_k = if i % 7 == 0 { "NULL".into() } else { (i % 17).to_string() };
+                    format!("({i}, {a_k}, {})", i % 11)
+                })
+                .collect();
+            db.execute(&format!("INSERT INTO a VALUES {}", a.join(", "))).unwrap();
+            db.execute(&format!("INSERT INTO b VALUES {}", b.join(", "))).unwrap();
+
+            for (condition, method) in conditions {
+                for kind in ["JOIN", "LEFT JOIN"] {
+                    for filter in ["", " WHERE a.id < 40", " WHERE b.id IS NULL OR b.v != 3"] {
+                        let sql = |on: &str| format!("SELECT a.id, b.id, b.v FROM a {kind} b ON {on}{filter}");
+                        let mut planned = query(&mut db, &sql(condition));
+                        let mut looped = query(&mut db, &sql(&format!("({condition}) OR FALSE")));
+                        planned.sort_by(|x, y| x[0].sort_cmp(&y[0]).then(x[1].sort_cmp(&y[1])));
+                        looped.sort_by(|x, y| x[0].sort_cmp(&y[0]).then(x[1].sort_cmp(&y[1])));
+                        let label = format!("{storage}, indexed {indexed}: {}", sql(condition));
+                        assert_eq!(planned, looped, "{label}");
+                        assert!(explain(&mut db, &sql(condition)).contains(method), "{label}");
+                    }
+                }
+            }
+            let plan = explain(&mut db, "SELECT * FROM a JOIN b ON b.a_k = a.k");
+            let expected = if indexed && storage != "COLUMN" { "INDEX JOIN" } else { "HASH JOIN" };
+            assert!(plan.contains(expected), "{storage}, indexed {indexed}: {plan}");
+            let plan = explain(&mut db, "SELECT * FROM a JOIN b ON b.id = a.k");
+            assert!(plan.contains(if storage == "COLUMN" { "HASH JOIN" } else { "INDEX JOIN" }), "{plan}");
+        }
+    }
+}
+
+#[test]
+fn join_names_and_conditions_are_checked() {
+    let mut db = setup_shop();
+    let errors = [
+        ("SELECT id FROM users u JOIN orders o ON o.user_id = u.id", "column reference id is ambiguous"),
+        ("SELECT x.id FROM users u JOIN orders o ON o.user_id = u.id", "unknown column: x.id"),
+        ("SELECT users.id FROM users u", "unknown column: users.id"),
+        ("SELECT * FROM users u JOIN orders u ON u.id = 1", "appears more than once"),
+        ("SELECT * FROM users JOIN users ON users.id = 1", "appears more than once"),
+        ("SELECT * FROM users u JOIN orders o ON c.name = u.city JOIN cities c ON c.name = u.city", "unknown"),
+        ("SELECT * FROM users u JOIN orders o ON COUNT(*) > 1", "not allowed in JOIN ... ON"),
+        ("SELECT * FROM users u JOIN orders o", "expected ON"),
+        ("SELECT * FROM missing m JOIN users u ON u.id = m.id", "unknown table: missing"),
+        ("SELECT u.name FROM users u JOIN orders o ON o.user_id = u.id GROUP BY u.city", "u.name must appear"),
+    ];
+    for (sql, expected) in errors {
+        let e = db.execute(sql).expect_err(sql);
+        assert!(e.0.contains(expected), "{sql}: {e}");
+    }
+    db.execute("CREATE TABLE cities (name TEXT PRIMARY KEY)").unwrap();
+    let e = db.execute("SELECT * FROM users u JOIN orders o ON c.name = u.city JOIN cities c ON c.name = u.city");
+    assert!(e.unwrap_err().0.contains("joined after it"));
+    // A single table may still be referred to by its name.
+    assert_eq!(query(&mut db, "SELECT users.name FROM users WHERE users.id = 2"), vec![vec![text("bo")]]);
+}
