@@ -10,7 +10,7 @@
 //! where `sql` is the table's CREATE TABLE statement, parsed again on open
 //! (the same idea as SQLite's `sqlite_schema` table). Its `USING` clause
 //! says how the rows are stored: for a heap the two pages are its first and
-//! last page, for an LSM tree both are its manifest page.
+//! last page, for an LSM tree or a column store both are its manifest page.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

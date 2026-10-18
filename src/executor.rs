@@ -60,9 +60,16 @@ fn select(
     limit: Option<usize>,
 ) -> Result<QueryResult> {
     let columns = &table.columns;
+    let needed = match &projection {
+        Projection::All => vec![true; columns.len()],
+        Projection::Exprs(exprs) => {
+            let order_by = order_by.iter().map(|o| &o.expr);
+            needed_columns(columns, exprs.iter().chain(&filter).chain(order_by))
+        }
+    };
 
     let mut rows: Vec<Row> = Vec::new();
-    for item in table.scan() {
+    for item in table.scan_columns(&needed) {
         let (_, row) = item?;
         if matches(&filter, columns, &row)? {
             rows.push(row);
@@ -145,7 +152,7 @@ fn update(table: &mut Table, assignments: Vec<(String, Expr)>, filter: Option<Ex
 
 fn delete(table: &mut Table, filter: Option<Expr>) -> Result<QueryResult> {
     let mut rids = Vec::new();
-    for item in table.scan() {
+    for item in table.scan_columns(&needed_columns(&table.columns, &filter)) {
         let (rid, row) = item?;
         if matches(&filter, &table.columns, &row)? {
             rids.push(rid);
@@ -153,6 +160,25 @@ fn delete(table: &mut Table, filter: Option<Expr>) -> Result<QueryResult> {
     }
     table.delete(&rids)?;
     Ok(message(format!("{} row(s) deleted", rids.len())))
+}
+
+/// Marks the columns the expressions use, so that a scan may skip the others.
+fn needed_columns<'a>(columns: &[Column], exprs: impl IntoIterator<Item = &'a Expr>) -> Vec<bool> {
+    fn visit(expr: &Expr, columns: &[Column], needed: &mut [bool]) {
+        match expr {
+            Expr::Literal(_) => {}
+            // An unknown name is reported when the expression is evaluated.
+            Expr::Column(name) => column_index(columns, name).into_iter().for_each(|i| needed[i] = true),
+            Expr::Unary(_, inner) | Expr::IsNull(inner, _) => visit(inner, columns, needed),
+            Expr::Binary(left, _, right) => {
+                visit(left, columns, needed);
+                visit(right, columns, needed);
+            }
+        }
+    }
+    let mut needed = vec![false; columns.len()];
+    exprs.into_iter().for_each(|expr| visit(expr, columns, &mut needed));
+    needed
 }
 
 /// Evaluates a WHERE clause; NULL counts as false.

@@ -2,7 +2,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::error::{Error, Result, err};
-use crate::storage::{BufferPool, LsmConfig, LsmTree, MAX_TUPLE_SIZE, PageId, RecordId, TableHeap, tuple};
+use crate::storage::{
+    BufferPool, ColumnConfig, ColumnStore, LsmConfig, LsmTree, MAX_TUPLE_SIZE, PageId, Position, RecordId, TableHeap,
+    tuple,
+};
 use crate::types::{Column, StorageKind, Value};
 
 pub type Row = Vec<Value>;
@@ -14,6 +17,8 @@ pub enum RowId {
     Record(RecordId),
     /// An LSM row's key.
     Key(Vec<u8>),
+    /// Where a column store row is.
+    Position(Position),
 }
 
 /// A table: a schema plus the storage holding its encoded rows. Enforces
@@ -32,6 +37,7 @@ enum Storage {
     /// Rows are keyed by their primary key or, in a table without one, by a
     /// hidden rowid: 1, 2, 3, ... in insertion order.
     Lsm { tree: LsmTree, next_rowid: i64 },
+    Column(ColumnStore),
 }
 
 impl Table {
@@ -40,6 +46,9 @@ impl Table {
         let storage = match kind {
             StorageKind::Heap => Storage::Heap(TableHeap::create(pool)?),
             StorageKind::Lsm => Storage::Lsm { tree: LsmTree::create(pool, LsmConfig::default())?, next_rowid: 1 },
+            StorageKind::Column => {
+                Storage::Column(ColumnStore::create(pool, columns.clone(), ColumnConfig::default())?)
+            }
         };
         Ok(Table { name, columns, storage })
     }
@@ -62,6 +71,9 @@ impl Table {
                 };
                 Storage::Lsm { tree, next_rowid }
             }
+            StorageKind::Column => {
+                Storage::Column(ColumnStore::open(pool, first, columns.clone(), ColumnConfig::default())?)
+            }
         };
         Ok(Table { name, columns, storage })
     }
@@ -70,15 +82,17 @@ impl Table {
         match self.storage {
             Storage::Heap(_) => StorageKind::Heap,
             Storage::Lsm { .. } => StorageKind::Lsm,
+            Storage::Column(_) => StorageKind::Column,
         }
     }
 
     /// The pages the catalog records to open the table again: a heap's first
-    /// and last page, or an LSM tree's manifest page twice.
+    /// and last page, or the manifest page of an LSM tree or column store twice.
     pub fn root_pages(&self) -> (PageId, PageId) {
         match &self.storage {
             Storage::Heap(heap) => (heap.first_page(), heap.last_page()),
             Storage::Lsm { tree, .. } => (tree.manifest_page(), tree.manifest_page()),
+            Storage::Column(store) => (store.manifest_page(), store.manifest_page()),
         }
     }
 
@@ -86,8 +100,17 @@ impl Table {
         column_index(&self.columns, name)
     }
 
-    /// Iterates over all rows with their ids: a heap in storage order, an LSM tree in key order.
+    /// Iterates over all rows with their ids: a heap in storage order, an LSM
+    /// tree in key order, a column store row group by row group.
     pub fn scan(&self) -> Box<dyn Iterator<Item = Result<(RowId, Row)>> + '_> {
+        self.scan_columns(&vec![true; self.columns.len()])
+    }
+
+    /// Like [`Table::scan`], but only the columns marked in `needed` must be
+    /// read. Unneeded columns may hold anything, NULL usually: a column store
+    /// skips their chunks, while heaps and LSM trees return whole rows.
+    pub fn scan_columns(&self, needed: &[bool]) -> Box<dyn Iterator<Item = Result<(RowId, Row)>> + '_> {
+        assert_eq!(needed.len(), self.columns.len());
         match &self.storage {
             Storage::Heap(heap) => Box::new(heap.scan().map(|item| {
                 let (rid, bytes) = item?;
@@ -97,6 +120,9 @@ impl Table {
                 let (key, bytes) = item?;
                 Ok((RowId::Key(key), tuple::decode(&self.columns, &bytes)?))
             })),
+            Storage::Column(store) => Box::new(
+                store.scan(needed.to_vec()).map(|item| item.map(|(position, row)| (RowId::Position(position), row))),
+            ),
         }
     }
 
@@ -123,6 +149,12 @@ impl Table {
                 }
                 *next_rowid += rows.len() as i64;
             }
+            Storage::Column(store) => {
+                encoded.iter().try_for_each(|bytes| check_heap_size(bytes))?;
+                for bytes in encoded {
+                    store.insert(&bytes)?;
+                }
+            }
         }
         Ok(())
     }
@@ -132,6 +164,7 @@ impl Table {
     /// A heap row stays where it is if its page has room for the new value;
     /// otherwise it is deleted and inserted again, possibly in another page.
     /// An LSM row is simply written again, under a new key if its primary key changed.
+    /// A column store row is deleted and inserted again into the delta store.
     pub fn update(&mut self, changes: Vec<(RowId, Row)>) -> Result<()> {
         let (ids, rows): (Vec<RowId>, Vec<Row>) = changes.into_iter().unzip();
         let encoded = self.encode_all(&rows)?;
@@ -175,6 +208,17 @@ impl Table {
                     tree.put(key, bytes)?;
                 }
             }
+            Storage::Column(store) => {
+                encoded.iter().try_for_each(|bytes| check_heap_size(bytes))?;
+                let positions: Vec<Position> = ids.into_iter().map(RowId::into_position).collect::<Result<_>>()?;
+                // Deletes first: an insert may migrate the delta store, moving its rows.
+                for position in positions {
+                    store.delete(position)?;
+                }
+                for bytes in encoded {
+                    store.insert(&bytes)?;
+                }
+            }
         }
         Ok(())
     }
@@ -186,6 +230,7 @@ impl Table {
                     heap.delete(id.into_record()?)?;
                 }
                 Storage::Lsm { tree, .. } => tree.delete(id.into_key()?)?,
+                Storage::Column(store) => store.delete(id.into_position()?)?,
             }
         }
         Ok(())
@@ -196,6 +241,7 @@ impl Table {
         match self.storage {
             Storage::Heap(heap) => heap.destroy(),
             Storage::Lsm { tree, .. } => tree.destroy(),
+            Storage::Column(store) => store.destroy(),
         }
     }
 
@@ -206,14 +252,16 @@ impl Table {
 
     /// Checks that `new_rows`, together with the existing rows except those in
     /// `replaced`, have unique non-null primary keys. A heap is scanned in
-    /// full; an LSM tree is searched for each new key.
+    /// full, a column store reads only its key column; an LSM tree is
+    /// searched for each new key.
     fn check_primary_key(&self, replaced: &HashSet<RowId>, new_rows: &[Row]) -> Result<()> {
         let Some(pk) = primary_key(&self.columns) else {
             return Ok(());
         };
         let mut seen = HashSet::new();
-        if let Storage::Heap(_) = self.storage {
-            for item in self.scan() {
+        if let Storage::Heap(_) | Storage::Column(_) = self.storage {
+            let needed: Vec<bool> = (0..self.columns.len()).map(|i| i == pk).collect();
+            for item in self.scan_columns(&needed) {
                 let (id, row) = item?;
                 if !replaced.contains(&id) {
                     seen.insert(row[pk].clone());
@@ -226,7 +274,7 @@ impl Table {
                 return err(format!("primary key {} cannot be NULL", self.columns[pk].name));
             }
             let stored = match &self.storage {
-                Storage::Heap(_) => false, // already in `seen`
+                Storage::Heap(_) | Storage::Column(_) => false, // already in `seen`
                 Storage::Lsm { tree, .. } => {
                     let key = tuple::encode_key(key);
                     !replaced.contains(&RowId::Key(key.clone())) && tree.get(&key)?.is_some()
@@ -244,14 +292,21 @@ impl RowId {
     fn into_record(self) -> Result<RecordId> {
         match self {
             RowId::Record(rid) => Ok(rid),
-            RowId::Key(_) => err("expected a heap row"),
+            _ => err("expected a heap row"),
+        }
+    }
+
+    fn into_position(self) -> Result<Position> {
+        match self {
+            RowId::Position(position) => Ok(position),
+            _ => err("expected a column store row"),
         }
     }
 
     fn into_key(self) -> Result<Vec<u8>> {
         match self {
             RowId::Key(key) => Ok(key),
-            RowId::Record(_) => err("expected an LSM row"),
+            _ => err("expected an LSM row"),
         }
     }
 }

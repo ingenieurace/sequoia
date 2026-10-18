@@ -17,7 +17,7 @@ pub struct Column {
     pub primary_key: bool,
 }
 
-/// How a table stores its rows: `CREATE TABLE ... USING HEAP | LSM`.
+/// How a table stores its rows: `CREATE TABLE ... USING HEAP | LSM | COLUMN`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StorageKind {
     /// Slotted pages, updated in place. The default.
@@ -25,6 +25,8 @@ pub enum StorageKind {
     Heap,
     /// A log-structured merge tree.
     Lsm,
+    /// Compressed row groups stored column by column, plus a delta store.
+    Column,
 }
 
 /// A single SQL value.
@@ -98,6 +100,7 @@ impl fmt::Display for StorageKind {
         f.write_str(match self {
             StorageKind::Heap => "HEAP",
             StorageKind::Lsm => "LSM",
+            StorageKind::Column => "COLUMN",
         })
     }
 }

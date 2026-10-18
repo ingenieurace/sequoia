@@ -23,7 +23,7 @@ Shell commands: `.tables`, `.exit`.
 
 ## Supported SQL
 
-- Statements: `CREATE TABLE ... [USING HEAP | LSM]`, `DROP TABLE`, `INSERT`,
+- Statements: `CREATE TABLE ... [USING HEAP | LSM | COLUMN]`, `DROP TABLE`, `INSERT`,
   `SELECT`, `UPDATE`, `DELETE`
 - Types: `INT`, `TEXT`, `BOOL`, and `NULL`
 - Constraints: `PRIMARY KEY` (unique, not null); values are type-checked
@@ -58,6 +58,8 @@ src/
     lsm.rs      LSM tree: log + MemTable, SSTables, level/universal compaction
     sstable.rs  SSTable: sorted entries in pages, in-memory summary
     bloom.rs    Bloom filter for SSTable lookups
+    column.rs   column store: PAX row groups, delete bitmaps, delta store
+    encoding.rs column compression: RLE, bit-packing, patching, delta, dictionary, bitmap
     tuple.rs    row <-> bytes (null bitmap + column values)
 tests/sql.rs    end-to-end tests
 ```
@@ -91,8 +93,21 @@ A database is a single file of 4 KB pages:
   skipping those whose key range or Bloom filter rules the key out. A
   manifest page lists the log and the SSTables. SSTable summaries are not
   stored: opening a table reads its SSTables once to rebuild them.
-- **Freed pages** (from `DROP TABLE`, an LSM flush or compaction) go on a free
-  list and are reused.
+- **A column table** (`USING COLUMN`) is a column store in the PAX layout.
+  New rows go to a **delta store**, a heap of whole rows. Once it holds 1024
+  rows they are migrated into a **row group**, where each column's values are
+  stored together in their own chunk, so a query reads only the columns it
+  uses. Each chunk is compressed with whichever lossless encoding makes it
+  smallest: run-length, bit-packing (relative to the smallest value),
+  patching (bit-packing with a few outliers stored apart), delta (then
+  encoded again), an order-preserving dictionary, or one bitmap per value.
+  Row groups are never rewritten: a delete sets the row's bit in the group's
+  delete bitmap, an update deletes the row and inserts the new value into the
+  delta store, and a group whose rows are all deleted is freed. A manifest
+  page lists the delta store and the row groups, which limits a column table
+  to about a thousand row groups.
+- **Freed pages** (from `DROP TABLE`, an LSM flush or compaction, or a
+  column store migration) go on a free list and are reused.
 
 Pages are read and written through a **buffer pool** of 256 frames (1 MB). A
 page in use is pinned and cannot be evicted; when the pool is full, ARC

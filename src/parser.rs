@@ -57,11 +57,12 @@ impl Parser {
         self.expect_symbol(")")?;
         let mut storage = StorageKind::default();
         if self.eat_keyword("USING") {
-            // HEAP and LSM are not keywords, so they stay usable as names.
+            // HEAP, LSM and COLUMN are not keywords, so they stay usable as names.
             storage = match self.ident()?.to_uppercase().as_str() {
                 "HEAP" => StorageKind::Heap,
                 "LSM" => StorageKind::Lsm,
-                other => return Err(Error(format!("unknown storage: {other}, expected HEAP or LSM"))),
+                "COLUMN" => StorageKind::Column,
+                other => return Err(Error(format!("unknown storage: {other}, expected HEAP, LSM or COLUMN"))),
             };
         }
         Ok(Statement::CreateTable { name, columns, storage })

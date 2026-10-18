@@ -5,12 +5,16 @@
 //! a table's rows, stored in one of two ways:
 //! - `heap`: tuples in a linked list of pages, updated in place.
 //! - `lsm`: a log-structured merge tree of `sstable`s, never updated in place.
+//! - `column`: row groups stored column by column, compressed by `encoding`,
+//!   with a heap as the delta store for new rows.
 //!
 //! `tuple` converts rows to and from bytes.
 
 mod bloom;
 pub mod buffer;
+pub mod column;
 pub mod disk;
+pub mod encoding;
 pub mod heap;
 pub mod lsm;
 pub mod page;
@@ -19,6 +23,7 @@ pub mod sstable;
 pub mod tuple;
 
 pub use buffer::{BufferPool, PageReadGuard, PageWriteGuard, REPLACEMENT_POLICY};
+pub use column::{ColumnConfig, ColumnStore, Position};
 pub use disk::{DiskManager, PAGE_SIZE, PAGE_USABLE, Page, PageId};
 pub use heap::{RecordId, TableHeap};
 pub use lsm::{LsmConfig, LsmTree};

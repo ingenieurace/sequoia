@@ -258,9 +258,10 @@ fn storage_clause_is_parsed_and_checked() {
     let mut db = Database::in_memory();
     db.execute("CREATE TABLE a (x INT) using lsm").unwrap();
     db.execute("CREATE TABLE b (x INT) USING heap").unwrap();
+    db.execute("CREATE TABLE d (x INT) USING Column").unwrap();
     assert!(db.execute("CREATE TABLE c (x INT) USING btree").is_err());
-    // HEAP and LSM are not reserved words.
-    db.execute("CREATE TABLE lsm (heap INT)").unwrap();
+    // HEAP, LSM and COLUMN are not reserved words.
+    db.execute("CREATE TABLE lsm (heap INT, column INT)").unwrap();
 }
 
 #[test]
@@ -315,6 +316,113 @@ fn dropped_lsm_tables_free_their_pages() {
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, body TEXT) USING LSM").unwrap();
         for i in 0..1000 {
             db.execute(&format!("INSERT INTO t VALUES ({i}, '{}')", "y".repeat(200))).unwrap();
+        }
+    };
+    fill(&mut db);
+    let size = std::fs::metadata(&path.0).unwrap().len();
+    db.execute("DROP TABLE t").unwrap();
+    fill(&mut db);
+    assert_eq!(std::fs::metadata(&path.0).unwrap().len(), size, "freed pages are reused");
+}
+
+fn setup_column() -> Database {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT, active BOOL) USING COLUMN;
+         INSERT INTO users VALUES (1, 'alice', 30, TRUE), (2, 'bob', 25, FALSE);
+         INSERT INTO users (id, name) VALUES (3, 'carol');",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn column_tables_run_every_statement() {
+    let mut db = setup_column();
+    assert_eq!(query(&mut db, "SELECT name FROM users WHERE age IS NULL"), vec![vec![text("carol")]]);
+
+    db.execute("UPDATE users SET age = age * 2, active = NOT active WHERE name = 'bob'").unwrap();
+    assert_eq!(
+        query(&mut db, "SELECT age, active FROM users WHERE id = 2"),
+        vec![vec![int(50), Value::Bool(true)]]
+    );
+    db.execute("UPDATE users SET id = id + 10 WHERE id >= 2").unwrap();
+    assert_eq!(query(&mut db, "SELECT id FROM users ORDER BY id"), vec![vec![int(1)], vec![int(12)], vec![int(13)]]);
+
+    db.execute("DELETE FROM users WHERE id != 12").unwrap();
+    assert_eq!(query(&mut db, "SELECT * FROM users"), vec![vec![int(12), text("bob"), int(50), Value::Bool(true)]]);
+}
+
+#[test]
+fn column_tables_enforce_constraints() {
+    let mut db = setup_column();
+    assert!(db.execute("INSERT INTO users VALUES (1, 'dup', 1, TRUE)").is_err());
+    assert!(db.execute("INSERT INTO users VALUES (9, 'x', 1, TRUE), (9, 'y', 1, TRUE)").is_err());
+    assert!(db.execute("INSERT INTO users (name) VALUES ('no id')").is_err());
+    assert!(db.execute("UPDATE users SET id = 1").is_err());
+    assert!(db.execute("INSERT INTO users VALUES ('one', 'x', 1, TRUE)").is_err());
+    assert!(db.execute(&format!("INSERT INTO users (id, name) VALUES (9, '{}')", "z".repeat(5000))).is_err());
+    assert_eq!(query(&mut db, "SELECT id FROM users").len(), 3, "failed statements change nothing");
+
+    db.execute("UPDATE users SET id = 3 - id WHERE id <= 2").unwrap();
+    assert_eq!(query(&mut db, "SELECT name FROM users WHERE id = 1"), vec![vec![text("bob")]]);
+}
+
+#[test]
+fn column_tables_survive_migrations_and_reopening() {
+    let path = TempDb::new("column");
+    let cities = ["lima", "oslo", "paris", "tokyo"];
+    {
+        let mut db = Database::open(&path.0).unwrap();
+        db.execute("CREATE TABLE visits (id INT PRIMARY KEY, city TEXT, nights INT, paid BOOL) USING COLUMN").unwrap();
+        // Several row groups of 1024 rows, plus rows left in the delta store.
+        for batch in 0..5 {
+            let values: Vec<String> = (0..1000)
+                .map(|i| {
+                    let id = batch * 1000 + i;
+                    let nights = if id % 7 == 0 { "NULL".to_string() } else { (id % 10).to_string() };
+                    format!("({id}, '{}', {nights}, {})", cities[id as usize % 4], id % 2 == 0)
+                })
+                .collect();
+            db.execute(&format!("INSERT INTO visits VALUES {}", values.join(", "))).unwrap();
+        }
+        // Touches rows in row groups and in the delta store.
+        db.execute("UPDATE visits SET city = 'rome' WHERE id / 100 * 100 = id").unwrap();
+        db.execute("DELETE FROM visits WHERE city = 'oslo'").unwrap();
+    }
+
+    let mut db = Database::open(&path.0).unwrap();
+    assert_eq!(query(&mut db, "SELECT id FROM visits").len(), 3750);
+    assert_eq!(query(&mut db, "SELECT city FROM visits WHERE city = 'rome'").len(), 50);
+    assert!(query(&mut db, "SELECT id FROM visits WHERE city = 'oslo'").is_empty());
+    assert_eq!(query(&mut db, "SELECT id FROM visits WHERE nights IS NULL").len(), 537);
+    assert_eq!(
+        query(&mut db, "SELECT * FROM visits WHERE id = 4994"),
+        vec![vec![int(4994), text("paris"), int(4), Value::Bool(true)]]
+    );
+    // Selecting only some columns still filters and sorts on others.
+    assert_eq!(
+        query(&mut db, "SELECT id FROM visits WHERE paid AND nights = 9 ORDER BY city DESC, id LIMIT 2"),
+        Vec::<Vec<Value>>::new()
+    );
+    assert_eq!(
+        query(&mut db, "SELECT city FROM visits WHERE nights = 8 ORDER BY id DESC LIMIT 1"),
+        vec![vec![text("lima")]]
+    );
+    assert!(db.execute("INSERT INTO visits VALUES (6, 'dup', 1, TRUE)").is_err());
+    db.execute("INSERT INTO visits VALUES (5, 'back', 1, TRUE)").unwrap(); // its old row was deleted
+}
+
+#[test]
+fn dropped_column_tables_free_their_pages() {
+    let path = TempDb::new("column-drop");
+    let mut db = Database::open(&path.0).unwrap();
+    let fill = |db: &mut Database| {
+        db.execute("CREATE TABLE t (id INT, body TEXT) USING COLUMN").unwrap();
+        for batch in 0..3 {
+            let values: Vec<String> =
+                (0..1000).map(|i| format!("({}, '{}')", batch * 1000 + i, "y".repeat(50))).collect();
+            db.execute(&format!("INSERT INTO t VALUES {}", values.join(", "))).unwrap();
         }
     };
     fill(&mut db);
