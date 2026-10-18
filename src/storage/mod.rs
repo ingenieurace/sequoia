@@ -1,6 +1,7 @@
 //! Storage engine: page-oriented on-disk layout.
 //!
-//! Layers, bottom up: `disk` (pages in a file) -> `buffer` (pages cached in
+//! Layers, bottom up: `medium` (bytes in a file) -> `wal` (page writes made
+//! durable in groups) -> `disk` (pages in a file) -> `buffer` (pages cached in
 //! memory, evicted by a `replacer` policy) -> `page` (tuples in a page) ->
 //! a table's rows, stored in one of two ways:
 //! - `heap`: tuples in a linked list of pages, updated in place.
@@ -19,16 +20,18 @@ pub mod disk;
 pub mod encoding;
 pub mod heap;
 pub mod lsm;
+pub mod medium;
 pub mod page;
 pub mod replacer;
 pub mod sstable;
 pub mod tuple;
+pub mod wal;
 
 pub use btree::BPlusTree;
 pub use buffer::{BufferPool, PageReadGuard, PageWriteGuard, REPLACEMENT_POLICY};
 pub use column::{ColumnConfig, ColumnStore, Position, Predicate};
 pub use encoding::Compare;
-pub use disk::{DiskManager, PAGE_SIZE, PAGE_USABLE, Page, PageId};
+pub use disk::{CHECKPOINT_BYTES, DiskManager, PAGE_SIZE, PAGE_USABLE, Page, PageId};
 pub use heap::{RecordId, TableHeap};
 pub use lsm::{LsmConfig, LsmTree};
 pub use page::{MAX_TUPLE_SIZE, SlottedPage};

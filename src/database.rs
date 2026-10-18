@@ -1,16 +1,19 @@
 //! Public entry point: owns the catalog and the disk it lives on.
 //!
-//! After every statement that changes data, the catalog is saved, dirty pages
-//! are written back from the buffer pool, and the file is synced, so a
-//! statement that returns successfully is on disk.
-//! Without a WAL, a crash in the middle of a statement may leave it half applied.
+//! Every statement that changes data is atomic. When it succeeds, the catalog
+//! is saved, dirty pages are written back from the buffer pool, and the disk
+//! commits them through its write-ahead log, so a statement that returns
+//! successfully is durable. When it fails, its writes are rolled back: the
+//! buffer pool drops its cached pages, the disk drops the uncommitted log
+//! frames, and the catalog is opened again from the committed pages. A crash
+//! in the middle of a statement likewise loses all of it.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::ast::Statement;
 use crate::catalog::Catalog;
-use crate::error::Result;
+use crate::error::{Result, err};
 use crate::executor;
 use crate::parser::parse;
 use crate::result::QueryResult;
@@ -20,7 +23,10 @@ use crate::storage::{BufferPool, DiskManager};
 const BUFFER_POOL_FRAMES: usize = 256;
 
 pub struct Database {
+    pool: Arc<BufferPool>,
     catalog: Catalog,
+    /// Set when a rollback failed, leaving the state in memory unknown.
+    broken: bool,
 }
 
 impl Database {
@@ -35,8 +41,10 @@ impl Database {
     }
 
     fn with_disk(disk: DiskManager) -> Result<Self> {
-        let pool = BufferPool::new(Arc::new(disk), BUFFER_POOL_FRAMES);
-        Ok(Database { catalog: Catalog::open(Arc::new(pool))? })
+        let pool = Arc::new(BufferPool::new(Arc::new(disk), BUFFER_POOL_FRAMES));
+        let mut catalog = Catalog::open(pool.clone())?;
+        catalog.save()?; // a new database's empty catalog
+        Ok(Database { pool, catalog, broken: false })
     }
 
     /// Parses and runs every statement in `sql`, stopping at the first error.
@@ -46,15 +54,202 @@ impl Database {
 
     /// Runs a single parsed statement.
     pub fn run(&mut self, statement: Statement) -> Result<QueryResult> {
+        if self.broken {
+            return err("a failed rollback left the database unusable: open it again");
+        }
         let modifies = !matches!(statement, Statement::Select { .. } | Statement::Explain(_));
         let result = executor::execute(&mut self.catalog, statement);
-        if modifies {
-            self.catalog.save()?;
+        if !modifies {
+            return result;
         }
-        result
+        match result.and_then(|result| self.catalog.save().map(|()| result)) {
+            Ok(result) => Ok(result),
+            Err(e) => match self.rollback() {
+                Ok(()) => Err(e),
+                Err(rollback) => {
+                    self.broken = true;
+                    err(format!("{e}; then the rollback failed: {rollback}"))
+                }
+            },
+        }
+    }
+
+    /// Undoes everything since the last commit, in memory and on disk.
+    fn rollback(&mut self) -> Result<()> {
+        self.pool.discard_all()?;
+        self.pool.disk().rollback()?;
+        self.catalog = Catalog::open(self.pool.clone())?;
+        Ok(())
     }
 
     pub fn table_names(&self) -> Vec<&str> {
         self.catalog.table_names()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::storage::medium::sim::Sim;
+    use crate::types::Value;
+
+    /// A database on simulated files: 0 is the database file, 1 its log.
+    fn open(sim: &Arc<Sim>) -> Result<Database> {
+        Database::with_disk(DiskManager::init(sim.file(0), sim.file(1))?)
+    }
+
+    fn values(rows: impl Iterator<Item = String>) -> String {
+        rows.collect::<Vec<_>>().join(", ")
+    }
+
+    /// A heap, an LSM and a column table with some rows; the first two with an index on `tag`.
+    fn setup(sim: &Arc<Sim>) -> Database {
+        let mut db = open(sim).unwrap();
+        for (table, storage) in [("h", "HEAP"), ("l", "LSM"), ("c", "COLUMN")] {
+            let schema = "(id INT PRIMARY KEY, tag TEXT, n INT, body TEXT)";
+            db.execute(&format!("CREATE TABLE {table} {schema} USING {storage}")).unwrap();
+            if storage != "COLUMN" {
+                db.execute(&format!("CREATE INDEX {table}_tag ON {table} (tag)")).unwrap();
+            }
+            let rows = values((0..300).map(|i| format!("({i}, 'tag{}', {i}, '{}')", i % 7, "b".repeat(100))));
+            db.execute(&format!("INSERT INTO {table} VALUES {rows}")).unwrap();
+        }
+        db
+    }
+
+    /// Statements that each write many pages: heap pages and B+ tree nodes
+    /// split, rows move, an LSM tree flushes, a column store migrates.
+    fn statements() -> Vec<String> {
+        let rows = |n: i64, body: usize| {
+            values((1000..1000 + n).map(|i| format!("({i}, 'new{}', {i}, '{}')", i % 5, "n".repeat(body))))
+        };
+        vec![
+            format!("INSERT INTO h VALUES {}", rows(200, 150)),
+            format!("UPDATE h SET body = '{}', tag = 'moved' WHERE id < 100", "z".repeat(300)),
+            "DELETE FROM h WHERE tag = 'tag3' OR id > 250".into(),
+            "CREATE INDEX h_n ON h (n)".into(),
+            format!("INSERT INTO l VALUES {}", rows(400, 200)),
+            "UPDATE l SET id = id + 5000, tag = 'up' WHERE n < 150".into(),
+            format!("INSERT INTO c VALUES {}", rows(1100, 10)),
+            "DROP TABLE h".into(),
+        ]
+    }
+
+    fn rows(db: &mut Database, sql: &str) -> Result<Vec<Vec<Value>>> {
+        match db.execute(sql)?.pop() {
+            Some(QueryResult::Rows { mut rows, .. }) => {
+                rows.sort_by(|a, b| a[0].sort_cmp(&b[0]));
+                Ok(rows)
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    /// Every table's rows by id and how it finds `n = 5` (which shows its
+    /// indexes), after checking that its indexes agree with its rows.
+    fn snapshot(db: &mut Database) -> Vec<(&'static str, String, Vec<Vec<Value>>)> {
+        let mut snapshot = Vec::new();
+        for table in ["h", "l", "c"] {
+            let Ok(all) = rows(db, &format!("SELECT * FROM {table}")) else {
+                continue; // dropped
+            };
+            if table != "c" {
+                let mut tags: Vec<Value> = all.iter().map(|row| row[1].clone()).collect();
+                tags.sort_by(|a, b| a.sort_cmp(b));
+                tags.dedup();
+                for tag in tags {
+                    let found = rows(db, &format!("SELECT * FROM {table} WHERE tag = {}", tag.to_sql())).unwrap();
+                    let expected: Vec<Vec<Value>> = all.iter().filter(|row| row[1] == tag).cloned().collect();
+                    assert!(found == expected, "index {table}_tag for {}", tag.to_sql());
+                }
+                let found = rows(db, &format!("SELECT * FROM {table} WHERE n >= 100 AND n < 200")).unwrap();
+                let in_range = |row: &&Vec<Value>| matches!(row[2], Value::Int(n) if (100..200).contains(&n));
+                let expected: Vec<Vec<Value>> = all.iter().filter(in_range).cloned().collect();
+                assert!(found == expected, "range of n in {table}");
+            }
+            let plan = match db.execute(&format!("EXPLAIN SELECT * FROM {table} WHERE n = 5")).unwrap().pop() {
+                Some(QueryResult::Message(plan)) => plan,
+                other => panic!("expected a plan, got {other:?}"),
+            };
+            snapshot.push((table, plan, all));
+        }
+        snapshot
+    }
+
+    #[test]
+    fn committed_statements_survive_a_crash() {
+        let sim = Sim::new(2);
+        let mut db = setup(&sim);
+        for statement in statements() {
+            db.execute(&statement).unwrap();
+        }
+        let expected = snapshot(&mut db);
+        // Only what was synced reaches the disk.
+        let mut db = open(&sim.crashed(0)).unwrap();
+        assert!(snapshot(&mut db) == expected);
+    }
+
+    #[test]
+    fn a_crash_loses_all_of_a_statement_or_none() {
+        for (i, statement) in statements().into_iter().enumerate() {
+            // Run it once to learn how many operations it does and what it leaves.
+            let sim = Sim::new(2);
+            let mut db = setup(&sim);
+            let before = snapshot(&mut db);
+            let start = sim.ops();
+            db.execute(&statement).unwrap();
+            let ops = sim.ops() - start;
+            let after = snapshot(&mut db);
+            assert!(before != after, "statement {i} changes something");
+
+            for crash in (0..ops).step_by(ops.div_ceil(12)).chain([ops - 1]) {
+                let sim = Sim::new(2);
+                let mut db = setup(&sim);
+                sim.crash_after(crash);
+                let result = db.execute(&statement);
+                for kept in [0, 1, usize::MAX] {
+                    let mut db = open(&sim.crashed(kept)).unwrap();
+                    let found = snapshot(&mut db);
+                    let label = format!("statement {i}, crash after {crash} of {ops} ops, {kept} unsynced kept");
+                    match &result {
+                        Ok(_) => assert!(found == after, "{label}"),
+                        Err(_) => assert!(found == before || found == after, "{label}"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_statement_is_rolled_back() {
+        let sim = Sim::new(2);
+        let mut db = setup(&sim);
+        let mut expected = snapshot(&mut db);
+        for (i, statement) in statements().iter().enumerate() {
+            let mut done = false;
+            for fail in [0, 3, 40, 200] {
+                sim.fail_once_after(fail);
+                match db.execute(statement) {
+                    Ok(_) => {
+                        done = true; // it did fewer operations than that
+                        break;
+                    }
+                    Err(e) => {
+                        assert_eq!(e.0, "simulated I/O error", "statement {i}");
+                        assert!(snapshot(&mut db) == expected, "statement {i} failing after {fail} ops left nothing");
+                    }
+                }
+            }
+            sim.heal();
+            if !done {
+                db.execute(statement).unwrap();
+            }
+            expected = snapshot(&mut db);
+        }
+        // Everything committed survives a crash.
+        let mut db = open(&sim.crashed(0)).unwrap();
+        assert!(snapshot(&mut db) == expected);
     }
 }

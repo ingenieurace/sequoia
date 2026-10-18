@@ -143,17 +143,13 @@ impl Catalog {
 
     pub fn drop_table(&mut self, name: &str) -> Result<()> {
         let entry = self.tables.remove(name).ok_or_else(|| unknown_table(name))?;
-        // Remove the catalog rows before freeing pages: a crash in between leaks
-        // pages instead of leaving the catalog pointing at freed ones.
         let indexes: Vec<String> =
             self.indexes.iter().filter(|(_, index)| index.table == name).map(|(n, _)| n.clone()).collect();
         for index in indexes {
             let rid = self.indexes.remove(&index).expect("listed above").rid;
             self.heap.delete(rid)?;
-            self.pool.flush_page(rid.page_id)?;
         }
         self.heap.delete(entry.rid)?;
-        self.pool.flush_page(entry.rid.page_id)?;
         entry.table.destroy()
     }
 
@@ -187,12 +183,16 @@ impl Catalog {
         }
         let index = self.indexes.remove(name).expect("found above");
         self.heap.delete(index.rid)?;
-        self.pool.flush_page(index.rid.page_id)?;
         self.tables.get_mut(&index.table).expect("an index's table exists").table.drop_index(name)
     }
 
+    /// Copies the committed pages from the write-ahead log into the database file.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.pool.disk().checkpoint()
+    }
+
     /// Records heaps that grew since the last save, then writes every dirty
-    /// page back and syncs the file.
+    /// page back and commits, making everything since the last save durable.
     pub fn save(&mut self) -> Result<()> {
         for entry in self.tables.values_mut() {
             let last_page = entry.table.root_pages().1;
@@ -205,7 +205,7 @@ impl Catalog {
             }
         }
         self.pool.flush_all()?;
-        self.pool.disk().sync()
+        self.pool.disk().commit()
     }
 }
 

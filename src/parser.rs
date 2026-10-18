@@ -40,6 +40,10 @@ impl Parser {
         match keyword.as_str() {
             "CREATE" => self.create(),
             "DROP" => self.drop(),
+            "CHECKPOINT" => {
+                self.pos += 1;
+                Ok(Statement::Checkpoint)
+            }
             "EXPLAIN" => {
                 self.pos += 1;
                 Ok(Statement::Explain(Box::new(self.statement()?)))

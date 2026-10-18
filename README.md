@@ -7,7 +7,7 @@ It is meant to be small and easy to read, not fast.
 
 ```bash
 cargo run                # in-memory database
-cargo run -- my.db       # persisted to my.db
+cargo run -- my.db       # persisted to my.db (and its log, my.db-wal, while open)
 ```
 
 ```sql
@@ -28,8 +28,8 @@ Shell commands: `.tables`, `.exit`.
 
 - Statements: `CREATE TABLE ... [USING HEAP | LSM | COLUMN]`, `DROP TABLE`,
   `CREATE [UNIQUE] INDEX name ON table (column)`, `DROP INDEX`, `INSERT`, `SELECT`,
-  `UPDATE`, `DELETE`, and `EXPLAIN` before a `SELECT`, `UPDATE` or `DELETE` to see
-  how it finds its rows
+  `UPDATE`, `DELETE`, `CHECKPOINT`, and `EXPLAIN` before a `SELECT`, `UPDATE` or
+  `DELETE` to see how it finds its rows
 - Types: `INT`, `TEXT`, `BOOL`, and `NULL`
 - Constraints: `PRIMARY KEY` (unique, not null), unique indexes (NULLs may repeat);
   values are type-checked
@@ -37,7 +37,8 @@ Shell commands: `.tables`, `.exit`.
 - Expressions: `+ - * /`, `= != <> < <= > >=`, `AND OR NOT`, `IS [NOT] NULL`,
   parentheses, with SQL three-valued logic for `NULL`
 
-Not supported: joins, aggregates, multi-column indexes, transactions.
+Every statement is atomic and durable once it returns. Not supported: joins,
+aggregates, multi-column indexes, transactions of several statements.
 
 ## Layout
 
@@ -45,7 +46,7 @@ Not supported: joins, aggregates, multi-column indexes, transactions.
 src/
   main.rs       interactive shell
   lib.rs        module list and public exports
-  database.rs   entry point; runs SQL, saves and syncs after changes
+  database.rs   entry point; runs SQL, commits or rolls back each statement
   lexer.rs      SQL text -> tokens
   parser.rs     tokens -> AST (recursive descent)
   ast.rs        statement and expression types
@@ -57,7 +58,9 @@ src/
   result.rs     query results and table printing
   error.rs      shared error type
   storage/
-    disk.rs     DiskManager: fixed-size pages in one file, free list
+    medium.rs   byte-addressed files: on disk, in memory, or crashing (for tests)
+    wal.rs      write-ahead log: page frames, commits, recovery, checkpoints
+    disk.rs     DiskManager: fixed-size pages in one file, free list, via the WAL
     buffer.rs   buffer pool: cached frames, pin counts, dirty pages
     replacer.rs page replacement policies: ARC (default), LRU-K, CLOCK
     page.rs     slotted page: many tuples in one page
@@ -145,7 +148,7 @@ A database is a single file of 4 KB pages:
   checked on the rows read. `EXPLAIN` shows the choice.
 - **Freed pages** (from `DROP TABLE`, `DROP INDEX`, B+ tree merges, an LSM
   flush or compaction, or a column store migration) go on a free list and
-  are reused.
+  are reused. A rolled-back statement's allocations are undone with it.
 
 Pages are read and written through a **buffer pool** of 256 frames (1 MB). A
 page in use is pinned and cannot be evicted; when the pool is full, ARC
@@ -154,9 +157,26 @@ it is dirty. ARC balances recently used against frequently used pages, so a
 full table scan does not push frequently used pages out. LRU-K and CLOCK are
 also available: to switch, edit `REPLACEMENT_POLICY` in `src/storage/buffer.rs`.
 
-Every statement that changes data has its dirty pages written back and synced
-before it returns. There is no WAL yet: a crash in the middle of a
-statement may leave it half applied, or a table and its indexes out of step.
+**The write-ahead log** (`<file>-wal`) makes every statement atomic. The
+DiskManager never writes the database file directly: each page write, the
+header page's included, is appended to the log as a frame holding the whole
+page, and reads find a page's newest frame through an in-memory map. When a
+statement that changes data succeeds, its dirty pages are written back from
+the buffer pool and a commit frame is appended and synced: one sync per
+statement. When it fails, it is rolled back: the log is cut back to the last
+commit frame, the buffer pool drops its cached pages, and the catalog is
+opened again from the committed pages. Each frame carries a checksum of
+itself and the frame before it, so opening the log after a crash keeps the
+frames up to the last valid commit frame and cuts off the rest: a statement
+is either all there or not at all. A **checkpoint** copies the newest
+committed version of each page into the database file, syncs it, and only
+then empties the log, so a crash during one leaves the log to be copied
+again. It runs after a commit that leaves the log at 4 MB or more, on
+`CHECKPOINT`, when the database is closed (which also removes the log), and
+when it is opened after a crash. Crash tests run every kind of statement on
+simulated files that stop at an arbitrary write, and check that every table
+and index afterwards shows the statement entirely or not at all.
+
 Primary key checks use the key's index on heap tables, look the key up on LSM
 tables and read the key column on column tables (heap tables in files written
 before indexes existed have no key index and scan the table). A row must fit

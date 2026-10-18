@@ -22,6 +22,8 @@ pub enum Statement {
     },
     /// `EXPLAIN statement`: describes how the statement would read its table.
     Explain(Box<Statement>),
+    /// Copies the committed pages from the write-ahead log into the database file.
+    Checkpoint,
     Insert {
         table: String,
         columns: Option<Vec<String>>,

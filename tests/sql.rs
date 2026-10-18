@@ -109,7 +109,14 @@ impl TempDb {
 impl Drop for TempDb {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(format!("{}-wal", self.0.display()));
     }
+}
+
+/// The size of the database file once every committed page is checkpointed into it.
+fn file_size(db: &mut Database, path: &std::path::Path) -> u64 {
+    db.execute("CHECKPOINT").unwrap();
+    std::fs::metadata(path).unwrap().len()
 }
 
 #[test]
@@ -143,10 +150,10 @@ fn dropped_tables_free_their_pages() {
         }
     };
     fill(&mut db);
-    let size = std::fs::metadata(&path.0).unwrap().len();
+    let size = file_size(&mut db, &path.0);
     db.execute("DROP TABLE t").unwrap();
     fill(&mut db);
-    assert_eq!(std::fs::metadata(&path.0).unwrap().len(), size, "freed pages are reused");
+    assert_eq!(file_size(&mut db, &path.0), size, "freed pages are reused");
 
     drop(db);
     let mut db = Database::open(&path.0).unwrap();
@@ -172,14 +179,14 @@ fn deleted_space_is_reused_after_reopening() {
             db.execute(&format!("INSERT INTO t VALUES ({i}, '{}')", "x".repeat(100))).unwrap();
         }
         db.execute("DELETE FROM t WHERE id < 100").unwrap();
-        std::fs::metadata(&path.0).unwrap().len()
+        file_size(&mut db, &path.0)
     };
 
     let mut db = Database::open(&path.0).unwrap();
     for i in 0..100 {
         db.execute(&format!("INSERT INTO t VALUES ({i}, '{}')", "y".repeat(100))).unwrap();
     }
-    assert_eq!(std::fs::metadata(&path.0).unwrap().len(), size, "the file did not grow");
+    assert_eq!(file_size(&mut db, &path.0), size, "the file did not grow");
     assert_eq!(query(&mut db, "SELECT id FROM t").len(), 200);
 }
 
@@ -191,10 +198,10 @@ fn updates_that_grow_rows_keep_every_row() {
     for i in 0..100 {
         db.execute(&format!("INSERT INTO t VALUES ({i}, 'x')")).unwrap();
     }
-    let size = std::fs::metadata(&path.0).unwrap().len();
+    let size = file_size(&mut db, &path.0);
     // Shrinking or same-size updates stay in place.
     db.execute("UPDATE t SET body = 'y'").unwrap();
-    assert_eq!(std::fs::metadata(&path.0).unwrap().len(), size);
+    assert_eq!(file_size(&mut db, &path.0), size);
 
     // Rows too big for their page move elsewhere.
     db.execute(&format!("UPDATE t SET body = '{}' WHERE id < 50", "z".repeat(500))).unwrap();
@@ -319,10 +326,10 @@ fn dropped_lsm_tables_free_their_pages() {
         }
     };
     fill(&mut db);
-    let size = std::fs::metadata(&path.0).unwrap().len();
+    let size = file_size(&mut db, &path.0);
     db.execute("DROP TABLE t").unwrap();
     fill(&mut db);
-    assert_eq!(std::fs::metadata(&path.0).unwrap().len(), size, "freed pages are reused");
+    assert_eq!(file_size(&mut db, &path.0), size, "freed pages are reused");
 }
 
 fn setup_column() -> Database {
@@ -426,10 +433,10 @@ fn dropped_column_tables_free_their_pages() {
         }
     };
     fill(&mut db);
-    let size = std::fs::metadata(&path.0).unwrap().len();
+    let size = file_size(&mut db, &path.0);
     db.execute("DROP TABLE t").unwrap();
     fill(&mut db);
-    assert_eq!(std::fs::metadata(&path.0).unwrap().len(), size, "freed pages are reused");
+    assert_eq!(file_size(&mut db, &path.0), size, "freed pages are reused");
 }
 
 #[test]
@@ -548,7 +555,8 @@ fn indexed_tables_answer_like_unindexed_ones() {
     for storage in ["HEAP", "LSM"] {
         for indexed in [false, true] {
             let t = format!("{storage}_{indexed}");
-            db.execute(&format!("CREATE TABLE {t} (id INT PRIMARY KEY, city TEXT, nights INT) USING {storage}")).unwrap();
+            let schema = "(id INT PRIMARY KEY, city TEXT, nights INT)";
+            db.execute(&format!("CREATE TABLE {t} {schema} USING {storage}")).unwrap();
             if indexed {
                 db.execute(&format!("CREATE INDEX {t}_city ON {t} (city)")).unwrap();
                 db.execute(&format!("CREATE INDEX {t}_nights ON {t} (nights)")).unwrap();
@@ -698,9 +706,9 @@ fn indexes_survive_reopening_and_are_dropped_with_their_table() {
     db.execute("DROP INDEX t_n").unwrap();
     assert_eq!(plan(&mut db, "SELECT * FROM t WHERE n = 3"), "SCAN t");
     db.execute("DROP TABLE t").unwrap();
-    let size = std::fs::metadata(&path.0).unwrap().len();
+    let size = file_size(&mut db, &path.0);
     fill(&mut db);
-    assert_eq!(std::fs::metadata(&path.0).unwrap().len(), size, "the indexes' pages were freed and reused");
+    assert_eq!(file_size(&mut db, &path.0), size, "the indexes' pages were freed and reused");
     drop(db);
 
     let mut db = Database::open(&path.0).unwrap();

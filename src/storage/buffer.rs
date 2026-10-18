@@ -15,7 +15,9 @@
 //!   frame dirty.
 //! - When no frame is free, a [`Replacer`] picks an unpinned victim, using
 //!   the policy set by [`REPLACEMENT_POLICY`] (see `replacer.rs`).
-//! - Write-back: a dirty page reaches disk only when it is evicted or flushed.
+//! - Write-back: a dirty page reaches the disk only when it is evicted or
+//!   flushed, and is durable only once the disk commits (see `disk.rs`).
+//!   Dropping the pool writes nothing back.
 //!
 //! Locking: one mutex (`state`) over all metadata, plus one RwLock per frame
 //! over its bytes. While holding `state`, the pool only locks frames that are
@@ -169,6 +171,23 @@ impl BufferPool {
         pages.into_iter().try_for_each(|id| self.flush_page(id))
     }
 
+    /// Forgets every cached page without writing it back, as after a
+    /// rollback undid the writes below. Fails if a page is pinned.
+    pub fn discard_all(&self) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        if state.meta.iter().any(|meta| meta.pins > 0) {
+            return err("cannot discard pinned pages");
+        }
+        for frame in 0..self.capacity() {
+            if let Some(page) = state.meta[frame].page {
+                state.clear_frame(frame);
+                state.replacer.remove(page);
+                state.free.push(frame);
+            }
+        }
+        Ok(())
+    }
+
     /// Pins the frame holding `id`, loading the page into one if needed.
     fn pin(&self, id: PageId) -> Result<usize> {
         let mut state = self.state.lock().unwrap();
@@ -221,13 +240,6 @@ impl BufferPool {
     #[cfg(test)]
     fn is_cached(&self, id: PageId) -> bool {
         self.state.lock().unwrap().page_table.contains_key(&id)
-    }
-}
-
-impl Drop for BufferPool {
-    /// Best effort: errors are lost. Call `flush_all` to see them.
-    fn drop(&mut self) {
-        let _ = self.flush_all();
     }
 }
 

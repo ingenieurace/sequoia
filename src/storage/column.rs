@@ -42,8 +42,8 @@
 //! 6..     bytes
 //! ```
 //!
-//! A migration writes the row group, then rewrites the manifest and syncs, and
-//! only then frees the old delta store, as an LSM flush does.
+//! A migration writes the row group, then rewrites the manifest, and only then
+//! frees the old delta store, as an LSM flush does.
 //!
 //! A scan may be given [`Predicate`]s (`column op literal`, ANDed). In a row
 //! group it evaluates them on the compressed chunks first (see
@@ -258,7 +258,7 @@ impl ColumnStore {
         old_delta.destroy()
     }
 
-    /// Rewrites the manifest page, then flushes and syncs it.
+    /// Rewrites the manifest page.
     fn write_manifest(&self) -> Result<()> {
         let mut page = self.pool.fetch_write(self.manifest)?;
         write_u32(&mut page, 0, self.delta.first_page().0);
@@ -266,9 +266,7 @@ impl ColumnStore {
         for (i, group) in self.groups.iter().enumerate() {
             write_u32(&mut page, 8 + 4 * i, group.header.0);
         }
-        drop(page);
-        self.pool.flush_page(self.manifest)?;
-        self.pool.disk().sync()
+        Ok(())
     }
 }
 

@@ -27,6 +27,10 @@ pub fn execute(catalog: &mut Catalog, statement: Statement) -> Result<QueryResul
             Ok(message(format!("index {name} dropped")))
         }
         Statement::Explain(statement) => explain(catalog, *statement),
+        Statement::Checkpoint => {
+            catalog.checkpoint()?;
+            Ok(message("checkpoint done".into()))
+        }
         Statement::Insert { table, columns, rows } => insert(catalog.get_mut(&table)?, columns, rows),
         Statement::Select { table, projection, filter, order_by, limit } => {
             select(catalog.get(&table)?, projection, filter, order_by, limit)

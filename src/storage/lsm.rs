@@ -50,9 +50,9 @@
 //!         level count m (levels 1..=m), then m page ids (u32::MAX = empty level)
 //! ```
 //!
-//! A flush or compaction writes its new pages, then rewrites the manifest page
-//! and syncs, and only then frees the old log or SSTables. A crash before the
-//! manifest is written leaks the new pages; the old ones are still intact.
+//! A flush or compaction writes its new pages, then rewrites the manifest page,
+//! and only then frees the old log or SSTables. The statement doing it commits
+//! all of that at once (see `wal.rs`), so a crash never leaves it half done.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -407,7 +407,7 @@ impl LsmTree {
         SsTable::write(self.pool.clone(), entries)
     }
 
-    /// Rewrites the manifest page, then flushes and syncs it.
+    /// Rewrites the manifest page.
     fn write_manifest(&self) -> Result<()> {
         let mut ids = vec![self.log.first_page().0, self.level0.len() as u32];
         ids.extend(self.level0.iter().map(|table| table.first_page().0));
@@ -419,9 +419,7 @@ impl LsmTree {
         for (i, &id) in ids.iter().enumerate() {
             write_u32(&mut page, i * 4, id);
         }
-        drop(page);
-        self.pool.flush_page(self.manifest)?;
-        self.pool.disk().sync()
+        Ok(())
     }
 }
 

@@ -95,8 +95,6 @@ impl TableHeap {
         let room = page.room();
         let new_id = new.id();
         drop(new);
-        // Write the new page before linking it, so a crash leaks a page instead of breaking the chain.
-        self.pool.flush_page(new_id)?;
         SlottedPage::new(&mut *last).set_next_page(Some(new_id));
         drop(last);
 
@@ -345,6 +343,7 @@ mod tests {
                 heap.insert(&row(i)).unwrap();
             }
             pool.flush_all().unwrap();
+            pool.disk().commit().unwrap();
             (heap.first_page(), heap.last_page())
         };
 
