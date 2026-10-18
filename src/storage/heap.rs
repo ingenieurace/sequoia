@@ -10,10 +10,14 @@
 //!
 //! The heap stores raw bytes and does not persist its own `first_page` /
 //! `last_page`; the catalog is responsible for saving them after changes.
+//!
+//! All page access goes through the buffer pool. The heap pins at most two
+//! pages at a time.
 
 use std::sync::Arc;
 
-use super::disk::{DiskManager, PAGE_SIZE, Page, PageId};
+use super::buffer::BufferPool;
+use super::disk::PageId;
 use super::page::{MAX_TUPLE_SIZE, SlottedPage};
 use crate::error::{Result, err};
 
@@ -25,26 +29,26 @@ pub struct RecordId {
 }
 
 pub struct TableHeap {
-    disk: Arc<DiskManager>,
+    pool: Arc<BufferPool>,
     first_page: PageId,
     last_page: PageId,
 }
 
 impl TableHeap {
     /// Creates an empty heap with one page.
-    pub fn create(disk: Arc<DiskManager>) -> Result<Self> {
-        let id = disk.allocate_page()?;
-        let mut buf = [0; PAGE_SIZE];
-        SlottedPage::init(&mut buf);
-        disk.write_page(id, &buf)?;
-        Ok(Self { disk, first_page: id, last_page: id })
+    pub fn create(pool: Arc<BufferPool>) -> Result<Self> {
+        let mut page = pool.new_page()?;
+        SlottedPage::init(&mut *page);
+        let id = page.id();
+        drop(page);
+        Ok(Self { pool, first_page: id, last_page: id })
     }
 
     /// Opens an existing heap. `last_page` is a hint: the chain is followed from
     /// there to the real end, in case pages were appended after it was recorded.
-    pub fn open(disk: Arc<DiskManager>, first_page: PageId, last_page: PageId) -> Result<Self> {
-        let mut heap = Self { disk, first_page, last_page };
-        while let Some(next) = SlottedPage::new(&heap.read(heap.last_page)?).next_page() {
+    pub fn open(pool: Arc<BufferPool>, first_page: PageId, last_page: PageId) -> Result<Self> {
+        let mut heap = Self { pool, first_page, last_page };
+        while let Some(next) = heap.next_page(heap.last_page)? {
             heap.last_page = next;
         }
         Ok(heap)
@@ -64,20 +68,20 @@ impl TableHeap {
             return err(format!("row is {} bytes, the maximum is {MAX_TUPLE_SIZE}", tuple.len()));
         }
 
-        let mut last = self.read(self.last_page)?;
-        if let Some(slot) = SlottedPage::new(&mut last).insert(tuple) {
-            self.disk.write_page(self.last_page, &last)?;
+        let mut last = self.pool.fetch_write(self.last_page)?;
+        if let Some(slot) = SlottedPage::new(&mut *last).insert(tuple) {
             return Ok(RecordId { page_id: self.last_page, slot });
         }
 
         // The last page is full: start a new one.
-        let new_id = self.disk.allocate_page()?;
-        let mut buf = [0; PAGE_SIZE];
-        let slot = SlottedPage::init(&mut buf).insert(tuple).expect("a tuple fits in an empty page");
+        let mut new = self.pool.new_page()?;
+        let slot = SlottedPage::init(&mut *new).insert(tuple).expect("a tuple fits in an empty page");
+        let new_id = new.id();
+        drop(new);
         // Write the new page before linking it, so a crash leaks a page instead of breaking the chain.
-        self.disk.write_page(new_id, &buf)?;
-        SlottedPage::new(&mut last).set_next_page(Some(new_id));
-        self.disk.write_page(self.last_page, &last)?;
+        self.pool.flush_page(new_id)?;
+        SlottedPage::new(&mut *last).set_next_page(Some(new_id));
+        drop(last);
 
         self.last_page = new_id;
         Ok(RecordId { page_id: new_id, slot })
@@ -86,27 +90,23 @@ impl TableHeap {
     /// Returns the tuple at `rid`, or `None` if it was deleted.
     /// `rid` must belong to this heap; that is not checked.
     pub fn get(&self, rid: RecordId) -> Result<Option<Vec<u8>>> {
-        let buf = self.read(rid.page_id)?;
-        Ok(SlottedPage::new(&buf).get(rid.slot).map(<[u8]>::to_vec))
+        let page = self.pool.fetch_read(rid.page_id)?;
+        Ok(SlottedPage::new(&*page).get(rid.slot).map(<[u8]>::to_vec))
     }
 
     /// Deletes the tuple at `rid`. Returns false if there was none.
     pub fn delete(&self, rid: RecordId) -> Result<bool> {
-        let mut buf = self.read(rid.page_id)?;
-        let deleted = SlottedPage::new(&mut buf).delete(rid.slot);
-        if deleted {
-            self.disk.write_page(rid.page_id, &buf)?;
-        }
-        Ok(deleted)
+        let mut page = self.pool.fetch_write(rid.page_id)?;
+        Ok(SlottedPage::new(&mut *page).delete(rid.slot))
     }
 
     /// Replaces a tuple in place with one of the same length. Touches a single page.
     pub fn overwrite(&self, rid: RecordId, tuple: &[u8]) -> Result<()> {
-        let mut buf = self.read(rid.page_id)?;
-        if !SlottedPage::new(&mut buf).overwrite(rid.slot, tuple) {
+        let mut page = self.pool.fetch_write(rid.page_id)?;
+        if !SlottedPage::new(&mut *page).overwrite(rid.slot, tuple) {
             return err("cannot overwrite tuple: missing or different length");
         }
-        self.disk.write_page(rid.page_id, &buf)
+        Ok(())
     }
 
     /// Iterates over all live tuples, page by page.
@@ -114,28 +114,26 @@ impl TableHeap {
     /// Each page is read when the scan reaches it, so changes made during the
     /// scan may be seen. Callers that modify the heap should collect first.
     pub fn scan(&self) -> Scan<'_> {
-        Scan { disk: &self.disk, next_page: Some(self.first_page), pending: Vec::new().into_iter() }
+        Scan { pool: &self.pool, next_page: Some(self.first_page), pending: Vec::new().into_iter() }
     }
 
     /// Returns all of the heap's pages to the free list.
     pub fn destroy(self) -> Result<()> {
         let mut next = Some(self.first_page);
         while let Some(id) = next {
-            next = SlottedPage::new(&self.read(id)?).next_page();
-            self.disk.deallocate_page(id)?;
+            next = self.next_page(id)?;
+            self.pool.delete_page(id)?;
         }
         Ok(())
     }
 
-    fn read(&self, id: PageId) -> Result<Page> {
-        let mut buf = [0; PAGE_SIZE];
-        self.disk.read_page(id, &mut buf)?;
-        Ok(buf)
+    fn next_page(&self, id: PageId) -> Result<Option<PageId>> {
+        Ok(SlottedPage::new(&*self.pool.fetch_read(id)?).next_page())
     }
 }
 
 pub struct Scan<'a> {
-    disk: &'a DiskManager,
+    pool: &'a BufferPool,
     next_page: Option<PageId>,
     /// Tuples of the current page not yet returned.
     pending: std::vec::IntoIter<(RecordId, Vec<u8>)>,
@@ -150,11 +148,11 @@ impl Iterator for Scan<'_> {
                 return Some(Ok(item));
             }
             let page_id = self.next_page.take()?;
-            let mut buf = [0; PAGE_SIZE];
-            if let Err(e) = self.disk.read_page(page_id, &mut buf) {
-                return Some(Err(e));
-            }
-            let page = SlottedPage::new(&buf);
+            let guard = match self.pool.fetch_read(page_id) {
+                Ok(guard) => guard,
+                Err(e) => return Some(Err(e)),
+            };
+            let page = SlottedPage::new(&*guard);
             self.next_page = page.next_page();
             let tuples: Vec<_> =
                 page.iter().map(|(slot, tuple)| (RecordId { page_id, slot }, tuple.to_vec())).collect();
@@ -166,9 +164,14 @@ impl Iterator for Scan<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::DiskManager;
+
+    fn pool(disk: DiskManager, frames: usize) -> Arc<BufferPool> {
+        Arc::new(BufferPool::new(Arc::new(disk), frames))
+    }
 
     fn heap() -> TableHeap {
-        TableHeap::create(Arc::new(DiskManager::in_memory())).unwrap()
+        TableHeap::create(pool(DiskManager::in_memory(), 16)).unwrap()
     }
 
     fn row(i: u32) -> Vec<u8> {
@@ -195,6 +198,16 @@ mod tests {
         for (i, (rid, tuple)) in scanned.into_iter().enumerate() {
             assert_eq!((rid, tuple), (rids[i], row(i as u32)));
         }
+    }
+
+    #[test]
+    fn works_with_a_two_frame_pool() {
+        let mut heap = TableHeap::create(pool(DiskManager::in_memory(), 2)).unwrap();
+        let rids: Vec<RecordId> = (0..100).map(|i| heap.insert(&row(i)).unwrap()).collect();
+        for (i, &rid) in rids.iter().enumerate() {
+            assert_eq!(heap.get(rid).unwrap(), Some(row(i as u32)));
+        }
+        assert_eq!(scan_all(&heap).len(), 100);
     }
 
     #[test]
@@ -237,18 +250,20 @@ mod tests {
         let path = std::env::temp_dir().join(format!("sequoia-heap-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let (first, last) = {
-            let mut heap = TableHeap::create(Arc::new(DiskManager::open(&path).unwrap())).unwrap();
+            let pool = pool(DiskManager::open(&path).unwrap(), 2);
+            let mut heap = TableHeap::create(pool.clone()).unwrap();
             for i in 0..50 {
                 heap.insert(&row(i)).unwrap();
             }
+            pool.flush_all().unwrap();
             (heap.first_page(), heap.last_page())
         };
 
-        let disk = Arc::new(DiskManager::open(&path).unwrap());
+        let pool = pool(DiskManager::open(&path).unwrap(), 2);
         // A stale last_page hint still finds the real end of the chain.
-        assert_eq!(TableHeap::open(disk.clone(), first, first).unwrap().last_page(), last);
+        assert_eq!(TableHeap::open(pool.clone(), first, first).unwrap().last_page(), last);
 
-        let heap = TableHeap::open(disk, first, last).unwrap();
+        let heap = TableHeap::open(pool, first, last).unwrap();
         let tuples: Vec<Vec<u8>> = scan_all(&heap).into_iter().map(|(_, t)| t).collect();
         assert_eq!(tuples, (0..50).map(row).collect::<Vec<_>>());
         std::fs::remove_file(&path).unwrap();
@@ -256,19 +271,19 @@ mod tests {
 
     #[test]
     fn destroy_frees_all_pages() {
-        let disk = Arc::new(DiskManager::in_memory());
-        let mut heap = TableHeap::create(disk.clone()).unwrap();
+        let pool = pool(DiskManager::in_memory(), 16);
+        let mut heap = TableHeap::create(pool.clone()).unwrap();
         for i in 0..100 {
             heap.insert(&row(i)).unwrap();
         }
-        let pages = disk.page_count();
+        let pages = pool.disk().page_count();
         heap.destroy().unwrap();
 
         // Every freed page is handed out again before the file grows.
-        let mut other = TableHeap::create(disk.clone()).unwrap();
+        let mut other = TableHeap::create(pool.clone()).unwrap();
         for i in 0..100 {
             other.insert(&row(i)).unwrap();
         }
-        assert_eq!(disk.page_count(), pages);
+        assert_eq!(pool.disk().page_count(), pages);
     }
 }

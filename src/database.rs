@@ -1,7 +1,8 @@
 //! Public entry point: owns the catalog and the disk it lives on.
 //!
-//! After every statement that changes data, the catalog is saved and the
-//! file is synced, so a statement that returns successfully is on disk.
+//! After every statement that changes data, the catalog is saved, dirty pages
+//! are written back from the buffer pool, and the file is synced, so a
+//! statement that returns successfully is on disk.
 //! Without a WAL, a crash in the middle of a statement may leave it half applied.
 
 use std::path::Path;
@@ -13,7 +14,10 @@ use crate::error::Result;
 use crate::executor;
 use crate::parser::parse;
 use crate::result::QueryResult;
-use crate::storage::DiskManager;
+use crate::storage::{BufferPool, DiskManager};
+
+/// Frames in the buffer pool: 256 x 4 KB = 1 MB of cached pages.
+const BUFFER_POOL_FRAMES: usize = 256;
 
 pub struct Database {
     catalog: Catalog,
@@ -31,7 +35,8 @@ impl Database {
     }
 
     fn with_disk(disk: DiskManager) -> Result<Self> {
-        Ok(Database { catalog: Catalog::open(Arc::new(disk))? })
+        let pool = BufferPool::new(Arc::new(disk), BUFFER_POOL_FRAMES);
+        Ok(Database { catalog: Catalog::open(Arc::new(pool))? })
     }
 
     /// Parses and runs every statement in `sql`, stopping at the first error.

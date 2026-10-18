@@ -50,6 +50,7 @@ src/
   error.rs      shared error type
   storage/
     disk.rs     DiskManager: fixed-size pages in one file, free list
+    buffer.rs   buffer pool: cached frames, pin counts, dirty pages, CLOCK eviction
     page.rs     slotted page: many tuples in one page
     heap.rs     table heap: linked list of pages, RecordId
     tuple.rs    row <-> bytes (null bitmap + column values)
@@ -68,7 +69,11 @@ A database is a single file of 4 KB pages:
   `RecordId` (page, slot) and stored as a null bitmap followed by its columns.
 - **Freed pages** (from `DROP TABLE`) go on a free list and are reused.
 
-Every statement that changes data is synced to disk before it returns. There is
-no buffer pool, WAL, or index yet: every page access is a disk read, a crash in
-the middle of a statement may leave it half applied, and primary key checks scan
-the whole table. A row must fit in one page (about 4 KB).
+Pages are read and written through a **buffer pool** of 256 frames (1 MB). A
+page in use is pinned and cannot be evicted; when the pool is full, CLOCK picks
+an unpinned victim, writing it back first if it is dirty.
+
+Every statement that changes data has its dirty pages written back and synced
+before it returns. There is no WAL or index yet: a crash in the middle of a
+statement may leave it half applied, and primary key checks scan the whole
+table. A row must fit in one page (about 4 KB).

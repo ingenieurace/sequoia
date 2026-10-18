@@ -16,12 +16,12 @@ use std::sync::Arc;
 use crate::ast::Statement;
 use crate::error::{Error, Result, err};
 use crate::parser::parse;
-use crate::storage::{DiskManager, PageId, RecordId, TableHeap, tuple};
+use crate::storage::{BufferPool, PageId, RecordId, TableHeap, tuple};
 use crate::table::{Table, validate_schema};
 use crate::types::{Column, DataType, Value};
 
 pub struct Catalog {
-    disk: Arc<DiskManager>,
+    pool: Arc<BufferPool>,
     /// Holds one row per table.
     heap: TableHeap,
     tables: BTreeMap<String, Entry>,
@@ -37,12 +37,14 @@ struct Entry {
 
 impl Catalog {
     /// Loads the catalog, creating an empty one in a new database.
-    pub fn open(disk: Arc<DiskManager>) -> Result<Self> {
-        let heap = match disk.root_page() {
-            Some(root) => TableHeap::open(disk.clone(), root, root)?,
+    pub fn open(pool: Arc<BufferPool>) -> Result<Self> {
+        let heap = match pool.disk().root_page() {
+            Some(root) => TableHeap::open(pool.clone(), root, root)?,
             None => {
-                let heap = TableHeap::create(disk.clone())?;
-                disk.set_root_page(Some(heap.first_page()))?;
+                let heap = TableHeap::create(pool.clone())?;
+                // The root must not point at a page that was never written.
+                pool.flush_page(heap.first_page())?;
+                pool.disk().set_root_page(Some(heap.first_page()))?;
                 heap
             }
         };
@@ -50,10 +52,10 @@ impl Catalog {
         let mut tables = BTreeMap::new();
         for item in heap.scan() {
             let (rid, bytes) = item?;
-            let (table, saved_last_page) = load_entry(&disk, &bytes)?;
+            let (table, saved_last_page) = load_entry(&pool, &bytes)?;
             tables.insert(table.name.clone(), Entry { table, rid, saved_last_page });
         }
-        Ok(Catalog { disk, heap, tables })
+        Ok(Catalog { pool, heap, tables })
     }
 
     pub fn get(&self, name: &str) -> Result<&Table> {
@@ -74,7 +76,7 @@ impl Catalog {
         }
         validate_schema(&columns)?;
 
-        let table = Table::new(name.clone(), columns, TableHeap::create(self.disk.clone())?);
+        let table = Table::new(name.clone(), columns, TableHeap::create(self.pool.clone())?);
         let rid = match encode_entry(&table).and_then(|bytes| self.heap.insert(&bytes)) {
             Ok(rid) => rid,
             Err(e) => {
@@ -92,10 +94,12 @@ impl Catalog {
         // Remove the catalog row before freeing pages: a crash in between leaks
         // pages instead of leaving the catalog pointing at freed ones.
         self.heap.delete(entry.rid)?;
+        self.pool.flush_page(entry.rid.page_id)?;
         entry.table.destroy()
     }
 
-    /// Records heaps that grew since the last save, then flushes everything to disk.
+    /// Records heaps that grew since the last save, then writes every dirty
+    /// page back and syncs the file.
     pub fn save(&mut self) -> Result<()> {
         for entry in self.tables.values_mut() {
             let last_page = entry.table.heap().last_page();
@@ -105,7 +109,8 @@ impl Catalog {
                 entry.saved_last_page = last_page;
             }
         }
-        self.disk.sync()
+        self.pool.flush_all()?;
+        self.pool.disk().sync()
     }
 }
 
@@ -126,7 +131,7 @@ fn encode_entry(table: &Table) -> Result<Vec<u8>> {
 }
 
 /// Decodes a catalog row into a table and the last page it records.
-fn load_entry(disk: &Arc<DiskManager>, bytes: &[u8]) -> Result<(Table, PageId)> {
+fn load_entry(pool: &Arc<BufferPool>, bytes: &[u8]) -> Result<(Table, PageId)> {
     let row = tuple::decode(&catalog_columns(), bytes)?;
     let [Value::Text(sql), Value::Int(first), Value::Int(last)] = row.as_slice() else {
         return err("corrupted catalog row");
@@ -135,7 +140,7 @@ fn load_entry(disk: &Arc<DiskManager>, bytes: &[u8]) -> Result<(Table, PageId)> 
         return err(format!("corrupted catalog row: {sql}"));
     };
     let (first, last) = (page_id(*first)?, page_id(*last)?);
-    let heap = TableHeap::open(disk.clone(), first, last)?;
+    let heap = TableHeap::open(pool.clone(), first, last)?;
     Ok((Table::new(name, columns, heap), last))
 }
 
