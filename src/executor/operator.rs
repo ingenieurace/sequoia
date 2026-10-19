@@ -9,7 +9,7 @@
 //! join reads its left side a block at a time, and its right side again for
 //! each block. A merge join sorts both sides when its first row is asked for.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use super::Settings;
 use super::aggregate;
@@ -48,14 +48,10 @@ pub fn open<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings) -> Ro
                     let sort = MergeSort { left_keys, right_keys, desc, then, budget: settings.sort_memory };
                     return Box::new(MergeJoin::new(left, left_fields, right, right_fields, sort, kind, condition));
                 }
-                JoinMethod::Hash { left_keys, right_keys } => Right::Hash {
-                    source: Some(open(*right, catalog, settings)),
-                    rows: Vec::new(),
-                    buckets: HashMap::new(),
-                    left_keys,
-                    right_keys,
-                    right_fields: right_fields.clone(),
-                },
+                JoinMethod::Hash { left_keys, right_keys } => {
+                    let source = open(*right, catalog, settings);
+                    Right::hash(source, left_keys, right_keys, &left_fields, right_fields.clone())
+                }
                 JoinMethod::Index => {
                     let (filter, lookup) = match *right {
                         Node::Filter { input, predicate } => (Some(predicate), *input),

@@ -42,7 +42,7 @@ use crate::error::Result;
 use crate::plan::query::LookupKey;
 use crate::predicate::{Compare, Predicate};
 use crate::sql::ast::{Expr, JoinKind, OrderBy};
-use crate::sql::eval::{Field, eval, matches};
+use crate::sql::eval::{Field, eval, matches, resolve};
 use crate::types::Value;
 
 /// Default memory a block nested loop join may hold left rows in: 4 MB.
@@ -57,26 +57,37 @@ pub struct Join<'a> {
     condition: Option<Expr>,
     /// The left fields, then the right ones: the fields of a joined row.
     fields: Vec<Field>,
-    /// The left row being joined, and which of `right.rows()` may match it.
+    /// The left row being joined, how many right rows may match it (see
+    /// [`Right::candidate`]), and the next of them to try.
     current: Option<Row>,
-    candidates: Vec<usize>,
+    candidates: usize,
     next: usize,
     matched: bool,
 }
 
 /// How a join finds the right rows that may match a left row.
 pub enum Right<'a> {
-    /// Right rows by their keys, read on first use. Rows with a NULL key are dropped: they match nothing.
+    /// Right rows grouped by their keys, read on first use. Rows with a NULL key are dropped: they match nothing.
     Hash {
         source: Option<Rows<'a>>,
-        rows: Vec<Row>,
-        buckets: HashMap<Vec<Value>, Vec<usize>>,
-        left_keys: Vec<Expr>,
-        right_keys: Vec<Expr>,
+        /// Each key's position in `buckets`, which holds the rows with that key.
+        index: HashMap<Vec<Value>, usize>,
+        buckets: Vec<Vec<Row>>,
+        left_keys: Vec<Key>,
+        right_keys: Vec<Key>,
         right_fields: Vec<Field>,
+        /// The current left row's keys, and its bucket, if any.
+        probe: Vec<Value>,
+        bucket: Option<usize>,
     },
     /// The right rows a lookup finds for the current left row.
     Index { lookup: Lookup<'a>, rows: Vec<Row> },
+}
+
+/// A join key: a column, found by its position, or any other expression.
+pub enum Key {
+    Column(usize),
+    Expr(Expr),
 }
 
 /// Finds the rows of a table whose `column` equals a left row's `left_key`,
@@ -109,7 +120,7 @@ impl<'a> Join<'a> {
             fields: [left_fields.clone(), right_fields].concat(),
             left_fields,
             current: None,
-            candidates: Vec::new(),
+            candidates: 0,
             next: 0,
             matched: false,
         }
@@ -126,15 +137,15 @@ impl Iterator for Join<'_> {
                     Ok(row) => row,
                     Err(e) => return Some(Err(e)),
                 };
-                match self.right.candidates(&row, &self.left_fields) {
+                match self.right.find(&row, &self.left_fields) {
                     Ok(candidates) => self.candidates = candidates,
                     Err(e) => return Some(Err(e)),
                 }
                 (self.current, self.next, self.matched) = (Some(row), 0, false);
             }
             let left = self.current.as_ref().expect("set above");
-            while self.next < self.candidates.len() {
-                let right = &self.right.rows()[self.candidates[self.next]];
+            while self.next < self.candidates {
+                let right = self.right.candidate(self.next);
                 self.next += 1;
                 let joined: Row = left.iter().chain(right).cloned().collect();
                 match matches(&self.condition, &self.fields, &joined) {
@@ -155,35 +166,93 @@ impl Iterator for Join<'_> {
     }
 }
 
-impl Right<'_> {
-    fn rows(&self) -> &[Row] {
-        match self {
-            Right::Hash { rows, .. } | Right::Index { rows, .. } => rows,
+impl<'a> Right<'a> {
+    /// A hash join's right side: the rows of `source`, by `right_keys`, for
+    /// left rows to find by `left_keys`.
+    pub fn hash(
+        source: Rows<'a>,
+        left_keys: Vec<Expr>,
+        right_keys: Vec<Expr>,
+        left_fields: &[Field],
+        right_fields: Vec<Field>,
+    ) -> Self {
+        Right::Hash {
+            source: Some(source),
+            index: HashMap::new(),
+            buckets: Vec::new(),
+            left_keys: Key::all(left_keys, left_fields),
+            right_keys: Key::all(right_keys, &right_fields),
+            right_fields,
+            probe: Vec::new(),
+            bucket: None,
         }
     }
 
-    /// The positions in `rows()` of the right rows that may match `left`.
-    fn candidates(&mut self, left: &Row, left_fields: &[Field]) -> Result<Vec<usize>> {
+    /// Finds the right rows that may match `left`, and returns how many there
+    /// are: [`candidate`](Self::candidate) gives each.
+    fn find(&mut self, left: &Row, left_fields: &[Field]) -> Result<usize> {
         match self {
-            Right::Hash { source, rows, buckets, left_keys, right_keys, right_fields } => {
+            Right::Hash { source, index, buckets, left_keys, right_keys, right_fields, probe, bucket } => {
                 if let Some(source) = source.take() {
                     for row in source {
                         let row = row?;
-                        let key = keys(right_keys, right_fields, &row)?;
-                        if !key.iter().any(Value::is_null) {
-                            buckets.entry(key).or_default().push(rows.len());
-                            rows.push(row);
+                        Key::eval_all(right_keys, right_fields, &row, probe)?;
+                        if probe.iter().any(Value::is_null) {
+                            continue;
                         }
+                        let at = match index.get(probe.as_slice()) {
+                            Some(&at) => at,
+                            None => {
+                                index.insert(probe.clone(), buckets.len());
+                                buckets.push(Vec::new());
+                                buckets.len() - 1
+                            }
+                        };
+                        buckets[at].push(row);
                     }
                 }
-                let key = keys(left_keys, left_fields, left)?;
-                Ok(buckets.get(&key).cloned().unwrap_or_default())
+                Key::eval_all(left_keys, left_fields, left, probe)?;
+                *bucket = index.get(probe.as_slice()).copied(); // a NULL key is in no bucket
+                Ok(bucket.map_or(0, |at| buckets[at].len()))
             }
             Right::Index { lookup, rows } => {
                 *rows = lookup.find(&eval(&lookup.left_key, left_fields, left)?)?;
-                Ok((0..rows.len()).collect())
+                Ok(rows.len())
             }
         }
+    }
+
+    /// The `i`th right row [`find`](Self::find) found.
+    fn candidate(&self, i: usize) -> &Row {
+        match self {
+            Right::Hash { buckets, bucket, .. } => &buckets[bucket.expect("found a bucket")][i],
+            Right::Index { rows, .. } => &rows[i],
+        }
+    }
+}
+
+impl Key {
+    /// The keys `exprs`, on rows with these fields.
+    fn all(exprs: Vec<Expr>, fields: &[Field]) -> Vec<Key> {
+        exprs
+            .into_iter()
+            .map(|expr| match &expr {
+                Expr::Column(column) => resolve(fields, column).map_or(Key::Expr(expr), Key::Column),
+                _ => Key::Expr(expr),
+            })
+            .collect()
+    }
+
+    /// Puts the values of `keys` on `row` in `values`.
+    fn eval_all(keys: &[Key], fields: &[Field], row: &Row, values: &mut Vec<Value>) -> Result<()> {
+        values.clear();
+        for key in keys {
+            values.push(match key {
+                Key::Column(i) => row[*i].clone(),
+                Key::Expr(expr) => eval(expr, fields, row)?,
+            });
+        }
+        Ok(())
     }
 }
 

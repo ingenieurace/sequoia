@@ -40,6 +40,13 @@ cases by default; run more, or other ones, with:
 SEQUOIA_DIFF_CASES=2000 SEQUOIA_DIFF_SEED=7 cargo test --release --test differential -- --nocapture
 ```
 
+`benches/hash_join.rs` times hash joins of 200,000 rows with 50,000, and
+prints the fastest of five runs of each query:
+
+```bash
+cargo bench --bench hash_join
+```
+
 ## Supported SQL
 
 - Statements: `CREATE TABLE ... [USING HEAP | LSM | COLUMN]`, `DROP TABLE`,
