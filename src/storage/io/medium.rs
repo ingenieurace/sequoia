@@ -4,7 +4,6 @@
 //! Writes may be lost in a crash until `sync` returns.
 
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::sync::RwLock;
 
 use crate::error::{Result, err};
@@ -25,11 +24,11 @@ pub struct FileMedium(pub File);
 
 impl Medium for FileMedium {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
-        Ok(self.0.read_exact_at(buf, offset)?)
+        Ok(positional::read_exact_at(&self.0, buf, offset)?)
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
-        Ok(self.0.write_all_at(buf, offset)?)
+        Ok(positional::write_all_at(&self.0, buf, offset)?)
     }
 
     fn size(&self) -> Result<u64> {
@@ -42,6 +41,61 @@ impl Medium for FileMedium {
 
     fn sync(&self) -> Result<()> {
         Ok(self.0.sync_data()?)
+    }
+}
+
+#[cfg(unix)]
+mod positional {
+    use std::fs::File;
+    use std::io;
+    use std::os::unix::fs::FileExt;
+
+    pub fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        file.read_exact_at(buf, offset)
+    }
+
+    pub fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+        file.write_all_at(buf, offset)
+    }
+}
+
+/// Windows has no `read_exact_at`: `seek_read` and `seek_write` may transfer
+/// fewer bytes, so they are looped. They also move the file's cursor, which
+/// nothing here uses.
+#[cfg(windows)]
+mod positional {
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::fs::FileExt;
+
+    pub fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+        while !buf.is_empty() {
+            match file.seek_read(buf, offset) {
+                Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+                Ok(n) => {
+                    buf = &mut buf[n..];
+                    offset += n as u64;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+        while !buf.is_empty() {
+            match file.seek_write(buf, offset) {
+                Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+                Ok(n) => {
+                    buf = &buf[n..];
+                    offset += n as u64;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 }
 
