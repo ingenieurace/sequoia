@@ -191,11 +191,12 @@ impl Gen {
     }
 
     /// An expression that reads a column: SQLite reads a constant integer in
-    /// ORDER BY, even `(- 1)`, as a column number.
+    /// ORDER BY, even `(- 1)`, as a column number. That includes one SQLite
+    /// folds to a constant, such as `(c1 AND ('b' IS NULL))`.
     fn key(&mut self, ty: Type, s: &Scope, budget: u32) -> String {
         loop {
             let e = self.expr(ty, s, budget);
-            if reads_column(&e) {
+            if reads_column(&e) && !folds_is_null(&e) {
                 return e;
             }
         }
@@ -729,6 +730,46 @@ fn reads_column(e: &str) -> bool {
     words.iter().any(|w| w == "id" || ((w.starts_with('c') || w.starts_with('x')) && numbered(w)))
 }
 
+/// Whether an expression has an `x IS NULL` that SQLite folds to 0 because
+/// `x` is never NULL, which an AND around it may fold to 0 in turn.
+fn folds_is_null(e: &str) -> bool {
+    let mut opens = Vec::new();
+    let mut quoted = false;
+    for (i, c) in e.char_indices() {
+        match c {
+            '\'' => quoted = !quoted,
+            '(' if !quoted => opens.push(i),
+            ')' if !quoted => {
+                let open = opens.pop().expect("balanced parentheses");
+                if let Some(operand) = e[open + 1..i].strip_suffix(" IS NULL")
+                    && never_null(operand)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether SQLite knows an operand of IS NULL is never NULL: a text or
+/// integer literal, its negation, or a test it folds to a constant. Operands
+/// are a single leaf or a parenthesized expression.
+fn never_null(e: &str) -> bool {
+    if e.starts_with('\'') || e.parse::<i64>().is_ok() {
+        return true;
+    }
+    let Some(inner) = e.strip_prefix('(').and_then(|e| e.strip_suffix(')')) else { return false };
+    match inner.strip_prefix("- ") {
+        Some(negated) => never_null(negated),
+        None => {
+            let operand = inner.strip_suffix(" IS NULL").or_else(|| inner.strip_suffix(" IS NOT NULL"));
+            operand.is_some_and(never_null)
+        }
+    }
+}
+
 /// What a statement did: its rows as SQLite's quote mode prints them, or an error.
 #[derive(Debug, PartialEq)]
 enum Outcome {
@@ -862,5 +903,27 @@ fn sequoia_agrees_with_sqlite() {
             mismatches.len(),
             all.join("\n\n")
         );
+    }
+}
+
+#[test]
+fn keys_sqlite_folds_to_constants_are_found() {
+    for folded in [
+        "(c1 AND ('b' IS NULL))",
+        "((-5 IS NULL) AND a0.c1)",
+        "(c1 AND ((- (- 1)) IS NULL))",
+        "(c1 AND (('it''s' IS NOT NULL) IS NULL))",
+        "(c1 AND ((c2 AND ('a)' IS NULL)) IS NULL))",
+    ] {
+        assert!(folds_is_null(folded), "{folded}");
+    }
+    for kept in [
+        "(c1 AND (TRUE IS NULL))",
+        "(c1 AND (NULL IS NULL))",
+        "(c1 AND ((1 + 2) IS NULL))",
+        "(c1 AND ((- c2) IS NULL))",
+        "(c1 AND ('b' IS NOT NULL))",
+    ] {
+        assert!(!folds_is_null(kept), "{kept}");
     }
 }
