@@ -40,11 +40,17 @@ cases by default; run more, or other ones, with:
 SEQUOIA_DIFF_CASES=2000 SEQUOIA_DIFF_SEED=7 cargo test --release --test differential -- --nocapture
 ```
 
-`benches/hash_join.rs` times hash joins of 200,000 rows with 50,000, and
-prints the fastest of five runs of each query:
+`benches/joins.rs` times every join method on 200,000 rows joined with
+50,000, mostly against another method on the same rows, checks that each
+query's plan uses the join it means to time, and prints the fastest of five
+runs of each. Name groups (`hash`, `index`, `block`, `merge`) to run only those:
 
 ```bash
-cargo bench --bench hash_join
+cargo bench --bench joins
+```
+
+```bash
+cargo bench --bench joins -- index merge
 ```
 
 ## Supported SQL
