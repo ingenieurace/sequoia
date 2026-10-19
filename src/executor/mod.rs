@@ -17,6 +17,7 @@ use crate::result::QueryResult;
 use crate::sql::ast::{Expr, Select, Statement};
 use crate::sql::eval::{Field, eval_with, matches_with};
 use crate::types::Value;
+use join::JOIN_MEMORY;
 use operator::Rows;
 use sort::SORT_MEMORY;
 use subquery::Runner;
@@ -27,11 +28,14 @@ pub struct Settings {
     /// Bytes a sort may buffer rows in before it writes sorted runs to a
     /// temporary file. Like PostgreSQL's `work_mem`.
     pub sort_memory: usize,
+    /// Bytes of left rows a block nested loop join may hold at once; it reads
+    /// its right side once for each block of them.
+    pub join_memory: usize,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { sort_memory: SORT_MEMORY }
+        Settings { sort_memory: SORT_MEMORY, join_memory: JOIN_MEMORY }
     }
 }
 

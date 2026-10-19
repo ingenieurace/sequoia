@@ -95,7 +95,7 @@ src/
   executor/       runs statements
     mod.rs        statement execution; a SELECT's rows as a stream (`Database::query`)
     operator.rs   each plan step as an iterator pulling rows from the one below
-    join.rs       nested loop, hash and index joins; LEFT JOIN padding
+    join.rs       block nested loop, hash and index joins; LEFT JOIN padding
     sort.rs       ORDER BY: external merge sort, top-N heap for LIMIT
     aggregate.rs  hash aggregation: one row per group, and the aggregate functions
     subquery.rs   runs subqueries for each row, with outer references replaced by its values
@@ -256,11 +256,14 @@ too. Each join then finds the right rows that may match a left row from its
 equalities `left = right column`: an **index join** looks them up in an
 index of the right table on that column (or an LSM primary key), once per
 left row; failing that, a **hash join** reads the right table once into a
-hash table keyed by the equalities; failing that, a **nested loop join**
-reads it once and tries every pair. The rest of the condition is checked on
-each pair. Keys are compared as values, so a NULL key matches nothing, and
-neither do keys of different types, where `=` would report an error. The
-right side of a hash or nested loop join is held in memory.
+hash table keyed by the equalities; failing that, a **block nested loop
+join** reads the left rows a block at a time, as many as fit in its budget
+(4 MB by default; `Database::set_join_memory` changes it), and reads the
+right table again for each block, trying every pair. The rest of the
+condition is checked on each pair. Keys are compared as values, so a NULL
+key matches nothing, and neither do keys of different types, where `=` would
+report an error. The right side of a hash join is held in memory; a block
+nested loop join holds one block of left rows.
 
 **Grouping**: a `SELECT` with `GROUP BY`, `HAVING` or an aggregate gets an
 aggregate step, which works by hash aggregation. Each expression of its

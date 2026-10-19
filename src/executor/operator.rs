@@ -5,13 +5,15 @@
 //! `LIMIT` stops the scan once it has enough, and a query's rows can be read
 //! without holding them all. A sort and an aggregate are blocking: they read
 //! all of their input when their first row is asked for. So is the right side
-//! of a hash or nested loop join (see `join.rs`); the left side streams.
+//! of a hash join (see `join.rs`); the left side streams. A block nested loop
+//! join reads its left side a block at a time, and its right side again for
+//! each block.
 
 use std::collections::{HashMap, HashSet};
 
 use super::Settings;
 use super::aggregate;
-use super::join::{Join, Lookup, Right};
+use super::join::{BlockJoin, Join, Lookup, Right};
 use super::sort::Sorter;
 use super::subquery::Runner;
 use crate::catalog::Catalog;
@@ -35,7 +37,12 @@ pub fn open<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings) -> Ro
             let (left_fields, right_fields) = (left.columns(), right.columns());
             let left = open(*left, catalog, settings);
             let right = match method {
-                JoinMethod::NestedLoop => Right::Loop { source: Some(open(*right, catalog, settings)), rows: Vec::new() },
+                JoinMethod::Block => {
+                    let budget = settings.join_memory;
+                    let settings = settings.clone();
+                    let right = Box::new(move || open((*right).clone(), catalog, &settings));
+                    return Box::new(BlockJoin::new(left, left_fields, right, right_fields, kind, condition, budget));
+                }
                 JoinMethod::Hash { left_keys, right_keys } => Right::Hash {
                     source: Some(open(*right, catalog, settings)),
                     rows: Vec::new(),

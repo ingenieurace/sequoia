@@ -1190,7 +1190,7 @@ fn every_join_method_and_storage_agrees_with_a_nested_loop() {
         ("b.id = a.k", "JOIN"),
         ("b.a_k = a.k AND b.v > a.id", "JOIN"),
         ("a.k + 1 = b.v AND a.tag = 'x'", "JOIN"),
-        ("b.v < a.k", "NESTED LOOP JOIN"),
+        ("b.v < a.k", "BLOCK NESTED LOOP JOIN"),
         ("b.a_k = a.k AND b.v > 5", "JOIN"),
     ];
     for storage in ["HEAP", "LSM", "COLUMN"] {
@@ -1235,6 +1235,45 @@ fn every_join_method_and_storage_agrees_with_a_nested_loop() {
             assert!(plan.contains(expected), "{storage}, indexed {indexed}: {plan}");
             let plan = explain(&mut db, "SELECT * FROM a JOIN b ON b.id = a.k");
             assert!(plan.contains(if storage == "COLUMN" { "HASH JOIN" } else { "INDEX JOIN" }), "{plan}");
+        }
+    }
+}
+
+#[test]
+fn block_nested_loop_join_agrees_for_every_block_size() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE a (id INT PRIMARY KEY, k INT);
+         CREATE TABLE b (id INT PRIMARY KEY, v INT);
+         CREATE TABLE empty (id INT PRIMARY KEY, v INT);",
+    )
+    .unwrap();
+    let a: Vec<String> =
+        (0..50i64).map(|i| format!("({i}, {})", if i % 7 == 0 { "NULL".into() } else { (i % 10).to_string() })).collect();
+    let b: Vec<String> = (0..30i64).map(|i| format!("({i}, {})", i % 8)).collect();
+    db.execute(&format!("INSERT INTO a VALUES {}", a.join(", "))).unwrap();
+    db.execute(&format!("INSERT INTO b VALUES {}", b.join(", "))).unwrap();
+
+    let queries = [
+        "SELECT a.id, b.id FROM a JOIN b ON b.v < a.k",
+        "SELECT a.id, b.id FROM a LEFT JOIN b ON b.v > a.k",
+        "SELECT a.id, b.id FROM a LEFT JOIN b ON b.v < a.k WHERE a.id < 20 AND b.id IS NULL",
+        // The right side is a sort, which runs again for each block.
+        "SELECT a.id, t.id FROM a JOIN (SELECT id, v FROM b ORDER BY v DESC LIMIT 5) t ON t.v < a.k",
+        "SELECT a.id, e.id FROM a LEFT JOIN empty e ON e.v < a.k",
+        "SELECT e.id, a.id FROM empty e LEFT JOIN a ON a.k < e.v",
+    ];
+    for sql in queries {
+        assert!(explain(&mut db, sql).contains("BLOCK NESTED LOOP JOIN"), "{sql}");
+        db.set_join_memory(usize::MAX);
+        let mut whole = query(&mut db, sql);
+        whole.sort_by(|x, y| x[0].sort_cmp(&y[0]).then(x[1].sort_cmp(&y[1])));
+        // A row of `a` takes about 96 bytes: blocks of 1, 3 and 11 rows.
+        for memory in [0, 200, 1000] {
+            db.set_join_memory(memory);
+            let mut rows = query(&mut db, sql);
+            rows.sort_by(|x, y| x[0].sort_cmp(&y[0]).then(x[1].sort_cmp(&y[1])));
+            assert_eq!(rows, whole, "{sql}, {memory} bytes");
         }
     }
 }

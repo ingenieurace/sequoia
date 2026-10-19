@@ -212,6 +212,13 @@ impl Database {
         self.settings.sort_memory = bytes;
     }
 
+    /// Sets how many bytes of left rows a block nested loop join may hold at
+    /// once ([`executor::join::JOIN_MEMORY`] by default); it reads its right
+    /// side once for each block of them.
+    pub fn set_join_memory(&mut self, bytes: usize) {
+        self.settings.join_memory = bytes;
+    }
+
     pub fn table_names(&self) -> Vec<&str> {
         self.catalog.table_names()
     }

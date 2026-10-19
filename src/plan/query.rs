@@ -43,8 +43,9 @@
 //!   column (or an LSM table's primary key), once per left row;
 //! - otherwise, with any equality between the two sides, a hash join reads
 //!   the right table once into a hash table keyed by the right sides;
-//! - otherwise a nested loop join reads the right table once and tries every
-//!   row with every left row.
+//! - otherwise a block nested loop join reads the left rows a block at a
+//!   time, as many as fit in its memory budget, and reads the right table
+//!   again for each block, trying every right row with every row of it.
 //!
 //! The rest of the condition is checked on each pair. Keys are compared as
 //! values, so a NULL key matches nothing, and neither do keys of different
@@ -59,8 +60,9 @@
 //! ORDER BY may only use expressions of the select list: rows that differ in
 //! anything else become one, which would have no single place in the order.
 //! The executor pulls rows through the tree one at a time;
-//! sorts, aggregates and the right sides of hash and nested loop joins read
-//! all of their input first. A distinct step streams, but remembers every row
+//! sorts, aggregates and the right sides of hash joins read all of their
+//! input first, and a block nested loop join reads its right side once per
+//! block of left rows. A distinct step streams, but remembers every row
 //! it has returned.
 //!
 //! **Groups.** An aggregate's rows hold its group keys, then its aggregates.
@@ -104,6 +106,7 @@ pub struct Plan<'a> {
 }
 
 /// One step of a plan.
+#[derive(Clone)]
 pub enum Node<'a> {
     /// Reads a table's rows the way `access` says. `qualifier` is what the
     /// query calls the table: its alias, or else its name.
@@ -130,9 +133,10 @@ pub enum Node<'a> {
 }
 
 /// How a join finds the right rows that may match a left row.
+#[derive(Clone)]
 pub enum JoinMethod {
-    /// Tries every right row.
-    NestedLoop,
+    /// Tries every right row, reading them again for each block of left rows.
+    Block,
     /// Those whose `right_keys` equal the left row's `left_keys`, from a hash table.
     Hash { left_keys: Vec<Expr>, right_keys: Vec<Expr> },
     /// Those the right side, a `Lookup` (maybe under filters), finds for the left row.
@@ -458,7 +462,7 @@ fn joins<'a>(
         } else {
             let right = source.read(right_filter, needed[i].clone());
             if keys.is_empty() {
-                (JoinMethod::NestedLoop, right)
+                (JoinMethod::Block, right)
             } else {
                 for (at, ..) in keys.iter().rev() {
                     residual.remove(*at);
@@ -716,7 +720,7 @@ impl Node<'_> {
             Node::Join { left, right, kind, method, condition } => {
                 let kind = if *kind == JoinKind::Left { "LEFT " } else { "" };
                 let (name, mut on) = match method {
-                    JoinMethod::NestedLoop => ("NESTED LOOP", Vec::new()),
+                    JoinMethod::Block => ("BLOCK NESTED LOOP", Vec::new()),
                     JoinMethod::Index => ("INDEX", Vec::new()),
                     JoinMethod::Hash { left_keys, right_keys } => {
                         ("HASH", left_keys.iter().zip(right_keys).map(|(l, r)| format!("{l} = {r}")).collect())

@@ -205,11 +205,15 @@ impl Iterator for Sorted {
 impl Keyed {
     /// A rough count of the bytes the row takes in memory.
     fn size(&self) -> usize {
-        let value = |v: &Value| match v {
-            Value::Text(s) => 24 + s.len(),
-            _ => 16,
-        };
-        64 + self.keys.iter().chain(&self.row).map(value).sum::<usize>()
+        64 + self.keys.iter().chain(&self.row).map(value_size).sum::<usize>()
+    }
+}
+
+/// A rough count of the bytes a value takes in memory.
+pub fn value_size(value: &Value) -> usize {
+    match value {
+        Value::Text(s) => 24 + s.len(),
+        _ => 16,
     }
 }
 
