@@ -1171,13 +1171,13 @@ fn joins_of_three_tables_self_joins_and_grouping() {
         ),
         "PROJECT u.name, c.country
   FILTER o.id IS NULL
-    LEFT INDEX JOIN
-      INDEX JOIN
+    LEFT HASH JOIN ON u.id = o.user_id
+      HASH JOIN ON u.city = c.name
         SCAN users u
         FILTER c.country = 'no'
-          LOOKUP cities c USING INDEX cities_pkey (c.name = u.city)
+          SCAN cities c
       FILTER o.total > 4
-        LOOKUP orders o USING INDEX orders_user (o.user_id = u.id)"
+        SCAN orders o"
     );
 }
 
@@ -1201,13 +1201,14 @@ fn every_join_method_and_storage_agrees_with_a_nested_loop() {
             if indexed && storage != "COLUMN" {
                 db.execute("CREATE INDEX b_a_k ON b (a_k)").unwrap();
             }
-            let a: Vec<String> = (0..60i64)
+            // Few left rows and many right ones, so that an index makes for an index join.
+            let a: Vec<String> = (0..20i64)
                 .map(|i| {
                     let k = if i % 9 == 0 { "NULL".into() } else { (i % 13).to_string() };
                     format!("({i}, {k}, '{}')", ["x", "y"][i as usize % 2])
                 })
                 .collect();
-            let b: Vec<String> = (0..80i64)
+            let b: Vec<String> = (0..300i64)
                 .map(|i| {
                     let a_k = if i % 7 == 0 { "NULL".into() } else { (i % 17).to_string() };
                     format!("({i}, {a_k}, {})", i % 11)
@@ -1218,7 +1219,7 @@ fn every_join_method_and_storage_agrees_with_a_nested_loop() {
 
             for (condition, method) in conditions {
                 for kind in ["JOIN", "LEFT JOIN"] {
-                    for filter in ["", " WHERE a.id < 40", " WHERE b.id IS NULL OR b.v != 3"] {
+                    for filter in ["", " WHERE a.id < 12", " WHERE b.id IS NULL OR b.v != 3"] {
                         let sql = |on: &str| format!("SELECT a.id, b.id, b.v FROM a {kind} b ON {on}{filter}");
                         let mut planned = query(&mut db, &sql(condition));
                         let mut looped = query(&mut db, &sql(&format!("({condition}) OR FALSE")));
@@ -1237,6 +1238,56 @@ fn every_join_method_and_storage_agrees_with_a_nested_loop() {
             assert!(plan.contains(if storage == "COLUMN" { "HASH JOIN" } else { "INDEX JOIN" }), "{plan}");
         }
     }
+}
+
+#[test]
+fn index_join_is_picked_for_few_left_rows_by_row_counts() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE l (id INT PRIMARY KEY, k INT);
+         CREATE TABLE r (id INT PRIMARY KEY, k INT, v INT);
+         CREATE INDEX r_k ON r (k);
+         CREATE TABLE p (id INT PRIMARY KEY, v INT) USING LSM;",
+    )
+    .unwrap();
+    let rows = |count: i64, row: &dyn Fn(i64) -> String| (0..count).map(row).collect::<Vec<_>>().join(", ");
+    db.execute(&format!("INSERT INTO l VALUES {}", rows(10, &|i| format!("({i}, {i})")))).unwrap();
+    db.execute(&format!("INSERT INTO r VALUES {}", rows(1000, &|i| format!("({i}, {}, {})", i % 100, i % 7)))).unwrap();
+    db.execute(&format!("INSERT INTO p VALUES {}", rows(100, &|i| format!("({i}, {i})")))).unwrap();
+
+    // Ten lookups cost less than reading a thousand rows into a hash table.
+    let sql = "SELECT * FROM l JOIN r ON r.k = l.k AND r.v > 5";
+    assert_eq!(
+        explain(&mut db, sql),
+        "INDEX JOIN
+  SCAN l
+  FILTER r.v > 5
+    LOOKUP r USING INDEX r_k (r.k = l.k)"
+    );
+    let method = |db: &mut Database, sql: &str| {
+        let plan = explain(db, sql);
+        ["INDEX JOIN", "HASH JOIN"].into_iter().find(|m| plan.contains(m)).unwrap_or_else(|| panic!("{plan}"))
+    };
+    // Thousands of lookups do not: the counts follow inserts and deletes.
+    let more = |from: i64| format!("INSERT INTO l VALUES {}", rows(2000, &|i| format!("({}, {i})", from + i)));
+    db.execute(&more(100)).unwrap();
+    assert_eq!(method(&mut db, sql), "HASH JOIN");
+    db.execute("DELETE FROM l WHERE id >= 100").unwrap();
+    assert_eq!(method(&mut db, sql), "INDEX JOIN");
+    // A rollback forgets the count, and the next plan counts again.
+    db.execute(&format!("BEGIN; {};", more(100))).unwrap();
+    assert_eq!(method(&mut db, sql), "HASH JOIN");
+    db.execute("ROLLBACK").unwrap();
+    assert_eq!(method(&mut db, sql), "INDEX JOIN");
+    // A filter on the left makes for fewer lookups: a third of the rows, as guessed.
+    db.execute(&more(100)).unwrap();
+    assert_eq!(method(&mut db, &format!("{sql} WHERE l.id > 1500")), "HASH JOIN");
+    assert_eq!(method(&mut db, &format!("{sql} WHERE l.id > 1500 AND l.k < 9 AND l.k > 1")), "INDEX JOIN");
+    // An LSM primary key lookup is cheaper: worth it for as many left rows as right ones.
+    db.execute("DELETE FROM l WHERE id >= 100").unwrap();
+    assert_eq!(method(&mut db, "SELECT * FROM l JOIN p ON p.id = l.k"), "INDEX JOIN");
+    db.execute(&format!("INSERT INTO l VALUES {}", rows(200, &|i| format!("({}, {i})", 100 + i)))).unwrap();
+    assert_eq!(method(&mut db, "SELECT * FROM l JOIN p ON p.id = l.k"), "HASH JOIN");
 }
 
 #[test]
@@ -1358,7 +1409,7 @@ fn block_nested_loop_join_agrees_for_every_block_size() {
         "SELECT a.id, b.id FROM a JOIN b ON b.v < a.k",
         "SELECT a.id, b.id FROM a LEFT JOIN b ON b.v > a.k",
         "SELECT a.id, b.id FROM a LEFT JOIN b ON b.v < a.k WHERE a.id < 20 AND b.id IS NULL",
-        // The right side is a sort, which runs again for each block.
+        // The right side is a sort, which runs again for each block unless its rows are kept.
         "SELECT a.id, t.id FROM a JOIN (SELECT id, v FROM b ORDER BY v DESC LIMIT 5) t ON t.v < a.k",
         "SELECT a.id, e.id FROM a LEFT JOIN empty e ON e.v < a.k",
         "SELECT e.id, a.id FROM empty e LEFT JOIN a ON a.k < e.v",
@@ -1368,8 +1419,10 @@ fn block_nested_loop_join_agrees_for_every_block_size() {
         db.set_join_memory(usize::MAX);
         let mut whole = query(&mut db, sql);
         whole.sort_by(|x, y| x[0].sort_cmp(&y[0]).then(x[1].sort_cmp(&y[1])));
-        // A row of `a` takes about 96 bytes: blocks of 1, 3 and 11 rows.
-        for memory in [0, 200, 1000] {
+        // A row of `a` or `b` takes about 96 bytes: blocks of 1, 3, 11 and
+        // 32 rows. With 3000 bytes the 30 rows of `b` are read once and kept
+        // for the second block; with less they are read again for each one.
+        for memory in [0, 200, 1000, 3000] {
             db.set_join_memory(memory);
             let mut rows = query(&mut db, sql);
             rows.sort_by(|x, y| x[0].sort_cmp(&y[0]).then(x[1].sort_cmp(&y[1])));
@@ -1505,7 +1558,7 @@ fn nested_correlated_and_grouped_subqueries() {
                WHERE o.total = (SELECT MAX(total) FROM orders x WHERE x.user_id = u.id) ORDER BY o.id";
     assert_eq!(query(&mut db, sql), [vec![text("ann"), int(11)], vec![text("bo"), int(12)]]);
     assert!(explain(&mut db, sql).contains(
-        "FILTER o.total = (SELECT MAX(total) FROM orders x WHERE x.user_id = u.id)\n      INDEX JOIN"
+        "FILTER o.total = (SELECT MAX(total) FROM orders x WHERE x.user_id = u.id)\n      HASH JOIN"
     ));
     let sql = "SELECT u.name, o.id FROM users u LEFT JOIN orders o ON o.user_id = u.id
                WHERE NOT EXISTS (SELECT * FROM orders x WHERE x.user_id = u.id AND x.total > 6) ORDER BY u.id";

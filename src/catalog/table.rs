@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::Relaxed;
 
 use super::index::{Bound, Index};
 use crate::error::{Error, Result, err};
@@ -40,7 +42,12 @@ pub struct Table {
     /// column store moves its rows when it migrates them, which would change
     /// their ids.
     indexes: Vec<Index>,
+    /// How many rows the table has, or [`UNCOUNTED`]: see [`Table::row_count`].
+    rows: AtomicU64,
 }
+
+/// A row count not counted yet.
+const UNCOUNTED: u64 = u64::MAX;
 
 enum Storage {
     Heap(TableHeap),
@@ -73,7 +80,7 @@ impl Table {
                 Storage::Column(ColumnStore::create(pool.clone(), columns.clone(), ColumnConfig::default())?)
             }
         };
-        Ok(Table { name, columns, pool, storage, indexes: Vec::new() })
+        Ok(Table { name, columns, pool, storage, indexes: Vec::new(), rows: AtomicU64::new(0) })
     }
 
     /// Opens a table from the pages [`Table::root_pages`] returned. Its
@@ -99,7 +106,7 @@ impl Table {
                 Storage::Column(ColumnStore::open(pool.clone(), first, columns.clone(), ColumnConfig::default())?)
             }
         };
-        Ok(Table { name, columns, pool, storage, indexes: Vec::new() })
+        Ok(Table { name, columns, pool, storage, indexes: Vec::new(), rows: AtomicU64::new(UNCOUNTED) })
     }
 
     pub fn storage_kind(&self) -> StorageKind {
@@ -239,6 +246,31 @@ impl Table {
         }
     }
 
+    /// How many rows the table has, for the planner to weigh plans by. The
+    /// first call after the table is opened counts them with a scan (as an
+    /// ANALYZE would), and writes keep the count from then on. Opening the
+    /// catalog again, as a rollback does, forgets it.
+    pub fn row_count(&self) -> Result<u64> {
+        let rows = self.rows.load(Relaxed);
+        if rows != UNCOUNTED {
+            return Ok(rows);
+        }
+        let mut rows = 0;
+        for item in self.scan_columns(&vec![false; self.columns.len()]) {
+            item?;
+            rows += 1;
+        }
+        self.rows.store(rows, Relaxed);
+        Ok(rows)
+    }
+
+    /// Adds `change` to the row count, if it was counted.
+    fn count(&self, change: i64) {
+        let _ = self.rows.fetch_update(Relaxed, Relaxed, |rows| {
+            (rows != UNCOUNTED).then(|| rows.saturating_add_signed(change))
+        });
+    }
+
     pub fn insert(&mut self, rows: Vec<Row>) -> Result<()> {
         let encoded = self.encode_all(&rows)?;
         self.check_unique(&HashSet::new(), &rows)?;
@@ -279,7 +311,10 @@ impl Table {
                 Vec::new() // no indexes to add the rows to
             }
         };
-        self.add_to_indexes(ids.into_iter().zip(rows))
+        let added = rows.len() as i64;
+        self.add_to_indexes(ids.into_iter().zip(rows))?;
+        self.count(added);
+        Ok(())
     }
 
     /// Replaces each row with the given id by a new value.
@@ -377,7 +412,9 @@ impl Table {
                 Storage::Column(store) => store.delete(id.into_position()?)?,
             }
         }
-        self.remove_from_indexes(&old_rows)
+        self.remove_from_indexes(&old_rows)?;
+        self.count(-(ids.len() as i64));
+        Ok(())
     }
 
     /// Frees all of the table's pages, its indexes' included.

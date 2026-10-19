@@ -268,15 +268,27 @@ conditions on its right table are checked after it, on the NULL-padded rows
 too. Each join then finds the right rows that may match a left row from its
 equalities `left = right column`: an **index join** looks them up in an
 index of the right table on that column (or an LSM primary key), once per
-left row; failing that, a **hash join** reads the right table once into a
-hash table keyed by the equalities; failing that, a **block nested loop
-join** reads the left rows a block at a time, as many as fit in its budget
-(4 MB by default; `Database::set_join_memory` changes it), and reads the
-right table again for each block, trying every pair. The rest of the
-condition is checked on each pair. Keys are compared as values, so a NULL
-key matches nothing, and neither do keys of different types, where `=` would
-report an error. The right side of a hash join is held in memory; a block
-nested loop join holds one block of left rows.
+left row, when that is cheaper than a hash join; otherwise a **hash join**
+reads the right table once into a hash table keyed by the equalities;
+failing any equality, a **block nested loop join** reads the left rows a
+block at a time, as many as fit in its budget (4 MB by default;
+`Database::set_join_memory` changes it), and reads the right table again
+for each block, unless its rows fit in the budget too and are kept from the
+first read, trying every pair. The rest of the condition is checked on each
+pair. Keys are compared as values, so a NULL key matches nothing, and
+neither do keys of different types, where `=` would report an error. The
+right side of a hash join is held in memory; a block nested loop join holds
+one block of left rows, and the right rows if it keeps them.
+
+Whether lookups are cheaper depends on how many there are against how many
+rows a hash join would read. The planner counts each table's rows the first
+time it needs them (writes keep the count up to date after that; a rollback
+makes it count again), and with no statistics guesses what share of them a
+condition keeps as PostgreSQL does without any: 1 in 200 for an equality,
+a third for a comparison. A lookup costs about 27 rows read when it goes
+through an index, and 2 for an LSM primary key; a hash join about 2 per right
+row and 0.4 per left row (measured with `benches/joins.rs`). So an index
+join over 200,000 rows into 50,000 becomes a hash join, about 18 times faster.
 
 A **sort-merge join** sorts both sides by the equalities, with the same
 external sort as `ORDER BY` (and its budget), and walks them together; its

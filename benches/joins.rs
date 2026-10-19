@@ -16,6 +16,14 @@ const LEFT: i64 = 200_000;
 const RIGHT: i64 = 50_000;
 const RUNS: usize = 5;
 
+/// A condition true of every row of `a`, of four comparisons that the
+/// planner guesses keep a third of the rows each: 1 in 81 in all.
+macro_rules! all_rows {
+    () => {
+        "a.k >= 0 AND a.k <= 1000000 AND a.k > -1 AND a.k < 1000001"
+    };
+}
+
 /// A query to time, the words its plan must have, and the memory budgets to
 /// run it with.
 struct Case {
@@ -57,16 +65,49 @@ fn main() {
         ),
         (
             "index",
+            // all_rows!() keeps every row of `a`, but the planner guesses that
+            // each of its four comparisons keeps a third of them: so few that
+            // it plans an index join. With `+ 0` hiding the key, the same
+            // query makes a hash join.
             vec![
-                case("index on k", "SELECT COUNT(*) FROM a JOIN bi ON bi.k = a.k", &["INDEX JOIN"]),
-                case("  as a hash join", "SELECT COUNT(*) FROM a JOIN bi ON bi.k + 0 = a.k", &["HASH JOIN"]),
-                case("LSM primary key", "SELECT COUNT(*) FROM a JOIN bl ON bl.id = a.k", &["INDEX JOIN"]),
-                case("  as a hash join", "SELECT COUNT(*) FROM a JOIN bl ON bl.id + 0 = a.k", &["HASH JOIN"]),
-                // A hash join reads all of the right side, however few left rows probe it.
-                case("1,000 left rows", "SELECT COUNT(*) FROM a JOIN bi ON bi.k = a.k WHERE a.id < 1000", &["INDEX JOIN"]),
+                case(
+                    "index on k",
+                    concat!("SELECT COUNT(*) FROM a JOIN bi ON bi.k = a.k WHERE ", all_rows!()),
+                    &["INDEX JOIN"],
+                ),
                 case(
                     "  as a hash join",
-                    "SELECT COUNT(*) FROM a JOIN bi ON bi.k + 0 = a.k WHERE a.id < 1000",
+                    concat!("SELECT COUNT(*) FROM a JOIN bi ON bi.k + 0 = a.k WHERE ", all_rows!()),
+                    &["HASH JOIN"],
+                ),
+                case(
+                    "LSM primary key",
+                    concat!("SELECT COUNT(*) FROM a JOIN bl ON bl.id = a.k WHERE ", all_rows!()),
+                    &["INDEX JOIN"],
+                ),
+                case(
+                    "  as a hash join",
+                    concat!("SELECT COUNT(*) FROM a JOIN bl ON bl.id + 0 = a.k WHERE ", all_rows!()),
+                    &["HASH JOIN"],
+                ),
+                // A hash join reads all of the right side, however few left rows probe it.
+                case(
+                    "1,000 left rows",
+                    concat!("SELECT COUNT(*) FROM a JOIN bi ON bi.k = a.k WHERE a.id < 1000 AND ", all_rows!()),
+                    &["INDEX JOIN"],
+                ),
+                case(
+                    "  as a hash join",
+                    concat!("SELECT COUNT(*) FROM a JOIN bi ON bi.k + 0 = a.k WHERE a.id < 1000 AND ", all_rows!()),
+                    &["HASH JOIN"],
+                ),
+                // What the planner picks on its own. For `a.id < 1000` it
+                // guesses a third of `a`, and so a hash join, though lookups
+                // would be faster.
+                case("200,000 left rows, planned", "SELECT COUNT(*) FROM a JOIN bi ON bi.k = a.k", &["HASH JOIN"]),
+                case(
+                    "1,000 left rows, planned",
+                    "SELECT COUNT(*) FROM a JOIN bi ON bi.k = a.k WHERE a.id < 1000",
                     &["HASH JOIN"],
                 ),
             ],
@@ -86,6 +127,16 @@ fn main() {
                     &["BLOCK NESTED LOOP JOIN"],
                 )
                 .join_memory(1000),
+                // 20,000 left rows in about 100 blocks of 20 KB, and on the
+                // right the 200 groups of an aggregate over all of `b`, which
+                // fit in 20 KB too: kept, rather than grouped again per block.
+                case(
+                    "100 blocks, aggregate kept",
+                    "SELECT COUNT(*) FROM a JOIN (SELECT k / 250 AS g, COUNT(*) AS n FROM b GROUP BY k / 250) t
+                     ON t.g * 250 < a.k WHERE a.id < 20000",
+                    &["BLOCK NESTED LOOP JOIN"],
+                )
+                .join_memory(20_000),
                 case(
                     "left join, 1 block",
                     // In the ON: WHERE would filter the right side only after the join.

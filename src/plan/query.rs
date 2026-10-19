@@ -40,16 +40,28 @@
 //! left row from its equalities `left expression = right column`:
 //!
 //! - an index join looks them up in an index of the right table on that
-//!   column (or an LSM table's primary key), once per left row;
+//!   column (or an LSM table's primary key), once per left row, if that
+//!   costs less than a hash join (see below);
 //! - otherwise, with any equality between the two sides, a hash join reads
 //!   the right table once into a hash table keyed by the right sides;
 //! - otherwise a block nested loop join reads the left rows a block at a
 //!   time, as many as fit in its memory budget, and reads the right table
-//!   again for each block, trying every right row with every row of it.
+//!   again for each block (or keeps its rows, if they fit in the budget
+//!   too), trying every right row with every row of it.
 //!
 //! The rest of the condition is checked on each pair. Keys are compared as
 //! values, so a NULL key matches nothing, and neither do keys of different
 //! types, where `=` would report an error.
+//!
+//! **Costs.** An index join costs a lookup per left row, a hash join a read
+//! of every right row (and a cheap probe per left row), so which is cheaper
+//! depends on how many rows each side has. The planner counts a table's rows
+//! the first time it needs them (the writes keep the count after that) and
+//! guesses, with no statistics, what share of them a condition keeps, the
+//! way PostgreSQL does without them: 1 in 200 for an equality, a third for a
+//! comparison. A join with equalities is guessed to return as many rows as
+//! its larger side. The costs of a lookup, of a hash table row and of a
+//! probe, relative to reading a row, were measured with `benches/joins.rs`.
 //!
 //! A merge join, which sorts both sides by the equalities and merges them,
 //! puts its rows in its left side's sorted order. With no statistics to
@@ -102,7 +114,7 @@ use crate::catalog::Catalog;
 use crate::catalog::table::{Access, Table};
 use crate::error::{Result, err};
 use crate::plan::{access, filter};
-use crate::predicate::Predicate;
+use crate::predicate::{Compare, Predicate};
 use crate::sql::ast::{
     Aggregate, BinaryOp, ColumnRef, Expr, From, JoinKind, OrderBy, Projection, Select, SelectItem, TableSource,
 };
@@ -456,11 +468,14 @@ fn joins<'a>(
         let mut residual = std::mem::take(&mut conditions[i]);
         let keys = equalities(&residual, i, binder);
 
-        let index = keys.iter().find_map(|(at, left, right)| {
-            let (Expr::Column(column), SourceKind::Table(table)) = (right, &source.kind) else { return None };
-            let column = table.column_index(&column.name).ok()?;
-            Some((*at, left.clone(), column, *table, lookup_key(table, column)?))
-        });
+        let index = keys
+            .iter()
+            .find_map(|(at, left, right)| {
+                let (Expr::Column(column), SourceKind::Table(table)) = (right, &source.kind) else { return None };
+                let column = table.column_index(&column.name).ok()?;
+                Some((*at, left.clone(), column, *table, lookup_key(table, column)?))
+            })
+            .filter(|(.., table, key)| lookups_win(estimate(&node), table, *key));
         let (method, right) = if let Some((_, (order, desc, then))) = merge.take_if(|(at, _)| *at == i) {
             for (at, ..) in keys.iter().rev() {
                 residual.remove(*at);
@@ -574,6 +589,76 @@ fn merge_order(
         }
     }
     Some((order, desc, rest.to_vec()))
+}
+
+/// What the planner's choices cost, in rows read by a scan, as measured with
+/// `benches/joins.rs`: a lookup through an index, then of the row it finds;
+/// a lookup of an LSM table's primary key; reading a right row into a hash
+/// join's hash table; and looking a left row up in it. Worth measuring again
+/// when one of them gets faster.
+const INDEX_LOOKUP_COST: f64 = 27.0;
+const KEY_LOOKUP_COST: f64 = 2.0;
+const HASH_BUILD_COST: f64 = 2.0;
+const HASH_PROBE_COST: f64 = 0.4;
+
+/// How many of its rows a condition keeps, guessed with no statistics as
+/// PostgreSQL guesses: an equality 1 in 200 (but at most one row on a
+/// primary key or unique index), `<>` all but that, and a comparison or
+/// anything else 1 in 3.
+const EQUAL_KEEPS: f64 = 0.005;
+const OTHER_KEEPS: f64 = 1.0 / 3.0;
+
+/// Whether an index join, looking each of `left` rows up in `table` by
+/// `key`, costs less than a hash join reading all of `table` once.
+fn lookups_win(left: f64, table: &Table, key: LookupKey) -> bool {
+    let right = table.row_count().map_or(f64::INFINITY, |rows| rows as f64);
+    let lookup = match key {
+        LookupKey::Index(_) => INDEX_LOOKUP_COST,
+        LookupKey::PrimaryKey => KEY_LOOKUP_COST,
+    };
+    left * lookup <= right * HASH_BUILD_COST + left * HASH_PROBE_COST
+}
+
+/// Roughly how many rows a plan step returns: tables' row counts, cut down
+/// by the guesses above for what conditions keep. A join with equalities
+/// returns about as many rows as its larger side (as if each row of that
+/// side matched one of the other), and one without, a third of every pair.
+fn estimate(node: &Node) -> f64 {
+    match node {
+        Node::Scan { table, predicates, .. } => {
+            let rows = table.row_count().map_or(1000.0, |rows| rows as f64);
+            let unique = |column| {
+                table.primary_key() == Some(column) || table.indexes().iter().any(|i| i.column == column && i.unique)
+            };
+            predicates.iter().fold(rows, |rows, p| match p.op {
+                Compare::Eq if unique(p.column) => rows.min(1.0),
+                Compare::Eq => rows * EQUAL_KEEPS,
+                Compare::NotEq => rows * (1.0 - EQUAL_KEEPS),
+                _ => rows * OTHER_KEEPS,
+            })
+        }
+        Node::Lookup { .. } => 1.0,
+        // Above a scan, a filter checks again what the scan's predicates did.
+        Node::Filter { input, .. } => match &**input {
+            Node::Scan { predicates, .. } if !predicates.is_empty() => estimate(input),
+            _ => estimate(input) * OTHER_KEEPS,
+        },
+        Node::Join { left, right, method, kind, .. } => {
+            let (left, right) = (estimate(left), estimate(right));
+            let rows = match method {
+                JoinMethod::Block => left * right * OTHER_KEEPS,
+                _ => left.max(right),
+            };
+            if *kind == JoinKind::Left { rows.max(left) } else { rows }
+        }
+        Node::Aggregate { input, group_by, .. } => match group_by.is_empty() {
+            true => 1.0,
+            false => (estimate(input) * OTHER_KEEPS).max(1.0),
+        },
+        Node::Sort { input, limit, .. } => limit.map_or(estimate(input), |n| estimate(input).min(n as f64)),
+        Node::Limit { input, count } => estimate(input).min(*count as f64),
+        Node::Distinct { input } | Node::Project { input, .. } | Node::Derived { input, .. } => estimate(input),
+    }
 }
 
 /// How a lookup on this column of the table can find rows, if it can: through
