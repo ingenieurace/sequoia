@@ -17,6 +17,11 @@
 //!
 //! **Tables.** The tables of FROM are joined left to right, each join
 //! reading the rows joined so far on its left and one table on its right.
+//! A subquery in FROM (a derived table) is planned like any SELECT, and its
+//! columns are named by its select list (an `AS` name, a column's name, an
+//! aggregate's function or `?column?`) and qualified by its alias. It cannot
+//! refer to the other tables of the FROM it is in, only, if it is itself in
+//! a subquery, to the queries around that.
 //! Every column reference is first bound to the table it belongs to, which
 //! fails if it names no column or, unqualified, a column of several tables.
 //! With a single table, references stay as written.
@@ -86,7 +91,9 @@ use crate::catalog::table::{Access, Table};
 use crate::error::{Result, err};
 use crate::plan::{access, filter};
 use crate::predicate::Predicate;
-use crate::sql::ast::{Aggregate, BinaryOp, ColumnRef, Expr, From, JoinKind, OrderBy, Projection, Select};
+use crate::sql::ast::{
+    Aggregate, BinaryOp, ColumnRef, Expr, From, JoinKind, OrderBy, Projection, Select, SelectItem, TableSource,
+};
 use crate::sql::eval::{Field, resolve};
 use crate::types::{StorageKind, Value};
 
@@ -118,6 +125,8 @@ pub enum Node<'a> {
     Limit { input: Box<Node<'a>>, count: usize },
     /// Evaluates the select list on each row.
     Project { input: Box<Node<'a>>, exprs: Vec<Expr> },
+    /// A derived table: its query's rows, with columns `names` qualified by `qualifier`.
+    Derived { input: Box<Node<'a>>, qualifier: String, names: Vec<String> },
 }
 
 /// How a join finds the right rows that may match a left row.
@@ -143,18 +152,75 @@ pub enum LookupKey {
 /// argument (none for `COUNT(*)`), and whether it is over distinct values.
 pub type AggregateCall = (Aggregate, Option<Expr>, bool);
 
-/// A table in FROM: the table, and what the query calls it.
+/// A table in FROM, what the query calls it, and its columns' names.
 struct Source<'a> {
-    table: &'a Table,
+    kind: SourceKind<'a>,
     qualifier: String,
+    names: Vec<String>,
+}
+
+enum SourceKind<'a> {
+    Table(&'a Table),
+    /// A derived table's plan, until `joins` takes it.
+    Derived(Option<Node<'a>>),
+}
+
+impl<'a> Source<'a> {
+    fn table(table: &'a Table, qualifier: &str) -> Self {
+        let names = table.columns.iter().map(|c| c.name.clone()).collect();
+        Source { kind: SourceKind::Table(table), qualifier: qualifier.into(), names }
+    }
+
+    fn fields(&self) -> Vec<Field> {
+        self.names.iter().map(|name| Field { table: Some(self.qualifier.clone()), name: name.clone() }).collect()
+    }
+
+    /// Plans reading the rows `filter` matches; `needed` marks the columns read above.
+    fn read(&mut self, filter: Option<Expr>, needed: Vec<bool>) -> Node<'a> {
+        match &mut self.kind {
+            SourceKind::Table(table) => scan(table, &self.qualifier, &filter, needed),
+            SourceKind::Derived(plan) => {
+                let input = Box::new(plan.take().expect("read once"));
+                let node = Node::Derived { input, qualifier: self.qualifier.clone(), names: self.names.clone() };
+                match filter {
+                    Some(predicate) => Node::Filter { input: Box::new(node), predicate },
+                    None => node,
+                }
+            }
+        }
+    }
+}
+
+/// The names of the columns a query returns, as its plan names them.
+pub fn output_names(catalog: &Catalog, query: &Select) -> Result<Vec<String>> {
+    match &query.projection {
+        Projection::Exprs(items) => Ok(items.iter().map(item_name).collect()),
+        Projection::All => {
+            let mut names = Vec::new();
+            for table in query.from.tables() {
+                match &table.source {
+                    TableSource::Table(name) => names.extend(catalog.get(name)?.columns.iter().map(|c| c.name.clone())),
+                    TableSource::Subquery(query) => names.extend(output_names(catalog, query)?),
+                }
+            }
+            Ok(names)
+        }
+    }
 }
 
 /// Plans a SELECT on the tables of the catalog.
 pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
-    let Select { distinct, from, projection, filter, group_by, having, order_by, limit } = query;
-    let sources = from
+    let Select { distinct, from, projection, filter, group_by, having, mut order_by, limit } = query;
+    let mut sources = from
         .tables()
-        .map(|r| Ok(Source { table: catalog.get(&r.name)?, qualifier: r.qualifier().into() }))
+        .map(|r| match &r.source {
+            TableSource::Table(name) => Ok(Source::table(catalog.get(name)?, r.qualifier())),
+            TableSource::Subquery(query) => {
+                let plan = select(catalog, (**query).clone())?;
+                let kind = SourceKind::Derived(Some(plan.root));
+                Ok(Source { kind, qualifier: r.qualifier().into(), names: plan.columns })
+            }
+        })
         .collect::<Result<Vec<_>>>()?;
     for (i, source) in sources.iter().enumerate() {
         if sources[..i].iter().any(|s| s.qualifier == source.qualifier) {
@@ -166,13 +232,29 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
     forbid_subqueries(from.joins.iter().filter_map(|j| j.on.as_ref()), "JOIN ... ON")?;
     forbid_subqueries(&group_by, "GROUP BY")?;
 
+    // ORDER BY may name a column of the select list by its AS name.
+    if let Projection::Exprs(items) = &projection {
+        for key in &mut order_by {
+            if let Expr::Column(ColumnRef { table: None, name }) = &key.expr
+                && let Some(item) = items.iter().find(|item| item.alias.as_ref() == Some(name))
+            {
+                key.expr = item.expr.clone();
+            }
+        }
+    }
+
     // Bind every column reference to its table.
     let binder = Binder::new(catalog, &sources);
     let bind = |e: &Expr| binder.bind(e);
     let bind_all = |exprs: &[Expr]| exprs.iter().map(bind).collect::<Result<Vec<_>>>();
     let projection = match projection {
         Projection::All => Projection::All,
-        Projection::Exprs(exprs) => Projection::Exprs(bind_all(&exprs)?),
+        Projection::Exprs(items) => Projection::Exprs(
+            items
+                .into_iter()
+                .map(|item| Ok(SelectItem { expr: bind(&item.expr)?, alias: item.alias }))
+                .collect::<Result<_>>()?,
+        ),
     };
     let filter = filter.as_ref().map(bind).transpose()?;
     let ons = from.joins.iter().map(|j| j.on.as_ref().map(bind).transpose()).collect::<Result<Vec<_>>>()?;
@@ -199,13 +281,10 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
     let grouped = is_grouped(&projection, &group_by, &having, &order_by);
     let (exprs, columns) = match projection {
         Projection::All if grouped => return err("SELECT * cannot be used with GROUP BY or aggregate functions"),
-        Projection::All => {
-            let names = sources.iter().flat_map(|s| s.table.columns.iter().map(|c| c.name.clone())).collect();
-            (None, names)
-        }
-        Projection::Exprs(exprs) => {
-            let names = exprs.iter().map(output_name).collect();
-            (Some(exprs), names)
+        Projection::All => (None, sources.iter().flat_map(|s| s.names.clone()).collect()),
+        Projection::Exprs(items) => {
+            let names = items.iter().map(item_name).collect();
+            (Some(items.into_iter().map(|item| item.expr).collect::<Vec<_>>()), names)
         }
     };
     if let (true, Some(exprs)) = (distinct, &exprs)
@@ -226,13 +305,13 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
         .collect();
     let needed: Vec<Vec<bool>> = sources
         .iter()
-        .map(|s| match exprs {
-            None => vec![true; s.table.columns.len()],
-            Some(_) => filter::needed_columns(s.table, &s.qualifier, used.iter().copied()),
+        .map(|s| match (&s.kind, &exprs) {
+            (SourceKind::Table(table), Some(_)) => filter::needed_columns(table, &s.qualifier, used.iter().copied()),
+            _ => vec![true; s.names.len()],
         })
         .collect();
 
-    let mut node = joins(&sources, &from, filter, ons, needed, &binder);
+    let mut node = joins(&mut sources, &from, filter, ons, needed, &binder);
 
     let (exprs, having, order_by) = if grouped {
         forbid(&group_by, "GROUP BY")?;
@@ -275,7 +354,7 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
 /// Plans the scans and joins of FROM, with WHERE and the ONs placed as the
 /// module docs describe.
 fn joins<'a>(
-    sources: &[Source<'a>],
+    sources: &mut [Source<'a>],
     from: &From,
     filter: Option<Expr>,
     ons: Vec<Option<Expr>>,
@@ -328,10 +407,9 @@ fn joins<'a>(
         }
     }
 
-    let first = &sources[0];
-    let mut node = scan(first.table, &first.qualifier, &and(std::mem::take(&mut pushed[0])), needed[0].clone());
+    let mut node = sources[0].read(and(std::mem::take(&mut pushed[0])), needed[0].clone());
     for i in 1..n {
-        let source = &sources[i];
+        let source = &mut sources[i];
         let right_filter = and(std::mem::take(&mut pushed[i]));
         let mut residual = std::mem::take(&mut conditions[i]);
         // Equalities between the tables joined so far and this one: (position, left side, right side).
@@ -357,15 +435,15 @@ fn joins<'a>(
             .collect();
 
         let index = keys.iter().find_map(|(at, left, right)| {
-            let Expr::Column(column) = right else { return None };
-            let column = source.table.column_index(&column.name).ok()?;
-            Some((*at, left.clone(), column, lookup_key(source.table, column)?))
+            let (Expr::Column(column), SourceKind::Table(table)) = (right, &source.kind) else { return None };
+            let column = table.column_index(&column.name).ok()?;
+            Some((*at, left.clone(), column, *table, lookup_key(table, column)?))
         });
-        let (method, right) = if let Some((at, left_key, column, key)) = index {
+        let (method, right) = if let Some((at, left_key, column, table, key)) = index {
             residual.remove(at);
             needed[i][column] = true;
             let lookup = Node::Lookup {
-                table: source.table,
+                table,
                 qualifier: source.qualifier.clone(),
                 needed: needed[i].clone(), // includes the filter's columns: it is part of the query
                 column,
@@ -378,7 +456,7 @@ fn joins<'a>(
             };
             (JoinMethod::Index, right)
         } else {
-            let right = scan(source.table, &source.qualifier, &right_filter, needed[i].clone());
+            let right = source.read(right_filter, needed[i].clone());
             if keys.is_empty() {
                 (JoinMethod::NestedLoop, right)
             } else {
@@ -431,7 +509,7 @@ pub fn scan<'a>(table: &'a Table, qualifier: &str, filter: &Option<Expr>, needed
 /// as a SELECT's are bound: its columns are checked and its subqueries'
 /// outer references marked.
 pub fn bind(catalog: &Catalog, table: Option<&Table>, expr: &Expr) -> Result<Expr> {
-    let sources: Vec<Source> = table.into_iter().map(|table| Source { table, qualifier: table.name.clone() }).collect();
+    let sources: Vec<Source> = table.into_iter().map(|table| Source::table(table, &table.name)).collect();
     Binder::new(catalog, &sources).bind(expr)
 }
 
@@ -449,7 +527,7 @@ impl<'c> Binder<'c> {
         let mut fields = Vec::new();
         let mut owners = Vec::new();
         for (i, source) in sources.iter().enumerate() {
-            let own = Field::of_table(&source.qualifier, &source.table.columns);
+            let own = source.fields();
             owners.extend(std::iter::repeat_n(i, own.len()));
             fields.extend(own);
         }
@@ -505,13 +583,23 @@ impl<'c> Binder<'c> {
     /// binds, and of the subqueries inside it: the columns that none of their
     /// own tables, nor those of the queries between (`scopes`), have, but
     /// this query's do.
+    /// A subquery in its FROM sees only the queries around this one, not the
+    /// other tables of that FROM.
     fn correlate(&self, query: &Select, scopes: &mut Vec<Vec<Field>>) -> Result<Select> {
+        let mut query = query.clone();
         let mut own = Vec::new();
-        for table in query.from.tables() {
-            own.extend(Field::of_table(table.qualifier(), &self.catalog.get(&table.name)?.columns));
+        for table in query.from.tables_mut() {
+            let names = match &mut table.source {
+                TableSource::Table(name) => self.catalog.get(name)?.columns.iter().map(|c| c.name.clone()).collect(),
+                TableSource::Subquery(sub) => {
+                    **sub = self.correlate(sub, scopes)?;
+                    output_names(self.catalog, sub)?
+                }
+            };
+            own.extend(names.into_iter().map(|name| Field { table: Some(table.qualifier().into()), name }));
         }
         scopes.push(own);
-        let query = query.try_map(&mut |e| self.correlate_expr(e, scopes));
+        let query = query.try_map_own(&mut |e| self.correlate_expr(e, scopes));
         scopes.pop();
         query
     }
@@ -596,6 +684,9 @@ impl Node<'_> {
                 .map(Field::named)
                 .collect(),
             Node::Project { exprs, .. } => exprs.iter().map(output_name).map(Field::named).collect(),
+            Node::Derived { qualifier, names, .. } => {
+                names.iter().map(|name| Field { table: Some(qualifier.clone()), name: name.clone() }).collect()
+            }
         }
     }
 
@@ -652,6 +743,7 @@ impl Node<'_> {
             Node::Project { input, exprs } => {
                 (format!("PROJECT {}", list(&mut exprs.iter().map(Expr::to_string))), vec![input])
             }
+            Node::Derived { input, qualifier, .. } => (format!("SUBQUERY {qualifier}"), vec![input]),
         };
         lines.push(format!("{}{line}", "  ".repeat(depth)));
         for input in inputs {
@@ -670,13 +762,18 @@ fn label(table: &Table, qualifier: &str) -> String {
 
 /// Whether a SELECT groups its rows: it has `GROUP BY` or `HAVING`, or uses an aggregate.
 fn is_grouped(projection: &Projection, group_by: &[Expr], having: &Option<Expr>, order_by: &[OrderBy]) -> bool {
-    let exprs = match projection {
+    let items = match projection {
         Projection::All => &[][..],
-        Projection::Exprs(exprs) => exprs,
+        Projection::Exprs(items) => items,
     };
     !group_by.is_empty()
         || having.is_some()
-        || exprs.iter().chain(order_by.iter().map(|o| &o.expr)).any(contains_aggregate)
+        || items.iter().map(|item| &item.expr).chain(order_by.iter().map(|o| &o.expr)).any(contains_aggregate)
+}
+
+/// The name of a select list item's column: its AS name, or else its expression's.
+fn item_name(item: &SelectItem) -> String {
+    item.alias.clone().unwrap_or_else(|| output_name(&item.expr))
 }
 
 /// The name of a result column: a column's name, an aggregate's function, or `?column?`.

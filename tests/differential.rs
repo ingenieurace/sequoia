@@ -282,18 +282,26 @@ impl Gen {
         let mut outer: Vec<(String, Type)> = Vec::new();
         let mut from = String::new();
         for i in 0..n {
-            let t = self.rng.below(self.tables.len());
-            let name = self.tables[t].name.clone();
-            let bare = n == 1 && self.rng.chance(30);
+            // A table, or a subquery (a derived table) with columns x0, x1...
+            let (name, columns, derived) = match self.rng.chance(20) {
+                true => {
+                    let (sql, columns) = self.derived();
+                    (sql, columns, true)
+                }
+                false => {
+                    let t = self.rng.below(self.tables.len());
+                    (self.tables[t].name.clone(), self.tables[t].columns.clone(), false)
+                }
+            };
+            let bare = n == 1 && !derived && self.rng.chance(30);
             let alias = format!("a{i}");
-            let own: Vec<(String, Type)> = self.tables[t]
-                .columns
+            let own: Vec<(String, Type)> = columns
                 .iter()
                 .map(|(c, ty)| (if bare { c.clone() } else { format!("{alias}.{c}") }, *ty))
                 .collect();
             if bare {
                 from = name.clone();
-                outer = self.tables[t].columns.iter().map(|(c, ty)| (format!("{name}.{c}"), *ty)).collect();
+                outer = columns.iter().map(|(c, ty)| (format!("{name}.{c}"), *ty)).collect();
             } else if i == 0 {
                 from = format!("{name} {alias}");
             } else {
@@ -377,6 +385,13 @@ impl Gen {
             let ty = *self.rng.pick(&TYPES);
             projection[0] = self.aggregate(ty, &scope);
         }
+        // Some get an AS name, which ORDER BY may use in their place.
+        let names: Vec<Option<String>> =
+            (0..projection.len()).map(|i| self.rng.chance(30).then(|| format!("o{i}"))).collect();
+        let by_name = |g: &mut Gen, i: usize| match &names[i] {
+            Some(name) if g.rng.chance(50) => name.clone(),
+            _ => projection[i].clone(),
+        };
 
         // ORDER BY: one that fixes the order (it sorts by every selected
         // expression), one that does not, or none.
@@ -390,18 +405,22 @@ impl Gen {
                     let extra = self.key(ty, &scope, 1);
                     keys.push(direction(self, extra));
                 }
-                let mut order: Vec<String> = projection.clone();
+                let mut order: Vec<usize> = (0..projection.len()).collect();
                 for i in (1..order.len()).rev() {
                     order.swap(i, self.rng.below(i + 1));
                 }
-                for e in order {
+                for i in order {
+                    let e = by_name(self, i);
                     keys.push(direction(self, e));
                 }
                 kind = Kind::Ordered;
             } else {
                 for _ in 0..1 + self.rng.below(2) {
                     let e = match distinct {
-                        true => self.rng.pick(&projection).clone(),
+                        true => {
+                            let i = self.rng.below(projection.len());
+                            by_name(self, i)
+                        }
                         false => {
                             let ty = *self.rng.pick(&TYPES);
                             self.key(ty, &scope, 1)
@@ -419,12 +438,57 @@ impl Gen {
             true => format!(" LIMIT {}", self.rng.below(8)),
             false => String::new(),
         };
-        let projection = if star { "*".into() } else { projection.join(", ") };
+        let projection = match star {
+            true => "*".into(),
+            false => {
+                let items = projection.iter().zip(&names).map(|(e, name)| match name {
+                    Some(name) => format!("{e} AS {name}"),
+                    None => e.clone(),
+                });
+                items.collect::<Vec<_>>().join(", ")
+            }
+        };
         let sql = format!(
             "SELECT {}{projection} FROM {from}{filter}{group_by}{having}{order_by}{limit}",
             if distinct { "DISTINCT " } else { "" }
         );
         stmt(sql, kind)
+    }
+
+    /// A derived table: its SQL, and its columns' names and types. Its own
+    /// table goes by `s1`, so that subqueries inside it start from `s2`.
+    fn derived(&mut self) -> (String, Vec<(String, Type)>) {
+        let all: Vec<usize> = (0..self.tables.len()).collect();
+        let s = Scope { depth: 0, sub_tables: all, subqueries: true, ..Scope::default() };
+        let (from, inner, _) = self.sub_from(&s);
+        let filter = self.where_clause(&inner, 50);
+        let mut columns = Vec::new();
+        let mut items = Vec::new();
+        let distinct = if self.rng.chance(20) { "DISTINCT " } else { "" };
+        if self.rng.chance(35) {
+            // Grouped by one column, with aggregates.
+            // Its scope has only its own table's columns: a derived table sees no other.
+            let (group, ty) = self.rng.pick(&inner.cols).clone();
+            let grouped = Scope { groups: Some(vec![(group.clone(), ty)]), ..inner.clone() };
+            items.push(group.clone());
+            columns.push(ty);
+            for _ in 0..1 + self.rng.below(2) {
+                let ty = *self.rng.pick(&TYPES);
+                items.push(self.aggregate(ty, &grouped));
+                columns.push(ty);
+            }
+            let names: Vec<(String, Type)> = columns.iter().enumerate().map(|(i, ty)| (format!("x{i}"), *ty)).collect();
+            let list: Vec<String> = items.iter().enumerate().map(|(i, e)| format!("{e} AS x{i}")).collect();
+            return (format!("(SELECT {distinct}{} FROM {from}{filter} GROUP BY {group})", list.join(", ")), names);
+        }
+        for _ in 0..1 + self.rng.below(3) {
+            let ty = *self.rng.pick(&TYPES);
+            items.push(self.expr(ty, &inner, 2));
+            columns.push(ty);
+        }
+        let names: Vec<(String, Type)> = columns.iter().enumerate().map(|(i, ty)| (format!("x{i}"), *ty)).collect();
+        let list: Vec<String> = items.iter().enumerate().map(|(i, e)| format!("{e} AS x{i}")).collect();
+        (format!("(SELECT {distinct}{} FROM {from}{filter})", list.join(", ")), names)
     }
 
     // ---- changes ----
@@ -646,7 +710,8 @@ fn cast_averages(sql: &str) -> String {
     out
 }
 
-/// Whether an expression names a column (`id` or `c1`, maybe qualified) outside its string literals.
+/// Whether an expression names a column (`id`, `c1` or a derived table's
+/// `x1`, maybe qualified) outside its string literals.
 fn reads_column(e: &str) -> bool {
     let mut words = Vec::new();
     let mut quoted = false;
@@ -660,7 +725,8 @@ fn reads_column(e: &str) -> bool {
         }
         words.push(std::mem::take(&mut word));
     }
-    words.iter().any(|w| w == "id" || (w.len() > 1 && w.starts_with('c') && w[1..].bytes().all(|b| b.is_ascii_digit())))
+    let numbered = |w: &str| w.len() > 1 && w[1..].bytes().all(|b| b.is_ascii_digit());
+    words.iter().any(|w| w == "id" || ((w.starts_with('c') || w.starts_with('x')) && numbered(w)))
 }
 
 /// What a statement did: its rows as SQLite's quote mode prints them, or an error.

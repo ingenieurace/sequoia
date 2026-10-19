@@ -54,8 +54,10 @@ SEQUOIA_DIFF_CASES=2000 SEQUOIA_DIFF_SEED=7 cargo test --release --test differen
   values are type-checked
 - `FROM`: one table, or several joined: `[INNER] JOIN ... ON`, `LEFT [OUTER]
   JOIN ... ON`, `CROSS JOIN` or commas, with aliases (`users u`, `users AS u`)
-  and qualified columns (`u.id`)
-- `SELECT [DISTINCT]`: `*` or expressions, `WHERE`, `GROUP BY` (expressions), `HAVING`,
+  and qualified columns (`u.id`). A table may be a subquery with an alias,
+  `(SELECT ...) d`, whose columns are named by its select list
+- `SELECT [DISTINCT]`: `*` or expressions, each maybe named with `AS` (a name
+  `ORDER BY` may use), `WHERE`, `GROUP BY` (expressions), `HAVING`,
   `ORDER BY ... ASC|DESC` (any expressions, NULL first, stable; with `DISTINCT`, only
   ones in the select list), `LIMIT`
 - Aggregates: `COUNT(*)`, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, each also as
@@ -75,7 +77,7 @@ A transaction is durable once `COMMIT` returns; until then a crash, `ROLLBACK`
 or closing the database undoes all of it. A statement that fails inside one is
 undone alone, and the transaction goes on. There is one connection, so no
 concurrency control. Not supported: `RIGHT` and `FULL` joins, subqueries in
-`FROM` or `JOIN ... ON`, `INSERT ... SELECT`, multi-column indexes.
+`JOIN ... ON`, `LATERAL`, `INSERT ... SELECT`, multi-column indexes.
 
 ## Layout
 

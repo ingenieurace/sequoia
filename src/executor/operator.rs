@@ -79,6 +79,7 @@ pub fn open<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings) -> Ro
             }))
         }
         Node::Limit { input, count } => Box::new(open(*input, catalog, settings).take(count)),
+        Node::Derived { input, .. } => open(*input, catalog, settings),
         Node::Project { input, exprs } => {
             let columns = input.columns();
             let mut subqueries = Runner::new(catalog, settings);

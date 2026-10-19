@@ -1607,3 +1607,94 @@ fn closing_the_database_rolls_back_an_open_transaction() {
     assert_eq!(ints(query(&mut db, "SELECT id FROM t ORDER BY id")), [int(1), int(2)]);
     assert!(!db.in_transaction());
 }
+
+fn columns(db: &mut Database, sql: &str) -> Vec<String> {
+    match db.execute(sql).unwrap().pop() {
+        Some(QueryResult::Rows { columns, .. }) => columns,
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn subqueries_in_from() {
+    let mut db = setup_shop();
+    // Joined to a table, by a column named with AS; hash joined, as it has no index.
+    let sql = "SELECT u.name, s.spent FROM users u JOIN (SELECT user_id, SUM(total) AS spent FROM orders GROUP BY user_id) s
+               ON s.user_id = u.id ORDER BY spent DESC";
+    assert_eq!(query(&mut db, sql), [vec![text("ann"), int(12)], vec![text("bo"), int(3)]]);
+    assert!(explain(&mut db, sql).contains("HASH JOIN ON u.id = s.user_id"), "{}", explain(&mut db, sql));
+    assert!(explain(&mut db, sql).contains("SUBQUERY s\n"));
+    // LEFT JOIN pads it with NULLs.
+    assert_eq!(
+        query(
+            &mut db,
+            "SELECT u.name, c.n FROM users u LEFT JOIN (SELECT user_id, COUNT(*) AS n FROM orders GROUP BY user_id) c
+             ON c.user_id = u.id ORDER BY u.id"
+        ),
+        [vec![text("ann"), int(2)], vec![text("bo"), int(1)], vec![text("cy"), Value::Null]]
+    );
+    // Nested, with its own ORDER BY and LIMIT, and grouped over.
+    assert_eq!(query(&mut db, "SELECT COUNT(*) FROM (SELECT DISTINCT city FROM (SELECT * FROM users) a) b"), [vec![
+        int(2)
+    ]]);
+    assert_eq!(ints(query(&mut db, "SELECT * FROM (SELECT id FROM orders ORDER BY total DESC LIMIT 2) t ORDER BY id")), [
+        int(11),
+        int(13)
+    ]);
+    assert_eq!(
+        query(
+            &mut db,
+            "SELECT city, MAX(n) FROM (SELECT u.city, (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) AS n
+             FROM users u) t GROUP BY city ORDER BY city"
+        ),
+        [vec![text("lima"), int(1)], vec![text("oslo"), int(2)]]
+    );
+    // Its columns are named as its select list names them.
+    assert_eq!(columns(&mut db, "SELECT * FROM (SELECT id + 1 AS next, name, COUNT(*) FROM users GROUP BY id, name) d"), [
+        "next", "name", "count"
+    ]);
+    assert_eq!(columns(&mut db, "SELECT * FROM (SELECT u.id, o.id FROM users u, orders o) d"), ["id", "id"]);
+    // Inside a subquery it may refer to the queries around it.
+    assert_eq!(
+        ints(query(
+            &mut db,
+            "SELECT name FROM users u WHERE EXISTS (SELECT * FROM (SELECT * FROM orders o WHERE o.user_id = u.id) x
+             WHERE x.total > 6)"
+        )),
+        [text("ann")]
+    );
+    db.execute(
+        "UPDATE users SET city = 'rich' WHERE id IN
+         (SELECT t.user_id FROM (SELECT user_id, SUM(total) AS s FROM orders GROUP BY user_id) t WHERE t.s > 10)",
+    )
+    .unwrap();
+    assert_eq!(ints(query(&mut db, "SELECT city FROM users ORDER BY id")), [text("rich"), text("lima"), text("oslo")]);
+
+    let errors = [
+        ("SELECT * FROM (SELECT * FROM users)", "must have an alias"),
+        ("SELECT * FROM users u, (SELECT * FROM orders WHERE user_id = u.id) o", "unknown column: u.id"),
+        ("SELECT d.id FROM (SELECT u.id, o.id FROM users u, orders o) d", "ambiguous"),
+        ("SELECT d.nope FROM (SELECT id FROM users) d", "unknown column: d.nope"),
+        ("SELECT * FROM (SELECT id FROM users) u, users u", "appears more than once"),
+    ];
+    for (sql, expected) in errors {
+        let e = db.execute(sql).expect_err(sql);
+        assert!(e.0.contains(expected), "{sql}: {e}");
+    }
+}
+
+#[test]
+fn select_list_names_and_order_by_them() {
+    let mut db = setup_shop();
+    assert_eq!(columns(&mut db, "SELECT name AS who, u.id * 2 AS twice, total FROM users u, orders LIMIT 1"), [
+        "who", "twice", "total"
+    ]);
+    assert_eq!(ints(query(&mut db, "SELECT name AS n FROM users ORDER BY n DESC")), [text("cy"), text("bo"), text("ann")]);
+    // A name of the select list wins over a column's, as in PostgreSQL and SQLite.
+    assert_eq!(ints(query(&mut db, "SELECT - id AS id FROM users ORDER BY id")), [int(-3), int(-2), int(-1)]);
+    assert_eq!(ints(query(&mut db, "SELECT DISTINCT city AS c FROM users ORDER BY c")), [text("lima"), text("oslo")]);
+    assert_eq!(
+        query(&mut db, "SELECT user_id AS u, COUNT(*) AS n FROM orders GROUP BY user_id ORDER BY n DESC, u LIMIT 2"),
+        [vec![int(1), int(2)], vec![Value::Null, int(1)]]
+    );
+}

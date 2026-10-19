@@ -7,8 +7,8 @@
 //! OR, AND, NOT, comparison / IS NULL / IN, + -, * /, unary -, primary.
 
 use super::ast::{
-    Aggregate, BinaryOp, ColumnRef, Expr, From, Join, JoinKind, OrderBy, Projection, Select, Statement, TableRef,
-    UnaryOp,
+    Aggregate, BinaryOp, ColumnRef, Expr, From, Join, JoinKind, OrderBy, Projection, Select, SelectItem, Statement,
+    TableRef, TableSource, UnaryOp,
 };
 use crate::error::{Error, Result};
 use super::lexer::{Token, tokenize};
@@ -181,7 +181,14 @@ impl Parser {
         let projection = if self.eat_symbol("*") {
             Projection::All
         } else {
-            Projection::Exprs(self.comma_list(Self::expr)?)
+            Projection::Exprs(self.comma_list(|p| {
+                let expr = p.expr()?;
+                let alias = match p.eat_keyword("AS") {
+                    true => Some(p.ident()?),
+                    false => None,
+                };
+                Ok(SelectItem { expr, alias })
+            })?)
         };
         self.expect_keyword("FROM")?;
         let from = self.from()?;
@@ -247,14 +254,24 @@ impl Parser {
         }
     }
 
-    /// `name [[AS] alias]`
+    /// `name [[AS] alias]`, or `(SELECT ...) [AS] alias`
     fn table_ref(&mut self) -> Result<TableRef> {
-        let name = self.ident()?;
+        let source = match self.eat_symbol("(") {
+            true => {
+                let query = self.select()?;
+                self.expect_symbol(")")?;
+                TableSource::Subquery(Box::new(query))
+            }
+            false => TableSource::Table(self.ident()?),
+        };
         let alias = match (self.eat_keyword("AS"), self.peek()) {
             (true, _) | (false, Some(Token::Ident(_))) => Some(self.ident()?),
+            _ if matches!(source, TableSource::Subquery(_)) => {
+                return Err(Error("a subquery in FROM must have an alias".into()));
+            }
             _ => None,
         };
-        Ok(TableRef { name, alias })
+        Ok(TableRef { source, alias })
     }
 
     fn update(&mut self) -> Result<Statement> {

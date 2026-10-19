@@ -68,14 +68,15 @@ pub struct Select {
 }
 
 impl Select {
-    /// Every expression of the query, not looking inside its subqueries.
-    pub fn exprs(&self) -> impl Iterator<Item = &Expr> {
+    /// The query's own expressions, not those of its subqueries.
+    pub fn own_exprs(&self) -> impl Iterator<Item = &Expr> {
         let projection = match &self.projection {
             Projection::All => &[][..],
-            Projection::Exprs(exprs) => exprs,
+            Projection::Exprs(items) => items,
         };
         projection
             .iter()
+            .map(|item| &item.expr)
             .chain(self.from.joins.iter().filter_map(|j| j.on.as_ref()))
             .chain(&self.filter)
             .chain(&self.group_by)
@@ -83,12 +84,36 @@ impl Select {
             .chain(self.order_by.iter().map(|o| &o.expr))
     }
 
+    /// The query's own expressions and those of the subqueries in its FROM,
+    /// not looking inside the subqueries in those expressions.
+    pub fn exprs(&self) -> Vec<&Expr> {
+        let mut exprs = Vec::new();
+        for table in self.from.tables() {
+            if let TableSource::Subquery(query) = &table.source {
+                exprs.extend(query.exprs());
+            }
+        }
+        exprs.extend(self.own_exprs());
+        exprs
+    }
+
     /// The query with each of its expressions (those `exprs` gives) replaced by `f`'s result.
     pub fn try_map(&self, f: &mut dyn FnMut(&Expr) -> Result<Expr>) -> Result<Select> {
         let mut query = self.clone();
-        if let Projection::Exprs(exprs) = &mut query.projection {
-            for e in exprs {
-                *e = f(e)?;
+        for table in query.from.tables_mut() {
+            if let TableSource::Subquery(sub) = &mut table.source {
+                **sub = sub.try_map(f)?;
+            }
+        }
+        query.try_map_own(f)
+    }
+
+    /// The query with each of its own expressions replaced by `f`'s result.
+    pub fn try_map_own(&self, f: &mut dyn FnMut(&Expr) -> Result<Expr>) -> Result<Select> {
+        let mut query = self.clone();
+        if let Projection::Exprs(items) = &mut query.projection {
+            for item in items {
+                item.expr = f(&item.expr)?;
             }
         }
         for on in query.from.joins.iter_mut().filter_map(|j| j.on.as_mut()) {
@@ -116,19 +141,42 @@ impl From {
     pub fn tables(&self) -> impl Iterator<Item = &TableRef> {
         std::iter::once(&self.table).chain(self.joins.iter().map(|j| &j.table))
     }
+
+    pub fn tables_mut(&mut self) -> impl Iterator<Item = &mut TableRef> {
+        std::iter::once(&mut self.table).chain(self.joins.iter_mut().map(|j| &mut j.table))
+    }
 }
 
 /// A table in FROM, and the name it goes by there.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableRef {
-    pub name: String,
+    pub source: TableSource,
+    /// Always given for a subquery.
     pub alias: Option<String>,
 }
 
+/// What a table in FROM reads.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TableSource {
+    /// A table of the database, by name.
+    Table(String),
+    /// `(SELECT ...)`: a derived table, whose columns are the query's.
+    Subquery(Box<Select>),
+}
+
 impl TableRef {
+    /// A table of the database, under its own name.
+    pub fn table(name: impl Into<String>) -> Self {
+        TableRef { source: TableSource::Table(name.into()), alias: None }
+    }
+
     /// What its columns are qualified by: the alias, or else the table's name.
     pub fn qualifier(&self) -> &str {
-        self.alias.as_deref().unwrap_or(&self.name)
+        match (&self.alias, &self.source) {
+            (Some(alias), _) => alias,
+            (None, TableSource::Table(name)) => name,
+            (None, TableSource::Subquery(_)) => unreachable!("a subquery in FROM has an alias"),
+        }
     }
 }
 
@@ -175,7 +223,14 @@ impl std::fmt::Display for ColumnRef {
 pub enum Projection {
     /// `SELECT *`
     All,
-    Exprs(Vec<Expr>),
+    Exprs(Vec<SelectItem>),
+}
+
+/// `expr [AS name]` in a select list.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SelectItem {
+    pub expr: Expr,
+    pub alias: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -252,10 +307,10 @@ impl Expr {
                 left.visit(f);
                 items.iter().for_each(|e| e.visit(f));
             }
-            Expr::Subquery(query) | Expr::Exists(query) => query.exprs().for_each(|e| e.visit(f)),
+            Expr::Subquery(query) | Expr::Exists(query) => query.exprs().into_iter().for_each(|e| e.visit(f)),
             Expr::InSubquery(left, query, _) => {
                 left.visit(f);
-                query.exprs().for_each(|e| e.visit(f));
+                query.exprs().into_iter().for_each(|e| e.visit(f));
             }
         }
     }
@@ -370,7 +425,13 @@ impl std::fmt::Display for Select {
         f.write_str(if self.distinct { "SELECT DISTINCT " } else { "SELECT " })?;
         match &self.projection {
             Projection::All => f.write_str("*")?,
-            Projection::Exprs(exprs) => f.write_str(&list(&mut exprs.iter().map(Expr::to_string)))?,
+            Projection::Exprs(items) => {
+                let items = items.iter().map(|item| match &item.alias {
+                    Some(alias) => format!("{} AS {alias}", item.expr),
+                    None => item.expr.to_string(),
+                });
+                f.write_str(&list(&mut items.into_iter()))?
+            }
         }
         write!(f, " FROM {}", self.from.table)?;
         for join in &self.from.joins {
@@ -407,9 +468,13 @@ impl std::fmt::Display for Select {
 
 impl std::fmt::Display for TableRef {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match &self.source {
+            TableSource::Table(name) => f.write_str(name)?,
+            TableSource::Subquery(query) => write!(f, "({query})")?,
+        }
         match &self.alias {
-            Some(alias) => write!(f, "{} {alias}", self.name),
-            None => f.write_str(&self.name),
+            Some(alias) => write!(f, " {alias}"),
+            None => Ok(()),
         }
     }
 }
@@ -459,6 +524,7 @@ mod tests {
             "a NOT IN (SELECT DISTINCT b FROM u x JOIN v ON v.c = x.c LEFT JOIN w ON w.d = v.d CROSS JOIN z \
              WHERE b > 0 GROUP BY b HAVING COUNT(*) > 1 ORDER BY b DESC, 2 LIMIT 3)",
             "NOT EXISTS (SELECT 1 FROM u WHERE u.a IN (SELECT a FROM v))",
+            "x IN (SELECT d.b + 1 AS c FROM (SELECT b, COUNT(*) AS n FROM u GROUP BY b) d JOIN (SELECT * FROM v) e ON e.b = d.b)",
             "-(a - b) IS NULL",
             "NOT (NOT a)",
             "a = NULL OR b = TRUE",
