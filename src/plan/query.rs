@@ -176,7 +176,14 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
     };
     let filter = filter.as_ref().map(bind).transpose()?;
     let ons = from.joins.iter().map(|j| j.on.as_ref().map(bind).transpose()).collect::<Result<Vec<_>>>()?;
-    let group_by = bind_all(&group_by)?;
+    // A repeated GROUP BY expression groups by nothing more, and would make its column ambiguous.
+    let mut distinct_group_by: Vec<Expr> = Vec::new();
+    for expr in bind_all(&group_by)? {
+        if !distinct_group_by.contains(&expr) {
+            distinct_group_by.push(expr);
+        }
+    }
+    let group_by = distinct_group_by;
     let having = having.as_ref().map(bind).transpose()?;
     let order_by = order_by
         .iter()

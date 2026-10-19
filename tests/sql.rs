@@ -858,6 +858,11 @@ fn group_by_with_having_order_by_and_limit() {
         query(&mut db, "SELECT city, vip, COUNT(*) FROM p GROUP BY city, vip HAVING COUNT(*) > 1"),
         vec![vec![text("oslo"), Value::Bool(true), int(2)]]
     );
+    // A repeated GROUP BY expression changes nothing.
+    assert_eq!(
+        query(&mut db, "SELECT city, COUNT(*) FROM p GROUP BY city, city ORDER BY city"),
+        vec![vec![Value::Null, int(2)], vec![text("lima"), int(2)], vec![text("oslo"), int(3)]]
+    );
     // HAVING without GROUP BY makes one group, which it may filter out.
     assert_eq!(query(&mut db, "SELECT COUNT(*) FROM p HAVING COUNT(*) > 100"), Vec::<Vec<Value>>::new());
     assert!(query(&mut db, "SELECT city FROM p WHERE id > 100 GROUP BY city").is_empty(), "no rows, no groups");
