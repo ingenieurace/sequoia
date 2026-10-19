@@ -24,6 +24,22 @@ DROP TABLE users;
 
 Shell commands: `.tables`, `.exit`.
 
+## Testing
+
+```bash
+cargo test
+```
+
+Besides unit and end-to-end tests, `tests/differential.rs` generates random
+schemas, rows, queries, changes and transactions, runs them on Sequoia and on
+SQLite (through the `sqlite3` command; skipped if there is none), and fails if
+the two disagree, printing the case as a script for the shell. It runs 40
+cases by default; run more, or other ones, with:
+
+```bash
+SEQUOIA_DIFF_CASES=2000 SEQUOIA_DIFF_SEED=7 cargo test --release --test differential -- --nocapture
+```
+
 ## Supported SQL
 
 - Statements: `CREATE TABLE ... [USING HEAP | LSM | COLUMN]`, `DROP TABLE`,
@@ -119,6 +135,7 @@ src/
       store.rs    PAX row groups, delete bitmaps, delta store
       encoding.rs column compression: RLE, bit-packing, patching, delta, dictionary, bitmap
 tests/sql.rs      end-to-end tests
+tests/differential.rs  random statements run on Sequoia and SQLite, which must agree
 ```
 
 ## Storage
