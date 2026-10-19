@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The differential tests skip themselves without sqlite3, so install it
+      # and fail here if it is missing rather than pass without comparing.
+      - name: Install sqlite3 (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y sqlite3
+      - name: Install sqlite3 (Windows)
+        if: runner.os == 'Windows'
+        run: choco install sqlite -y --no-progress
+      - name: Check sqlite3
+        run: sqlite3 --version
+
+      - name: Test
+        run: cargo test --release
