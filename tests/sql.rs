@@ -1240,6 +1240,106 @@ fn every_join_method_and_storage_agrees_with_a_nested_loop() {
 }
 
 #[test]
+fn merge_join_stands_in_for_an_order_by_on_its_keys() {
+    let mut db = setup_shop();
+    let sql = "SELECT u.name, o.total FROM users u LEFT JOIN orders o ON o.user_id = u.id ORDER BY u.id DESC LIMIT 4";
+    assert_eq!(
+        explain(&mut db, sql),
+        "PROJECT u.name, o.total
+  LIMIT 4
+    LEFT MERGE JOIN ON u.id = o.user_id (SORTED BY u.id DESC)
+      SCAN users u
+      SCAN orders o"
+    );
+    let names: Vec<Value> = query(&mut db, sql).into_iter().map(|row| row[0].clone()).collect();
+    assert_eq!(names, [text("cy"), text("bo"), text("ann"), text("ann")]);
+
+    // Not the join's keys, or a right key of a LEFT JOIN: sorted after the join.
+    for sql in [
+        "SELECT u.name FROM users u JOIN orders o ON o.user_id = u.id ORDER BY u.name",
+        "SELECT u.name FROM users u JOIN orders o ON o.user_id = u.id ORDER BY o.total, u.id",
+        "SELECT u.name FROM users u LEFT JOIN orders o ON o.user_id = u.id ORDER BY o.user_id",
+        "SELECT u.city FROM users u JOIN orders o ON o.user_id = u.id GROUP BY u.city ORDER BY u.city",
+    ] {
+        let plan = explain(&mut db, sql);
+        assert!(plan.contains("SORT BY") && !plan.contains("MERGE"), "{sql}\n{plan}");
+    }
+}
+
+#[test]
+fn merge_join_agrees_with_a_hash_join_and_a_sort() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE a (id INT PRIMARY KEY, k INT, g INT);
+         CREATE TABLE b (id INT PRIMARY KEY, k INT, t TEXT, h INT);
+         CREATE TABLE c (id INT PRIMARY KEY, v INT);",
+    )
+    .unwrap();
+    let a: Vec<String> = (0..60i64)
+        .map(|i| format!("({i}, {}, {})", if i % 7 == 0 { "NULL".into() } else { (i % 9).to_string() }, i % 4))
+        .collect();
+    let b: Vec<String> = (0..50i64)
+        .map(|i| {
+            let k = if i % 6 == 0 { "NULL".into() } else { (i % 11).to_string() };
+            format!("({i}, {k}, '{}', {})", i % 5, i % 4)
+        })
+        .collect();
+    let c: Vec<String> = (0..40i64).map(|i| format!("({i}, {})", i % 3)).collect();
+    db.execute(&format!("INSERT INTO a VALUES {}", a.join(", "))).unwrap();
+    db.execute(&format!("INSERT INTO b VALUES {}", b.join(", "))).unwrap();
+    db.execute(&format!("INSERT INTO c VALUES {}", c.join(", "))).unwrap();
+
+    // (FROM, ORDER BY, other columns, whether a merge join does the sort)
+    let cases = [
+        ("a JOIN b ON b.k = a.k", "a.k", "a.id, b.id", true),
+        ("a LEFT JOIN b ON b.k = a.k", "a.k DESC", "a.id, b.id", true),
+        ("a JOIN b ON b.k = a.k", "b.k DESC", "a.id, b.id", true),
+        ("a LEFT JOIN b ON b.k = a.k", "b.k", "a.id, b.id", false),
+        ("a JOIN b ON b.k = a.k AND b.id > a.g", "a.k, a.g DESC", "a.id, b.id", true),
+        ("a LEFT JOIN b ON b.k = a.k AND b.h = a.g", "a.k DESC", "a.id, b.id", true),
+        ("a JOIN b ON b.k = a.k AND b.h = a.g", "a.k, a.id", "b.id", false),
+        ("a JOIN b ON b.k = a.k WHERE a.id < 30 AND b.id > 5", "a.k", "a.id, b.id", true),
+        ("a JOIN b ON b.k = a.k JOIN c ON c.id = b.id", "a.k DESC", "a.id, b.id, c.v", true),
+        ("a JOIN b ON b.k = a.k LEFT JOIN c ON c.v = a.g", "a.k", "a.id, b.id, c.id", true),
+        ("a JOIN b ON b.k = a.k JOIN c ON c.v < a.g", "a.k", "a.id, b.id, c.id", false),
+        ("a JOIN c ON c.id = a.k JOIN b ON b.k = c.v", "c.v DESC, a.id", "b.id", true),
+        // Keys of different types are never equal, as in a hash join.
+        ("a JOIN b ON b.t = a.k", "a.k", "a.id, b.id", true),
+    ];
+    let hidden = |order: &str| {
+        order
+            .split(", ")
+            .map(|key| match key.strip_suffix(" DESC") {
+                Some(expr) => format!("{expr} + 0 DESC"),
+                None => format!("{key} + 0"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    for memory in [usize::MAX, 300] {
+        db.set_sort_memory(memory);
+        for (from, order, others, merged) in cases {
+            let keys: Vec<&str> = order.split(", ").map(|k| k.trim_end_matches(" DESC")).collect();
+            let sql = |order: &str| format!("SELECT {}, {others} FROM {from} ORDER BY {order}", keys.join(", "));
+            let plan = explain(&mut db, &sql(order));
+            assert_eq!(plan.contains("MERGE JOIN") && !plan.contains("SORT BY"), merged, "{}\n{plan}", sql(order));
+            let mut rows = query(&mut db, &sql(order));
+            let mut expected = query(&mut db, &sql(&hidden(order)));
+            assert!(explain(&mut db, &sql(&hidden(order))).contains("SORT BY"));
+            // The same keys in the same order; rows with equal keys may come in any order.
+            let prefix = |rows: &[Vec<Value>]| rows.iter().map(|r| r[..keys.len()].to_vec()).collect::<Vec<_>>();
+            assert_eq!(prefix(&rows), prefix(&expected), "{}, sort memory {memory}", sql(order));
+            let by_all = |x: &Vec<Value>, y: &Vec<Value>| {
+                x.iter().zip(y).map(|(a, b)| a.sort_cmp(b)).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal)
+            };
+            rows.sort_by(by_all);
+            expected.sort_by(by_all);
+            assert_eq!(rows, expected, "{}, sort memory {memory}", sql(order));
+        }
+    }
+}
+
+#[test]
 fn block_nested_loop_join_agrees_for_every_block_size() {
     let mut db = Database::in_memory();
     db.execute(

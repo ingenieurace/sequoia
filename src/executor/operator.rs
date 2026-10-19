@@ -7,13 +7,13 @@
 //! all of their input when their first row is asked for. So is the right side
 //! of a hash join (see `join.rs`); the left side streams. A block nested loop
 //! join reads its left side a block at a time, and its right side again for
-//! each block.
+//! each block. A merge join sorts both sides when its first row is asked for.
 
 use std::collections::{HashMap, HashSet};
 
 use super::Settings;
 use super::aggregate;
-use super::join::{BlockJoin, Join, Lookup, Right};
+use super::join::{BlockJoin, Join, Lookup, MergeJoin, MergeSort, Right};
 use super::sort::Sorter;
 use super::subquery::Runner;
 use crate::catalog::Catalog;
@@ -42,6 +42,11 @@ pub fn open<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings) -> Ro
                     let settings = settings.clone();
                     let right = Box::new(move || open((*right).clone(), catalog, &settings));
                     return Box::new(BlockJoin::new(left, left_fields, right, right_fields, kind, condition, budget));
+                }
+                JoinMethod::Merge { left_keys, right_keys, desc, then } => {
+                    let right = open(*right, catalog, settings);
+                    let sort = MergeSort { left_keys, right_keys, desc, then, budget: settings.sort_memory };
+                    return Box::new(MergeJoin::new(left, left_fields, right, right_fields, sort, kind, condition));
                 }
                 JoinMethod::Hash { left_keys, right_keys } => Right::Hash {
                     source: Some(open(*right, catalog, settings)),

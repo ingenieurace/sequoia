@@ -7,6 +7,10 @@
 //!                  index: the right rows an index lookup finds, per left row
 //!
 //! block of left rows --> every right row, read again per block --> left ++ right, if the condition holds
+//!
+//! left, sorted by keys  --+
+//!                         +--> merge: each left row with the right rows of equal keys
+//! right, sorted by keys --+
 //! ```
 //!
 //! A LEFT JOIN also returns each left row that no right row matched, with a
@@ -20,17 +24,24 @@
 //! than once per left row, and never holds more than one block. Its rows come
 //! out a block at a time, by right row within a block; a LEFT JOIN's
 //! unmatched rows of a block come after its pairs.
+//!
+//! A sort-merge join sorts both sides by their keys with the sort ORDER BY
+//! uses, which writes runs to a temporary file past its budget, so besides
+//! those budgets it holds only the right rows of one key at a time. Its rows come out in
+//! the left side's sorted order, which is why the planner picks it: for an
+//! ORDER BY that starts with its keys, the sort is already done.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use super::operator::Rows;
-use super::sort::value_size;
+use super::sort::{Sorted, Sorter, value_size};
 use crate::catalog::index::Bound;
 use crate::catalog::table::{Access, Row, Table};
 use crate::error::Result;
 use crate::plan::query::LookupKey;
 use crate::predicate::{Compare, Predicate};
-use crate::sql::ast::{Expr, JoinKind};
+use crate::sql::ast::{Expr, JoinKind, OrderBy};
 use crate::sql::eval::{Field, eval, matches};
 use crate::types::Value;
 
@@ -323,6 +334,209 @@ impl Iterator for BlockJoin<'_> {
                 }
             }
         }
+    }
+}
+
+/// How a merge join sorts its sides: see [`JoinMethod::Merge`](crate::plan::query::JoinMethod::Merge).
+pub struct MergeSort {
+    pub left_keys: Vec<Expr>,
+    pub right_keys: Vec<Expr>,
+    pub desc: Vec<bool>,
+    pub then: Vec<OrderBy>,
+    /// Bytes each side's sort may buffer before it writes runs out.
+    pub budget: usize,
+}
+
+/// A sort-merge join: sorts both sides by their keys, then walks them
+/// together, pairing each left row with the right rows of equal keys.
+pub struct MergeJoin<'a> {
+    /// Each side, until it is sorted: the left when the first row is asked
+    /// for, the right when the first left row with no NULL key is read.
+    left_input: Option<Rows<'a>>,
+    right_input: Option<Rows<'a>>,
+    left: Option<Sorted>,
+    right: Option<Sorted>,
+    left_fields: Vec<Field>,
+    right_fields: Vec<Field>,
+    sort: MergeSort,
+    right_width: usize,
+    kind: JoinKind,
+    condition: Option<Expr>,
+    /// The left fields, then the right ones: the fields of a joined row.
+    fields: Vec<Field>,
+    /// The next right row, with its keys, once read and until it joins `group`.
+    lookahead: Option<(Vec<Value>, Row)>,
+    /// The right rows whose keys are `group_key`, the last left keys looked up.
+    group_key: Option<Vec<Value>>,
+    group: Vec<Row>,
+    /// The left row being joined, how many rows of `group` match it, the next one to pair.
+    current: Option<Row>,
+    end: usize,
+    next: usize,
+    matched: bool,
+}
+
+impl<'a> MergeJoin<'a> {
+    pub fn new(
+        left: Rows<'a>,
+        left_fields: Vec<Field>,
+        right: Rows<'a>,
+        right_fields: Vec<Field>,
+        sort: MergeSort,
+        kind: JoinKind,
+        condition: Option<Expr>,
+    ) -> Self {
+        MergeJoin {
+            left_input: Some(left),
+            right_input: Some(right),
+            left: None,
+            right: None,
+            fields: [left_fields.clone(), right_fields.clone()].concat(),
+            left_fields,
+            right_width: right_fields.len(),
+            right_fields,
+            sort,
+            kind,
+            condition,
+            lookahead: None,
+            group_key: None,
+            group: Vec::new(),
+            current: None,
+            end: 0,
+            next: 0,
+            matched: false,
+        }
+    }
+
+    /// The next left row in order, sorting the left side first if it is not yet.
+    fn next_left(&mut self) -> Option<Result<Row>> {
+        if let Some(rows) = self.left_input.take() {
+            let MergeSort { left_keys, desc, then, budget, .. } = &self.sort;
+            match sort(rows, &self.left_fields, left_keys, desc, then, *budget) {
+                Ok(sorted) => self.left = Some(sorted),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        self.left.as_mut()?.next()
+    }
+
+    /// How many right rows have the keys of `left`: they are the whole `group`.
+    /// Left rows come in key order, so a right row with smaller keys than
+    /// these matches no later left row either, and is dropped.
+    fn find(&mut self, left: &Row) -> Result<usize> {
+        let key = keys(&self.sort.left_keys, &self.left_fields, left)?;
+        if key.iter().any(Value::is_null) {
+            return Ok(0); // nothing is equal to NULL
+        }
+        if self.group_key.as_ref().is_some_and(|group| compare(group, &key, &self.sort.desc).is_eq()) {
+            return Ok(self.group.len());
+        }
+        if let Some(rows) = self.right_input.take() {
+            let MergeSort { right_keys, desc, budget, .. } = &self.sort;
+            self.right = Some(sort(rows, &self.right_fields, right_keys, desc, &[], *budget)?);
+        }
+        let right = self.right.as_mut().expect("sorted above");
+        self.group.clear();
+        loop {
+            if self.lookahead.is_none() {
+                let Some(row) = right.next() else { break };
+                let row = row?;
+                self.lookahead = Some((keys(&self.sort.right_keys, &self.right_fields, &row)?, row));
+            }
+            // A right row with a NULL key is never equal, so never joins the group.
+            let (right_key, _) = self.lookahead.as_ref().expect("read above");
+            match compare(right_key, &key, &self.sort.desc) {
+                Ordering::Less => self.lookahead = None,
+                Ordering::Equal => self.group.push(self.lookahead.take().expect("read above").1),
+                Ordering::Greater => break,
+            }
+        }
+        self.group_key = Some(key);
+        Ok(self.group.len())
+    }
+}
+
+impl Iterator for MergeJoin<'_> {
+    type Item = Result<Row>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.current.is_none() {
+                let row = match self.next_left()? {
+                    Ok(row) => row,
+                    Err(e) => return Some(Err(e)),
+                };
+                match self.find(&row) {
+                    Ok(end) => self.end = end,
+                    Err(e) => return Some(Err(e)),
+                }
+                (self.current, self.next, self.matched) = (Some(row), 0, false);
+            }
+            let left = self.current.as_ref().expect("set above");
+            while self.next < self.end {
+                let right = &self.group[self.next];
+                self.next += 1;
+                let joined: Row = left.iter().chain(right).cloned().collect();
+                match matches(&self.condition, &self.fields, &joined) {
+                    Ok(true) => {
+                        self.matched = true;
+                        return Some(Ok(joined));
+                    }
+                    Ok(false) => {}
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+            let mut left = self.current.take().expect("set above");
+            if self.kind == JoinKind::Left && !self.matched {
+                left.extend(std::iter::repeat_n(Value::Null, self.right_width));
+                return Some(Ok(left));
+            }
+        }
+    }
+}
+
+/// Sorts rows by the values of `keys`, in the order [`compare`] puts them,
+/// then by `then`, as ORDER BY would.
+fn sort(rows: Rows, fields: &[Field], keys: &[Expr], desc: &[bool], then: &[OrderBy], budget: usize) -> Result<Sorted> {
+    // Each key sorts as two: its type's rank, then its value.
+    let directions = desc.iter().flat_map(|&d| [d, d]).chain(then.iter().map(|o| o.desc)).collect();
+    let mut sorter = Sorter::new(directions, None, budget);
+    for row in rows {
+        let row = row?;
+        let mut sort_keys = Vec::new();
+        for value in self::keys(keys, fields, &row)? {
+            sort_keys.extend([Value::Int(rank(&value)), value]);
+        }
+        for o in then {
+            sort_keys.push(eval(&o.expr, fields, &row)?);
+        }
+        sorter.push(sort_keys, row)?;
+    }
+    sorter.finish()
+}
+
+/// Compares keys as a merge join sorts them: each in its direction, and the
+/// values of one type all before or all after those of another, which they
+/// are never equal to.
+fn compare(a: &[Value], b: &[Value], desc: &[bool]) -> Ordering {
+    a.iter()
+        .zip(b)
+        .zip(desc)
+        .map(|((a, b), &desc)| {
+            let ord = rank(a).cmp(&rank(b)).then_with(|| a.sort_cmp(b));
+            if desc { ord.reverse() } else { ord }
+        })
+        .find(|ord| ord.is_ne())
+        .unwrap_or(Ordering::Equal)
+}
+
+/// Where a value's type sorts among the others, NULL first.
+fn rank(value: &Value) -> i64 {
+    match value {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Int(_) => 2,
+        Value::Text(_) => 3,
     }
 }
 

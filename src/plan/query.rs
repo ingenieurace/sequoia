@@ -51,18 +51,28 @@
 //! values, so a NULL key matches nothing, and neither do keys of different
 //! types, where `=` would report an error.
 //!
+//! A merge join, which sorts both sides by the equalities and merges them,
+//! puts its rows in its left side's sorted order. With no statistics to
+//! weigh it against the others, the planner picks it only to save a sort: for
+//! the join whose equalities ORDER BY starts with (their left sides, or the
+//! right sides of an inner join), when what follows reads only its left
+//! side, and only the joins after it, which keep their left side's order, are
+//! hash or index joins. The left side is sorted by the rest of ORDER BY too,
+//! and the ORDER BY needs no sort of its own.
+//!
 //! **Steps.** On top of the scans and joins, a SELECT has an aggregate (and a
-//! filter for HAVING) if it groups, a sort if it has ORDER BY (which applies
-//! the LIMIT itself, as a top-N sort) or else a limit, and a projection unless
+//! filter for HAVING) if it groups, a sort if it has ORDER BY that no merge
+//! join sorted for (which applies the LIMIT itself, as a top-N sort) or else
+//! a limit, and a projection unless
 //! it is `SELECT *`. `SELECT DISTINCT` adds a distinct step above the
 //! projection, which drops each row equal to one it has already returned, and
 //! the limit moves above it, as rows the sort keeps may still be dropped. Its
 //! ORDER BY may only use expressions of the select list: rows that differ in
 //! anything else become one, which would have no single place in the order.
 //! The executor pulls rows through the tree one at a time;
-//! sorts, aggregates and the right sides of hash joins read all of their
-//! input first, and a block nested loop join reads its right side once per
-//! block of left rows. A distinct step streams, but remembers every row
+//! sorts, aggregates, both sides of merge joins and the right sides of hash
+//! joins read all of their input first, and a block nested loop join reads
+//! its right side once per block of left rows. A distinct step streams, but remembers every row
 //! it has returned.
 //!
 //! **Groups.** An aggregate's rows hold its group keys, then its aggregates.
@@ -141,6 +151,11 @@ pub enum JoinMethod {
     Hash { left_keys: Vec<Expr>, right_keys: Vec<Expr> },
     /// Those the right side, a `Lookup` (maybe under filters), finds for the left row.
     Index,
+    /// Those whose `right_keys` equal the left row's `left_keys`, found by
+    /// sorting both sides by their keys, each in its direction in `desc`, the
+    /// left side then by `then`, and merging them. Its rows come out in the
+    /// left side's order.
+    Merge { left_keys: Vec<Expr>, right_keys: Vec<Expr>, desc: Vec<bool>, then: Vec<OrderBy> },
 }
 
 /// What a `Lookup` reads the table through.
@@ -315,7 +330,8 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
         })
         .collect();
 
-    let mut node = joins(&mut sources, &from, filter, ons, needed, &binder);
+    let order = if grouped { &[][..] } else { &order_by };
+    let (mut node, ordered) = joins(&mut sources, &from, filter, ons, needed, &binder, order);
 
     let (exprs, having, order_by) = if grouped {
         forbid(&group_by, "GROUP BY")?;
@@ -339,8 +355,10 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
         node = Node::Filter { input: Box::new(node), predicate };
     }
     node = match (order_by.is_empty(), limit) {
-        (false, _) => Node::Sort { input: Box::new(node), keys: order_by, limit: limit.filter(|_| !distinct) },
-        (true, Some(count)) if !distinct => Node::Limit { input: Box::new(node), count },
+        (false, _) if !ordered => {
+            Node::Sort { input: Box::new(node), keys: order_by, limit: limit.filter(|_| !distinct) }
+        }
+        (_, Some(count)) if !distinct => Node::Limit { input: Box::new(node), count },
         _ => node,
     };
     if let Some(exprs) = exprs {
@@ -356,7 +374,8 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
 }
 
 /// Plans the scans and joins of FROM, with WHERE and the ONs placed as the
-/// module docs describe.
+/// module docs describe, and whether a merge join puts its rows in the order
+/// `order_by` asks for.
 fn joins<'a>(
     sources: &mut [Source<'a>],
     from: &From,
@@ -364,7 +383,8 @@ fn joins<'a>(
     ons: Vec<Option<Expr>>,
     mut needed: Vec<Vec<bool>>,
     binder: &Binder,
-) -> Node<'a> {
+    order_by: &[OrderBy],
+) -> (Node<'a>, bool) {
     let n = sources.len();
     let kinds: Vec<JoinKind> = std::iter::once(JoinKind::Inner).chain(from.joins.iter().map(|j| j.kind)).collect();
     // For each table: conditions pushed down to its scan, conditions of the
@@ -411,39 +431,43 @@ fn joins<'a>(
         }
     }
 
+    // The join that can sort its sides into ORDER BY's order for a merge join.
+    // The joins after it must keep their left side's order, as hash and index
+    // joins do and a block nested loop join does not.
+    let mut merge = None;
+    if !order_by.is_empty() {
+        for i in (1..n).rev() {
+            let keys = equalities(&conditions[i], i, binder);
+            if keys.is_empty() {
+                break;
+            }
+            if let Some(order) = merge_order(order_by, &keys, kinds[i], i, binder) {
+                merge = Some((i, order));
+                break;
+            }
+        }
+    }
+    let ordered = merge.is_some();
+
     let mut node = sources[0].read(and(std::mem::take(&mut pushed[0])), needed[0].clone());
     for i in 1..n {
         let source = &mut sources[i];
         let right_filter = and(std::mem::take(&mut pushed[i]));
         let mut residual = std::mem::take(&mut conditions[i]);
-        // Equalities between the tables joined so far and this one: (position, left side, right side).
-        let keys: Vec<(usize, Expr, Expr)> = residual
-            .iter()
-            .enumerate()
-            .filter_map(|(at, part)| {
-                let Expr::Binary(a, BinaryOp::Eq, b) = part else { return None };
-                let side = |e: &Expr| {
-                    let tables = binder.tables(e);
-                    match tables.last() {
-                        Some(&last) if last < i => Some(false),
-                        Some(&last) if last == i && tables.len() == 1 => Some(true),
-                        _ => None,
-                    }
-                };
-                match (side(a)?, side(b)?) {
-                    (false, true) => Some((at, (**a).clone(), (**b).clone())),
-                    (true, false) => Some((at, (**b).clone(), (**a).clone())),
-                    _ => None,
-                }
-            })
-            .collect();
+        let keys = equalities(&residual, i, binder);
 
         let index = keys.iter().find_map(|(at, left, right)| {
             let (Expr::Column(column), SourceKind::Table(table)) = (right, &source.kind) else { return None };
             let column = table.column_index(&column.name).ok()?;
             Some((*at, left.clone(), column, *table, lookup_key(table, column)?))
         });
-        let (method, right) = if let Some((at, left_key, column, table, key)) = index {
+        let (method, right) = if let Some((_, (order, desc, then))) = merge.take_if(|(at, _)| *at == i) {
+            for (at, ..) in keys.iter().rev() {
+                residual.remove(*at);
+            }
+            let (left_keys, right_keys) = order.iter().map(|&k| (keys[k].1.clone(), keys[k].2.clone())).unzip();
+            (JoinMethod::Merge { left_keys, right_keys, desc, then }, source.read(right_filter, needed[i].clone()))
+        } else if let Some((at, left_key, column, table, key)) = index {
             residual.remove(at);
             needed[i][column] = true;
             let lookup = Node::Lookup {
@@ -482,7 +506,74 @@ fn joins<'a>(
             node = Node::Filter { input: Box::new(node), predicate };
         }
     }
-    node
+    (node, ordered)
+}
+
+/// The equalities among `parts` between the tables before table `i` and
+/// table `i` alone: (position in `parts`, left side, right side).
+fn equalities(parts: &[Expr], i: usize, binder: &Binder) -> Vec<(usize, Expr, Expr)> {
+    parts
+        .iter()
+        .enumerate()
+        .filter_map(|(at, part)| {
+            let Expr::Binary(a, BinaryOp::Eq, b) = part else { return None };
+            let side = |e: &Expr| {
+                let tables = binder.tables(e);
+                match tables.last() {
+                    Some(&last) if last < i => Some(false),
+                    Some(&last) if last == i && tables.len() == 1 => Some(true),
+                    _ => None,
+                }
+            };
+            match (side(a)?, side(b)?) {
+                (false, true) => Some((at, (**a).clone(), (**b).clone())),
+                (true, false) => Some((at, (**b).clone(), (**a).clone())),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// How a merge join on `keys`, the equalities of join `i`, can sort its sides
+/// so that its rows come out in the order `order_by` asks for, if it can: the
+/// keys to sort by (positions in `keys`), their directions, and what the left
+/// side is sorted by after them.
+///
+/// `order_by` must start with keys: their left sides, or for an inner join
+/// their right sides, which equal them on every row. Whatever follows may only
+/// read the left side, and only if every equality is among those keys, as any
+/// other would sort the left rows before it does.
+fn merge_order(
+    order_by: &[OrderBy],
+    keys: &[(usize, Expr, Expr)],
+    kind: JoinKind,
+    i: usize,
+    binder: &Binder,
+) -> Option<(Vec<usize>, Vec<bool>, Vec<OrderBy>)> {
+    let (mut order, mut desc) = (Vec::new(), Vec::new());
+    let mut rest: &[OrderBy] = &[];
+    for (at, o) in order_by.iter().enumerate() {
+        let Some(k) = keys.iter().position(|(_, l, r)| *l == o.expr || (kind == JoinKind::Inner && *r == o.expr))
+        else {
+            rest = &order_by[at..];
+            break;
+        };
+        if !order.contains(&k) {
+            order.push(k);
+            desc.push(o.desc);
+        }
+    }
+    let left_only = |o: &OrderBy| !o.expr.has_subquery() && binder.tables(&o.expr).iter().all(|&t| t < i);
+    if order.is_empty() || (!rest.is_empty() && (order.len() < keys.len() || !rest.iter().all(left_only))) {
+        return None;
+    }
+    for k in 0..keys.len() {
+        if !order.contains(&k) {
+            order.push(k);
+            desc.push(false);
+        }
+    }
+    Some((order, desc, rest.to_vec()))
 }
 
 /// How a lookup on this column of the table can find rows, if it can: through
@@ -722,13 +813,22 @@ impl Node<'_> {
                 let (name, mut on) = match method {
                     JoinMethod::Block => ("BLOCK NESTED LOOP", Vec::new()),
                     JoinMethod::Index => ("INDEX", Vec::new()),
-                    JoinMethod::Hash { left_keys, right_keys } => {
-                        ("HASH", left_keys.iter().zip(right_keys).map(|(l, r)| format!("{l} = {r}")).collect())
+                    JoinMethod::Hash { left_keys, right_keys } | JoinMethod::Merge { left_keys, right_keys, .. } => {
+                        let name = if matches!(method, JoinMethod::Hash { .. }) { "HASH" } else { "MERGE" };
+                        (name, left_keys.iter().zip(right_keys).map(|(l, r)| format!("{l} = {r}")).collect())
                     }
                 };
                 on.extend(condition.iter().map(Expr::to_string));
                 let on = if on.is_empty() { String::new() } else { format!(" ON {}", on.join(" AND ")) };
-                (format!("{kind}{name} JOIN{on}"), vec![left, right])
+                let by = match method {
+                    JoinMethod::Merge { left_keys, desc, then, .. } => {
+                        let keys = left_keys.iter().zip(desc).map(|(e, &desc)| sort_key(e, desc));
+                        let then = then.iter().map(|o| sort_key(&o.expr, o.desc));
+                        format!(" (SORTED BY {})", list(&mut keys.chain(then)))
+                    }
+                    _ => String::new(),
+                };
+                (format!("{kind}{name} JOIN{on}{by}"), vec![left, right])
             }
             Node::Aggregate { input, group_by, aggregates } => {
                 let mut line = format!("AGGREGATE {}", list(&mut aggregates.iter().map(aggregate_name)));
@@ -738,7 +838,7 @@ impl Node<'_> {
                 (line, vec![input])
             }
             Node::Sort { input, keys, limit } => {
-                let keys = list(&mut keys.iter().map(|k| format!("{}{}", k.expr, if k.desc { " DESC" } else { "" })));
+                let keys = list(&mut keys.iter().map(|k| sort_key(&k.expr, k.desc)));
                 let top = limit.map_or(String::new(), |n| format!(" (TOP {n})"));
                 (format!("SORT BY {keys}{top}"), vec![input])
             }
@@ -754,6 +854,11 @@ impl Node<'_> {
             input.explain_into(depth + 1, lines);
         }
     }
+}
+
+/// A sort key as EXPLAIN shows it: `u.city`, or `u.city DESC`.
+fn sort_key(expr: &Expr, desc: bool) -> String {
+    format!("{expr}{}", if desc { " DESC" } else { "" })
 }
 
 /// A table as EXPLAIN names it: `users`, or `users u` under an alias.

@@ -95,7 +95,7 @@ src/
   executor/       runs statements
     mod.rs        statement execution; a SELECT's rows as a stream (`Database::query`)
     operator.rs   each plan step as an iterator pulling rows from the one below
-    join.rs       block nested loop, hash and index joins; LEFT JOIN padding
+    join.rs       block nested loop, hash, index and sort-merge joins; LEFT JOIN padding
     sort.rs       ORDER BY: external merge sort, top-N heap for LIMIT
     aggregate.rs  hash aggregation: one row per group, and the aggregate functions
     subquery.rs   runs subqueries for each row, with outer references replaced by its values
@@ -264,6 +264,16 @@ condition is checked on each pair. Keys are compared as values, so a NULL
 key matches nothing, and neither do keys of different types, where `=` would
 report an error. The right side of a hash join is held in memory; a block
 nested loop join holds one block of left rows.
+
+A **sort-merge join** sorts both sides by the equalities, with the same
+external sort as `ORDER BY` (and its budget), and walks them together; its
+rows come out in key order. There are no statistics to weigh it against a
+hash join, so it is picked only when that order saves a sort: when `ORDER BY`
+starts with a join's keys, follows them only with columns of the tables
+before it, and every later join is a hash or index join, which keep their
+left side's order. That join becomes a merge join and the `ORDER BY` needs
+no sort of its own (`EXPLAIN` shows `MERGE JOIN ... (SORTED BY ...)` and no
+`SORT BY`).
 
 **Grouping**: a `SELECT` with `GROUP BY`, `HAVING` or an aggregate gets an
 aggregate step, which works by hash aggregation. Each expression of its
