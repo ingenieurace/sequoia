@@ -30,16 +30,45 @@
 //! full node splits it in two and adds a key to its parent. A delete that
 //! leaves a node under a quarter full merges it with a neighbour if both fit
 //! in one page, and otherwise moves keys between the two so they are about
-//! equally full. A range scan copies one leaf at a time and takes its keys
-//! out as it reaches them.
+//! equally full; the parent's separator may grow then, and a parent that no
+//! longer fits its page splits too. A range scan copies one leaf at a time
+//! and takes its keys out as it reaches them.
 //!
 //! The root never moves, so the page id the catalog records stays valid: a
 //! root that splits moves its keys into two new pages and becomes their
 //! parent, and a root left with one child takes over that child's keys.
+//!
+//! **Concurrency.** Any number of threads may search, insert and delete at
+//! once. Each page has a latch, its buffer pool frame's read-write lock, and
+//! they are taken by latch crabbing: from the root down, a node's latch is
+//! released only once its child's is held, so no change can slip between
+//! them, and never upward, so no two threads wait for each other.
+//!
+//! ```text
+//! search    read-latch root, read-latch child, release root, ...          down to the leaf
+//! insert    as a search, but write-latch the leaf (its parent still held)  then change it in place
+//!   or, if the leaf must split: write-latch from the root, releasing every
+//!   ancestor at a node that is safe, which a split below cannot overflow
+//! ```
+//!
+//! A delete does the same, where a safe node is one a merge below cannot
+//! leave under a quarter full, nor a longer separator overflow. Above a
+//! safe node nothing changes, so the latches held are exactly those of the
+//! nodes that may. Sibling nodes a rebalance needs are latched with their
+//! parent held, and a node is freed only while write-latched, its parent
+//! too, so no one can be reading it.
+//!
+//! Scans do not follow leaf links, which a merge may free under them: on the
+//! way down to a leaf a scan notes the smallest separator to its right, the
+//! leaf's upper bound (B-link trees keep it in each node), and after the
+//! leaf goes down again to the leaf holding that key. The keys of each leaf
+//! are below that bound when they are copied, so a scan returns keys in
+//! order, each once, and every key present for the whole scan.
 
+use std::mem;
 use std::sync::Arc;
 
-use crate::storage::buffer::pool::BufferPool;
+use crate::storage::buffer::pool::{BufferPool, PageWriteGuard};
 use crate::storage::io::disk::{PAGE_SIZE, PAGE_USABLE, Page, PageId, decode_id, encode_id, read_u32, write_u32};
 use crate::error::{Result, err};
 
@@ -89,11 +118,10 @@ impl BPlusTree {
     }
 
     /// Adds a key. Returns false if it was already there.
-    pub fn insert(&mut self, key: &[u8]) -> Result<bool> {
+    pub fn insert(&self, key: &[u8]) -> Result<bool> {
         Self::check_key(key)?;
-        let leaf = self.find_leaf(key)?;
         {
-            let mut page = self.pool.fetch_write(leaf)?;
+            let mut page = self.leaf_for_write(key)?;
             let (at, found, end) = leaf_search(&page, key)?;
             if found {
                 return Ok(false);
@@ -109,67 +137,27 @@ impl BPlusTree {
             }
         }
         // The leaf is full: split it, and its parents if need be.
-        self.insert_splitting(key)
-    }
-
-    /// Adds a key to a tree whose leaf for it is full, splitting nodes.
-    fn insert_splitting(&mut self, key: &[u8]) -> Result<bool> {
-        let mut root = self.read(self.root)?;
-        let Some(inserted) = self.insert_into(&mut root, key)? else {
-            return Ok(false);
-        };
-        if root.size() <= PAGE_USABLE {
-            self.write(self.root, &root)?;
-        } else {
-            // Split the root's contents into two new pages and point the root at them.
-            let (left, separator, right) = root.split();
-            let left_id = self.allocate(&left)?;
-            let right_id = self.allocate(&right)?;
-            if let Node::Leaf { .. } = left {
-                self.write(left_id, &left.with_next(Some(right_id)))?;
-            }
-            self.write(self.root, &Node::Internal { keys: vec![separator], children: vec![left_id, right_id] })?;
-        }
-        Ok(inserted)
+        self.restructure(key, Change::Insert)
     }
 
     /// Removes a key. Returns false if it was not there.
-    pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
-        let leaf = self.find_leaf(key)?;
+    pub fn delete(&self, key: &[u8]) -> Result<bool> {
         {
-            let mut page = self.pool.fetch_write(leaf)?;
+            let mut page = self.leaf_for_write(key)?;
             let (at, found, end) = leaf_search(&page, key)?;
             if !found {
                 return Ok(false);
             }
             // A leaf left at least a quarter full, or the root, needs no rebalancing.
             let size = 2 + key.len();
-            if leaf == self.root || end - size >= PAGE_USABLE / 4 {
+            if page.id() == self.root || end - size >= PAGE_USABLE / 4 {
                 page.copy_within(at + size..end, at);
                 let n = count(&page);
                 set_count(&mut page, n - 1);
                 return Ok(true);
             }
         }
-        self.delete_rebalancing(key)
-    }
-
-    /// Removes a key whose leaf it leaves under a quarter full, rebalancing nodes.
-    fn delete_rebalancing(&mut self, key: &[u8]) -> Result<bool> {
-        let mut root = self.read(self.root)?;
-        if !self.delete_from(&mut root, key)? {
-            return Ok(false);
-        }
-        // A root with a single child takes over the child's keys.
-        while let Node::Internal { keys, children } = &root
-            && keys.is_empty()
-        {
-            let child = children[0];
-            root = self.read(child)?;
-            self.pool.delete_page(child)?;
-        }
-        self.write(self.root, &root)?;
-        Ok(true)
+        self.restructure(key, Change::Delete)
     }
 
     /// Iterates over the keys `>= start` in order.
@@ -177,33 +165,181 @@ impl BPlusTree {
     /// Each leaf is read when the scan reaches it, so changes made during the
     /// scan may be seen. Callers that modify the tree should collect first.
     pub fn range(&self, start: &[u8]) -> Range<'_> {
-        Range { tree: self, start: Some(start.to_vec()), leaf: None, left: 0, pos: 0 }
+        Range { tree: self, next: Some(start.to_vec()), leaf: None, left: 0, pos: 0, bound: None }
     }
 
-    /// The leaf that holds `key` or would, found by reading the internal
-    /// nodes on the way down in place.
-    fn find_leaf(&self, key: &[u8]) -> Result<PageId> {
+    /// The leaf that holds `key` or would, write-latched. The way down is
+    /// read-latched, each node until its child is; the leaf's parent until
+    /// the leaf is write-latched, so that no split or merge, which would
+    /// need the parent's write latch, can move `key` out of the leaf
+    /// meanwhile.
+    fn leaf_for_write(&self, key: &[u8]) -> Result<PageWriteGuard<'_>> {
+        'again: loop {
+            let mut parent = None;
+            let mut id = self.root;
+            loop {
+                let page = self.pool.fetch_read(id)?;
+                if page[0] == LEAF {
+                    drop(page);
+                    let leaf = self.pool.fetch_write(id)?;
+                    // Only the root, which has no parent, can stop being a
+                    // leaf meanwhile: by splitting. Then go down again.
+                    if leaf[0] != LEAF {
+                        continue 'again;
+                    }
+                    drop(parent);
+                    return Ok(leaf);
+                }
+                id = child_of(&page, key)?.0;
+                parent = Some(page);
+            }
+        }
+    }
+
+    /// Makes a change that may split or merge nodes. Write-latches the way
+    /// down, releasing the nodes above each safe one (see [`Node::safe`]),
+    /// changes the leaf, and then, from the leaf up, splits each node that
+    /// overflows and rebalances each that underflows, which changes only
+    /// the nodes held. Writes back only the nodes that changed.
+    fn restructure(&self, key: &[u8], change: Change) -> Result<bool> {
+        let mut path: Vec<Level> = Vec::new();
         let mut id = self.root;
         loop {
-            let page = self.pool.fetch_read(id)?;
-            match page[0] {
-                LEAF => return Ok(id),
-                INTERNAL => {
-                    // The child to the right of the last key <= `key`.
-                    let mut child = read_u32(&page, 3);
-                    let mut pos = HEADER_SIZE;
-                    for _ in 0..count(&page) {
-                        let (k, next) = entry(&page, pos, 4)?;
-                        if k > key {
-                            break;
-                        }
-                        child = read_u32(&page, next - 4);
-                        pos = next;
-                    }
-                    id = PageId(child);
-                }
-                kind => return err(format!("corrupted B+ tree node: kind {kind}")),
+            let guard = self.pool.fetch_write(id)?;
+            let node = Node::read(&guard)?;
+            if node.safe(change, key.len(), id == self.root) {
+                path.clear(); // releases the ancestors, from the top
             }
+            let child = match &node {
+                Node::Internal { keys, children } => Some(child_index(keys, key)).map(|i| (i, children[i])),
+                Node::Leaf { .. } => None,
+            };
+            path.push(Level { id, guard, node, child: child.map_or(0, |(i, _)| i), changed: false });
+            match child {
+                Some((_, child)) => id = child,
+                None => break,
+            }
+        }
+
+        let leaf = path.last_mut().expect("the leaf");
+        let Node::Leaf { keys, .. } = &mut leaf.node else { unreachable!("the path ends at a leaf") };
+        match (keys.binary_search_by(|k| k.as_slice().cmp(key)), change) {
+            (Err(i), Change::Insert) => keys.insert(i, key.to_vec()),
+            (Ok(i), Change::Delete) => _ = keys.remove(i),
+            _ => return Ok(false),
+        }
+        leaf.changed = true;
+
+        while let Some(mut level) = path.pop() {
+            let parent = path.last_mut();
+            let root = level.id == self.root;
+            if level.node.size() > PAGE_USABLE {
+                let (left, separator, right) = mem::replace(&mut level.node, Node::empty()).split();
+                if root {
+                    // The root moves its keys into two new pages and becomes their parent.
+                    let right_id = self.allocate(&right)?;
+                    let left_id = self.allocate(&left.with_next(Some(right_id)))?;
+                    level.node = Node::Internal { keys: vec![separator], children: vec![left_id, right_id] };
+                } else {
+                    let parent = parent.expect("an unsafe node's parent is held");
+                    let right_id = self.allocate(&right)?;
+                    level.node = left.with_next(Some(right_id));
+                    let Node::Internal { keys, children } = &mut parent.node else { unreachable!("a parent") };
+                    keys.insert(parent.child, separator);
+                    children.insert(parent.child + 1, right_id);
+                    parent.changed = true;
+                }
+            } else if change == Change::Delete && !root && level.node.size() < PAGE_USABLE / 4 {
+                // Only a delete rebalances: a node an insert finds under a
+                // quarter full (with long keys, a split may leave one so)
+                // only grows, and its parent may not be held.
+                let parent = parent.expect("an unsafe node's parent is held");
+                parent.changed = true;
+                if self.rebalance(&mut level, parent)? {
+                    // Merged into its left sibling. Its latch goes with the
+                    // page: no one can reach it through the parent now.
+                    let id = level.id;
+                    drop(level);
+                    self.pool.delete_unreachable_page(id)?;
+                    continue;
+                }
+            }
+            if root {
+                // A root with a single child takes over the child's keys.
+                while let Node::Internal { keys, children } = &level.node
+                    && keys.is_empty()
+                {
+                    let child = children[0];
+                    level.node = Node::read(&*self.pool.fetch_write(child)?)?;
+                    self.pool.delete_unreachable_page(child)?;
+                }
+            }
+            if level.changed {
+                level.node.write(&mut level.guard);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Rebalances a node left under a quarter full with a sibling, which is
+    /// write-latched under their parent: the one to its right, or to its left
+    /// if it is the last child. Merges the two into the left one if they fit
+    /// in one page, freeing the right one, and otherwise splits their keys
+    /// evenly. Returns true if `level` merged into its left sibling, for the
+    /// caller to free its page.
+    fn rebalance(&self, level: &mut Level, parent: &mut Level) -> Result<bool> {
+        let Node::Internal { keys, children } = &mut parent.node else { unreachable!("a parent") };
+        let i = parent.child;
+        let pair = i.min(children.len() - 2); // the pair is children `pair` and `pair + 1`
+        let sibling_id = children[if pair == i { i + 1 } else { pair }];
+        let mut sibling = self.pool.fetch_write(sibling_id)?;
+        let node = mem::replace(&mut level.node, Node::empty());
+        let (left, right) = match pair == i {
+            true => (node, Node::read(&sibling)?),
+            false => (Node::read(&sibling)?, node),
+        };
+        let merged = match (left, right) {
+            (Node::Leaf { keys: mut left, .. }, Node::Leaf { keys: right, next }) => {
+                left.extend(right);
+                Node::Leaf { keys: left, next }
+            }
+            (
+                Node::Internal { keys: mut left, children: mut left_children },
+                Node::Internal { keys: right, children: right_children },
+            ) => {
+                // The separator comes down between the two halves.
+                left.push(keys[pair].clone());
+                left.extend(right);
+                left_children.extend(right_children);
+                Node::Internal { keys: left, children: left_children }
+            }
+            _ => return err("corrupted B+ tree: siblings of different kinds"),
+        };
+        level.changed = true;
+
+        if merged.size() <= PAGE_USABLE {
+            keys.remove(pair);
+            children.remove(pair + 1);
+            if pair == i {
+                level.node = merged;
+                drop(sibling);
+                self.pool.delete_unreachable_page(sibling_id)?;
+                Ok(false)
+            } else {
+                merged.write(&mut sibling);
+                Ok(true)
+            }
+        } else {
+            let (left, separator, right) = merged.split();
+            keys[pair] = separator;
+            if pair == i {
+                level.node = left.with_next(Some(sibling_id));
+                right.write(&mut sibling);
+            } else {
+                left.with_next(Some(level.id)).write(&mut sibling);
+                level.node = right;
+            }
+            Ok(false)
         }
     }
 
@@ -219,108 +355,8 @@ impl BPlusTree {
         Ok(())
     }
 
-    /// Inserts into the subtree whose root is `node`, which the caller writes
-    /// back. Returns `None` if the key was already there. A child that
-    /// overflows is split here, so `node` may be left too big for a page.
-    fn insert_into(&self, node: &mut Node, key: &[u8]) -> Result<Option<bool>> {
-        match node {
-            Node::Leaf { keys, .. } => match keys.binary_search_by(|k| k.as_slice().cmp(key)) {
-                Ok(_) => Ok(None),
-                Err(i) => {
-                    keys.insert(i, key.to_vec());
-                    Ok(Some(true))
-                }
-            },
-            Node::Internal { keys, children } => {
-                let i = child_index(keys, key);
-                let mut child = self.read(children[i])?;
-                let Some(inserted) = self.insert_into(&mut child, key)? else {
-                    return Ok(None);
-                };
-                if child.size() <= PAGE_USABLE {
-                    self.write(children[i], &child)?;
-                } else {
-                    let (left, separator, right) = child.split();
-                    let right_id = self.allocate(&right)?;
-                    self.write(children[i], &left.with_next(Some(right_id)))?;
-                    keys.insert(i, separator);
-                    children.insert(i + 1, right_id);
-                }
-                Ok(Some(inserted))
-            }
-        }
-    }
-
-    /// Deletes from the subtree whose root is `node`, which the caller writes
-    /// back. A child left under a quarter full is rebalanced with a neighbour.
-    fn delete_from(&self, node: &mut Node, key: &[u8]) -> Result<bool> {
-        match node {
-            Node::Leaf { keys, .. } => match keys.binary_search_by(|k| k.as_slice().cmp(key)) {
-                Ok(i) => {
-                    keys.remove(i);
-                    Ok(true)
-                }
-                Err(_) => Ok(false),
-            },
-            Node::Internal { keys, children } => {
-                let i = child_index(keys, key);
-                let mut child = self.read(children[i])?;
-                if !self.delete_from(&mut child, key)? {
-                    return Ok(false);
-                }
-                self.write(children[i], &child)?;
-                if child.size() < PAGE_USABLE / 4 {
-                    // Pair the child with its right neighbour, or its left one if it is the last.
-                    self.rebalance(keys, children, i.min(children.len() - 2))?;
-                }
-                Ok(true)
-            }
-        }
-    }
-
-    /// Rebalances the children `i` and `i + 1` of an internal node: merges
-    /// them if they fit in one page, and otherwise splits their keys evenly.
-    fn rebalance(&self, keys: &mut Vec<Vec<u8>>, children: &mut Vec<PageId>, i: usize) -> Result<()> {
-        let (left_id, right_id) = (children[i], children[i + 1]);
-        let merged = match (self.read(left_id)?, self.read(right_id)?) {
-            (Node::Leaf { keys: mut left, .. }, Node::Leaf { keys: right, next }) => {
-                left.extend(right);
-                Node::Leaf { keys: left, next }
-            }
-            (
-                Node::Internal { keys: mut left, children: mut left_children },
-                Node::Internal { keys: right, children: right_children },
-            ) => {
-                // The separator comes down between the two halves.
-                left.push(keys[i].clone());
-                left.extend(right);
-                left_children.extend(right_children);
-                Node::Internal { keys: left, children: left_children }
-            }
-            _ => return err("corrupted B+ tree: siblings of different kinds"),
-        };
-
-        if merged.size() <= PAGE_USABLE {
-            self.write(left_id, &merged)?;
-            self.pool.delete_page(right_id)?;
-            keys.remove(i);
-            children.remove(i + 1);
-        } else {
-            let (left, separator, right) = merged.split();
-            self.write(left_id, &left.with_next(Some(right_id)))?;
-            self.write(right_id, &right)?;
-            keys[i] = separator;
-        }
-        Ok(())
-    }
-
     fn read(&self, id: PageId) -> Result<Node> {
         Node::read(&*self.pool.fetch_read(id)?)
-    }
-
-    fn write(&self, id: PageId, node: &Node) -> Result<()> {
-        node.write(&mut *self.pool.fetch_write(id)?);
-        Ok(())
     }
 
     fn allocate(&self, node: &Node) -> Result<PageId> {
@@ -328,6 +364,47 @@ impl BPlusTree {
         node.write(&mut page);
         Ok(page.id())
     }
+}
+
+/// A change to the keys, for a restructuring to know which nodes it may change.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Change {
+    Insert,
+    Delete,
+}
+
+/// A node on a restructuring's way down, write-latched.
+struct Level<'a> {
+    id: PageId,
+    guard: PageWriteGuard<'a>,
+    node: Node,
+    /// The child the way goes on to, in an internal node.
+    child: usize,
+    changed: bool,
+}
+
+/// The most an internal node's entry can take: a separator a split below
+/// adds, or a rebalance swaps in.
+const MAX_ENTRY: usize = 2 + MAX_KEY_SIZE + 4;
+
+/// Of an internal node's page, the child that may hold `key`, and, if there
+/// is one, the separator to its right: every key below that child is less.
+fn child_of<'p>(page: &'p Page, key: &[u8]) -> Result<(PageId, Option<&'p [u8]>)> {
+    if page[0] != INTERNAL {
+        return err(format!("corrupted B+ tree node: kind {}", page[0]));
+    }
+    // The child to the right of the last key <= `key`.
+    let mut child = read_u32(page, 3);
+    let mut pos = HEADER_SIZE;
+    for _ in 0..count(page) {
+        let (k, next) = entry(page, pos, 4)?;
+        if k > key {
+            return Ok((PageId(child), Some(k)));
+        }
+        child = read_u32(page, next - 4);
+        pos = next;
+    }
+    Ok((PageId(child), None))
 }
 
 /// Which child of an internal node with these keys may hold `key`.
@@ -379,6 +456,28 @@ fn leaf_search(page: &Page, key: &[u8]) -> Result<(usize, bool, usize)> {
 }
 
 impl Node {
+    /// A leaf with no keys, which a node taken out to change stands in for.
+    fn empty() -> Node {
+        Node::Leaf { keys: Vec::new(), next: None }
+    }
+
+    /// Whether a change of `key` below this node cannot spread above it: an
+    /// insert cannot overflow it, by adding the key to a leaf or a separator
+    /// to an internal node, and a delete cannot leave it under a quarter full
+    /// (the root: with no key) nor overflow it with a longer separator.
+    fn safe(&self, change: Change, key_len: usize, root: bool) -> bool {
+        let size = self.size();
+        match (self, change) {
+            (Node::Leaf { .. }, Change::Insert) => size + 2 + key_len <= PAGE_USABLE,
+            (Node::Internal { .. }, Change::Insert) => size + MAX_ENTRY <= PAGE_USABLE,
+            (Node::Leaf { .. }, Change::Delete) => root || size.saturating_sub(2 + key_len) >= PAGE_USABLE / 4,
+            (Node::Internal { keys, .. }, Change::Delete) => {
+                let stays = if root { keys.len() >= 2 } else { size.saturating_sub(MAX_ENTRY) >= PAGE_USABLE / 4 };
+                stays && size + MAX_ENTRY <= PAGE_USABLE
+            }
+        }
+    }
+
     fn keys(&self) -> &[Vec<u8>] {
         match self {
             Node::Leaf { keys, .. } | Node::Internal { keys, .. } => keys,
@@ -501,33 +600,45 @@ impl Node {
 
 pub struct Range<'a> {
     tree: &'a BPlusTree,
-    /// Set until the first leaf is found.
-    start: Option<Vec<u8>>,
+    /// Where to go down to next: the start, then each leaf's upper bound.
+    next: Option<Vec<u8>>,
     /// A copy of the current leaf's page, once there is one.
     leaf: Option<Box<Page>>,
     /// Keys of the current leaf not yet returned, and where the next one is.
     left: usize,
     pos: usize,
+    /// The current leaf's upper bound; `None` for the last leaf.
+    bound: Option<Vec<u8>>,
 }
 
 impl Range<'_> {
-    /// Copies the leaf `id` to read its keys from the first.
-    fn load(&mut self, id: PageId) -> Result<()> {
-        let page = self.tree.pool.fetch_read(id)?;
-        if page[0] != LEAF {
-            return err("corrupted B+ tree: a leaf links to an internal node");
-        }
+    /// Goes down to the leaf that may hold `start`, read-latching as a
+    /// search does and noting the leaf's upper bound, copies it, and skips
+    /// its keys below `start`.
+    fn seek(&mut self, start: &[u8]) -> Result<()> {
+        let mut id = self.tree.root;
+        let mut bound = None;
+        let mut parent = None;
+        let page = loop {
+            let page = self.tree.pool.fetch_read(id)?;
+            drop(parent);
+            if page[0] == LEAF {
+                break page;
+            }
+            let (child, right) = child_of(&page, start)?;
+            // A separator lower down is tighter than one above.
+            if let Some(right) = right {
+                bound = Some(right.to_vec());
+            }
+            id = child;
+            parent = Some(page);
+        };
         let leaf = self.leaf.get_or_insert_with(|| Box::new([0; PAGE_SIZE]));
         leaf.copy_from_slice(&*page);
+        drop(page);
+        self.bound = bound;
         self.left = count(leaf);
         self.pos = HEADER_SIZE;
-        Ok(())
-    }
-
-    /// Descends to the leaf that may hold `start`, and skips its keys below `start`.
-    fn seek(&mut self, start: &[u8]) -> Result<()> {
-        self.load(self.tree.find_leaf(start)?)?;
-        let leaf = self.leaf.as_ref().expect("loaded");
         while self.left > 0 {
             let (key, next) = entry(leaf, self.pos, 0)?;
             if key >= start {
@@ -540,25 +651,20 @@ impl Range<'_> {
     }
 
     fn step(&mut self) -> Result<Option<Vec<u8>>> {
-        if let Some(start) = self.start.take() {
-            self.seek(&start)?;
-        }
         loop {
-            let Some(leaf) = &self.leaf else { return Ok(None) };
-            if self.left > 0 {
+            if let Some(leaf) = &self.leaf
+                && self.left > 0
+            {
                 let (key, next) = entry(leaf, self.pos, 0)?;
                 let key = key.to_vec();
                 self.pos = next;
                 self.left -= 1;
                 return Ok(Some(key));
             }
-            match decode_id(read_u32(leaf, 3)) {
-                Some(next) => self.load(next)?,
-                None => {
-                    self.leaf = None;
-                    return Ok(None);
-                }
-            }
+            // The next leaf holds the keys from this one's upper bound on.
+            let Some(start) = self.next.take() else { return Ok(None) };
+            self.seek(&start)?;
+            self.next = self.bound.take();
         }
     }
 }
@@ -570,7 +676,8 @@ impl Iterator for Range<'_> {
         match self.step() {
             Ok(key) => key.map(Ok),
             Err(e) => {
-                self.leaf = None;
+                self.next = None;
+                self.left = 0;
                 Some(Err(e))
             }
         }
@@ -610,6 +717,114 @@ mod tests {
         }
     }
 
+    /// Checks every node below `id`: its keys sorted and within the bounds
+    /// its parent gives it, its page not overfull, and every leaf at the
+    /// same depth. Returns the height. (A node may be under a quarter full:
+    /// with long keys, even halves of a split can be.)
+    fn check(tree: &BPlusTree, id: PageId, low: Option<&[u8]>, high: Option<&[u8]>) -> usize {
+        let node = tree.read(id).unwrap();
+        let keys = node.keys();
+        assert!(node.size() <= PAGE_USABLE, "node {} overflows", id.0);
+        assert!(keys.windows(2).all(|w| w[0] < w[1]), "node {} unsorted", id.0);
+        assert!(keys.iter().all(|k| low.is_none_or(|l| k.as_slice() >= l) && high.is_none_or(|h| k.as_slice() < h)));
+        match node {
+            Node::Leaf { .. } => 1,
+            Node::Internal { keys, children } => {
+                let bound = |i: usize| keys.get(i).map(Vec::as_slice);
+                let heights: BTreeSet<usize> = (0..children.len())
+                    .map(|i| check(tree, children[i], if i == 0 { low } else { bound(i - 1) }, bound(i).or(high)))
+                    .collect();
+                assert_eq!(heights.len(), 1, "unbalanced below {}", id.0);
+                heights.first().unwrap() + 1
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_inserts_deletes_and_scans_keep_every_key() {
+        const WRITERS: u32 = 8;
+        // Per writer: 32,000 in all at the peak, three levels deep, so
+        // internal nodes split, and merge again as two in three go.
+        const KEYS: u32 = 4000;
+        // A small pool, so pages are evicted and read back while latched in turn.
+        let tree = BPlusTree::create(pool(128)).unwrap();
+        // Keys every reader must always find: inserted first, never removed.
+        let stable: Vec<Vec<u8>> = (0..200).map(|i| key(1_000_000 + i)).collect();
+        for k in &stable {
+            tree.insert(k).unwrap();
+        }
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let done = &done;
+        let (tree, stable) = (&tree, &stable);
+        std::thread::scope(|s| {
+            // Each writer owns the keys i with i % WRITERS == w: inserts them all,
+            // deletes two in three, and inserts back one in three of those.
+            let writers: Vec<_> = (0..WRITERS)
+                .map(|w| {
+                    s.spawn(move || {
+                        let mine = (0..KEYS).map(|i| i * WRITERS + w);
+                        for i in mine.clone() {
+                            assert!(tree.insert(&key(i)).unwrap());
+                        }
+                        for i in mine.clone().filter(|i| i % 3 != 0) {
+                            assert!(tree.delete(&key(i)).unwrap(), "{i} was there");
+                        }
+                        for i in mine.filter(|i| i % 9 == 1) {
+                            assert!(tree.insert(&key(i)).unwrap());
+                        }
+                    })
+                })
+                .collect();
+            for _ in 0..2 {
+                s.spawn(move || {
+                    while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                        let keys = all(tree);
+                        assert!(keys.windows(2).all(|w| w[0] < w[1]), "a scan returns keys in order, each once");
+                        let found: BTreeSet<&Vec<u8>> = keys.iter().collect();
+                        assert!(stable.iter().all(|k| found.contains(k)), "a scan misses no key that stays");
+                        for k in stable.iter().step_by(17) {
+                            assert_eq!(tree.range(k).next().unwrap().unwrap(), *k);
+                        }
+                    }
+                });
+            }
+            let results: Vec<_> = writers.into_iter().map(|w| w.join()).collect();
+            // Stop the readers before reporting a writer's panic, which would otherwise wait for them.
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            results.into_iter().for_each(|r| r.unwrap());
+        });
+
+        let mut expected: BTreeSet<Vec<u8>> = (0..KEYS * WRITERS).filter(|i| i % 3 == 0 || i % 9 == 1).map(key).collect();
+        expected.extend(stable.iter().cloned());
+        assert_eq!(all(tree), expected.into_iter().collect::<Vec<_>>());
+        check(tree, tree.root, None, None);
+    }
+
+    #[test]
+    fn a_parent_a_longer_separator_overflows_splits() {
+        // Long and short keys mixed: a rebalance below may swap a short
+        // separator for a long one, overflowing its parent, as seed 17 did
+        // before parents were split then.
+        for seed in 1..40u64 {
+            let tree = BPlusTree::create(pool(16)).unwrap();
+            let mut expected = BTreeSet::new();
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            for _ in 0..8000 {
+                let i = rng.below(300);
+                let len = if rng.below(3) == 0 { 600 + rng.below(MAX_KEY_SIZE as u32 - 600) } else { 4 + rng.below(8) };
+                let mut k = i.to_be_bytes().to_vec();
+                k.resize(len as usize, b'x');
+                if rng.below(2) == 0 {
+                    assert_eq!(tree.delete(&k).unwrap(), expected.remove(&k));
+                } else {
+                    assert_eq!(tree.insert(&k).unwrap(), expected.insert(k));
+                }
+            }
+            assert_eq!(all(&tree), expected.into_iter().collect::<Vec<_>>(), "seed {seed}");
+            check(&tree, tree.root, None, None);
+        }
+    }
+
     /// A small xorshift generator, so the tests need no dependencies.
     struct Rng(u64);
 
@@ -624,7 +839,7 @@ mod tests {
 
     #[test]
     fn inserts_split_nodes_and_keep_keys_sorted() {
-        let mut tree = BPlusTree::create(pool(8)).unwrap();
+        let tree = BPlusTree::create(pool(8)).unwrap();
         for i in (0..20_000).rev() {
             assert!(tree.insert(&key(i)).unwrap());
         }
@@ -635,7 +850,7 @@ mod tests {
 
     #[test]
     fn range_starts_at_the_first_key_not_below_start() {
-        let mut tree = BPlusTree::create(pool(8)).unwrap();
+        let tree = BPlusTree::create(pool(8)).unwrap();
         for i in (0..2000u32).step_by(2) {
             tree.insert(&i.to_be_bytes()).unwrap();
         }
@@ -650,7 +865,7 @@ mod tests {
     #[test]
     fn deletes_merge_nodes_and_free_their_pages() {
         let pool = pool(8);
-        let mut tree = BPlusTree::create(pool.clone()).unwrap();
+        let tree = BPlusTree::create(pool.clone()).unwrap();
         for i in 0..5000 {
             tree.insert(&key(i)).unwrap();
         }
@@ -671,7 +886,7 @@ mod tests {
 
     #[test]
     fn random_inserts_and_deletes_match_a_btreeset() {
-        let mut tree = BPlusTree::create(pool(4)).unwrap();
+        let tree = BPlusTree::create(pool(4)).unwrap();
         let mut expected = BTreeSet::new();
         let mut rng = Rng(0x2545_F491_4F6C_DD1D);
         for round in 0..20_000 {
@@ -688,7 +903,7 @@ mod tests {
 
     #[test]
     fn large_keys_still_split() {
-        let mut tree = BPlusTree::create(pool(8)).unwrap();
+        let tree = BPlusTree::create(pool(8)).unwrap();
         let big = |i: u8| vec![i; MAX_KEY_SIZE];
         for i in 0..100 {
             tree.insert(&big(i)).unwrap();
@@ -704,7 +919,7 @@ mod tests {
     #[test]
     fn reopens_from_its_root_and_destroys_all_pages() {
         let pool = pool(8);
-        let mut tree = BPlusTree::create(pool.clone()).unwrap();
+        let tree = BPlusTree::create(pool.clone()).unwrap();
         for i in 0..3000 {
             tree.insert(&key(i)).unwrap();
         }
@@ -715,7 +930,7 @@ mod tests {
         assert_eq!(all(&tree).len(), 3000);
         tree.destroy().unwrap();
 
-        let mut other = BPlusTree::create(pool.clone()).unwrap();
+        let other = BPlusTree::create(pool.clone()).unwrap();
         for i in 0..3000 {
             other.insert(&key(i)).unwrap();
         }

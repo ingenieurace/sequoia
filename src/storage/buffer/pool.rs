@@ -139,6 +139,24 @@ impl BufferPool {
         self.disk.deallocate_page(id)
     }
 
+    /// Deletes a page that no one can reach any more, such as a B+ tree
+    /// node unlinked from its parent, waiting for the threads still leaving
+    /// it: a guard releases its latch before it unpins the page, so a
+    /// thread whose latch the caller took over may still hold a pin.
+    pub fn delete_unreachable_page(&self, id: PageId) -> Result<()> {
+        loop {
+            match self.delete_page(id) {
+                Err(_) if self.is_pinned(id) => std::thread::yield_now(),
+                result => return result,
+            }
+        }
+    }
+
+    fn is_pinned(&self, id: PageId) -> bool {
+        let state = self.state.lock().unwrap();
+        state.page_table.get(&id).is_some_and(|&frame| state.meta[frame].pins > 0)
+    }
+
     /// Writes a page back to disk if it is cached and dirty. Does not sync.
     pub fn flush_page(&self, id: PageId) -> Result<()> {
         let frame = {
