@@ -187,7 +187,8 @@ Every statement is atomic and, outside a transaction, durable once it returns.
 A transaction is durable once `COMMIT` returns; until then a crash, `ROLLBACK`
 or closing the database undoes all of it. A statement that fails inside one is
 undone alone, and the transaction goes on. There is one connection, so no
-concurrency control. Not supported: `RIGHT` and `FULL` joins, subqueries in
+concurrency control between transactions; below that, the buffer pool and
+B+ trees may be used by many threads at once, with page latches. Not supported: `RIGHT` and `FULL` joins, subqueries in
 `JOIN ... ON`, `LATERAL`, `INSERT ... SELECT`.
 
 ## Layout
@@ -239,7 +240,7 @@ src/
     tuple.rs      row <-> bytes (null bitmap + column values)
     sort_key.rs   values <-> bytes that sort like them: sort keys and index keys
     heap.rs       table heap: linked list of pages, free-space map, RecordId
-    btree.rs      B+ tree: sorted byte-string keys, splits, merges, range scans
+    btree.rs      B+ tree: sorted byte-string keys, splits, merges, range scans, latch crabbing
     lsm/          log-structured merge tree
       tree.rs     log + MemTable, SSTables, level/universal compaction
       skiplist.rs skip list: the MemTable, nodes in a Vec linked by index
@@ -317,8 +318,16 @@ A database is a single file of 4 KB pages:
   `WHERE` is true for; every other row has an entry, NULL keys included. A
   node that overflows its
   page splits; a delete that leaves a node under a quarter full merges it
-  with a neighbour, or moves keys over from it. The root page never moves, so
-  the catalog row stays valid. Every insert, update and delete updates every
+  with a neighbour, or moves keys over from it (and a parent that the longer
+  separator this may bring overflows splits in turn). The root page never
+  moves, so the catalog row stays valid. Threads may search and change a
+  tree at once, latching pages by **latch crabbing**: down from the root,
+  a node's latch is released only once its child's is held. A change that
+  fits in its leaf write-latches only the leaf; one that must split or merge
+  write-latches the way down, releasing everything above each node that the
+  change cannot spread past. A scan copies one leaf at a time and, instead
+  of following the leaf links (a merge may free the next leaf), goes down
+  again to the key that bounds the leaf above, which it noted on the way. Every insert, update and delete updates every
   index of the table. A heap table with a primary key gets a unique index
   `<table>_pkey` on it, which enforces the key and is dropped only with the
   table. Column tables cannot have indexes: migrating rows into a row group
