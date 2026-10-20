@@ -256,7 +256,9 @@ A database is a single file of 4 KB pages:
   newer ones take twice the space of the oldest. It rewrites data less often
   but leaves more SSTables to check. To switch, edit `COMPACTION` in
   `src/storage/lsm/tree.rs`. Lookups check the MemTable, then SSTables newest first,
-  skipping those whose key range or Bloom filter rules the key out. A
+  skipping those whose key range or Bloom filter rules the key out. Scans
+  merge the MemTable and the SSTables in key order, each read in place from
+  the key the scan starts at, so a range of keys reads only its own pages. A
   manifest page lists the log and the SSTables. SSTable summaries are not
   stored: opening a table reads its SSTables once to rebuild them.
 - **A column table** (`USING COLUMN`) is a column store in the PAX layout.
@@ -297,7 +299,9 @@ A database is a single file of 4 KB pages:
   uses the index those conditions narrow down most, an equality before a range
   with two ends before one with one end, and reads only the rows the index
   lists, in index order. An LSM table whose primary key is fixed by an
-  equality looks that key up. Otherwise every row is read, a column table's
+  equality looks that key up, and one whose primary key the conditions bound
+  reads only that range of keys, in key order (ranked as an index would be,
+  and winning ties). Otherwise every row is read, a column table's
   with its conditions pushed down (above). The full WHERE clause is always
   checked on the rows read. `EXPLAIN` shows the choice on its last line.
 - **Freed pages** (from `DROP TABLE`, `DROP INDEX`, B+ tree merges, an LSM

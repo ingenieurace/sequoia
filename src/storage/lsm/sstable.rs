@@ -16,11 +16,12 @@
 //! rebuild the summary. A lookup checks the key range and the filter, picks
 //! the one page that could hold the key, and binary searches its slots.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use super::bloom::{self, Bloom};
 use crate::storage::buffer::pool::{BufferPool, PageWriteGuard};
-use crate::storage::io::disk::PageId;
+use crate::storage::io::disk::{PAGE_SIZE, Page, PageId};
 use crate::storage::page::SlottedPage;
 use crate::error::{Result, err};
 
@@ -141,6 +142,23 @@ impl SsTable {
         Iter { pool: &self.pool, next_page: Some(self.first_page()), pending: Vec::new().into_iter() }
     }
 
+    /// A cursor at the first entry with a key `>= start`, tombstones
+    /// included, which reads from the one page that could hold `start`, or
+    /// reads nothing if every key is below it.
+    pub fn cursor(&self, start: &[u8]) -> Result<Cursor<'_>> {
+        let first = (start <= self.max_key.as_slice()).then(|| {
+            // The last page whose first key is <= start, or the first page.
+            self.pages[self.pages.partition_point(|(_, first)| first.as_slice() <= start).saturating_sub(1)].0
+        });
+        let mut cursor =
+            Cursor { pool: &self.pool, page: Box::new([0; PAGE_SIZE]), next_page: first, slot: 0, slots: 0, current: None };
+        cursor.load()?;
+        while cursor.entry().is_some_and(|(key, _)| key < start) {
+            cursor.advance()?;
+        }
+        Ok(cursor)
+    }
+
     /// Returns all of the SSTable's pages to the free list.
     pub fn destroy(self) -> Result<()> {
         self.pages.iter().try_for_each(|&(id, _)| self.pool.delete_page(id))
@@ -178,6 +196,67 @@ impl Iterator for Iter<'_> {
                 Err(e) => return Some(Err(e)),
             }
         }
+    }
+}
+
+/// Reads an SSTable's entries in key order from a copy of one page at a
+/// time, handing out the current entry where it lies in the copy, without
+/// copying it out.
+pub struct Cursor<'a> {
+    pool: &'a BufferPool,
+    page: Box<Page>,
+    next_page: Option<PageId>,
+    /// The current entry's slot in `page`; past the last once exhausted.
+    slot: u16,
+    slots: u16,
+    /// Where the current entry's key and value lie in `page`, found when
+    /// the cursor reaches it; `None` once exhausted.
+    current: Option<(Range<usize>, Option<Range<usize>>)>,
+}
+
+impl Cursor<'_> {
+    /// The current entry: its key and value (`None` for a tombstone), or `None` once exhausted.
+    pub fn entry(&self) -> Option<(&[u8], Option<&[u8]>)> {
+        let (key, value) = self.current.as_ref()?;
+        Some((&self.page[key.clone()], value.clone().map(|value| &self.page[value])))
+    }
+
+    /// Moves to the next entry, reading the next page if this one is done.
+    pub fn advance(&mut self) -> Result<()> {
+        self.slot += 1;
+        if self.slot < self.slots {
+            return self.reach();
+        }
+        self.load()
+    }
+
+    /// Copies the next page, if any, and starts at its first entry.
+    fn load(&mut self) -> Result<()> {
+        let Some(id) = self.next_page.take() else {
+            (self.slot, self.current) = (self.slots, None);
+            return Ok(());
+        };
+        self.page.copy_from_slice(&*self.pool.fetch_read(id)?);
+        let page = SlottedPage::new(&*self.page);
+        self.next_page = page.next_page();
+        (self.slot, self.slots) = (0, page.slot_count());
+        self.reach()
+    }
+
+    /// Finds where the entry in the current slot lies, failing if it is
+    /// missing or corrupted.
+    fn reach(&mut self) -> Result<()> {
+        let page: &Page = &self.page;
+        let Some(bytes) = SlottedPage::new(page).into_tuple(self.slot) else {
+            return err("corrupted SSTable: empty slot");
+        };
+        let (key, value) = decode_entry(bytes)?;
+        let at = |part: &[u8]| {
+            let start = part.as_ptr() as usize - page.as_ptr() as usize;
+            start..start + part.len()
+        };
+        self.current = Some((at(key), value.map(at)));
+        Ok(())
     }
 }
 

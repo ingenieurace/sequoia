@@ -650,6 +650,49 @@ fn indexed_tables_answer_like_unindexed_ones() {
     assert!(plan(&mut db, "SELECT * FROM LSM_true WHERE nights < 0").contains("USING INDEX LSM_true_nights"));
     assert_eq!(plan(&mut db, "SELECT * FROM LSM_true WHERE id = 7"), "SEARCH LSM_true USING PRIMARY KEY (id = 7)");
     assert_eq!(plan(&mut db, "SELECT * FROM LSM_false WHERE city = 'oslo'"), "SCAN LSM_false");
+    assert_eq!(
+        plan(&mut db, "SELECT * FROM LSM_false WHERE id >= 1990 AND city = 'paris'"),
+        "SEARCH LSM_false USING PRIMARY KEY (id >= 1990)"
+    );
+}
+
+#[test]
+fn lsm_primary_key_ranges_read_only_their_keys() {
+    let mut db = Database::in_memory();
+    for (t, key) in [("ints", "INT"), ("texts", "TEXT")] {
+        db.execute(&format!("CREATE TABLE {t} (k {key} PRIMARY KEY, v INT) USING LSM")).unwrap();
+        // Enough rows to fill SSTables, then deletes and new rows still in the MemTable.
+        let values: Vec<String> = (0..3000).map(|i| format!("({}, {i})", key_of(t, i))).collect();
+        db.execute(&format!("INSERT INTO {t} VALUES {}", values.join(", "))).unwrap();
+        db.execute(&format!("DELETE FROM {t} WHERE v >= 1000 AND v < 1010")).unwrap();
+        db.execute(&format!("UPDATE {t} SET v = v + 10000 WHERE v >= 2000 AND v < 2005")).unwrap();
+    }
+    let keys = |db: &mut Database, sql: &str| -> Vec<i64> {
+        query(db, sql).into_iter().map(|row| match row[1] { Value::Int(v) => v % 10000, _ => unreachable!() }).collect()
+    };
+    for t in ["ints", "texts"] {
+        let k = |i| key_of(t, i);
+        let range = |db: &mut Database, condition: String| {
+            let sql = format!("SELECT * FROM {t} WHERE {condition}");
+            assert!(plan(db, &sql).contains("USING PRIMARY KEY"), "{sql}");
+            keys(db, &sql)
+        };
+        assert_eq!(range(&mut db, format!("k >= {} AND k < {}", k(5), k(9))), [5, 6, 7, 8]);
+        assert_eq!(range(&mut db, format!("k > {} AND k <= {}", k(5), k(9))), [6, 7, 8, 9]);
+        assert_eq!(range(&mut db, format!("k > {} AND k < {}", k(5), k(6))), Vec::<i64>::new());
+        assert_eq!(range(&mut db, format!("k >= {} AND k < {}", k(9), k(5))), Vec::<i64>::new());
+        assert_eq!(range(&mut db, format!("k >= {} AND k <= {}", k(998), k(1011))), [998, 999, 1010, 1011]);
+        assert_eq!(range(&mut db, format!("k >= {} AND k < {}", k(1998), k(2007))), (1998..2007).collect::<Vec<_>>());
+        assert_eq!(range(&mut db, format!("k > {}", k(2996))), [2997, 2998, 2999]);
+        assert_eq!(range(&mut db, format!("k < {}", k(3))), [0, 1, 2]);
+        // Other conditions are still checked on the rows read.
+        assert_eq!(range(&mut db, format!("k >= {} AND k < {} AND v != 7", k(5), k(9))), [5, 6, 8]);
+    }
+}
+
+/// The key of row `i` of table `t`: a number, or text that sorts the same way.
+fn key_of(t: &str, i: i64) -> String {
+    if t == "ints" { i.to_string() } else { format!("'key {i:05}'") }
 }
 
 #[test]

@@ -112,6 +112,15 @@ impl<K: Ord, V> SkipList<K, V> {
         Iter { list: self, node: self.nodes[HEAD].next[0] }
     }
 
+    /// Iterates over the entries with keys `>= start` in key order: level 0
+    /// from the first such node, found as a lookup finds a key.
+    pub fn iter_from<Q: Ord + ?Sized>(&self, start: &Q) -> Iter<'_, K, V>
+    where
+        K: Borrow<Q>,
+    {
+        Iter { list: self, node: self.nodes[self.search(start, &mut [HEAD; MAX_LEVEL])].next[0] }
+    }
+
     pub fn clear(&mut self) {
         self.nodes.truncate(1);
         self.nodes[HEAD].next.fill(NIL);

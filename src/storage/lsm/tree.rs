@@ -54,13 +54,14 @@
 //! and only then frees the old log or SSTables. The statement doing it commits
 //! all of that at once (see `storage/io/wal.rs`), so a crash never leaves it half done.
 
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::storage::buffer::pool::BufferPool;
 use crate::storage::io::disk::{PAGE_USABLE, PageId, decode_id, encode_id, read_u32, write_u32};
 use crate::storage::heap::TableHeap;
 use crate::storage::page::MAX_TUPLE_SIZE;
-use super::skiplist::SkipList;
+use super::skiplist::{self, SkipList};
 use super::sstable::{self, Entry, SsTable};
 use crate::error::{Result, err};
 
@@ -246,14 +247,21 @@ impl LsmTree {
 
     /// Iterates over the live keys and their values in key order.
     pub fn scan(&self) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + '_ {
-        let memtable = self.memtable.iter().map(|(k, v)| Ok((k.clone(), v.clone())));
-        let mut sources: Vec<Source> = vec![Box::new(memtable)];
-        sources.extend(self.tables().map(|table| Box::new(table.iter()) as Source));
-        Merge::new(sources).filter_map(|item| match item {
-            Ok((key, Some(value))) => Some(Ok((key, value))),
-            Ok((_, None)) => None,
-            Err(e) => Some(Err(e)),
-        })
+        self.scan_from(&[])
+    }
+
+    /// Iterates over the live keys `>= start` and their values in key order.
+    pub fn scan_from(&self, start: &[u8]) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + '_ {
+        self.scan_map(start, |key, value| Ok((key.to_vec(), value.to_vec())))
+    }
+
+    /// Like [`LsmTree::scan_from`], but turns each live key and value into a
+    /// `T` with `f` where they lie, in the MemTable or in a copy of an
+    /// SSTable page, rather than copying them out first. Each source starts
+    /// where `start` would be, and reads its pages only as the merge reaches
+    /// them, so a caller that stops early reads little more than it took.
+    pub fn scan_map<T, F: FnMut(&[u8], &[u8]) -> Result<T>>(&self, start: &[u8], f: F) -> ScanMap<'_, T, F> {
+        ScanMap { tree: self, start: Some(start.to_vec()), cursors: Vec::new(), key: Vec::new(), f, done: false, made: PhantomData }
     }
 
     /// The largest key ever written that may still be stored, deleted or not.
@@ -424,6 +432,109 @@ impl LsmTree {
     }
 }
 
+/// A source of a [`ScanMap`]: the MemTable's entries, borrowed where they
+/// lie, or an SSTable's cursor.
+enum Cursor<'a> {
+    MemTable {
+        entries: skiplist::Iter<'a, Vec<u8>, Option<Vec<u8>>>,
+        current: Option<(&'a [u8], Option<&'a [u8]>)>,
+    },
+    Table(sstable::Cursor<'a>),
+}
+
+impl Cursor<'_> {
+    fn entry(&self) -> Option<(&[u8], Option<&[u8]>)> {
+        match self {
+            Cursor::MemTable { current, .. } => *current,
+            Cursor::Table(cursor) => cursor.entry(),
+        }
+    }
+
+    fn advance(&mut self) -> Result<()> {
+        match self {
+            Cursor::MemTable { entries, current } => {
+                *current = entries.next().map(|(k, v)| (k.as_slice(), v.as_deref()));
+                Ok(())
+            }
+            Cursor::Table(cursor) => cursor.advance(),
+        }
+    }
+}
+
+/// The live entries of an LSM tree from a key on, merged from its sources
+/// as [`Merge`] does, each made into a `T` by `f`.
+pub struct ScanMap<'a, T, F> {
+    tree: &'a LsmTree,
+    /// Set until the sources are opened, on the first call to `next`.
+    start: Option<Vec<u8>>,
+    /// Newest first.
+    cursors: Vec<Cursor<'a>>,
+    /// The key just returned, kept to move every source holding it past it.
+    key: Vec<u8>,
+    f: F,
+    done: bool,
+    made: PhantomData<fn() -> T>,
+}
+
+impl<T, F: FnMut(&[u8], &[u8]) -> Result<T>> ScanMap<'_, T, F> {
+    fn open(&mut self, start: &[u8]) -> Result<()> {
+        let mut entries = self.tree.memtable.iter_from(start);
+        let current = entries.next().map(|(k, v)| (k.as_slice(), v.as_deref()));
+        self.cursors.push(Cursor::MemTable { entries, current });
+        for table in self.tree.tables() {
+            self.cursors.push(Cursor::Table(table.cursor(start)?));
+        }
+        Ok(())
+    }
+
+    /// The next live entry, made into a `T`, or `None` at the end.
+    fn step(&mut self) -> Result<Option<T>> {
+        if let Some(start) = self.start.take() {
+            self.open(&start)?;
+        }
+        loop {
+            // The smallest key; on a tie, the first (newest) source's.
+            let mut newest: Option<usize> = None;
+            for (i, cursor) in self.cursors.iter().enumerate() {
+                if let Some((key, _)) = cursor.entry()
+                    && newest.is_none_or(|n| key < self.cursors[n].entry().expect("has an entry").0)
+                {
+                    newest = Some(i);
+                }
+            }
+            let Some(newest) = newest else { return Ok(None) };
+            let (key, value) = self.cursors[newest].entry().expect("has an entry");
+            let made = value.map(|value| (self.f)(key, value)).transpose()?;
+            self.key.clear();
+            self.key.extend_from_slice(key);
+
+            // Move every source holding the key past it: older versions are hidden.
+            for cursor in &mut self.cursors {
+                if cursor.entry().is_some_and(|(key, _)| key == self.key.as_slice()) {
+                    cursor.advance()?;
+                }
+            }
+            if made.is_some() {
+                return Ok(made);
+            }
+        }
+    }
+}
+
+impl<T, F: FnMut(&[u8], &[u8]) -> Result<T>> Iterator for ScanMap<'_, T, F> {
+    type Item = Result<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let item = self.step().transpose();
+        // An error ends the scan.
+        self.done = !matches!(item, Some(Ok(_)));
+        item
+    }
+}
+
 type Source<'a> = Box<dyn Iterator<Item = Result<Entry>> + 'a>;
 
 /// Merges sorted sources into one sorted stream. Sources are ordered newest
@@ -569,6 +680,27 @@ mod tests {
             assert_eq!(tree.get(&key(i)).unwrap(), want, "key {i}");
         }
         tree
+    }
+
+    #[test]
+    fn scan_from_starts_at_any_key_in_every_source() {
+        for config in [small(), small_universal()] {
+            let mut tree = check_newest_version_wins(config);
+            // Recent writes, still in the MemTable, over keys in the SSTables.
+            for i in (1..600).step_by(50) {
+                tree.put(key(i), value(i, 7)).unwrap();
+                tree.delete(key(i + 1)).unwrap();
+            }
+            assert!(!tree.memtable.is_empty());
+            let all = scan(&tree);
+            let mut between = key(300);
+            between.push(0); // after key 300, before key 301
+            for start in [Vec::new(), key(0), key(1), key(2), key(299), between, key(599), key(600), vec![0xFF; 8]] {
+                let from: Vec<_> = tree.scan_from(&start).collect::<Result<_>>().unwrap();
+                let want: Vec<_> = all.iter().filter(|(k, _)| *k >= start).cloned().collect();
+                assert_eq!(from, want, "from {start:?}");
+            }
+        }
     }
 
     #[test]

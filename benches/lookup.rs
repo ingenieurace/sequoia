@@ -56,8 +56,8 @@ fn main() {
                 // Rows in `id` order are in the heap's order too: pages in a row.
                 points("1%, primary key", 20, |i| format!("SELECT * FROM t WHERE id >= {i} AND id < {}", i + 2000), &["t_pkey"]),
                 points("1%, one value of g", 20, |i| format!("SELECT * FROM t WHERE g = {}", i % 100), &["USING INDEX t_g"]),
-                // An LSM tree is searched only for a key fixed by an equality.
-                points("1%, LSM key range", 5, |i| format!("SELECT * FROM l WHERE id >= {i} AND id < {}", i + 4000), &["SCAN l"]),
+                // An LSM tree reads only the keys in the range, in key order.
+                points("1%, LSM key range", 5, |i| format!("SELECT * FROM l WHERE id >= {i} AND id < {}", i + 4000), &["USING PRIMARY KEY"]),
             ],
         ),
     ];

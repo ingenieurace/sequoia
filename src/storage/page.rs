@@ -107,6 +107,19 @@ impl<P: Deref<Target = Page>> SlottedPage<P> {
     }
 }
 
+impl<'a> SlottedPage<&'a Page> {
+    /// Like [`SlottedPage::get`], but the tuple borrows the page itself rather
+    /// than this view of it, so it outlives the view.
+    pub fn into_tuple(self, slot: u16) -> Option<&'a [u8]> {
+        if slot >= self.slot_count() {
+            return None;
+        }
+        let (offset, len) = self.slot(slot);
+        let page: &'a Page = self.0;
+        (len > 0).then(|| &page[offset..offset + len])
+    }
+}
+
 impl<P: DerefMut<Target = Page>> SlottedPage<P> {
     /// Formats a page as an empty slotted page.
     pub fn init(page: P) -> Self {

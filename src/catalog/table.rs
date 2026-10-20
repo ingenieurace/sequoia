@@ -64,6 +64,9 @@ pub enum Access {
     Scan,
     /// Look one primary key up in an LSM tree.
     Key(Value),
+    /// Read the rows of an LSM tree whose primary keys lie between two
+    /// bounds, in key order. A missing bound leaves that end open.
+    KeyRange { lower: Option<Bound>, upper: Option<Bound> },
     /// Read the rows an index lists between two bounds.
     Index { index: usize, lower: Option<Bound>, upper: Option<Bound> },
 }
@@ -222,10 +225,9 @@ impl Table {
             (Access::Scan, Storage::Heap(heap)) => {
                 Box::new(heap.scan_map(decode).map(|item| item.map(|(rid, row)| (RowId::Record(rid), row))))
             }
-            (Access::Scan, Storage::Lsm { tree, .. }) => Box::new(tree.scan().map(move |item| {
-                let (key, bytes) = item?;
-                Ok((RowId::Key(key), decode(&bytes)?))
-            })),
+            (Access::Scan, Storage::Lsm { tree, .. }) => {
+                Box::new(tree.scan_map(&[], move |key, bytes| Ok((RowId::Key(key.to_vec()), decode(bytes)?))))
+            }
             (_, Storage::Column(store)) => Box::new(
                 store
                     .scan(needed.to_vec(), predicates.to_vec())
@@ -235,6 +237,29 @@ impl Table {
                 let id = RowId::Key(tuple::encode_key(&value));
                 Box::new(self.get(&id).transpose().map(|row| Ok((id, row?))).into_iter())
             }
+            (Access::KeyRange { lower, upper }, Storage::Lsm { tree, .. }) => {
+                // Keys are encoded so that their bytes sort as the values do.
+                let lower = lower.map(|b| (tuple::encode_key(&b.value), b.inclusive));
+                let upper = upper.map(|b| (tuple::encode_key(&b.value), b.inclusive));
+                let start = lower.as_ref().map_or(Vec::new(), |(key, _)| key.clone());
+                let below = move |key: &[u8]| {
+                    upper.as_ref().is_none_or(|(upper, inclusive)| key < upper.as_slice() || (*inclusive && key == upper))
+                };
+                fn key(item: &Result<(RowId, Row)>) -> Option<&[u8]> {
+                    match item {
+                        Ok((RowId::Key(key), _)) => Some(key),
+                        _ => None,
+                    }
+                }
+                let rows = tree
+                    .scan_map(&start, move |key, bytes| Ok((RowId::Key(key.to_vec()), decode(bytes)?)))
+                    .skip_while(move |item| {
+                        matches!((key(item), &lower), (Some(key), Some((bound, false))) if key == bound.as_slice())
+                    })
+                    .take_while(move |item| key(item).is_none_or(&below));
+                Box::new(rows)
+            }
+            (Access::KeyRange { .. }, Storage::Heap(_)) => unreachable!("only an LSM tree has key ranges"),
             (Access::Index { index, lower, upper }, _) => {
                 let ids = match self.indexes[index].range(lower.as_ref(), upper.as_ref()) {
                     Ok(ids) => ids,
