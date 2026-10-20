@@ -13,6 +13,7 @@ pub mod predicate;
 pub mod result;
 pub mod sql;
 pub mod storage;
+pub mod trie;
 pub mod types;
 
 pub use database::Database;

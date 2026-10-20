@@ -26,6 +26,8 @@
 
 use std::borrow::Borrow;
 
+use crate::trie::SortedMap;
+
 /// Levels a node can be on: enough for 4^12, about 16 million, entries.
 const MAX_LEVEL: usize = 12;
 const HEAD: usize = 0;
@@ -160,6 +162,37 @@ impl<K: Ord, V> SkipList<K, V> {
             bits >>= 2;
         }
         height
+    }
+}
+
+impl<V> SortedMap<V> for SkipList<Vec<u8>, V> {
+    type Iter<'a>
+        = std::iter::Map<Iter<'a, Vec<u8>, V>, fn((&'a Vec<u8>, &'a V)) -> (&'a [u8], &'a V)>
+    where
+        V: 'a;
+
+    fn insert(&mut self, key: Vec<u8>, value: V) -> Option<V> {
+        SkipList::insert(self, key, value)
+    }
+
+    fn get(&self, key: &[u8]) -> Option<&V> {
+        SkipList::get(self, key)
+    }
+
+    fn iter_from(&self, start: &[u8]) -> Self::Iter<'_> {
+        SkipList::iter_from(self, start).map(|(k, v)| (k.as_slice(), v))
+    }
+
+    fn last_key(&self) -> Option<&[u8]> {
+        SkipList::last_key(self).map(Vec::as_slice)
+    }
+
+    fn len(&self) -> usize {
+        SkipList::len(self)
+    }
+
+    fn clear(&mut self) {
+        SkipList::clear(self)
     }
 }
 

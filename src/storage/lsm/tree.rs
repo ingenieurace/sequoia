@@ -13,7 +13,8 @@
 //! level 2:   one SSTable, up to `fanout` times bigger ... and so on
 //! ```
 //!
-//! Every write goes to the MemTable, a skip list in memory, and is appended to
+//! Every write goes to the MemTable, a sorted map in memory (a skip list or
+//! a trie, as [`LsmConfig::memtable`] says), and is appended to
 //! the log, so it survives a crash: opening the tree replays the log into the
 //! MemTable. A deletion is a write too, of a tombstone. When the log reaches
 //! `log_bytes`, the MemTable is written out as a new level-0 SSTable and the
@@ -61,7 +62,7 @@ use crate::storage::buffer::pool::BufferPool;
 use crate::storage::io::disk::{PAGE_USABLE, PageId, decode_id, encode_id, read_u32, write_u32};
 use crate::storage::heap::TableHeap;
 use crate::storage::page::MAX_TUPLE_SIZE;
-use super::skiplist::{self, SkipList};
+use super::memtable::{self, MEMTABLE, MemTable, MemTableKind};
 use super::sstable::{self, Entry, SsTable};
 use crate::error::{Result, err};
 
@@ -86,6 +87,8 @@ pub struct LsmConfig {
     /// Log size, in bytes, at which the MemTable is written out.
     pub log_bytes: usize,
     pub compaction: Compaction,
+    /// The sorted map that holds the MemTable (see `memtable.rs`).
+    pub memtable: MemTableKind,
     /// Level: level-0 SSTables that trigger a merge into level 1.
     pub level0_tables: usize,
     /// Level: largest level 1, in pages, before it is merged into level 2.
@@ -104,6 +107,7 @@ impl Default for LsmConfig {
         LsmConfig {
             log_bytes: 64 * 1024,
             compaction: COMPACTION,
+            memtable: MEMTABLE,
             level0_tables: 4,
             level1_pages: 64,
             fanout: 10,
@@ -118,7 +122,7 @@ pub struct LsmTree {
     config: LsmConfig,
     manifest: PageId,
     /// Each key's latest value since the last flush; `None` is a tombstone.
-    memtable: SkipList<Vec<u8>, Option<Vec<u8>>>,
+    memtable: MemTable,
     /// Holds the MemTable's writes as records `(seq, entry)`.
     log: TableHeap,
     log_bytes: usize,
@@ -142,7 +146,7 @@ impl LsmTree {
             pool,
             config,
             manifest,
-            memtable: SkipList::new(),
+            memtable: MemTable::new(config.memtable),
             log,
             log_bytes: 0,
             next_seq: 0,
@@ -174,7 +178,7 @@ impl LsmTree {
             pool: pool.clone(),
             config,
             manifest,
-            memtable: SkipList::new(),
+            memtable: MemTable::new(config.memtable),
             log: TableHeap::open(pool.clone(), log_page, log_page)?,
             log_bytes: 0,
             next_seq: 0,
@@ -267,7 +271,7 @@ impl LsmTree {
     /// The largest key ever written that may still be stored, deleted or not.
     pub fn max_key(&self) -> Option<Vec<u8>> {
         let stored = self.tables().map(SsTable::max_key);
-        self.memtable.last_key().map(Vec::as_slice).into_iter().chain(stored).max().map(<[u8]>::to_vec)
+        self.memtable.last_key().into_iter().chain(stored).max().map(<[u8]>::to_vec)
     }
 
     /// Frees every page of the tree.
@@ -301,7 +305,7 @@ impl LsmTree {
 
     /// Writes the MemTable out as a new level-0 SSTable and starts a new log.
     fn flush(&mut self) -> Result<()> {
-        let entries = self.memtable.iter().map(|(k, v)| Ok((k.clone(), v.clone())));
+        let entries = self.memtable.iter().map(|(k, v)| Ok((k.to_vec(), v.clone())));
         let table = SsTable::write(self.pool.clone(), entries)?;
         self.pages_written += table.as_ref().map_or(0, SsTable::page_count);
         let new_log = TableHeap::create(self.pool.clone())?;
@@ -436,7 +440,7 @@ impl LsmTree {
 /// lie, or an SSTable's cursor.
 enum Cursor<'a> {
     MemTable {
-        entries: skiplist::Iter<'a, Vec<u8>, Option<Vec<u8>>>,
+        entries: memtable::Iter<'a>,
         current: Option<(&'a [u8], Option<&'a [u8]>)>,
     },
     Table(sstable::Cursor<'a>),
@@ -453,7 +457,7 @@ impl Cursor<'_> {
     fn advance(&mut self) -> Result<()> {
         match self {
             Cursor::MemTable { entries, current } => {
-                *current = entries.next().map(|(k, v)| (k.as_slice(), v.as_deref()));
+                *current = entries.next().map(|(k, v)| (k, v.as_deref()));
                 Ok(())
             }
             Cursor::Table(cursor) => cursor.advance(),
@@ -479,7 +483,7 @@ pub struct ScanMap<'a, T, F> {
 impl<T, F: FnMut(&[u8], &[u8]) -> Result<T>> ScanMap<'_, T, F> {
     fn open(&mut self, start: &[u8]) -> Result<()> {
         let mut entries = self.tree.memtable.iter_from(start);
-        let current = entries.next().map(|(k, v)| (k.as_slice(), v.as_deref()));
+        let current = entries.next().map(|(k, v)| (k, v.as_deref()));
         self.cursors.push(Cursor::MemTable { entries, current });
         for table in self.tree.tables() {
             self.cursors.push(Cursor::Table(table.cursor(start)?));
@@ -600,6 +604,7 @@ mod tests {
         LsmConfig {
             log_bytes: 2000,
             compaction: Compaction::Level,
+            memtable: MEMTABLE,
             level0_tables: 3,
             level1_pages: 4,
             fanout: 2,
@@ -640,14 +645,18 @@ mod tests {
 
     #[test]
     fn newest_version_wins_with_level_compaction() {
-        let tree = check_newest_version_wins(small());
-        assert!(tree.levels.len() >= 2, "compacted down at least two levels");
+        for memtable in MemTableKind::ALL {
+            let tree = check_newest_version_wins(LsmConfig { memtable, ..small() });
+            assert!(tree.levels.len() >= 2, "compacted down at least two levels");
+        }
     }
 
     #[test]
     fn newest_version_wins_with_universal_compaction() {
-        let tree = check_newest_version_wins(small_universal());
-        assert!(tree.levels.is_empty() && tree.level0.len() < 4);
+        for memtable in MemTableKind::ALL {
+            let tree = check_newest_version_wins(LsmConfig { memtable, ..small_universal() });
+            assert!(tree.levels.is_empty() && tree.level0.len() < 4);
+        }
     }
 
     /// Writes several versions of each key with flushes and compactions in
@@ -684,7 +693,8 @@ mod tests {
 
     #[test]
     fn scan_from_starts_at_any_key_in_every_source() {
-        for config in [small(), small_universal()] {
+        let configs = [small(), small_universal()].into_iter();
+        for config in configs.flat_map(|c| MemTableKind::ALL.map(|memtable| LsmConfig { memtable, ..c })) {
             let mut tree = check_newest_version_wins(config);
             // Recent writes, still in the MemTable, over keys in the SSTables.
             for i in (1..600).step_by(50) {
@@ -805,9 +815,15 @@ mod tests {
 
     #[test]
     fn reopening_replays_the_log_and_finds_the_sstables() {
+        for memtable in MemTableKind::ALL {
+            reopen(LsmConfig { memtable, ..small() });
+        }
+    }
+
+    fn reopen(config: LsmConfig) {
         let pool = pool();
         let manifest = {
-            let mut tree = LsmTree::create(pool.clone(), small()).unwrap();
+            let mut tree = LsmTree::create(pool.clone(), config).unwrap();
             for i in 0..500 {
                 tree.put(key(i), value(i, 1)).unwrap();
             }
@@ -818,7 +834,7 @@ mod tests {
             tree.manifest_page()
         };
 
-        let tree = LsmTree::open(pool, manifest, small()).unwrap();
+        let tree = LsmTree::open(pool, manifest, config).unwrap();
         assert_eq!(scan(&tree).len(), 499);
         assert_eq!(tree.get(&key(7)).unwrap(), None);
         assert_eq!(tree.get(&key(8)).unwrap(), Some(b"latest".to_vec()));

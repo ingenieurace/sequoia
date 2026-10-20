@@ -111,7 +111,7 @@ with more indexes, `commit` single-row statements against one transaction,
 `checkpoint`. SQLite runs in WAL mode with `synchronous = FULL`, so it syncs
 its log at each commit as Sequoia does.
 
-Four benchmarks time the storage layer and its data structures alone, with
+Five benchmarks time the storage layer and its data structures alone, with
 no SQL or SQLite: `benches/buffer_pool.rs` reads pages in five patterns
 through 256 frames under each replacement policy and prints the hit rate and
 time of each, `benches/lsm.rs` loads and reads LSM trees under level and
@@ -121,7 +121,10 @@ each kind of data, the bytes a value takes, and the time to encode, decode
 and filter it, and `benches/hash.rs` times the five hash tables of
 `src/hash` (linear probing, cuckoo, chained, extendible and linear hashing)
 against `std::collections::HashMap` on a million keys, and linear probing
-alone at three load factors. Group names work for all of them:
+alone at three load factors, and `benches/trie.rs` times the tries of
+`src/trie` (trie, radix tree and ART) against a `BTreeMap` and the skip list
+on INT-like and text keys, with the memory each takes, and loads LSM trees
+with each kind of MemTable. Group names work for all of them:
 
 ```bash
 cargo bench --bench writes -- commit
@@ -242,12 +245,20 @@ src/
     btree.rs      B+ tree: sorted byte-string keys, splits, merges, range scans
     lsm/          log-structured merge tree
       tree.rs     log + MemTable, SSTables, level/universal compaction
-      skiplist.rs skip list: the MemTable, nodes in a Vec linked by index
+      memtable.rs the MemTable: a skip list or a trie, as `MEMTABLE` says
+      skiplist.rs skip list: a MemTable, nodes in a Vec linked by index
       sstable.rs  SSTable: sorted entries in pages, in-memory summary
       bloom.rs    Bloom filter for SSTable lookups
     column/       column store
       store.rs    PAX row groups, delete bitmaps, delta store
       encoding.rs column compression: RLE, bit-packing, patching, delta, dictionary, bitmap
+  hash/           hash tables to compare with std's HashMap (nothing uses them yet)
+    linear_probe.rs, cuckoo.rs       static: one array of slots
+    chained.rs, extendible.rs, linear_hash.rs   dynamic: buckets that split
+  trie/           tries: sorted maps that branch on a byte of the key per level
+    mod.rs        one tree for the trie, radix tree (paths compressed) and ART
+    list.rs       children in a sorted list: the trie's and radix tree's
+    adaptive.rs   ART's children: Node4, Node16, Node48, Node256
 tests/sql.rs      end-to-end tests
 tests/differential.rs  random statements run on Sequoia and SQLite, which must agree
 ```
@@ -270,8 +281,9 @@ A database is a single file of 4 KB pages:
   new value, and only otherwise deletes it and inserts it again.
 - **An LSM table** (`USING LSM`) is a log-structured merge tree keyed by the
   primary key, or by a hidden rowid if there is none. Writes, deletes
-  included, go to an in-memory MemTable, a skip list, and are appended to a
-  log. When the
+  included, go to an in-memory MemTable, and are appended to a log. The
+  MemTable is an adaptive radix tree (default), or a radix tree, a trie or a
+  skip list: to switch, edit `MEMTABLE` in `src/storage/lsm/memtable.rs`. When the
   log reaches 64 KB the MemTable is written out sorted as an SSTable.
   SSTables are merged by **level compaction** (default): four level-0
   SSTables are merged into level 1, and each deeper level is a single SSTable
