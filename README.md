@@ -360,10 +360,11 @@ rows a hash join would read. The planner counts each table's rows the first
 time it needs them (writes keep the count up to date after that; a rollback
 makes it count again), and with no statistics guesses what share of them a
 condition keeps as PostgreSQL does without any: 1 in 200 for an equality,
-a third for a comparison. A lookup costs about 27 rows read when it goes
+a third for a comparison. A lookup costs about 6 rows read when it goes
 through an index, and 2 for an LSM primary key; a hash join about 2 per right
 row and 0.4 per left row (measured with `benches/joins.rs`). So an index
-join over 200,000 rows into 50,000 becomes a hash join, about 18 times faster.
+join over 200,000 rows into 50,000 becomes a hash join, about 3 times faster,
+while one of up to about a third as many rows as the right side stays.
 
 A **sort-merge join** sorts both sides by the equalities, with the same
 external sort as `ORDER BY` (and its budget), and walks them together; its

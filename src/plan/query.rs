@@ -596,7 +596,7 @@ fn merge_order(
 /// a lookup of an LSM table's primary key; reading a right row into a hash
 /// join's hash table; and looking a left row up in it. Worth measuring again
 /// when one of them gets faster.
-const INDEX_LOOKUP_COST: f64 = 27.0;
+const INDEX_LOOKUP_COST: f64 = 6.0;
 const KEY_LOOKUP_COST: f64 = 2.0;
 const HASH_BUILD_COST: f64 = 2.0;
 const HASH_PROBE_COST: f64 = 0.4;

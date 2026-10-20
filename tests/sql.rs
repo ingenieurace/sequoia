@@ -626,6 +626,8 @@ fn indexed_tables_answer_like_unindexed_ones() {
         "id >= 1990 AND city = 'paris'",
     ];
     let changes = [
+        // Keys and indexed values that stay the same keep their entries.
+        "UPDATE {t} SET id = id, nights = nights WHERE id < 500",
         "UPDATE {t} SET city = 'rome' WHERE city = 'lima' AND id < 1000",
         "UPDATE {t} SET nights = nights + 1 WHERE nights >= 0",
         // Grown rows move to other heap pages; changed keys move in an LSM tree.

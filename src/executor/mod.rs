@@ -173,19 +173,20 @@ fn update(
         let mut subqueries = Runner::new(catalog, settings);
         let mut changes = Vec::new();
         for item in scan(table, &vec![true; table.columns.len()], &filter) {
-            let (rid, mut row) = item?;
-            if !matches_with(&filter, &fields, &row, &mut subqueries)? {
+            let (rid, old) = item?;
+            if !matches_with(&filter, &fields, &old, &mut subqueries)? {
                 continue;
             }
             // All right-hand sides see the old row values.
             let values: Vec<Value> = assignments
                 .iter()
-                .map(|(_, e)| eval_with(e, &fields, &row, &mut subqueries))
+                .map(|(_, e)| eval_with(e, &fields, &old, &mut subqueries))
                 .collect::<Result<_>>()?;
+            let mut row = old.clone();
             for ((i, _), value) in assignments.iter().zip(values) {
                 row[*i] = value;
             }
-            changes.push((rid, row));
+            changes.push((rid, old, row));
         }
         changes
     };
@@ -197,23 +198,26 @@ fn update(
 
 fn delete(catalog: &mut Catalog, table: &str, filter: Option<Expr>, settings: &Settings) -> Result<QueryResult> {
     forbid(&filter, "WHERE")?;
-    let rids = {
+    let rows = {
         let catalog: &Catalog = catalog;
         let table = catalog.get(table)?;
         let filter = filter.map(|f| query::bind(catalog, Some(table), &f)).transpose()?;
         let fields = Field::of_table(&table.name, &table.columns);
         let mut subqueries = Runner::new(catalog, settings);
-        let mut rids = Vec::new();
-        for item in scan(table, &filter::needed_columns(table, &table.name, &filter), &filter) {
+        // The filter's columns, and the indexed ones, whose entries the delete removes.
+        let mut needed = filter::needed_columns(table, &table.name, &filter);
+        needed.iter_mut().zip(table.indexed_columns()).for_each(|(needed, indexed)| *needed |= indexed);
+        let mut rows = Vec::new();
+        for item in scan(table, &needed, &filter) {
             let (rid, row) = item?;
             if matches_with(&filter, &fields, &row, &mut subqueries)? {
-                rids.push(rid);
+                rows.push((rid, row));
             }
         }
-        rids
+        rows
     };
-    catalog.get_mut(table)?.delete(&rids)?;
-    Ok(message(format!("{} row(s) deleted", rids.len())))
+    catalog.get_mut(table)?.delete(&rows)?;
+    Ok(message(format!("{} row(s) deleted", rows.len())))
 }
 
 /// Reads the rows of `table` that `filter` may match, the way the planner chooses.

@@ -273,7 +273,7 @@ impl Table {
 
     pub fn insert(&mut self, rows: Vec<Row>) -> Result<()> {
         let encoded = self.encode_all(&rows)?;
-        self.check_unique(&HashSet::new(), &rows)?;
+        self.check_unique(&HashSet::new(), &rows, &[])?;
         let pk = primary_key(&self.columns);
         let keys: Vec<Vec<u8>> = match &self.storage {
             Storage::Lsm { next_rowid, .. } => (0..)
@@ -317,16 +317,20 @@ impl Table {
         Ok(())
     }
 
-    /// Replaces each row with the given id by a new value.
+    /// Replaces each row with the given id, whose stored value is the first
+    /// row given, by the second.
     ///
     /// A heap row stays where it is if its page has room for the new value;
     /// otherwise it is deleted and inserted again, possibly in another page.
     /// An LSM row is simply written again, under a new key if its primary key changed.
     /// A column store row is deleted and inserted again into the delta store.
-    pub fn update(&mut self, changes: Vec<(RowId, Row)>) -> Result<()> {
-        let (ids, rows): (Vec<RowId>, Vec<Row>) = changes.into_iter().unzip();
+    /// Index entries change only for rows whose indexed value or id does.
+    pub fn update(&mut self, changes: Vec<(RowId, Row, Row)>) -> Result<()> {
+        let (old_rows, rows): (Vec<(RowId, Row)>, Vec<Row>) =
+            changes.into_iter().map(|(id, old, new)| ((id, old), new)).unzip();
+        let ids: Vec<RowId> = old_rows.iter().map(|(id, _)| id.clone()).collect();
         let encoded = self.encode_all(&rows)?;
-        self.check_unique(&ids.iter().cloned().collect(), &rows)?;
+        self.check_unique(&ids.iter().cloned().collect(), &rows, &old_rows)?;
         let pk = primary_key(&self.columns);
         let new_keys: Vec<Vec<u8>> = match &self.storage {
             Storage::Lsm { .. } => ids
@@ -346,7 +350,6 @@ impl Table {
             _ => encoded.iter().try_for_each(|bytes| check_heap_size(bytes))?,
         }
         self.check_index_entries(&rows, |i| new_keys.get(i).map_or(RECORD_ID_LEN, Vec::len))?;
-        let old_rows = self.indexed_rows(&ids)?;
 
         let new_ids: Vec<RowId> = match &mut self.storage {
             Storage::Heap(heap) => {
@@ -396,14 +399,30 @@ impl Table {
                 Vec::new() // no indexes to update
             }
         };
-        // Old entries first, so a new entry may reuse a key an old one is leaving.
-        self.remove_from_indexes(&old_rows)?;
-        self.add_to_indexes(new_ids.into_iter().zip(rows))
+        if self.indexes.is_empty() {
+            return Ok(());
+        }
+        // An entry whose value and row id are both unchanged stays. Old
+        // entries go first, so a new entry may reuse a key an old one is leaving.
+        let new_rows: Vec<(RowId, Row)> = new_ids.into_iter().zip(rows).collect();
+        for index in &mut self.indexes {
+            let column = index.column;
+            let changed = |(old, new): &(&(RowId, Row), &(RowId, Row))| old.0 != new.0 || old.1[column] != new.1[column];
+            for (old, _) in old_rows.iter().zip(&new_rows).filter(changed) {
+                index.delete(&old.1[column], &old.0.to_bytes())?;
+            }
+            for (_, new) in old_rows.iter().zip(&new_rows).filter(changed) {
+                index.insert(&new.1[column], &new.0.to_bytes())?;
+            }
+        }
+        Ok(())
     }
 
-    pub fn delete(&mut self, ids: &[RowId]) -> Result<()> {
-        let old_rows = self.indexed_rows(ids)?;
-        for id in ids.iter().cloned() {
+    /// Deletes the rows with these ids, given with their stored values of
+    /// every indexed column (see [`Table::indexed_columns`]; the other
+    /// columns' values are not read).
+    pub fn delete(&mut self, rows: &[(RowId, Row)]) -> Result<()> {
+        for (id, _) in rows.iter().cloned() {
             match &mut self.storage {
                 Storage::Heap(heap) => {
                     heap.delete(id.into_record()?)?;
@@ -412,9 +431,18 @@ impl Table {
                 Storage::Column(store) => store.delete(id.into_position()?)?,
             }
         }
-        self.remove_from_indexes(&old_rows)?;
-        self.count(-(ids.len() as i64));
+        self.remove_from_indexes(rows)?;
+        self.count(-(rows.len() as i64));
         Ok(())
+    }
+
+    /// Which columns have an index, that [`Table::delete`] needs the values of.
+    pub fn indexed_columns(&self) -> Vec<bool> {
+        let mut indexed = vec![false; self.columns.len()];
+        for index in &self.indexes {
+            indexed[index.column] = true;
+        }
+        indexed
     }
 
     /// Frees all of the table's pages, its indexes' included.
@@ -439,19 +467,6 @@ impl Table {
         bytes.map(|bytes| tuple::decode(&self.columns, &bytes)).transpose()
     }
 
-    /// The current rows with the given ids, if the table has indexes to remove them from.
-    fn indexed_rows(&self, ids: &[RowId]) -> Result<Vec<(RowId, Row)>> {
-        if self.indexes.is_empty() {
-            return Ok(Vec::new());
-        }
-        ids.iter()
-            .map(|id| {
-                let row = self.get(id)?.ok_or_else(|| Error(format!("missing row: {id:?}")))?;
-                Ok((id.clone(), row))
-            })
-            .collect()
-    }
-
     fn add_to_indexes(&mut self, rows: impl IntoIterator<Item = (RowId, Row)>) -> Result<()> {
         if self.indexes.is_empty() {
             return Ok(());
@@ -466,6 +481,9 @@ impl Table {
     }
 
     fn remove_from_indexes(&mut self, rows: &[(RowId, Row)]) -> Result<()> {
+        if self.indexes.is_empty() {
+            return Ok(());
+        }
         for (id, row) in rows {
             let id = id.to_bytes();
             for index in &mut self.indexes {
@@ -507,8 +525,10 @@ impl Table {
 
     /// Checks that `new_rows`, together with the existing rows except those in
     /// `replaced`, have non-null primary keys and unique values in the primary
-    /// key and every unique index.
-    fn check_unique(&self, replaced: &HashSet<RowId>, new_rows: &[Row]) -> Result<()> {
+    /// key and every unique index. `old_rows` are the rows the new ones
+    /// replace, in the same order, if known: a value a row keeps is unique
+    /// among the stored rows already, and is checked only against the new ones.
+    fn check_unique(&self, replaced: &HashSet<RowId>, new_rows: &[Row], old_rows: &[(RowId, Row)]) -> Result<()> {
         let pk = primary_key(&self.columns);
         if let Some(pk) = pk
             && new_rows.iter().any(|row| row[pk].is_null())
@@ -522,7 +542,7 @@ impl Table {
             }
         }
         for column in columns {
-            self.check_unique_column(column, pk == Some(column), replaced, new_rows)?;
+            self.check_unique_column(column, pk == Some(column), replaced, new_rows, old_rows)?;
         }
         Ok(())
     }
@@ -538,6 +558,7 @@ impl Table {
         is_pk: bool,
         replaced: &HashSet<RowId>,
         new_rows: &[Row],
+        old_rows: &[(RowId, Row)],
     ) -> Result<()> {
         let index = self.indexes.iter().find(|index| index.unique && index.column == column);
         let mut seen = HashSet::new();
@@ -550,12 +571,14 @@ impl Table {
                 }
             }
         }
-        for row in new_rows {
+        for (i, row) in new_rows.iter().enumerate() {
             let value = &row[column];
             if value.is_null() {
                 continue;
             }
+            let kept = old_rows.get(i).is_some_and(|(_, old)| &old[column] == value);
             let stored = match (index, &self.storage) {
+                _ if kept => false,
                 (Some(index), _) => {
                     let mut stored = false;
                     for bytes in index.get(value)? {

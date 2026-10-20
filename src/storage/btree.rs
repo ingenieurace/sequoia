@@ -22,11 +22,16 @@
 //!         internal: n x (u16 length, key bytes, u32 child to the right of the key)
 //! ```
 //!
-//! A node is read into memory whole, changed there and written back whole:
-//! simple, not fast. An insert into a full node splits it in two and adds a
-//! key to its parent. A delete that leaves a node under a quarter full merges
-//! it with a neighbour if both fit in one page, and otherwise moves keys
-//! between the two so they are about equally full.
+//! Searches read the pages on their way down in place, without copying keys
+//! out, and an insert or delete that changes only its leaf (most of them)
+//! shifts that leaf's bytes in place and writes no other page. A change that
+//! must split or merge nodes instead reads the nodes on its path into memory
+//! whole, changes them there and writes them back whole. An insert into a
+//! full node splits it in two and adds a key to its parent. A delete that
+//! leaves a node under a quarter full merges it with a neighbour if both fit
+//! in one page, and otherwise moves keys between the two so they are about
+//! equally full. A range scan copies one leaf at a time and takes its keys
+//! out as it reaches them.
 //!
 //! The root never moves, so the page id the catalog records stays valid: a
 //! root that splits moves its keys into two new pages and becomes their
@@ -35,7 +40,7 @@
 use std::sync::Arc;
 
 use crate::storage::buffer::pool::BufferPool;
-use crate::storage::io::disk::{PAGE_USABLE, Page, PageId, decode_id, encode_id, read_u32, write_u32};
+use crate::storage::io::disk::{PAGE_SIZE, PAGE_USABLE, Page, PageId, decode_id, encode_id, read_u32, write_u32};
 use crate::error::{Result, err};
 
 /// The longest key the tree accepts. Small enough that a full node always
@@ -86,6 +91,29 @@ impl BPlusTree {
     /// Adds a key. Returns false if it was already there.
     pub fn insert(&mut self, key: &[u8]) -> Result<bool> {
         Self::check_key(key)?;
+        let leaf = self.find_leaf(key)?;
+        {
+            let mut page = self.pool.fetch_write(leaf)?;
+            let (at, found, end) = leaf_search(&page, key)?;
+            if found {
+                return Ok(false);
+            }
+            let size = 2 + key.len();
+            if end + size <= PAGE_USABLE {
+                page.copy_within(at..end, at + size);
+                page[at..at + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
+                page[at + 2..at + size].copy_from_slice(key);
+                let n = count(&page);
+                set_count(&mut page, n + 1);
+                return Ok(true);
+            }
+        }
+        // The leaf is full: split it, and its parents if need be.
+        self.insert_splitting(key)
+    }
+
+    /// Adds a key to a tree whose leaf for it is full, splitting nodes.
+    fn insert_splitting(&mut self, key: &[u8]) -> Result<bool> {
         let mut root = self.read(self.root)?;
         let Some(inserted) = self.insert_into(&mut root, key)? else {
             return Ok(false);
@@ -107,6 +135,27 @@ impl BPlusTree {
 
     /// Removes a key. Returns false if it was not there.
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
+        let leaf = self.find_leaf(key)?;
+        {
+            let mut page = self.pool.fetch_write(leaf)?;
+            let (at, found, end) = leaf_search(&page, key)?;
+            if !found {
+                return Ok(false);
+            }
+            // A leaf left at least a quarter full, or the root, needs no rebalancing.
+            let size = 2 + key.len();
+            if leaf == self.root || end - size >= PAGE_USABLE / 4 {
+                page.copy_within(at + size..end, at);
+                let n = count(&page);
+                set_count(&mut page, n - 1);
+                return Ok(true);
+            }
+        }
+        self.delete_rebalancing(key)
+    }
+
+    /// Removes a key whose leaf it leaves under a quarter full, rebalancing nodes.
+    fn delete_rebalancing(&mut self, key: &[u8]) -> Result<bool> {
         let mut root = self.read(self.root)?;
         if !self.delete_from(&mut root, key)? {
             return Ok(false);
@@ -128,7 +177,34 @@ impl BPlusTree {
     /// Each leaf is read when the scan reaches it, so changes made during the
     /// scan may be seen. Callers that modify the tree should collect first.
     pub fn range(&self, start: &[u8]) -> Range<'_> {
-        Range { tree: self, start: Some(start.to_vec()), next_leaf: None, pending: Vec::new().into_iter() }
+        Range { tree: self, start: Some(start.to_vec()), leaf: None, left: 0, pos: 0 }
+    }
+
+    /// The leaf that holds `key` or would, found by reading the internal
+    /// nodes on the way down in place.
+    fn find_leaf(&self, key: &[u8]) -> Result<PageId> {
+        let mut id = self.root;
+        loop {
+            let page = self.pool.fetch_read(id)?;
+            match page[0] {
+                LEAF => return Ok(id),
+                INTERNAL => {
+                    // The child to the right of the last key <= `key`.
+                    let mut child = read_u32(&page, 3);
+                    let mut pos = HEADER_SIZE;
+                    for _ in 0..count(&page) {
+                        let (k, next) = entry(&page, pos, 4)?;
+                        if k > key {
+                            break;
+                        }
+                        child = read_u32(&page, next - 4);
+                        pos = next;
+                    }
+                    id = PageId(child);
+                }
+                kind => return err(format!("corrupted B+ tree node: kind {kind}")),
+            }
+        }
     }
 
     /// Returns all of the tree's pages to the free list.
@@ -259,6 +335,49 @@ fn child_index(keys: &[Vec<u8>], key: &[u8]) -> usize {
     keys.partition_point(|k| k.as_slice() <= key)
 }
 
+/// The number of keys in a node's page.
+fn count(page: &Page) -> usize {
+    u16::from_le_bytes([page[1], page[2]]) as usize
+}
+
+fn set_count(page: &mut Page, count: usize) {
+    page[1..3].copy_from_slice(&(count as u16).to_le_bytes());
+}
+
+/// The key of the entry at `pos` in a node's page, and where the next entry
+/// starts. `child_size` is 4 in an internal node, whose entries end with a
+/// child, and 0 in a leaf.
+fn entry(page: &Page, pos: usize, child_size: usize) -> Result<(&[u8], usize)> {
+    if pos + 2 > PAGE_USABLE {
+        return err("corrupted B+ tree node");
+    }
+    let len = u16::from_le_bytes([page[pos], page[pos + 1]]) as usize;
+    let end = pos + 2 + len + child_size;
+    if end > PAGE_USABLE {
+        return err("corrupted B+ tree node");
+    }
+    Ok((&page[pos + 2..pos + 2 + len], end))
+}
+
+/// Looks for `key` in a leaf's page: where its entry is or would go,
+/// whether it is there, and where the leaf's entries end.
+fn leaf_search(page: &Page, key: &[u8]) -> Result<(usize, bool, usize)> {
+    if page[0] != LEAF {
+        return err("corrupted B+ tree: expected a leaf");
+    }
+    let mut pos = HEADER_SIZE;
+    let mut place = None;
+    for _ in 0..count(page) {
+        let (k, next) = entry(page, pos, 0)?;
+        if place.is_none() && k >= key {
+            place = Some((pos, k == key));
+        }
+        pos = next;
+    }
+    let (at, found) = place.unwrap_or((pos, false));
+    Ok((at, found, pos))
+}
+
 impl Node {
     fn keys(&self) -> &[Vec<u8>] {
         match self {
@@ -384,23 +503,63 @@ pub struct Range<'a> {
     tree: &'a BPlusTree,
     /// Set until the first leaf is found.
     start: Option<Vec<u8>>,
-    next_leaf: Option<PageId>,
-    /// Keys of the current leaf not yet returned.
-    pending: std::vec::IntoIter<Vec<u8>>,
+    /// A copy of the current leaf's page, once there is one.
+    leaf: Option<Box<Page>>,
+    /// Keys of the current leaf not yet returned, and where the next one is.
+    left: usize,
+    pos: usize,
 }
 
 impl Range<'_> {
-    /// Descends to the leaf that may hold `start`, keeping its keys `>= start`.
-    fn seek(&mut self, start: &[u8]) -> Result<()> {
-        let mut node = self.tree.read(self.tree.root)?;
-        while let Node::Internal { keys, children } = node {
-            node = self.tree.read(children[child_index(&keys, start)])?;
+    /// Copies the leaf `id` to read its keys from the first.
+    fn load(&mut self, id: PageId) -> Result<()> {
+        let page = self.tree.pool.fetch_read(id)?;
+        if page[0] != LEAF {
+            return err("corrupted B+ tree: a leaf links to an internal node");
         }
-        let Node::Leaf { mut keys, next } = node else { unreachable!() };
-        keys.drain(..keys.partition_point(|k| k.as_slice() < start));
-        self.next_leaf = next;
-        self.pending = keys.into_iter();
+        let leaf = self.leaf.get_or_insert_with(|| Box::new([0; PAGE_SIZE]));
+        leaf.copy_from_slice(&*page);
+        self.left = count(leaf);
+        self.pos = HEADER_SIZE;
         Ok(())
+    }
+
+    /// Descends to the leaf that may hold `start`, and skips its keys below `start`.
+    fn seek(&mut self, start: &[u8]) -> Result<()> {
+        self.load(self.tree.find_leaf(start)?)?;
+        let leaf = self.leaf.as_ref().expect("loaded");
+        while self.left > 0 {
+            let (key, next) = entry(leaf, self.pos, 0)?;
+            if key >= start {
+                break;
+            }
+            self.pos = next;
+            self.left -= 1;
+        }
+        Ok(())
+    }
+
+    fn step(&mut self) -> Result<Option<Vec<u8>>> {
+        if let Some(start) = self.start.take() {
+            self.seek(&start)?;
+        }
+        loop {
+            let Some(leaf) = &self.leaf else { return Ok(None) };
+            if self.left > 0 {
+                let (key, next) = entry(leaf, self.pos, 0)?;
+                let key = key.to_vec();
+                self.pos = next;
+                self.left -= 1;
+                return Ok(Some(key));
+            }
+            match decode_id(read_u32(leaf, 3)) {
+                Some(next) => self.load(next)?,
+                None => {
+                    self.leaf = None;
+                    return Ok(None);
+                }
+            }
+        }
     }
 }
 
@@ -408,23 +567,11 @@ impl Iterator for Range<'_> {
     type Item = Result<Vec<u8>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(start) = self.start.take()
-            && let Err(e) = self.seek(&start)
-        {
-            return Some(Err(e));
-        }
-        loop {
-            if let Some(key) = self.pending.next() {
-                return Some(Ok(key));
-            }
-            let id = self.next_leaf.take()?;
-            match self.tree.read(id) {
-                Ok(Node::Leaf { keys, next }) => {
-                    self.next_leaf = next;
-                    self.pending = keys.into_iter();
-                }
-                Ok(_) => return Some(err("corrupted B+ tree: a leaf links to an internal node")),
-                Err(e) => return Some(Err(e)),
+        match self.step() {
+            Ok(key) => key.map(Ok),
+            Err(e) => {
+                self.leaf = None;
+                Some(Err(e))
             }
         }
     }
