@@ -195,7 +195,7 @@ impl Table {
 
     /// Like [`Table::scan`], but only the columns marked in `needed` must be
     /// read. Unneeded columns may hold anything, NULL usually: a column store
-    /// skips their chunks, while heaps and LSM trees return whole rows.
+    /// skips their chunks, and heaps and LSM trees skip their bytes.
     pub fn scan_columns(&self, needed: &[bool]) -> Box<dyn Iterator<Item = Result<(RowId, Row)>> + '_> {
         self.scan_filtered(needed, &[], &Access::Scan)
     }
@@ -214,14 +214,17 @@ impl Table {
         access: &Access,
     ) -> Box<dyn Iterator<Item = Result<(RowId, Row)>> + '_> {
         assert_eq!(needed.len(), self.columns.len());
+        let decode = {
+            let needed = needed.to_vec();
+            move |bytes: &[u8]| tuple::decode_columns(&self.columns, bytes, &needed)
+        };
         match (access.clone(), &self.storage) {
-            (Access::Scan, Storage::Heap(heap)) => Box::new(heap.scan().map(|item| {
-                let (rid, bytes) = item?;
-                Ok((RowId::Record(rid), tuple::decode(&self.columns, &bytes)?))
-            })),
-            (Access::Scan, Storage::Lsm { tree, .. }) => Box::new(tree.scan().map(|item| {
+            (Access::Scan, Storage::Heap(heap)) => {
+                Box::new(heap.scan_map(decode).map(|item| item.map(|(rid, row)| (RowId::Record(rid), row))))
+            }
+            (Access::Scan, Storage::Lsm { tree, .. }) => Box::new(tree.scan().map(move |item| {
                 let (key, bytes) = item?;
-                Ok((RowId::Key(key), tuple::decode(&self.columns, &bytes)?))
+                Ok((RowId::Key(key), decode(&bytes)?))
             })),
             (_, Storage::Column(store)) => Box::new(
                 store

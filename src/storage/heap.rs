@@ -138,8 +138,14 @@ impl TableHeap {
     ///
     /// Each page is read when the scan reaches it, so changes made during the
     /// scan may be seen. Callers that modify the heap should collect first.
-    pub fn scan(&self) -> Scan<'_> {
-        Scan { pool: &self.pool, next_page: Some(self.first_page), pending: Vec::new().into_iter() }
+    pub fn scan(&self) -> Scan<'_, Vec<u8>, impl FnMut(&[u8]) -> Result<Vec<u8>>> {
+        self.scan_map(|tuple| Ok(tuple.to_vec()))
+    }
+
+    /// Like [`TableHeap::scan`], but turns each tuple into a `T` with `f`
+    /// where it lies in its page, rather than copying it out first.
+    pub fn scan_map<T, F: FnMut(&[u8]) -> Result<T>>(&self, f: F) -> Scan<'_, T, F> {
+        Scan { pool: &self.pool, next_page: Some(self.first_page), pending: Vec::new().into_iter(), f }
     }
 
     /// Returns all of the heap's pages to the free list.
@@ -180,20 +186,21 @@ impl TableHeap {
     }
 }
 
-pub struct Scan<'a> {
+pub struct Scan<'a, T, F> {
     pool: &'a BufferPool,
     next_page: Option<PageId>,
-    /// Tuples of the current page not yet returned.
-    pending: std::vec::IntoIter<(RecordId, Vec<u8>)>,
+    /// Tuples of the current page not yet returned, each as `f` made it.
+    pending: std::vec::IntoIter<Result<(RecordId, T)>>,
+    f: F,
 }
 
-impl Iterator for Scan<'_> {
-    type Item = Result<(RecordId, Vec<u8>)>;
+impl<T, F: FnMut(&[u8]) -> Result<T>> Iterator for Scan<'_, T, F> {
+    type Item = Result<(RecordId, T)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(item) = self.pending.next() {
-                return Some(Ok(item));
+                return Some(item);
             }
             let page_id = self.next_page.take()?;
             let guard = match self.pool.fetch_read(page_id) {
@@ -202,8 +209,8 @@ impl Iterator for Scan<'_> {
             };
             let page = SlottedPage::new(&*guard);
             self.next_page = page.next_page();
-            let tuples: Vec<_> =
-                page.iter().map(|(slot, tuple)| (RecordId { page_id, slot }, tuple.to_vec())).collect();
+            let f = &mut self.f;
+            let tuples: Vec<_> = page.iter().map(|(slot, tuple)| Ok((RecordId { page_id, slot }, f(tuple)?))).collect();
             self.pending = tuples.into_iter();
         }
     }

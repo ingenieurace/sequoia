@@ -42,12 +42,34 @@ pub fn encode(columns: &[Column], row: &[Value]) -> Result<Vec<u8>> {
 }
 
 pub fn decode(columns: &[Column], bytes: &[u8]) -> Result<Vec<Value>> {
+    decode_with(columns, bytes, |_| true)
+}
+
+/// Decodes only the columns marked in `needed`, skipping the bytes of the
+/// others, which come out NULL: a TEXT value skipped is never copied out.
+pub fn decode_columns(columns: &[Column], bytes: &[u8], needed: &[bool]) -> Result<Vec<Value>> {
+    decode_with(columns, bytes, |i| needed[i])
+}
+
+fn decode_with(columns: &[Column], bytes: &[u8], needed: impl Fn(usize) -> bool) -> Result<Vec<Value>> {
     let mut reader = Reader { bytes, pos: 0 };
     let bitmap = reader.take(columns.len().div_ceil(8))?;
 
     let mut row = Vec::with_capacity(columns.len());
     for (i, column) in columns.iter().enumerate() {
         if bitmap[i / 8] & (1 << (i % 8)) != 0 {
+            row.push(Value::Null);
+            continue;
+        }
+        if !needed(i) {
+            match column.data_type {
+                DataType::Int => reader.take(8)?,
+                DataType::Bool => reader.take(1)?,
+                DataType::Text => {
+                    let len = u16::from_le_bytes(reader.array()?) as usize;
+                    reader.take(len)?
+                }
+            };
             row.push(Value::Null);
             continue;
         }
