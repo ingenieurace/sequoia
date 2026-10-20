@@ -11,13 +11,7 @@ pub enum Statement {
     DropTable {
         name: String,
     },
-    /// `CREATE [UNIQUE] INDEX name ON table (column)`
-    CreateIndex {
-        name: String,
-        table: String,
-        column: String,
-        unique: bool,
-    },
+    CreateIndex(CreateIndex),
     DropIndex {
         name: String,
     },
@@ -52,6 +46,38 @@ pub enum Statement {
         table: String,
         filter: Option<Expr>,
     },
+}
+
+/// `CREATE [UNIQUE] INDEX name ON table (key, ...) [INCLUDE (column, ...)] [WHERE condition]`
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateIndex {
+    pub name: String,
+    pub table: String,
+    /// What the index is sorted by: columns, or expressions of the table's columns.
+    pub keys: Vec<Expr>,
+    /// Columns stored in each entry besides the keys, so a query that reads
+    /// only those and the keys never reads the table.
+    pub include: Vec<String>,
+    /// A partial index's condition: only the rows it is true for are indexed.
+    pub predicate: Option<Expr>,
+    /// Whether two indexed rows may not have the same keys, unless one is NULL.
+    pub unique: bool,
+}
+
+impl std::fmt::Display for CreateIndex {
+    /// Writes the statement as SQL that parses back to it, as the catalog stores it.
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let keys = self.keys.iter().map(Expr::to_string).collect::<Vec<_>>().join(", ");
+        let unique = if self.unique { "UNIQUE " } else { "" };
+        write!(f, "CREATE {unique}INDEX {} ON {} ({keys})", self.name, self.table)?;
+        if !self.include.is_empty() {
+            write!(f, " INCLUDE ({})", self.include.join(", "))?;
+        }
+        if let Some(predicate) = &self.predicate {
+            write!(f, " WHERE {predicate}")?;
+        }
+        Ok(())
+    }
 }
 
 /// A query: a SELECT statement, or a subquery in an expression.
@@ -526,7 +552,11 @@ impl std::fmt::Display for Expr {
             Expr::Literal(value) => f.write_str(&value.to_sql()),
             Expr::Column(column) | Expr::Outer(column) => write!(f, "{column}"),
             Expr::Unary(UnaryOp::Not, inner) => write!(f, "NOT {}", operand(inner)),
-            Expr::Unary(UnaryOp::Neg, inner) => write!(f, "-{}", operand(inner)),
+            Expr::Unary(UnaryOp::Neg, inner) => match operand(inner) {
+                // Not `--`, which starts a comment.
+                inner if inner.starts_with('-') => write!(f, "-({inner})"),
+                inner => write!(f, "-{inner}"),
+            },
             Expr::Binary(left, op, right) => write!(f, "{} {} {}", operand(left), op.symbol(), operand(right)),
             Expr::IsNull(inner, negated) => {
                 write!(f, "{} IS {}NULL", operand(inner), if *negated { "NOT " } else { "" })
@@ -682,6 +712,7 @@ mod tests {
             "NOT EXISTS (SELECT 1 FROM u WHERE u.a IN (SELECT a FROM v))",
             "x IN (SELECT d.b + 1 AS c FROM (SELECT b, COUNT(*) AS n FROM u GROUP BY b) d JOIN (SELECT * FROM v) e ON e.b = d.b)",
             "-(a - b) IS NULL",
+            "- -0.75 < ABS(c1) AND - -a > - - -1 AND -(-2) = 2",
             "NOT (NOT a)",
             "a = NULL OR b = TRUE",
             "CASE WHEN a > 1 THEN 'x' WHEN b IS NULL THEN 'y' ELSE 'z' END = c",

@@ -111,6 +111,7 @@
 use std::collections::BTreeSet;
 
 use crate::catalog::Catalog;
+use crate::catalog::index::{Index, Key};
 use crate::catalog::table::{Access, Table};
 use crate::error::{Result, err};
 use crate::plan::{access, filter};
@@ -682,7 +683,7 @@ fn estimate(node: &Node) -> f64 {
         Node::Scan { table, predicates, .. } => {
             let rows = table.row_count().map_or(1000.0, |rows| rows as f64);
             let unique = |column| {
-                table.primary_key() == Some(column) || table.indexes().iter().any(|i| i.column == column && i.unique)
+                table.primary_key() == Some(column) || table.indexes().iter().any(|i| i.unique && i.is_on_column(column))
             };
             predicates.iter().fold(rows, |rows, p| match p.op {
                 Compare::Eq if unique(p.column) => rows.min(1.0),
@@ -720,9 +721,11 @@ fn estimate(node: &Node) -> f64 {
 }
 
 /// How a lookup on this column of the table can find rows, if it can: through
-/// an index on it, or the primary key of an LSM table.
+/// an index whose first key it is and that holds every row, or the primary
+/// key of an LSM table.
 fn lookup_key(table: &Table, column: usize) -> Option<LookupKey> {
-    if let Some(i) = table.indexes().iter().position(|index| index.column == column) {
+    let first = |index: &Index| index.keys.first() == Some(&Key::Column(column)) && index.predicate.is_none();
+    if let Some(i) = table.indexes().iter().position(first) {
         return Some(LookupKey::Index(i));
     }
     (table.storage_kind() == StorageKind::Lsm && table.primary_key() == Some(column)).then_some(LookupKey::PrimaryKey)
@@ -733,9 +736,10 @@ fn lookup_key(table: &Table, column: usize) -> Option<LookupKey> {
 /// columns read above the filter.
 pub fn scan<'a>(table: &'a Table, qualifier: &str, filter: &Option<Expr>, needed: Vec<bool>) -> Node<'a> {
     let needed_by_filter = filter::needed_columns(table, qualifier, filter);
-    let needed = needed.iter().zip(needed_by_filter).map(|(a, b)| *a || b).collect();
-    let predicates = filter::predicates(table, qualifier, filter);
-    let access = access::choose(table, &predicates);
+    let needed: Vec<bool> = needed.iter().zip(needed_by_filter).map(|(a, b)| *a || b).collect();
+    let conditions = filter::conditions(table, qualifier, filter);
+    let predicates = filter::predicates(table, &conditions);
+    let access = access::choose(table, qualifier, filter, &conditions, &needed);
     let scan = Node::Scan { table, qualifier: qualifier.into(), needed, predicates, access };
     match filter {
         Some(predicate) => Node::Filter { input: Box::new(scan), predicate: predicate.clone() },

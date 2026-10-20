@@ -566,7 +566,7 @@ fn heap_primary_keys_and_created_indexes_are_used_by_where() {
     assert_eq!(plan(&mut db, "SELECT * FROM users WHERE age = 'x'"), "SCAN users", "a literal of the wrong type");
 
     assert_eq!(query(&mut db, "SELECT id FROM users WHERE name = 'bob'"), vec![vec![int(2)]]);
-    // Rows come back in index order, and NULL ages are not in the index.
+    // Rows come back in index order, and a range leaves out NULL ages.
     assert_eq!(
         query(&mut db, "SELECT name FROM users WHERE age < 100"),
         vec![vec![text("bob")], vec![text("alice")]]
@@ -784,6 +784,250 @@ fn indexes_survive_reopening_and_are_dropped_with_their_table() {
 
     let mut db = Database::open(&path.0).unwrap();
     assert_eq!(query(&mut db, "SELECT id FROM t WHERE tag = 'tag1'").len(), 40);
+}
+
+#[test]
+fn several_keys_expressions_partial_and_covering_indexes_are_used() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, city TEXT, nights INT, status TEXT)").unwrap();
+    let values: Vec<String> = (0..200)
+        .map(|id| {
+            let nights = if id % 9 == 0 { "NULL".to_string() } else { (id % 7).to_string() };
+            let (city, status) = (["oslo", "lima", "rome"][id % 3], ["open", "closed"][(id / 3) % 2]);
+            format!("({id}, '{}', '{city}', {nights}, '{status}')", ["Bob", "ALICE", "carol"][id % 3])
+        })
+        .collect();
+    db.execute(&format!("INSERT INTO t VALUES {}", values.join(", "))).unwrap();
+    db.execute("CREATE INDEX t_city_nights ON t (city, nights)").unwrap();
+    db.execute("CREATE INDEX t_lower ON t (LOWER(name))").unwrap();
+    db.execute("CREATE INDEX t_open ON t (nights) WHERE status = 'open'").unwrap();
+    db.execute("CREATE INDEX t_status ON t (status) INCLUDE (name)").unwrap();
+
+    // Equalities on the first keys, then a range on the next.
+    assert_eq!(
+        plan(&mut db, "SELECT * FROM t WHERE city = 'oslo' AND nights > 2 AND nights <= 5"),
+        "SEARCH t USING INDEX t_city_nights (city = 'oslo' AND nights > 2 AND nights <= 5)"
+    );
+    assert_eq!(
+        plan(&mut db, "SELECT * FROM t WHERE nights = 3 AND city = 'lima'"),
+        "SEARCH t USING INDEX t_city_nights (city = 'lima' AND nights = 3)"
+    );
+    assert_eq!(plan(&mut db, "SELECT * FROM t WHERE city = 'rome'"), "SEARCH t USING INDEX t_city_nights (city = 'rome')");
+    assert_eq!(plan(&mut db, "SELECT * FROM t WHERE nights = 3"), "SCAN t", "not the first key, and not a partial index's rows");
+    // An expression, matched however its columns are qualified.
+    assert_eq!(plan(&mut db, "SELECT * FROM t WHERE lower(name) = 'bob'"), "SEARCH t USING INDEX t_lower (LOWER(name) = 'bob')");
+    assert_eq!(
+        plan(&mut db, "SELECT x.id FROM t x WHERE 'alice' < LOWER(x.name)"),
+        "SEARCH t x USING INDEX t_lower (LOWER(name) > 'alice')"
+    );
+    // A partial index serves only a WHERE that implies its condition.
+    assert_eq!(plan(&mut db, "SELECT id FROM t WHERE status = 'open' AND nights < 2"), "SEARCH t USING INDEX t_open (nights < 2)");
+    assert_eq!(plan(&mut db, "SELECT id FROM t WHERE nights = 4 AND status = 'open'"), "SEARCH t USING INDEX t_open (nights = 4)");
+    assert_eq!(plan(&mut db, "SELECT nights FROM t WHERE 'open' = status"), "SCAN t USING INDEX t_open");
+    assert_eq!(plan(&mut db, "SELECT * FROM t WHERE 'open' = status"), "SCAN t USING INDEX t_open", "the earlier index");
+    db.execute("CREATE INDEX t_long ON t (name) WHERE nights > 3").unwrap();
+    for (filter, uses) in [("nights > 5", true), ("nights >= 3", false), ("nights >= 4", true), ("nights = 6", true), ("nights < 9", false)] {
+        let sql = format!("SELECT * FROM t WHERE name = 'Bob' AND {filter}");
+        assert_eq!(plan(&mut db, &sql).contains("t_long"), uses, "{filter} implies nights > 3: {uses}");
+    }
+    db.execute("DROP INDEX t_long").unwrap();
+    // An index holding every column needed is read alone.
+    assert_eq!(
+        plan(&mut db, "SELECT name FROM t WHERE status = 'closed'"),
+        "SEARCH t USING COVERING INDEX t_status (status = 'closed')"
+    );
+    assert_eq!(
+        plan(&mut db, "SELECT city, nights FROM t WHERE city = 'oslo' AND nights IS NULL"),
+        "SEARCH t USING COVERING INDEX t_city_nights (city = 'oslo')"
+    );
+
+    // The rows as inserted above: (city, nights, open), and the name's case aside.
+    type Row = (usize, Option<usize>, bool);
+    let rows: Vec<Row> = (0..200).map(|id| (id % 3, (id % 9 != 0).then_some(id % 7), (id / 3) % 2 == 0)).collect();
+    let expect = |f: &dyn Fn(&Row) -> bool| rows.iter().filter(|r| f(r)).count();
+    let count = |db: &mut Database, sql: &str| query(db, sql).len();
+    assert_eq!(
+        count(&mut db, "SELECT * FROM t WHERE city = 'oslo' AND nights > 2 AND nights <= 5"),
+        expect(&|r| r.0 == 0 && r.1.is_some_and(|n| n > 2 && n <= 5))
+    );
+    assert_eq!(
+        count(&mut db, "SELECT * FROM t WHERE city = 'oslo' AND nights IS NULL"),
+        expect(&|r| r.0 == 0 && r.1.is_none()),
+        "NULL keys are indexed"
+    );
+    assert_eq!(count(&mut db, "SELECT * FROM t WHERE lower(name) = 'bob'"), expect(&|r| r.0 == 0));
+    assert_eq!(
+        count(&mut db, "SELECT id FROM t WHERE status = 'open' AND nights < 2"),
+        expect(&|r| r.2 && r.1.is_some_and(|n| n < 2))
+    );
+    assert_eq!(
+        query(&mut db, "SELECT name, id FROM t WHERE status = 'closed' AND id < 6"),
+        vec![vec![text("Bob"), int(3)], vec![text("ALICE"), int(4)], vec![text("carol"), int(5)]]
+    );
+}
+
+#[test]
+fn indexes_of_every_kind_answer_like_no_index() {
+    let mut db = Database::in_memory();
+    let indexes = [
+        "CREATE INDEX {t}_a ON {t} (city, nights)",
+        "CREATE INDEX {t}_b ON {t} (LOWER(city), nights * 2 + 1)",
+        "CREATE INDEX {t}_c ON {t} (nights) INCLUDE (city, score) WHERE score > 0.5",
+        "CREATE INDEX {t}_d ON {t} (score, city) WHERE nights IS NOT NULL",
+        "CREATE INDEX {t}_e ON {t} (vip) INCLUDE (id)",
+    ];
+    let tables = ["heap_plain", "heap_indexed", "lsm_plain", "lsm_indexed"];
+    for t in tables {
+        let storage = if t.starts_with("lsm") { "LSM" } else { "HEAP" };
+        db.execute(&format!(
+            "CREATE TABLE {t} (id INT PRIMARY KEY, city TEXT, nights INT, score REAL, vip BOOL) USING {storage}"
+        ))
+        .unwrap();
+        if t.ends_with("indexed") {
+            for index in indexes {
+                db.execute(&index.replace("{t}", t)).unwrap();
+            }
+        }
+        let values: Vec<String> = (0..1500i64)
+            .map(|id| {
+                let nights = if id % 11 == 0 { "NULL".to_string() } else { (id % 7 - 3).to_string() };
+                let score = if id % 13 == 0 { "NULL".to_string() } else { format!("{}.25", id % 4) };
+                let city = ["Lima", "oslo", "OSLO", "rome", "a\0b", ""][id as usize % 6];
+                format!("({id}, '{city}', {nights}, {score}, {})", id % 5 == 0)
+            })
+            .collect();
+        db.execute(&format!("INSERT INTO {t} VALUES {}", values.join(", "))).unwrap();
+    }
+    let queries = [
+        "SELECT * FROM {t} WHERE city = 'oslo' AND nights = 1",
+        "SELECT id, nights FROM {t} WHERE city = 'oslo' AND nights >= -1",
+        "SELECT city, nights FROM {t} WHERE city = 'rome'",
+        "SELECT * FROM {t} WHERE LOWER(city) = 'oslo' AND nights * 2 + 1 > 1",
+        "SELECT * FROM {t} WHERE lower(city) >= 'oslo'",
+        "SELECT city, score FROM {t} WHERE score > 0.5 AND nights = 2",
+        "SELECT * FROM {t} WHERE nights < 0 AND score > 0.5",
+        "SELECT nights FROM {t} WHERE score > 0.5",
+        "SELECT * FROM {t} WHERE score = 2.25 AND nights > 0",
+        "SELECT city FROM {t} WHERE score >= 1 AND city > 'a' AND nights != 3",
+        "SELECT id FROM {t} WHERE vip = TRUE",
+        "SELECT * FROM {t} WHERE vip = FALSE AND id > 1400",
+    ];
+    let changes = [
+        "UPDATE {t} SET nights = nights + 1 WHERE city = 'oslo'",
+        // In and out of partial indexes, and changes to included columns alone.
+        "UPDATE {t} SET score = 0.0 WHERE id - id / 4 * 4 = 3",
+        "UPDATE {t} SET score = 3.25, nights = NULL WHERE id - id / 10 * 10 = 1",
+        "UPDATE {t} SET city = 'OSLO' WHERE city = 'Lima' AND id < 700",
+        "UPDATE {t} SET vip = NOT vip WHERE id > 1000",
+        "UPDATE {t} SET id = id + 5000 WHERE nights = 2",
+        "DELETE FROM {t} WHERE score < 1 OR city = 'rome'",
+        "INSERT INTO {t} VALUES (9000, 'oslo', 1, 0.75, TRUE), (9001, NULL, NULL, NULL, NULL)",
+    ];
+    for change in [""].into_iter().chain(changes) {
+        if !change.is_empty() {
+            for t in tables {
+                db.execute(&change.replace("{t}", t)).unwrap_or_else(|e| panic!("{change} on {t}: {e:?}"));
+            }
+        }
+        for sql in queries {
+            let results: Vec<Vec<Vec<Value>>> = tables
+                .iter()
+                .map(|t| {
+                    let mut rows = query(&mut db, &sql.replace("{t}", t));
+                    rows.sort_by(|a, b| a.iter().zip(b).map(|(a, b)| a.sort_cmp(b)).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal));
+                    rows
+                })
+                .collect();
+            for (t, rows) in tables.iter().zip(&results) {
+                assert_eq!(rows, &results[0], "{sql} on {t} after {change}");
+            }
+        }
+    }
+    for t in ["heap_indexed", "lsm_indexed"] {
+        let plans: Vec<String> = queries.iter().map(|sql| plan(&mut db, &sql.replace("{t}", t))).collect();
+        for index in ["a", "b", "c", "d", "e"] {
+            assert!(plans.iter().any(|p| p.contains(&format!("INDEX {t}_{index} "))), "{t}_{index} unused: {plans:#?}");
+        }
+        assert!(plans.iter().any(|p| p.contains("COVERING INDEX")));
+    }
+}
+
+#[test]
+fn unique_indexes_of_several_keys_or_partial_ones_reject_duplicates() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE r (id INT PRIMARY KEY, room INT, day INT, active BOOL)").unwrap();
+    db.execute("CREATE UNIQUE INDEX r_booking ON r (room, day) WHERE active").unwrap();
+    db.execute("INSERT INTO r VALUES (1, 1, 1, TRUE), (2, 1, 2, TRUE), (3, 2, 1, TRUE), (4, 1, 1, FALSE)").unwrap();
+    // Inactive rows, and rows with a NULL key, are not checked.
+    db.execute("INSERT INTO r VALUES (5, 1, 1, FALSE), (6, 1, NULL, TRUE), (7, 1, NULL, TRUE)").unwrap();
+    let duplicate = db.execute("INSERT INTO r VALUES (8, 1, 2, TRUE)").unwrap_err().0;
+    assert_eq!(duplicate, "duplicate value in unique index r_booking: (1, 2)");
+    assert!(db.execute("INSERT INTO r VALUES (8, 3, 3, TRUE), (9, 3, 3, TRUE)").is_err(), "among the new rows");
+    assert!(db.execute("UPDATE r SET active = TRUE WHERE id = 4").is_err(), "a row coming into the index");
+    // Rows may swap keys in one statement, and leave the index to free theirs.
+    db.execute("UPDATE r SET day = 3 - day WHERE room = 1 AND id < 3").unwrap();
+    db.execute("UPDATE r SET active = FALSE WHERE id = 2").unwrap();
+    db.execute("UPDATE r SET active = TRUE WHERE id = 4").unwrap();
+    assert_eq!(query(&mut db, "SELECT id FROM r WHERE room = 1 AND day = 2 AND active"), vec![vec![int(1)]]);
+
+    assert!(db.execute("CREATE UNIQUE INDEX r_day ON r (room, day)").is_err(), "inactive rows clash");
+    db.execute("CREATE UNIQUE INDEX r_room_id ON r (room, id)").unwrap();
+    let message = db.execute("CREATE UNIQUE INDEX r_lower ON r (room * 0)").unwrap_err().0;
+    assert_eq!(message, "cannot create unique index r_lower: duplicate value 0");
+}
+
+#[test]
+fn index_definitions_are_checked() {
+    let mut db = setup();
+    for (sql, error) in [
+        ("CREATE INDEX i ON users (missing)", "unknown column: missing"),
+        ("CREATE INDEX i ON users (LOWER(missing))", "unknown column: missing"),
+        ("CREATE INDEX i ON users (other.name)", "unknown column: other.name"),
+        ("CREATE INDEX i ON users (name) INCLUDE (missing)", "unknown column: missing"),
+        ("CREATE INDEX i ON users (name) WHERE missing > 1", "unknown column: missing"),
+        ("CREATE INDEX i ON users (COUNT(*))", "an index key cannot use an aggregate"),
+        ("CREATE INDEX i ON users (name) WHERE id IN (SELECT id FROM users)", "an index's WHERE cannot use a subquery"),
+        ("CREATE INDEX i ON users (name) WHERE age", "WHERE clause must be boolean, got 30"),
+        ("CREATE INDEX i ON users (age / 0)", "division by zero"),
+    ] {
+        assert_eq!(db.execute(sql).unwrap_err().0, error, "{sql}");
+    }
+    assert!(db.execute("CREATE INDEX i ON users (name) INCLUDE ()").is_err());
+    assert!(db.execute("CREATE INDEX i ON users (name) WHERE").is_err());
+    assert_eq!(plan(&mut db, "SELECT * FROM users WHERE name = 'bob'"), "SCAN users", "no index was left behind");
+
+    // A key or condition that fails on a new row fails the write.
+    db.execute("CREATE INDEX users_ratio ON users (100 / age) WHERE age IS NOT NULL").unwrap();
+    assert!(db.execute("INSERT INTO users VALUES (4, 'dan', 0, TRUE)").is_err());
+    db.execute("INSERT INTO users VALUES (4, 'dan', NULL, TRUE)").unwrap();
+    assert_eq!(query(&mut db, "SELECT id FROM users WHERE 100 / age = 4"), vec![vec![int(2)]]);
+}
+
+#[test]
+fn indexes_of_every_kind_survive_reopening() {
+    let path = TempDb::new("index-kinds");
+    {
+        let mut db = Database::open(&path.0).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, n INT, x REAL)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a', -1, 1.0), (2, 'B', 2, 2.5), (3, 'c', NULL, -0.5), (4, NULL, 4, 3.0)")
+            .unwrap();
+        db.execute("CREATE INDEX t_k ON t (LOWER(name), - -n) INCLUDE (x, name) WHERE x > 0 AND name IS NOT NULL").unwrap();
+        db.execute("CREATE UNIQUE INDEX t_u ON t (x, n)").unwrap();
+    }
+    let mut db = Database::open(&path.0).unwrap();
+    assert_eq!(
+        plan(&mut db, "SELECT x FROM t WHERE lower(name) = 'b' AND x > 0 AND name IS NOT NULL"),
+        "SEARCH t USING COVERING INDEX t_k (LOWER(name) = 'b')"
+    );
+    assert_eq!(
+        query(&mut db, "SELECT x FROM t WHERE lower(name) = 'b' AND x > 0 AND name IS NOT NULL"),
+        vec![vec![Value::Real(2.5)]]
+    );
+    assert_eq!(query(&mut db, "SELECT n, x FROM t WHERE x = 3"), vec![vec![int(4), Value::Real(3.0)]]);
+    assert!(db.execute("INSERT INTO t VALUES (5, 'e', 2, 2.5)").is_err(), "the unique index was reopened");
+    db.execute("ROLLBACK").unwrap_err();
+    db.execute("BEGIN; INSERT INTO t VALUES (6, 'b', 9, 9.0); ROLLBACK").unwrap();
+    assert_eq!(query(&mut db, "SELECT id FROM t WHERE lower(name) = 'b' AND x > 0 AND name IS NOT NULL").len(), 1);
 }
 
 #[test]

@@ -20,6 +20,7 @@ pub mod heap;
 pub mod io;
 pub mod lsm;
 pub mod page;
+pub mod sort_key;
 pub mod tuple;
 
 pub use btree::BPlusTree;

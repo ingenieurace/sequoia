@@ -36,7 +36,6 @@ use std::collections::HashMap;
 
 use super::operator::Rows;
 use super::sort::{Sorted, Sorter, value_size};
-use crate::catalog::index::Bound;
 use crate::catalog::table::{Access, Row, Table};
 use crate::error::Result;
 use crate::plan::query::LookupKey;
@@ -268,8 +267,8 @@ impl Lookup<'_> {
         let predicates = [Predicate { column: self.column, op: Compare::Eq, literal: value.clone() }];
         let access = match self.key {
             LookupKey::Index(index) => {
-                let bound = Some(Bound { value: value.clone(), inclusive: true });
-                Access::Index { index, lower: bound.clone(), upper: bound }
+                let covering = self.table.indexes()[index].covers(&self.needed);
+                Access::Index { index, equal: vec![value.clone()], lower: None, upper: None, covering }
             }
             LookupKey::PrimaryKey => Access::Key(value.clone()),
         };

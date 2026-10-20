@@ -111,7 +111,19 @@ enum Kind {
 struct Gen {
     rng: Rng,
     tables: Vec<Table>,
-    indexes: Vec<String>,
+    indexes: Vec<Index>,
+}
+
+/// An index a case made, for queries meant to use it.
+struct Index {
+    name: String,
+    table: usize,
+    /// Columns or expressions of the table's columns, and their types.
+    keys: Vec<(String, Type)>,
+    /// The columns it includes (Sequoia only: SQLite has no INCLUDE).
+    include: Vec<String>,
+    /// A partial index's condition.
+    predicate: Option<String>,
 }
 
 impl Gen {
@@ -698,20 +710,88 @@ impl Gen {
         }
     }
 
+    /// Drops an index, or creates one: on one column, or on several keys,
+    /// each a column or an expression, maybe with included columns, maybe
+    /// partial.
     fn index(&mut self) -> Stmt {
         if !self.indexes.is_empty() && self.rng.chance(30) {
             let i = self.rng.below(self.indexes.len());
-            return stmt(format!("DROP INDEX {}", self.indexes.swap_remove(i)), Kind::Other);
+            return stmt(format!("DROP INDEX {}", self.indexes.swap_remove(i).name), Kind::Other);
         }
         let indexable: Vec<usize> = (0..self.tables.len()).filter(|&t| self.tables[t].storage != "COLUMN").collect();
         if indexable.is_empty() {
             return self.insert();
         }
         let t = *self.rng.pick(&indexable);
-        let column = self.rng.pick(&self.tables[t].columns[1..]).0.clone();
+        let columns = self.tables[t].columns.clone();
+        let rows = Scope { cols: columns.clone(), ..Scope::default() };
+        let keys: Vec<(String, Type)> = match self.rng.chance(40) {
+            true => vec![self.rng.pick(&columns[1..]).clone()],
+            false => (0..1 + self.rng.below(3))
+                .map(|_| match self.rng.chance(60) {
+                    true => self.rng.pick(&columns).clone(),
+                    false => {
+                        let ty = *self.rng.pick(&TYPES);
+                        (self.key(ty, &rows, 2), ty)
+                    }
+                })
+                .collect(),
+        };
+        let include: Vec<String> = match self.rng.chance(30) {
+            true => columns.iter().filter(|_| self.rng.chance(50)).map(|(c, _)| c.clone()).collect(),
+            false => Vec::new(),
+        };
+        let predicate = match self.rng.below(10) {
+            0..=1 => Some(self.key(Type::Bool, &rows, 2)),
+            2 => Some(format!("({} IS NOT NULL)", self.rng.pick(&columns[1..]).0)),
+            _ => None,
+        };
         let name = format!("ix{}", self.rng.next() % 1_000_000);
-        self.indexes.push(name.clone());
-        stmt(format!("CREATE INDEX {name} ON {} ({column})", self.tables[t].name), Kind::Other)
+        let list = keys.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(", ");
+        let sqlite = format!("CREATE INDEX {name} ON {} ({list})", self.tables[t].name);
+        let filter = predicate.as_ref().map_or(String::new(), |p| format!(" WHERE {p}"));
+        let sequoia = match include.is_empty() {
+            true => format!("{sqlite}{filter}"),
+            false => format!("{sqlite} INCLUDE ({}){filter}", include.join(", ")),
+        };
+        self.indexes.push(Index { name, table: t, keys, include, predicate });
+        Stmt { sequoia, sqlite: format!("{sqlite}{filter}"), kind: Kind::Other }
+    }
+
+    /// A query on one table meant to use one of its indexes: conditions on
+    /// its first keys, and a partial index's condition, reading its keys and
+    /// included columns, or every column.
+    fn index_select(&mut self) -> Stmt {
+        if self.indexes.is_empty() {
+            return self.select();
+        }
+        let index = self.rng.below(self.indexes.len());
+        let Index { table, keys, include, predicate, .. } = &self.indexes[index];
+        let (table, keys, include, predicate) = (*table, keys.clone(), include.clone(), predicate.clone());
+        let mut conditions = Vec::new();
+        for (i, (key, ty)) in keys.iter().enumerate() {
+            let op = match i + 1 < keys.len() && self.rng.chance(70) {
+                true => "=",
+                false => *self.rng.pick(&["=", "<", "<=", ">", ">=", "!="]),
+            };
+            conditions.push(format!("({key} {op} {})", self.literal(*ty)));
+            if op != "=" || self.rng.chance(30) {
+                break;
+            }
+        }
+        conditions.extend(predicate);
+        let columns: Vec<String> = keys
+            .iter()
+            .map(|(k, _)| k.clone())
+            .filter(|k| self.tables[table].columns.iter().any(|(c, _)| c == k))
+            .chain(include)
+            .collect();
+        let projection = match columns.is_empty() || self.rng.chance(30) {
+            true => "*".to_string(),
+            false => columns.join(", "),
+        };
+        let name = &self.tables[table].name;
+        stmt(format!("SELECT {projection} FROM {name} WHERE {}", conditions.join(" AND ")), Kind::Unordered)
     }
 
     /// A transaction of changes, queries and savepoints, committed or rolled back.
@@ -794,7 +874,8 @@ impl Gen {
         }
         for _ in 0..40 {
             match g.rng.below(20) {
-                0..=11 => out.push(g.select()),
+                0..=9 => out.push(g.select()),
+                10 | 11 => out.push(g.index_select()),
                 12..=13 => out.push(g.union()),
                 14..=17 => g.change(&mut out),
                 _ => g.transaction(&mut out),

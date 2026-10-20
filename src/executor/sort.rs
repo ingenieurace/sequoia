@@ -8,7 +8,7 @@
 //! ```
 //!
 //! Each row's sort keys are encoded as one byte string that compares, byte
-//! by byte, as the keys do (see [`encode_key`]), and rows with equal keys
+//! by byte, as the keys do (see [`sort_key`](crate::storage::sort_key)), and rows with equal keys
 //! by the order they came in: the sort is stable. Its first eight bytes are
 //! kept as a number, beside the rest and the row's arrival number, so a key
 //! of up to eight bytes, as most INT keys are, takes no memory of its own,
@@ -46,7 +46,8 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use crate::catalog::table::Row;
 use crate::error::{Result, err};
 use crate::storage::io::medium::{FileMedium, Medium};
-use crate::types::{Value, ordered_real, real_as_int};
+use crate::storage::sort_key::encode as encode_key;
+use crate::types::Value;
 
 /// Default memory a sort may buffer rows in before writing runs out: 4 MB.
 pub const SORT_MEMORY: usize = 4 << 20;
@@ -328,90 +329,6 @@ impl PartialEq for Keyed {
 }
 
 impl Eq for Keyed {}
-
-// ---- keys ----
-
-const NULL: u8 = 0x01;
-const FALSE: u8 = 0x02;
-const TRUE: u8 = 0x03;
-/// INT zero; a positive INT of n bytes is `INT + n`, a negative one `INT - n`.
-const INT: u8 = 0x14;
-const TEXT: u8 = 0x20;
-/// After an INT, or a REAL equal to one.
-const WHOLE: u8 = 0x00;
-/// After the INT below a REAL with a fraction, before the fraction.
-const FRACTION: u8 = 0x80;
-
-/// Appends a sort key's encoding, whose bytes compare as ORDER BY orders
-/// values: NULL first, then BOOL, the numbers (INT and REAL together, by
-/// value) and TEXT (as values of different types are never equal, those of
-/// one type all sort before those of another). Each value's encoding ends
-/// where it can be told to, so a key of several values compares like its
-/// values one after another:
-///
-/// ```text
-/// NULL   01
-/// BOOL   02 for FALSE, 03 for TRUE
-/// INT    14 for zero; 14 + n, then its n big-endian bytes, for a positive one;
-///        14 - n, then the bytes of the complement of its magnitude, for a
-///        negative one; then 00
-/// REAL   as the INT it equals, if any; else, if an INT is below it, that INT
-///        as above but for 80 in place of 00, then its fraction's big-endian
-///        bits; else 0B (below every INT) or 1D (above), then its ordered bits
-/// TEXT   20, its UTF-8 bytes with each 00 as 00 FF, then 00 00
-/// ```
-///
-/// A descending key has every byte of its encoding inverted.
-fn encode_key(value: &Value, desc: bool, out: &mut Vec<u8>) {
-    let start = out.len();
-    match value {
-        Value::Null => out.push(NULL),
-        Value::Bool(b) => out.push(if *b { TRUE } else { FALSE }),
-        Value::Int(n) => {
-            encode_int(*n, out);
-            out.push(WHOLE);
-        }
-        Value::Real(r) => match real_as_int(*r) {
-            Some(n) => {
-                encode_int(n, out);
-                out.push(WHOLE);
-            }
-            // Within the INTs, and not one: so it has a fraction, which is exact.
-            None if r.abs() < 9_223_372_036_854_775_808.0 => {
-                let floor = r.floor();
-                encode_int(floor as i64, out);
-                out.push(FRACTION);
-                out.extend_from_slice(&(r - floor).to_bits().to_be_bytes());
-            }
-            None => {
-                out.push(if *r < 0.0 { INT - 9 } else { INT + 9 });
-                out.extend_from_slice(&ordered_real(*r).to_be_bytes());
-            }
-        },
-        Value::Text(s) => {
-            out.push(TEXT);
-            for (i, part) in s.as_bytes().split(|&b| b == 0).enumerate() {
-                if i > 0 {
-                    out.extend_from_slice(&[0, 0xFF]);
-                }
-                out.extend_from_slice(part);
-            }
-            out.extend_from_slice(&[0, 0]);
-        }
-    }
-    if desc {
-        out[start..].iter_mut().for_each(|b| *b = !*b);
-    }
-}
-
-/// Appends an INT's tag and bytes (see [`encode_key`]).
-fn encode_int(n: i64, out: &mut Vec<u8>) {
-    let magnitude = n.unsigned_abs();
-    let len = 8 - magnitude.leading_zeros() as usize / 8;
-    let (tag, bits) = if n < 0 { (INT - len as u8, !magnitude) } else { (INT + len as u8, magnitude) };
-    out.push(tag);
-    out.extend_from_slice(&bits.to_be_bytes()[8 - len..]);
-}
 
 // ---- runs ----
 

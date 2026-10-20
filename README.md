@@ -131,7 +131,9 @@ cargo bench --bench buffer_pool -- scans
 ## Supported SQL
 
 - Statements: `CREATE TABLE ... [USING HEAP | LSM | COLUMN]`, `DROP TABLE`,
-  `CREATE [UNIQUE] INDEX name ON table (column)`, `DROP INDEX`, `INSERT`, `SELECT`,
+  `CREATE [UNIQUE] INDEX name ON table (key, ...) [INCLUDE (column, ...)]
+  [WHERE condition]` (keys are columns or expressions of them, like
+  `LOWER(name)`; `WHERE` makes a partial index), `DROP INDEX`, `INSERT`, `SELECT`,
   `UPDATE`, `DELETE`, `CHECKPOINT`, and `EXPLAIN` before a `SELECT`, `UPDATE` or
   `DELETE` to see its plan, or `EXPLAIN ANALYZE` before a `SELECT` to run it
   and see what each step of its plan did
@@ -142,7 +144,8 @@ cargo bench --bench buffer_pool -- scans
   `2.5` or `1e20`), `TEXT`, `BOOL`, and `NULL`. INTs and REALs compare, sort,
   group and join by value (`1 = 1.0`); arithmetic with a REAL gives a REAL, and
   a REAL that would be infinite is an error
-- Constraints: `PRIMARY KEY` (unique, not null), unique indexes (NULLs may repeat);
+- Constraints: `PRIMARY KEY` (unique, not null), unique indexes (keys with a
+  NULL may repeat; a partial one checks only the rows it holds);
   values are type-checked, but an INT stored in a REAL column becomes a REAL,
   and a REAL with no fraction stored in an INT column an INT
 - `FROM`: one table, or several joined: `[INNER] JOIN ... ON`, `LEFT [OUTER]
@@ -182,7 +185,7 @@ A transaction is durable once `COMMIT` returns; until then a crash, `ROLLBACK`
 or closing the database undoes all of it. A statement that fails inside one is
 undone alone, and the transaction goes on. There is one connection, so no
 concurrency control. Not supported: `RIGHT` and `FULL` joins, subqueries in
-`JOIN ... ON`, `LATERAL`, `INSERT ... SELECT`, multi-column indexes.
+`JOIN ... ON`, `LATERAL`, `INSERT ... SELECT`.
 
 ## Layout
 
@@ -220,7 +223,7 @@ src/
   catalog/        tables and indexes
     mod.rs        Catalog: table and index schemas and where their pages live
     table.rs      a table: schema + storage + indexes, constraint checks
-    index.rs      secondary index: B+ tree entries of (value, row id)
+    index.rs      secondary index: B+ tree entries of (keys, included columns, row id)
   storage/
     io/           durable pages
       medium.rs   byte-addressed files: on disk, in memory, or crashing (for tests)
@@ -231,6 +234,7 @@ src/
       replacer.rs page replacement policies: ARC (default), LRU-K, CLOCK
     page.rs       slotted page: many tuples in one page
     tuple.rs      row <-> bytes (null bitmap + column values)
+    sort_key.rs   values <-> bytes that sort like them: sort keys and index keys
     heap.rs       table heap: linked list of pages, free-space map, RecordId
     btree.rs      B+ tree: sorted byte-string keys, splits, merges, range scans
     lsm/          log-structured merge tree
@@ -253,7 +257,8 @@ A database is a single file of 4 KB pages:
   free list head, and the root page.
 - **The catalog** is a table heap starting at the root page. Each row holds a
   table's `CREATE TABLE` statement plus its first and last page, or an index's
-  `CREATE INDEX` statement plus its root page.
+  `CREATE INDEX` statement plus its root page. (An index from a file written
+  before indexes had several keys is built again when the file is opened.)
 - **A heap table** (the default) is a linked list of slotted pages. A row is identified by its
   `RecordId` (page, slot) and stored as a null bitmap followed by its columns.
   An in-memory free-space map (rebuilt from the pages after opening) sends
@@ -298,12 +303,16 @@ A database is a single file of 4 KB pages:
   delta store, and a group whose rows are all deleted is freed. A manifest
   page lists the delta store and the row groups, which limits a column table
   to about a thousand row groups.
-- **An index** is a B+ tree over one column of a heap or LSM table. Each entry
-  is a key of the tree: the value, encoded so that bytes sort like values and
-  no value's encoding is a prefix of another's, followed by the row's id (a
-  heap row's page and slot, or an LSM row's key). The entries of one value
-  are therefore adjacent, and a lookup is a range scan of the leaves, which
-  are linked in key order. NULLs are not indexed. A node that overflows its
+- **An index** is a B+ tree over the keys of a heap or LSM table's rows:
+  columns, or expressions of them. Each entry is a key of the tree: the keys,
+  each encoded as a sort key is (so bytes sort like values, NULL first, and
+  each value's encoding ends where it can be told to), then the `INCLUDE`
+  columns, then the row's id (a heap row's page and slot, or an LSM row's
+  key). The entries of rows with equal first keys are therefore adjacent, in
+  the order of the next key, and a lookup is a range scan of the leaves,
+  which are linked in key order. A partial index holds only the rows its
+  `WHERE` is true for; every other row has an entry, NULL keys included. A
+  node that overflows its
   page splits; a delete that leaves a node under a quarter full merges it
   with a neighbour, or moves keys over from it. The root page never moves, so
   the catalog row stays valid. Every insert, update and delete updates every
@@ -311,11 +320,18 @@ A database is a single file of 4 KB pages:
   `<table>_pkey` on it, which enforces the key and is dropped only with the
   table. Column tables cannot have indexes: migrating rows into a row group
   moves them, which would change their ids.
-- **Finding rows**: a WHERE clause's conditions of the form `column op literal`
-  (joined by AND) choose how a statement reads its table. A heap or LSM table
-  uses the index those conditions narrow down most, an equality before a range
-  with two ends before one with one end, and reads only the rows the index
-  lists, in index order. An LSM table whose primary key is fixed by an
+- **Finding rows**: a WHERE clause's conditions of the form `expression op
+  literal` (joined by AND) choose how a statement reads its table. A heap or
+  LSM table uses the index those conditions narrow down most: equalities on
+  its first keys, then a range on the next key (an equality counts more than
+  a range with two ends, which counts more than one with one end). A partial
+  index serves only a WHERE that implies its condition: each of the
+  condition's conjuncts is one of the WHERE's, or follows from one of its
+  comparisons (`x > 5` gives `x > 0`), or is `e IS NOT NULL` for an `e` it
+  compares. The scan reads only the rows the index lists, in index order;
+  when the index's column keys and included columns hold every column the
+  statement reads, it reads them from the index alone (`USING COVERING
+  INDEX`). An LSM table whose primary key is fixed by an
   equality looks that key up, and one whose primary key the conditions bound
   reads only that range of keys, in key order (ranked as an index would be,
   and winning ties). Otherwise every row is read, a column table's

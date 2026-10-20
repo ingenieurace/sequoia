@@ -3,9 +3,10 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 
-use super::index::{Bound, Index};
+use super::index::{Bound, Index, encode_keys};
 use crate::error::{Error, Result, err};
 use crate::predicate::Predicate;
+use crate::sql::ast::CreateIndex;
 use crate::storage::{
     BufferPool, ColumnConfig, ColumnStore, LsmConfig, LsmTree, MAX_TUPLE_SIZE, PageId, Position,
     RecordId, TableHeap, tuple,
@@ -67,8 +68,11 @@ pub enum Access {
     /// Read the rows of an LSM tree whose primary keys lie between two
     /// bounds, in key order. A missing bound leaves that end open.
     KeyRange { lower: Option<Bound>, upper: Option<Bound> },
-    /// Read the rows an index lists between two bounds.
-    Index { index: usize, lower: Option<Bound>, upper: Option<Bound> },
+    /// Read the rows of an index whose first keys equal `equal` and whose
+    /// next key lies between two bounds, in index order. A covering index
+    /// holds every column the scan needs: the rows are read from its entries,
+    /// not from the table.
+    Index { index: usize, equal: Vec<Value>, lower: Option<Bound>, upper: Option<Bound>, covering: bool },
 }
 
 impl Table {
@@ -143,24 +147,28 @@ impl Table {
     }
 
     /// Builds an index over the table's rows. Fails, leaving no index behind,
-    /// if the table is a column table, or the index is unique and two rows
-    /// share a value, or a value is too long to index.
-    pub fn create_index(&mut self, name: String, column: usize, unique: bool) -> Result<()> {
+    /// if the table is a column table, or the definition names what the
+    /// table does not have, or the index is unique and two indexed rows
+    /// share their keys, or an entry is too long.
+    pub fn create_index(&mut self, definition: &CreateIndex) -> Result<()> {
         if let Storage::Column(_) = self.storage {
             return err("COLUMN tables cannot have indexes");
         }
-        let data_type = self.columns[column].data_type;
-        let mut index = Index::create(self.pool.clone(), name, column, data_type, unique)?;
+        let mut index = Index::create(self.pool.clone(), definition, &self.columns)?;
         let mut build = || {
             for item in self.scan() {
                 let (id, row) = item?;
-                let (value, id) = (&row[column], id.to_bytes());
-                index.check(value, id.len())?;
-                if unique && !value.is_null() && !index.get(value)?.is_empty() {
+                let id = id.to_bytes();
+                let Some(entry) = index.entry(&row, &id)? else { continue };
+                index.check(&row, id.len())?;
+                if index.unique
+                    && let Some(keys) = unique_keys(&index, &row)?
+                    && !index.find(&encode_keys(&keys))?.is_empty()
+                {
                     let name = &index.name;
-                    return err(format!("cannot create unique index {name}: duplicate value {}", value.to_sql()));
+                    return err(format!("cannot create unique index {name}: duplicate value {}", show(&keys)));
                 }
-                index.insert(value, &id)?;
+                index.insert_entry(&entry)?;
             }
             Ok(())
         };
@@ -177,9 +185,9 @@ impl Table {
     }
 
     /// Adds an index the catalog recorded, which already holds the table's rows.
-    pub fn open_index(&mut self, name: String, column: usize, unique: bool, root: PageId) {
-        let data_type = self.columns[column].data_type;
-        self.indexes.push(Index::open(self.pool.clone(), name, column, data_type, unique, root));
+    pub fn open_index(&mut self, definition: &CreateIndex, root: PageId) -> Result<()> {
+        self.indexes.push(Index::open(self.pool.clone(), definition, &self.columns, root)?);
+        Ok(())
     }
 
     /// Removes an index and frees its pages.
@@ -260,14 +268,21 @@ impl Table {
                 Box::new(rows)
             }
             (Access::KeyRange { .. }, Storage::Heap(_)) => unreachable!("only an LSM tree has key ranges"),
-            (Access::Index { index, lower, upper }, _) => {
-                let ids = match self.indexes[index].range(lower.as_ref(), upper.as_ref()) {
-                    Ok(ids) => ids,
+            (Access::Index { index, equal, lower, upper, covering }, _) => {
+                let index = &self.indexes[index];
+                let entries = match index.scan(&equal, lower.as_ref(), upper.as_ref()) {
+                    Ok(entries) => entries,
                     Err(e) => return Box::new(std::iter::once(Err(e))),
                 };
-                Box::new(ids.into_iter().map(|bytes| {
-                    let id = self.row_id(bytes)?;
-                    let row = self.get(&id)?.ok_or_else(|| Error(format!("index points to a missing row: {id:?}")))?;
+                let needed = needed.to_vec();
+                Box::new(entries.into_iter().map(move |entry| {
+                    let id = self.row_id(index.row_id(&entry)?.to_vec())?;
+                    let row = match covering {
+                        true => index.row(&entry, &needed)?,
+                        false => {
+                            self.get(&id)?.ok_or_else(|| Error(format!("index points to a missing row: {id:?}")))?
+                        }
+                    };
                     Ok((id, row))
                 }))
             }
@@ -432,25 +447,32 @@ impl Table {
         if self.indexes.is_empty() {
             return Ok(());
         }
-        // An entry whose value and row id are both unchanged stays. Old
-        // entries go first, so a new entry may reuse a key an old one is leaving.
+        // An entry that is the same for the old and new row stays: its keys,
+        // included columns and row id are unchanged, or the row was and is
+        // left out. Old entries go first, so a new entry may reuse a key an
+        // old one is leaving.
         let new_rows: Vec<(RowId, Row)> = new_ids.into_iter().zip(rows).collect();
         for index in &mut self.indexes {
-            let column = index.column;
-            let changed = |(old, new): &(&(RowId, Row), &(RowId, Row))| old.0 != new.0 || old.1[column] != new.1[column];
-            for (old, _) in old_rows.iter().zip(&new_rows).filter(changed) {
-                index.delete(&old.1[column], &old.0.to_bytes())?;
+            let mut changed = Vec::new();
+            for ((old_id, old), (new_id, new)) in old_rows.iter().zip(&new_rows) {
+                let entries = (index.entry(old, &old_id.to_bytes())?, index.entry(new, &new_id.to_bytes())?);
+                if entries.0 != entries.1 {
+                    changed.push(entries);
+                }
             }
-            for (_, new) in old_rows.iter().zip(&new_rows).filter(changed) {
-                index.insert(&new.1[column], &new.0.to_bytes())?;
+            for old in changed.iter().filter_map(|(old, _)| old.as_ref()) {
+                index.delete_entry(old)?;
+            }
+            for new in changed.iter().filter_map(|(_, new)| new.as_ref()) {
+                index.insert_entry(new)?;
             }
         }
         Ok(())
     }
 
     /// Deletes the rows with these ids, given with their stored values of
-    /// every indexed column (see [`Table::indexed_columns`]; the other
-    /// columns' values are not read).
+    /// every column their index entries are made from (see
+    /// [`Table::indexed_columns`]; the other columns' values are not read).
     pub fn delete(&mut self, rows: &[(RowId, Row)]) -> Result<()> {
         for (id, _) in rows.iter().cloned() {
             match &mut self.storage {
@@ -466,11 +488,13 @@ impl Table {
         Ok(())
     }
 
-    /// Which columns have an index, that [`Table::delete`] needs the values of.
+    /// Which columns index entries are made from, that [`Table::delete`]
+    /// needs the values of: index keys, included columns, and the columns of
+    /// key expressions and partial indexes' conditions.
     pub fn indexed_columns(&self) -> Vec<bool> {
         let mut indexed = vec![false; self.columns.len()];
         for index in &self.indexes {
-            indexed[index.column] = true;
+            index.reads().iter().for_each(|&i| indexed[i] = true);
         }
         indexed
     }
@@ -504,7 +528,7 @@ impl Table {
         for (id, row) in rows {
             let id = id.to_bytes();
             for index in &mut self.indexes {
-                index.insert(&row[index.column], &id)?;
+                index.insert(&row, &id)?;
             }
         }
         Ok(())
@@ -517,7 +541,7 @@ impl Table {
         for (id, row) in rows {
             let id = id.to_bytes();
             for index in &mut self.indexes {
-                index.delete(&row[index.column], &id)?;
+                index.delete(row, &id)?;
             }
         }
         Ok(())
@@ -527,7 +551,7 @@ impl Table {
     fn check_index_entries(&self, rows: &[Row], id_len: impl Fn(usize) -> usize) -> Result<()> {
         for index in &self.indexes {
             for (i, row) in rows.iter().enumerate() {
-                index.check(&row[index.column], id_len(i))?;
+                index.check(row, id_len(i))?;
             }
         }
         Ok(())
@@ -570,10 +594,10 @@ impl Table {
     }
 
     /// Checks that `new_rows`, together with the existing rows except those in
-    /// `replaced`, have non-null primary keys and unique values in the primary
-    /// key and every unique index. `old_rows` are the rows the new ones
-    /// replace, in the same order, if known: a value a row keeps is unique
-    /// among the stored rows already, and is checked only against the new ones.
+    /// `replaced`, have non-null primary keys, unique primary keys, and unique
+    /// keys in every unique index. `old_rows` are the rows the new ones
+    /// replace, in the same order, if known: keys a row keeps are unique
+    /// among the stored rows already, and are checked only against the new ones.
     fn check_unique(&self, replaced: &HashSet<RowId>, new_rows: &[Row], old_rows: &[(RowId, Row)]) -> Result<()> {
         let pk = primary_key(&self.columns);
         if let Some(pk) = pk
@@ -581,34 +605,65 @@ impl Table {
         {
             return err(format!("primary key {} cannot be NULL", self.columns[pk].name));
         }
-        let mut columns: Vec<usize> = pk.into_iter().collect();
         for index in self.indexes.iter().filter(|index| index.unique) {
-            if !columns.contains(&index.column) {
-                columns.push(index.column);
-            }
+            let is_pk = pk.is_some_and(|pk| index.is_on_column(pk));
+            self.check_unique_index(index, is_pk, replaced, new_rows, old_rows)?;
         }
-        for column in columns {
-            self.check_unique_column(column, pk == Some(column), replaced, new_rows, old_rows)?;
+        if let Some(pk) = pk
+            && !self.indexes.iter().any(|index| index.unique && index.is_on_column(pk))
+        {
+            self.check_unique_key(pk, replaced, new_rows, old_rows)?;
         }
         Ok(())
     }
 
-    /// Checks one column that must be unique. Uses a unique index on it if
-    /// there is one. Otherwise the column is the primary key: an LSM tree is
-    /// searched for each new key, a column store reads only its key column,
-    /// and a heap is scanned in full (only in files from before heap tables
-    /// had a primary key index).
-    fn check_unique_column(
+    /// Checks the keys of a unique index: among the new rows it indexes, and
+    /// against the stored ones it lists.
+    fn check_unique_index(
         &self,
-        column: usize,
+        index: &Index,
         is_pk: bool,
         replaced: &HashSet<RowId>,
         new_rows: &[Row],
         old_rows: &[(RowId, Row)],
     ) -> Result<()> {
-        let index = self.indexes.iter().find(|index| index.unique && index.column == column);
         let mut seen = HashSet::new();
-        if index.is_none() && !matches!(self.storage, Storage::Lsm { .. }) {
+        for (i, row) in new_rows.iter().enumerate() {
+            let Some(keys) = unique_keys(index, row)? else { continue };
+            let encoded = encode_keys(&keys);
+            let kept = match old_rows.get(i) {
+                Some((_, old)) => unique_keys(index, old)?.is_some_and(|old| encode_keys(&old) == encoded),
+                None => false,
+            };
+            let mut stored = false;
+            if !kept {
+                for bytes in index.find(&encoded)? {
+                    stored |= !replaced.contains(&self.row_id(bytes)?);
+                }
+            }
+            if stored || !seen.insert(encoded) {
+                return match is_pk {
+                    true => err(format!("duplicate primary key: {}", show(&keys))),
+                    false => err(format!("duplicate value in unique index {}: {}", index.name, show(&keys))),
+                };
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks a primary key that has no unique index: an LSM tree is
+    /// searched for each new key, a column store reads only its key column,
+    /// and a heap is scanned in full (only in files from before heap tables
+    /// had a primary key index).
+    fn check_unique_key(
+        &self,
+        column: usize,
+        replaced: &HashSet<RowId>,
+        new_rows: &[Row],
+        old_rows: &[(RowId, Row)],
+    ) -> Result<()> {
+        let mut seen = HashSet::new();
+        if !matches!(self.storage, Storage::Lsm { .. }) {
             let needed: Vec<bool> = (0..self.columns.len()).map(|i| i == column).collect();
             for item in self.scan_columns(&needed) {
                 let (id, row) = item?;
@@ -619,34 +674,33 @@ impl Table {
         }
         for (i, row) in new_rows.iter().enumerate() {
             let value = &row[column];
-            if value.is_null() {
-                continue;
-            }
             let kept = old_rows.get(i).is_some_and(|(_, old)| &old[column] == value);
-            let stored = match (index, &self.storage) {
-                _ if kept => false,
-                (Some(index), _) => {
-                    let mut stored = false;
-                    for bytes in index.get(value)? {
-                        stored |= !replaced.contains(&self.row_id(bytes)?);
-                    }
-                    stored
-                }
-                (None, Storage::Lsm { tree, .. }) => {
+            let stored = match &self.storage {
+                Storage::Lsm { tree, .. } if !kept => {
                     let key = tuple::encode_key(value);
                     !replaced.contains(&RowId::Key(key.clone())) && tree.get(&key)?.is_some()
                 }
-                (None, _) => false, // already in `seen`
+                _ => false, // kept, or already in `seen`
             };
             if stored || !seen.insert(value.clone()) {
-                let value = value.to_sql();
-                return match (is_pk, index) {
-                    (false, Some(index)) => err(format!("duplicate value in unique index {}: {value}", index.name)),
-                    _ => err(format!("duplicate primary key: {value}")),
-                };
+                return err(format!("duplicate primary key: {}", value.to_sql()));
             }
         }
         Ok(())
+    }
+}
+
+/// A row's keys in a unique index, if they must be unique: the row is
+/// indexed and none of them is NULL.
+fn unique_keys(index: &Index, row: &[Value]) -> Result<Option<Vec<Value>>> {
+    Ok(index.key_values(row)?.filter(|keys| !keys.iter().any(Value::is_null)))
+}
+
+/// Keys as an error message shows them: one as a literal, several in parentheses.
+fn show(keys: &[Value]) -> String {
+    match keys {
+        [key] => key.to_sql(),
+        keys => format!("({})", keys.iter().map(Value::to_sql).collect::<Vec<_>>().join(", ")),
     }
 }
 

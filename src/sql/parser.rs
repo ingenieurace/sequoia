@@ -7,7 +7,7 @@
 //! OR, AND, NOT, comparison / IS NULL / IN, + -, * /, unary -, primary.
 
 use super::ast::{
-    Aggregate, BinaryOp, ColumnRef, Expr, From, Function, Join, JoinKind, OrderBy, Projection, Select, SelectItem, Statement,
+    Aggregate, BinaryOp, ColumnRef, CreateIndex, Expr, From, Function, Join, JoinKind, OrderBy, Projection, Select, SelectItem, Statement,
     TableRef, TableSource, UnaryOp,
 };
 use crate::error::{Error, Result};
@@ -145,9 +145,21 @@ impl Parser {
         self.expect_keyword("ON")?;
         let table = self.ident()?;
         self.expect_symbol("(")?;
-        let column = self.ident()?;
+        let keys = self.comma_list(Self::expr)?;
         self.expect_symbol(")")?;
-        Ok(Statement::CreateIndex { name, table, column, unique })
+        // Not a keyword, so that it stays free as a name.
+        let include = match self.peek() {
+            Some(Token::Ident(word)) if word.eq_ignore_ascii_case("INCLUDE") => {
+                self.pos += 1;
+                self.expect_symbol("(")?;
+                let columns = self.comma_list(Self::ident)?;
+                self.expect_symbol(")")?;
+                columns
+            }
+            _ => Vec::new(),
+        };
+        let predicate = if self.eat_keyword("WHERE") { Some(self.expr()?) } else { None };
+        Ok(Statement::CreateIndex(CreateIndex { name, table, keys, include, predicate, unique }))
     }
 
     fn drop(&mut self) -> Result<Statement> {

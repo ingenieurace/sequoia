@@ -53,7 +53,21 @@ pub fn decode_columns(columns: &[Column], bytes: &[u8], needed: &[bool]) -> Resu
     decode_with(columns, bytes, |i| needed[i])
 }
 
+/// Decodes the row at the start of `bytes`, and returns it with where it
+/// ends: what follows it is not part of it.
+pub fn decode_prefix(columns: &[Column], bytes: &[u8]) -> Result<(Vec<Value>, usize)> {
+    decode_from(columns, bytes, |_| true)
+}
+
 fn decode_with(columns: &[Column], bytes: &[u8], needed: impl Fn(usize) -> bool) -> Result<Vec<Value>> {
+    let (row, end) = decode_from(columns, bytes, needed)?;
+    if end != bytes.len() {
+        return err("corrupted row: trailing bytes");
+    }
+    Ok(row)
+}
+
+fn decode_from(columns: &[Column], bytes: &[u8], needed: impl Fn(usize) -> bool) -> Result<(Vec<Value>, usize)> {
     let mut reader = Reader { bytes, pos: 0 };
     let bitmap = reader.take(columns.len().div_ceil(8))?;
 
@@ -93,11 +107,7 @@ fn decode_with(columns: &[Column], bytes: &[u8], needed: impl Fn(usize) -> bool)
         };
         row.push(value);
     }
-
-    if reader.pos != bytes.len() {
-        return err("corrupted row: trailing bytes");
-    }
-    Ok(row)
+    Ok((row, reader.pos))
 }
 
 /// Encodes a key value so that comparing the bytes orders keys like the values.

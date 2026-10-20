@@ -12,8 +12,11 @@
 //! INDEX statement, parsed again on open (the same idea as SQLite's
 //! `sqlite_schema` table). A table's `USING` clause says how the rows are
 //! stored: for a heap the two pages are its first and last page, for an LSM
-//! tree or a column store both are its manifest page. For an index both are
-//! the root page of its B+ tree, which never moves.
+//! tree or a column store both are its manifest page. For an index the first
+//! is the root page of its B+ tree, which never moves, and the second is
+//! [`INDEX_FORMAT`]. In files from before indexes had several keys, included
+//! columns and NULL keys, the second was the root page again: such an index
+//! is built again, in the format of today, when the catalog is opened.
 //!
 //! A heap table with a primary key gets a unique index on it, `<table>_pkey`,
 //! when it is created; it is dropped with the table and not on its own.
@@ -25,11 +28,15 @@ pub mod index;
 pub mod table;
 
 use crate::error::{Error, Result, err};
-use crate::sql::ast::Statement;
+use crate::sql::ast::{ColumnRef, CreateIndex, Expr, Statement};
 use crate::sql::parse;
-use crate::storage::{BufferPool, PageId, RecordId, TableHeap, tuple};
+use crate::storage::{BPlusTree, BufferPool, PageId, RecordId, TableHeap, tuple};
 use table::{Table, primary_key, validate_schema};
 use crate::types::{Column, DataType, StorageKind, Value};
+
+/// The second page of an index's catalog row: not a page, but a mark of the
+/// format of its entries.
+const INDEX_FORMAT: PageId = PageId(u32::MAX);
 
 pub struct Catalog {
     pool: Arc<BufferPool>,
@@ -57,7 +64,7 @@ struct Entry {
 impl Catalog {
     /// Loads the catalog, creating an empty one in a new database.
     pub fn open(pool: Arc<BufferPool>) -> Result<Self> {
-        let heap = match pool.disk().root_page() {
+        let mut heap = match pool.disk().root_page() {
             Some(root) => TableHeap::open(pool.clone(), root, root)?,
             None => {
                 let heap = TableHeap::create(pool.clone())?;
@@ -77,21 +84,28 @@ impl Catalog {
                     let table = Table::open(pool.clone(), name.clone(), columns, storage, (first, last))?;
                     tables.insert(name, Entry { table, rid, saved_last_page: last });
                 }
-                (Statement::CreateIndex { name, table, column, unique }, root, _) => {
-                    index_rows.push((rid, name, table, column, unique, root));
-                }
+                (Statement::CreateIndex(definition), root, format) => index_rows.push((rid, definition, root, format)),
                 (statement, ..) => return err(format!("corrupted catalog row: {statement:?}")),
             }
         }
 
         // Indexes are opened once every table is, as their rows may come first.
         let mut indexes = BTreeMap::new();
-        for (rid, name, table, column, unique, root) in index_rows {
+        for (mut rid, definition, root, format) in index_rows {
+            let (name, table) = (definition.name.clone(), definition.table.clone());
             let Some(entry) = tables.get_mut(&table) else {
                 return err(format!("corrupted catalog: index {name} on unknown table {table}"));
             };
-            let column = entry.table.column_index(&column)?;
-            entry.table.open_index(name.clone(), column, unique, root);
+            if format == INDEX_FORMAT {
+                entry.table.open_index(&definition, root)?;
+            } else {
+                // From before entries held NULL keys: built again.
+                BPlusTree::open(pool.clone(), root).destroy()?;
+                entry.table.create_index(&definition)?;
+                let root = entry.table.indexes().last().expect("just created").root_page();
+                heap.delete(rid)?;
+                rid = heap.insert(&encode_entry(definition.to_string(), (root, INDEX_FORMAT))?)?;
+            }
             indexes.insert(name, IndexEntry { table, rid });
         }
         Ok(Catalog { pool, heap, tables, indexes })
@@ -115,13 +129,20 @@ impl Catalog {
         }
         validate_schema(&columns)?;
         let pk_index = match (storage, primary_key(&columns)) {
-            (StorageKind::Heap, Some(pk)) => Some((pk_index_name(&name), columns[pk].name.clone())),
+            (StorageKind::Heap, Some(pk)) => Some(CreateIndex {
+                name: pk_index_name(&name),
+                table: name.clone(),
+                keys: vec![Expr::Column(ColumnRef::bare(&columns[pk].name))],
+                include: Vec::new(),
+                predicate: None,
+                unique: true,
+            }),
             _ => None,
         };
-        if let Some((index, _)) = &pk_index
-            && self.indexes.contains_key(index)
+        if let Some(index) = &pk_index
+            && self.indexes.contains_key(&index.name)
         {
-            return err(format!("index already exists: {index}"));
+            return err(format!("index already exists: {}", index.name));
         }
 
         let table = Table::create(self.pool.clone(), name.clone(), columns, storage)?;
@@ -135,8 +156,8 @@ impl Catalog {
         let saved_last_page = table.root_pages().1;
         self.tables.insert(name.clone(), Entry { table, rid, saved_last_page });
 
-        if let Some((index, column)) = pk_index
-            && let Err(e) = self.create_index(index, name.clone(), &column, true)
+        if let Some(index) = pk_index
+            && let Err(e) = self.create_index(index)
         {
             self.drop_table(&name)?;
             return Err(e);
@@ -156,18 +177,17 @@ impl Catalog {
         entry.table.destroy()
     }
 
-    /// Builds an index on one column of a table from its current rows.
-    pub fn create_index(&mut self, name: String, table: String, column: &str, unique: bool) -> Result<()> {
+    /// Builds an index on a table from its current rows.
+    pub fn create_index(&mut self, definition: CreateIndex) -> Result<()> {
+        let (name, table) = (definition.name.clone(), definition.table.clone());
         if self.indexes.contains_key(&name) {
             return err(format!("index already exists: {name}"));
         }
         let entry = self.tables.get_mut(&table).ok_or_else(|| unknown_table(&table))?;
-        let column_index = entry.table.column_index(column)?;
-        entry.table.create_index(name.clone(), column_index, unique)?;
+        entry.table.create_index(&definition)?;
 
         let root = entry.table.indexes().last().expect("just created").root_page();
-        let sql = create_index_sql(&name, &table, column, unique);
-        match encode_entry(sql, (root, root)).and_then(|bytes| self.heap.insert(&bytes)) {
+        match encode_entry(definition.to_string(), (root, INDEX_FORMAT)).and_then(|bytes| self.heap.insert(&bytes)) {
             Ok(rid) => {
                 self.indexes.insert(name, IndexEntry { table, rid });
                 Ok(())
@@ -238,11 +258,6 @@ fn decode_entry(bytes: &[u8]) -> Result<(Statement, PageId, PageId)> {
     Ok((statement, page_id(*first)?, page_id(*last)?))
 }
 
-fn create_index_sql(name: &str, table: &str, column: &str, unique: bool) -> String {
-    let unique = if unique { "UNIQUE " } else { "" };
-    format!("CREATE {unique}INDEX {name} ON {table} ({column})")
-}
-
 fn pk_index_name(table: &str) -> String {
     format!("{table}_pkey")
 }
@@ -268,4 +283,49 @@ fn page_id(raw: i64) -> Result<PageId> {
 
 fn unknown_table(name: &str) -> Error {
     Error(format!("unknown table: {name}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::DiskManager;
+
+    fn create_index(catalog: &mut Catalog, sql: &str) {
+        let Some(Statement::CreateIndex(definition)) = parse(sql).unwrap().pop() else { unreachable!() };
+        catalog.create_index(definition).unwrap();
+    }
+
+    #[test]
+    fn indexes_from_before_null_keys_are_built_again_when_opened() {
+        let pool = Arc::new(BufferPool::new(Arc::new(DiskManager::in_memory()), 64));
+        let mut catalog = Catalog::open(pool.clone()).unwrap();
+        let columns = vec![
+            Column { name: "id".into(), data_type: DataType::Int, primary_key: true },
+            Column { name: "n".into(), data_type: DataType::Int, primary_key: false },
+        ];
+        catalog.create_table("t".into(), columns, StorageKind::Heap).unwrap();
+        let rows = (0..500).map(|i| vec![Value::Int(i), if i % 5 == 0 { Value::Null } else { Value::Int(i % 7) }]);
+        catalog.get_mut("t").unwrap().insert(rows.collect()).unwrap();
+        create_index(&mut catalog, "CREATE INDEX t_n ON t (n)");
+
+        // Record it as files from before did, its root page twice.
+        let rid = catalog.indexes["t_n"].rid;
+        let root = catalog.get("t").unwrap().indexes()[1].root_page();
+        assert!(catalog.heap.update(rid, &encode_entry("CREATE INDEX t_n ON t (n)".into(), (root, root)).unwrap()).unwrap());
+        catalog.save().unwrap();
+        let pages = pool.disk().page_count();
+
+        let catalog = Catalog::open(pool.clone()).unwrap();
+        let (sql, _, format) = decode_entry(&catalog.heap.get(catalog.indexes["t_n"].rid).unwrap().unwrap()).unwrap();
+        assert_eq!(format, INDEX_FORMAT);
+        assert!(matches!(sql, Statement::CreateIndex(CreateIndex { name, .. }) if name == "t_n"));
+        let index = &catalog.get("t").unwrap().indexes()[1];
+        assert_eq!(index.scan(&[Value::Null], None, None).unwrap().len(), 100, "NULL keys are in it now");
+        assert_eq!(index.scan(&[Value::Int(3)], None, None).unwrap().len(), 57);
+        assert_eq!(pool.disk().page_count(), pages, "the old tree's pages were freed and reused");
+
+        // Once built again, it is opened as it is.
+        let reopened = Catalog::open(pool.clone()).unwrap();
+        assert_eq!(reopened.get("t").unwrap().indexes()[1].root_page(), index.root_page());
+    }
 }

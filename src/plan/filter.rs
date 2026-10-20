@@ -65,67 +65,131 @@ fn own_column(table: &Table, qualifier: &str, column: &ColumnRef) -> Option<usiz
     }
 }
 
-/// Pulls the conjuncts `column op literal` (or `literal op column`) out of a
-/// WHERE clause, for a column store to evaluate on its compressed chunks, or
-/// for a heap or LSM table to pick an index with. A row the clause matches
-/// satisfies every conjunct, so the scan may skip rows that fail one; the
-/// whole clause is still evaluated on the rows returned.
-/// A literal that is NULL or of the wrong type is left to that evaluation,
-/// which matches nothing or reports the error. As in any database that
-/// reorders predicates, the rest of the clause is then never evaluated on the
-/// skipped rows, so an error it would raise only there (`1 / 0`) is not raised.
-pub fn predicates(table: &Table, qualifier: &str, filter: &Option<Expr>) -> Vec<Predicate> {
-    fn conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+/// A conjunct `expr op constant` of a WHERE clause (or `constant op expr`,
+/// turned around), whose expression reads columns of one table and nothing
+/// else: written with those columns unqualified, as index keys are. The
+/// constant is not NULL, and, compared with a column, is of its type.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Condition {
+    pub expr: Expr,
+    pub op: Compare,
+    pub literal: Value,
+}
+
+/// Splits a WHERE clause at its ANDs.
+pub fn conjuncts(expr: &Expr) -> Vec<&Expr> {
+    fn split<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
         match expr {
             Expr::Binary(left, BinaryOp::And, right) => {
-                conjuncts(left, out);
-                conjuncts(right, out);
+                split(left, out);
+                split(right, out);
             }
             expr => out.push(expr),
         }
     }
-    /// The value of an expression that reads no column, if it has one.
-    fn constant(expr: &Expr) -> Option<Value> {
-        fn reads_columns(expr: &Expr) -> bool {
-            match expr {
-                Expr::Literal(_) => false,
-                Expr::Column(_) | Expr::Outer(_) => true,
-                Expr::Unary(_, inner) | Expr::IsNull(inner, _) => reads_columns(inner),
-                Expr::InList(left, items, _) => reads_columns(left) || items.iter().any(reads_columns),
-                Expr::Aggregate(..) | Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(..) => true,
-                Expr::Binary(left, _, right) => reads_columns(left) || reads_columns(right),
-                Expr::Case { .. } | Expr::Function(..) => expr.parts().into_iter().any(reads_columns),
-            }
-        }
-        if reads_columns(expr) { None } else { eval(expr, &[], &[]).ok() }
-    }
+    let mut out = Vec::new();
+    split(expr, &mut out);
+    out
+}
 
+/// The conjuncts of a WHERE clause that read only `table`, which goes by
+/// `qualifier`, with its columns unqualified, as a partial index's condition
+/// is written.
+pub fn own_conjuncts(table: &Table, qualifier: &str, filter: &Option<Expr>) -> Vec<Expr> {
     let Some(filter) = filter else { return Vec::new() };
-    let mut exprs = Vec::new();
-    conjuncts(filter, &mut exprs);
-    exprs
-        .into_iter()
-        .filter_map(|expr| {
-            let Expr::Binary(left, op, right) = expr else { return None };
-            let op = match op {
-                BinaryOp::Eq => Compare::Eq,
-                BinaryOp::NotEq => Compare::NotEq,
-                BinaryOp::Lt => Compare::Lt,
-                BinaryOp::LtEq => Compare::LtEq,
-                BinaryOp::Gt => Compare::Gt,
-                BinaryOp::GtEq => Compare::GtEq,
-                _ => return None,
-            };
-            let (column, literal, op) = match (&**left, &**right) {
-                (Expr::Column(column), other) => (column, constant(other)?, op),
-                (other, Expr::Column(column)) => (column, constant(other)?, op.flip()),
-                _ => return None,
-            };
-            let column = own_column(table, qualifier, column)?;
-            // As a value of the column's type, which an index or a chunk holds:
-            // `price > 10` on a REAL column compares with 10.0.
-            let literal = literal.coerce(table.columns[column].data_type).filter(|l| !l.is_null())?;
-            Some(Predicate { column, op, literal })
+    conjuncts(filter).into_iter().filter_map(|e| own_expr(table, qualifier, e)).collect()
+}
+
+/// The conditions among the conjuncts of a WHERE clause on `table`, which
+/// goes by `qualifier`.
+///
+/// A row the clause matches satisfies every one, so a scan may skip rows
+/// that fail one: through an index, or in a column store's compressed
+/// chunks. The whole clause is still evaluated on the rows returned. A
+/// comparison with NULL, or of a column with a value of another type, is
+/// left to that evaluation, which matches nothing or reports the error. As
+/// in any database that reorders predicates, the rest of the clause is then
+/// never evaluated on the skipped rows, so an error it would raise only
+/// there (`1 / 0`) is not raised; nor is the error of comparing an
+/// expression an index has with a value of another type.
+pub fn conditions(table: &Table, qualifier: &str, filter: &Option<Expr>) -> Vec<Condition> {
+    let Some(filter) = filter else { return Vec::new() };
+    let mut conditions = Vec::new();
+    for part in conjuncts(filter) {
+        let Expr::Binary(left, op, right) = part else { continue };
+        let op = match op {
+            BinaryOp::Eq => Compare::Eq,
+            BinaryOp::NotEq => Compare::NotEq,
+            BinaryOp::Lt => Compare::Lt,
+            BinaryOp::LtEq => Compare::LtEq,
+            BinaryOp::Gt => Compare::Gt,
+            BinaryOp::GtEq => Compare::GtEq,
+            _ => continue,
+        };
+        let sides = match (constant(left), constant(right)) {
+            (None, Some(literal)) => (left, literal, op),
+            (Some(literal), None) => (right, literal, op.flip()),
+            _ => continue,
+        };
+        let (expr, literal, op) = sides;
+        let Some(expr) = own_expr(table, qualifier, expr) else { continue };
+        // As a value of the column's type, which an index or a chunk holds:
+        // `price > 10` on a REAL column compares with 10.0.
+        let literal = match &expr {
+            Expr::Column(column) => table.column_index(&column.name).ok().and_then(|i| literal.coerce(table.columns[i].data_type)),
+            _ => Some(literal),
+        };
+        if let Some(literal) = literal.filter(|l| !l.is_null()) {
+            conditions.push(Condition { expr, op, literal });
+        }
+    }
+    conditions
+}
+
+/// The conditions `column op literal` among a WHERE clause's (see
+/// [`conditions`]), for a column store to evaluate on its compressed chunks.
+pub fn predicates(table: &Table, conditions: &[Condition]) -> Vec<Predicate> {
+    conditions
+        .iter()
+        .filter_map(|Condition { expr, op, literal }| {
+            let Expr::Column(column) = expr else { return None };
+            Some(Predicate { column: table.column_index(&column.name).ok()?, op: *op, literal: literal.clone() })
         })
         .collect()
+}
+
+/// The expression with its columns unqualified, if it reads columns of
+/// `table`, which goes by `qualifier`, and nothing else: no other table's
+/// columns, subquery or aggregate.
+fn own_expr(table: &Table, qualifier: &str, expr: &Expr) -> Option<Expr> {
+    if let Expr::Column(column) = expr {
+        return own_column(table, qualifier, column).map(|_| Expr::Column(ColumnRef::bare(&column.name)));
+    }
+    let mut own = true;
+    expr.visit(&mut |e| match e {
+        Expr::Column(column) => own &= own_column(table, qualifier, column).is_some(),
+        Expr::Outer(_) | Expr::Aggregate(..) | Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(..) => own = false,
+        _ => {}
+    });
+    let expr = expr.replace(&mut |e| match e {
+        Expr::Column(column) => Some(Ok(Expr::Column(ColumnRef::bare(&column.name)))),
+        _ => None,
+    });
+    own.then_some(expr.expect("replacing columns cannot fail"))
+}
+
+/// The value of an expression that reads no column, if it has one.
+fn constant(expr: &Expr) -> Option<Value> {
+    fn reads_columns(expr: &Expr) -> bool {
+        match expr {
+            Expr::Literal(_) => false,
+            Expr::Column(_) | Expr::Outer(_) => true,
+            Expr::Unary(_, inner) | Expr::IsNull(inner, _) => reads_columns(inner),
+            Expr::InList(left, items, _) => reads_columns(left) || items.iter().any(reads_columns),
+            Expr::Aggregate(..) | Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(..) => true,
+            Expr::Binary(left, _, right) => reads_columns(left) || reads_columns(right),
+            Expr::Case { .. } | Expr::Function(..) => expr.parts().into_iter().any(reads_columns),
+        }
+    }
+    if reads_columns(expr) { None } else { eval(expr, &[], &[]).ok() }
 }

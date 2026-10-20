@@ -52,8 +52,9 @@ pub fn execute(catalog: &mut Catalog, statement: Statement, settings: &Settings)
             catalog.drop_table(&name)?;
             Ok(message(format!("table {name} dropped")))
         }
-        Statement::CreateIndex { name, table, column, unique } => {
-            catalog.create_index(name.clone(), table, &column, unique)?;
+        Statement::CreateIndex(definition) => {
+            let name = definition.name.clone();
+            catalog.create_index(definition)?;
             Ok(message(format!("index {name} created")))
         }
         Statement::DropIndex { name } => {
@@ -278,8 +279,9 @@ fn scan<'a>(
     needed: &[bool],
     filter: &Option<Expr>,
 ) -> Box<dyn Iterator<Item = Result<(RowId, Row)>> + 'a> {
-    let predicates = filter::predicates(table, &table.name, filter);
-    let access = access::choose(table, &predicates);
+    let conditions = filter::conditions(table, &table.name, filter);
+    let predicates = filter::predicates(table, &conditions);
+    let access = access::choose(table, &table.name, filter, &conditions, needed);
     table.scan_filtered(needed, &predicates, &access)
 }
 
