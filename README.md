@@ -90,6 +90,44 @@ cargo bench --bench aggregate
 cargo bench --bench aggregate -- distinct
 ```
 
+`benches/scan.rs` times reading 200,000 rows, the cost under every other
+step: `engines` the same rows in a heap, an LSM tree and a column store,
+`filter` WHERE clauses keeping 1% to all of the rows, `project` more and
+more columns and expressions (in Sequoia alone, as SQLite computes no column
+its count leaves unread), and `limit` a `LIMIT` without `ORDER BY`.
+`benches/subquery.rs` times subqueries over 200,000 orders: uncorrelated,
+correlated with 10 to 10,000 distinct outer values, and in `FROM`.
+
+`benches/lookup.rs` times finding rows by key, in batches of many queries,
+each finding different rows, and prints how long each took: `point` one row
+by a heap's indexes, an LSM tree's key, or reading every row, and `range`
+0.1% to 10% of the rows by an index against reading them all. SQLite is
+made to read each row found, not only its index.
+
+`benches/writes.rs` times writes to a database file, made afresh and filled
+for each of three runs: `insert` 50,000 rows into each storage engine and
+with more indexes, `commit` single-row statements against one transaction,
+`update` and `delete` a tenth of 50,000 rows or all of them, and
+`checkpoint`. SQLite runs in WAL mode with `synchronous = FULL`, so it syncs
+its log at each commit as Sequoia does.
+
+Three benchmarks time the storage layer alone, with no SQL or SQLite:
+`benches/buffer_pool.rs` reads pages in five patterns through 256 frames
+under each replacement policy and prints the hit rate and time of each,
+`benches/lsm.rs` loads and reads LSM trees under level and universal
+compaction and prints their write amplification, and
+`benches/column_encoding.rs` prints the encoding the column store picks for
+each kind of data, the bytes a value takes, and the time to encode, decode
+and filter it. Group names work for all of them:
+
+```bash
+cargo bench --bench writes -- commit
+```
+
+```bash
+cargo bench --bench buffer_pool -- scans
+```
+
 ## Supported SQL
 
 - Statements: `CREATE TABLE ... [USING HEAP | LSM | COLUMN]`, `DROP TABLE`,

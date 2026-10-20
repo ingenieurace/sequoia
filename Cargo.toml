@@ -16,3 +16,31 @@ harness = false
 [[bench]]
 name = "aggregate"
 harness = false
+
+[[bench]]
+name = "scan"
+harness = false
+
+[[bench]]
+name = "writes"
+harness = false
+
+[[bench]]
+name = "lookup"
+harness = false
+
+[[bench]]
+name = "subquery"
+harness = false
+
+[[bench]]
+name = "buffer_pool"
+harness = false
+
+[[bench]]
+name = "lsm"
+harness = false
+
+[[bench]]
+name = "column_encoding"
+harness = false
