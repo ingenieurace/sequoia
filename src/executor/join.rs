@@ -263,9 +263,8 @@ impl Lookup<'_> {
             return Ok(Vec::new());
         }
         let data_type = self.table.columns[self.column].data_type;
-        if !value.fits(data_type) {
-            return Ok(Vec::new()); // never equal, as in a hash join
-        }
+        // The column's value that equals this one, if any: as in a hash join, 1 finds 1.0.
+        let Some(value) = &value.coerce(data_type) else { return Ok(Vec::new()) };
         let predicates = [Predicate { column: self.column, op: Compare::Eq, literal: value.clone() }];
         let access = match self.key {
             LookupKey::Index(index) => {
@@ -679,7 +678,7 @@ fn sort(rows: Rows, fields: &[Field], keys: &[Expr], desc: &[bool], then: &[Orde
 
 /// Compares keys as a merge join sorts them: each in its direction, and the
 /// values of one type all before or all after those of another, which they
-/// are never equal to.
+/// are never equal to, but for INTs and REALs, which compare by value.
 fn compare(a: &[Value], b: &[Value], desc: &[bool]) -> Ordering {
     a.iter()
         .zip(b)
@@ -697,7 +696,7 @@ fn rank(value: &Value) -> i64 {
     match value {
         Value::Null => 0,
         Value::Bool(_) => 1,
-        Value::Int(_) => 2,
+        Value::Int(_) | Value::Real(_) => 2,
         Value::Text(_) => 3,
     }
 }

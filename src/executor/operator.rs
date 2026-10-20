@@ -177,7 +177,29 @@ fn open_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step
                 Err(_) => true,
             }))
         }
-        Node::Limit { input, count } => Box::new(open(*input, below(step, 0)).take(count)),
+        Node::Limit { input, count, offset } => {
+            // Skips rows, not errors, which end the query.
+            let mut skipped = 0;
+            let rows = open(*input, below(step, 0)).filter(move |item| {
+                let skip = item.is_ok() && skipped < offset;
+                skipped += skip as usize;
+                !skip
+            });
+            match count {
+                Some(count) => Box::new(rows.take(count)),
+                None => Box::new(rows),
+            }
+        }
+        Node::Union { inputs } => {
+            let mut parts = Vec::new();
+            let mut before = 0;
+            for input in inputs {
+                let steps = input.steps();
+                parts.push(open(input, below(step, before)));
+                before += steps;
+            }
+            Box::new(parts.into_iter().flatten())
+        }
         Node::Derived { input, .. } => open(*input, below(step, 0)),
         Node::Project { input, exprs } => {
             let columns = input.columns();

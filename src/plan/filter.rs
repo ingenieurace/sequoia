@@ -42,6 +42,7 @@ pub fn visit_columns(expr: &Expr, f: &mut impl FnMut(&ColumnRef)) {
             visit_columns(left, f);
             visit_outer(query, f);
         }
+        Expr::Case { .. } | Expr::Function(..) => expr.parts().into_iter().for_each(|e| visit_columns(e, f)),
     }
 }
 
@@ -93,6 +94,7 @@ pub fn predicates(table: &Table, qualifier: &str, filter: &Option<Expr>) -> Vec<
                 Expr::InList(left, items, _) => reads_columns(left) || items.iter().any(reads_columns),
                 Expr::Aggregate(..) | Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(..) => true,
                 Expr::Binary(left, _, right) => reads_columns(left) || reads_columns(right),
+                Expr::Case { .. } | Expr::Function(..) => expr.parts().into_iter().any(reads_columns),
             }
         }
         if reads_columns(expr) { None } else { eval(expr, &[], &[]).ok() }
@@ -120,8 +122,10 @@ pub fn predicates(table: &Table, qualifier: &str, filter: &Option<Expr>) -> Vec<
                 _ => return None,
             };
             let column = own_column(table, qualifier, column)?;
-            (!literal.is_null() && literal.fits(table.columns[column].data_type))
-                .then_some(Predicate { column, op, literal })
+            // As a value of the column's type, which an index or a chunk holds:
+            // `price > 10` on a REAL column compares with 10.0.
+            let literal = literal.coerce(table.columns[column].data_type).filter(|l| !l.is_null())?;
+            Some(Predicate { column, op, literal })
         })
         .collect()
 }

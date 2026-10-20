@@ -116,7 +116,7 @@ use crate::error::{Result, err};
 use crate::plan::{access, filter};
 use crate::predicate::{Compare, Predicate};
 use crate::sql::ast::{
-    Aggregate, BinaryOp, ColumnRef, Expr, From, JoinKind, OrderBy, Projection, Select, SelectItem, TableSource,
+    Aggregate, BinaryOp, ColumnRef, Expr, From, JoinKind, OrderBy, Projection, Select, SelectItem, TableRef, TableSource,
 };
 use crate::sql::eval::{Field, resolve};
 use crate::types::{StorageKind, Value};
@@ -144,10 +144,13 @@ pub enum Node<'a> {
     Aggregate { input: Box<Node<'a>>, group_by: Vec<Expr>, aggregates: Vec<AggregateCall> },
     /// Orders the rows, keeping the first `limit` if given.
     Sort { input: Box<Node<'a>>, keys: Vec<OrderBy>, limit: Option<usize> },
+    /// The rows of each input in turn, as `UNION ALL` returns them; with a
+    /// distinct step above, as `UNION` does.
+    Union { inputs: Vec<Node<'a>> },
     /// Drops each row equal to one already returned, NULLs included.
     Distinct { input: Box<Node<'a>> },
     /// Keeps the first `count` rows.
-    Limit { input: Box<Node<'a>>, count: usize },
+    Limit { input: Box<Node<'a>>, count: Option<usize>, offset: usize },
     /// Evaluates the select list on each row.
     Project { input: Box<Node<'a>>, exprs: Vec<Expr> },
     /// A derived table: its query's rows, with columns `names` qualified by `qualifier`.
@@ -241,7 +244,11 @@ pub fn output_names(catalog: &Catalog, query: &Select) -> Result<Vec<String>> {
 
 /// Plans a SELECT on the tables of the catalog.
 pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
-    let Select { distinct, from, projection, filter, group_by, having, mut order_by, limit } = query;
+    if !query.compound.is_empty() {
+        return union(catalog, query);
+    }
+    let Select { distinct, from, projection, filter, group_by, having, mut order_by, limit, offset, .. } = query;
+    let offset = offset.unwrap_or(0);
     let mut sources = from
         .tables()
         .map(|r| match &r.source {
@@ -366,20 +373,67 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
     if let Some(predicate) = having {
         node = Node::Filter { input: Box::new(node), predicate };
     }
-    node = match (order_by.is_empty(), limit) {
-        (false, _) if !ordered => {
-            Node::Sort { input: Box::new(node), keys: order_by, limit: limit.filter(|_| !distinct) }
-        }
-        (_, Some(count)) if !distinct => Node::Limit { input: Box::new(node), count },
-        _ => node,
-    };
+    // A sort keeps the rows the limit and offset take, and is all the limit
+    // there is without an offset. Under DISTINCT, they wait until rows equal
+    // to earlier ones are dropped.
+    let sorted = !order_by.is_empty() && !ordered;
+    let limited = limit.is_some() || offset > 0;
+    if sorted {
+        let top = limit.map(|n| n.saturating_add(offset)).filter(|_| !distinct);
+        node = Node::Sort { input: Box::new(node), keys: order_by, limit: top };
+    }
+    if limited && !distinct && !(sorted && offset == 0) {
+        node = Node::Limit { input: Box::new(node), count: limit, offset };
+    }
     if let Some(exprs) = exprs {
         node = Node::Project { input: Box::new(node), exprs };
     }
     if distinct {
         node = Node::Distinct { input: Box::new(node) };
-        if let Some(count) = limit {
-            node = Node::Limit { input: Box::new(node), count };
+        if limited {
+            node = Node::Limit { input: Box::new(node), count: limit, offset };
+        }
+    }
+    Ok(Plan { root: node, columns })
+}
+
+/// Plans queries joined by `UNION [ALL]`: the rows of each in turn, left to
+/// right, a distinct step dropping repeats wherever `UNION` without ALL
+/// stands. With an ORDER BY, LIMIT or OFFSET, the union is planned as a
+/// subquery in FROM of a query that has them, so that ORDER BY names its
+/// columns as it would a table's.
+fn union<'a>(catalog: &'a Catalog, mut query: Select) -> Result<Plan<'a>> {
+    if !query.order_by.is_empty() || query.limit.is_some() || query.offset.is_some() {
+        let (order_by, limit, offset) = (std::mem::take(&mut query.order_by), query.limit.take(), query.offset.take());
+        let table = TableRef { source: TableSource::Subquery(Box::new(query)), alias: Some("union".into()) };
+        let projection = Projection::All;
+        let (filter, group_by, having, compound) = (None, Vec::new(), None, Vec::new());
+        let from = From { table, joins: Vec::new() };
+        let outer = Select { distinct: false, from, projection, filter, group_by, having, order_by, limit, offset, compound };
+        return select(catalog, outer);
+    }
+    let parts = std::mem::take(&mut query.compound);
+    let first = select(catalog, query)?;
+    let columns = first.columns;
+    let mut node = first.root;
+    for (all, part) in parts {
+        let part = select(catalog, part)?;
+        if part.columns.len() != columns.len() {
+            return err(format!(
+                "each query of a UNION must return as many columns: {} and {}",
+                columns.len(),
+                part.columns.len()
+            ));
+        }
+        node = match node {
+            Node::Union { mut inputs } => {
+                inputs.push(part.root);
+                Node::Union { inputs }
+            }
+            node => Node::Union { inputs: vec![node, part.root] },
+        };
+        if !all {
+            node = Node::Distinct { input: Box::new(node) };
         }
     }
     Ok(Plan { root: node, columns })
@@ -656,7 +710,11 @@ fn estimate(node: &Node) -> f64 {
             false => (estimate(input) * OTHER_KEEPS).max(1.0),
         },
         Node::Sort { input, limit, .. } => limit.map_or(estimate(input), |n| estimate(input).min(n as f64)),
-        Node::Limit { input, count } => estimate(input).min(*count as f64),
+        Node::Limit { input, count, offset } => {
+            let rows = (estimate(input) - *offset as f64).max(0.0);
+            count.map_or(rows, |n| rows.min(n as f64))
+        }
+        Node::Union { inputs } => inputs.iter().map(estimate).sum(),
         Node::Distinct { input } | Node::Project { input, .. } | Node::Derived { input, .. } => estimate(input),
     }
 }
@@ -745,6 +803,7 @@ impl<'c> Binder<'c> {
                 Expr::InSubquery(bind(left)?, Box::new(self.subquery(query, true)?), *negated)
             }
             Expr::Outer(_) => expr.clone(),
+            Expr::Case { .. } | Expr::Function(..) => expr.try_map_parts(&mut |e| self.bind(e))?,
         })
     }
 
@@ -857,6 +916,8 @@ impl Node<'_> {
             | Node::Distinct { input }
             | Node::Limit { input, .. } => input.columns(),
             Node::Join { left, right, .. } => [left.columns(), right.columns()].concat(),
+            // Named by the first query's columns, which ORDER BY above refers to.
+            Node::Union { inputs } => inputs[0].columns().into_iter().map(|f| Field::named(f.name)).collect(),
             Node::Aggregate { group_by, aggregates, .. } => group_by
                 .iter()
                 .map(Expr::to_string)
@@ -894,6 +955,7 @@ impl Node<'_> {
         match self {
             Node::Scan { .. } | Node::Lookup { .. } => vec![],
             Node::Join { left, right, .. } => vec![left, right],
+            Node::Union { inputs } => inputs.iter().collect(),
             Node::Filter { input, .. }
             | Node::Aggregate { input, .. }
             | Node::Sort { input, .. }
@@ -954,7 +1016,12 @@ impl Node<'_> {
                 format!("SORT BY {keys}{top}")
             }
             Node::Distinct { .. } => "DISTINCT".into(),
-            Node::Limit { count, .. } => format!("LIMIT {count}"),
+            Node::Limit { count, offset, .. } => match (count, offset) {
+                (Some(count), 0) => format!("LIMIT {count}"),
+                (Some(count), offset) => format!("LIMIT {count} OFFSET {offset}"),
+                (None, offset) => format!("OFFSET {offset}"),
+            },
+            Node::Union { .. } => "UNION ALL".into(),
             Node::Project { exprs, .. } => format!("PROJECT {}", list(&mut exprs.iter().map(Expr::to_string))),
             Node::Derived { qualifier, .. } => format!("SUBQUERY {qualifier}"),
         };
@@ -999,6 +1066,8 @@ fn output_name(expr: &Expr) -> String {
     match expr {
         Expr::Column(column) => column.name.clone(),
         Expr::Aggregate(function, ..) => function.name().into(),
+        Expr::Function(function, _) => function.name().into(),
+        Expr::Case { .. } => "case".into(),
         _ => "?column?".into(),
     }
 }
@@ -1032,6 +1101,7 @@ fn rewrite(expr: &Expr, group_by: &[Expr], aggregates: &mut Vec<AggregateCall>) 
             Expr::InSubquery(rewrite(left)?, Box::new(regroup(query, group_by)?), *negated)
         }
         Expr::Outer(_) => unreachable!("outer references are inside subqueries"),
+        Expr::Case { .. } | Expr::Function(..) => expr.try_map_parts(&mut |e| rewrite(e).map(|e| *e))?,
         Expr::Aggregate(function, arg, distinct) => {
             if arg.as_deref().is_some_and(contains_aggregate) {
                 return err("aggregate functions cannot be nested");
@@ -1093,5 +1163,6 @@ fn contains_aggregate(expr: &Expr) -> bool {
         Expr::InSubquery(left, ..) => contains_aggregate(left),
         Expr::Unary(_, inner) | Expr::IsNull(inner, _) => contains_aggregate(inner),
         Expr::Binary(left, _, right) => contains_aggregate(left) || contains_aggregate(right),
+        Expr::Case { .. } | Expr::Function(..) => expr.parts().into_iter().any(contains_aggregate),
     }
 }

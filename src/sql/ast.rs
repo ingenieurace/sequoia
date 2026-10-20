@@ -67,6 +67,13 @@ pub struct Select {
     pub having: Option<Expr>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
+    /// `OFFSET n`: the first `n` rows are left out.
+    pub offset: Option<usize>,
+    /// `UNION [ALL] query`...: the queries whose rows follow this one's, each
+    /// with whether it is `UNION ALL`, which keeps rows equal to earlier
+    /// ones. They have no ORDER BY, LIMIT or OFFSET of their own: this
+    /// query's apply to all of the rows.
+    pub compound: Vec<(bool, Select)>,
 }
 
 impl Select {
@@ -86,8 +93,9 @@ impl Select {
             .chain(self.order_by.iter().map(|o| &o.expr))
     }
 
-    /// The query's own expressions and those of the subqueries in its FROM,
-    /// not looking inside the subqueries in those expressions.
+    /// The query's own expressions and those of the subqueries in its FROM
+    /// and of the queries UNION adds to it, not looking inside the
+    /// subqueries in those expressions.
     pub fn exprs(&self) -> Vec<&Expr> {
         let mut exprs = Vec::new();
         for table in self.from.tables() {
@@ -96,6 +104,9 @@ impl Select {
             }
         }
         exprs.extend(self.own_exprs());
+        for (_, part) in &self.compound {
+            exprs.extend(part.exprs());
+        }
         exprs
     }
 
@@ -106,6 +117,9 @@ impl Select {
             if let TableSource::Subquery(sub) = &mut table.source {
                 **sub = sub.try_map(f)?;
             }
+        }
+        for (_, part) in &mut query.compound {
+            *part = part.try_map(f)?;
         }
         query.try_map_own(f)
     }
@@ -263,6 +277,79 @@ pub enum Expr {
     /// A column, inside a subquery, of the query around it. The planner marks
     /// these, and each is replaced by its value before the subquery runs.
     Outer(ColumnRef),
+    /// `CASE [operand] WHEN a THEN b ... [ELSE c] END`: the value of the first
+    /// branch whose `a` equals the operand, or without one, whose `a` is
+    /// true; else `c`, or NULL. Only the branches up to the one taken are
+    /// evaluated, and of those only their `a`.
+    Case { operand: Option<Box<Expr>>, branches: Vec<(Expr, Expr)>, otherwise: Option<Box<Expr>> },
+    /// A scalar function of its arguments.
+    Function(Function, Vec<Expr>),
+}
+
+/// The scalar functions, which take values and give one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Function {
+    /// The first argument that is not NULL; the later ones are not evaluated.
+    Coalesce,
+    /// NULL if its two arguments are equal, else the first.
+    Nullif,
+    /// The number of characters in a TEXT.
+    Length,
+    /// A TEXT with its ASCII letters in upper case, as SQLite does.
+    Upper,
+    /// A TEXT with its ASCII letters in lower case, as SQLite does.
+    Lower,
+    /// `SUBSTR(text, start[, length])`: characters counted from 1, a negative
+    /// start counting from the end, a negative length taking the characters
+    /// before the start, as SQLite does.
+    Substr,
+    /// The absolute value of a number.
+    Abs,
+    /// `ROUND(number[, digits])`: a REAL rounded to `digits` decimal places
+    /// (none by default), halves away from zero, as SQLite does.
+    Round,
+}
+
+impl Function {
+    /// The function with this name, in any case.
+    pub fn from_name(name: &str) -> Option<Function> {
+        Some(match name.to_uppercase().as_str() {
+            "COALESCE" => Function::Coalesce,
+            "NULLIF" => Function::Nullif,
+            "LENGTH" => Function::Length,
+            "UPPER" => Function::Upper,
+            "LOWER" => Function::Lower,
+            "SUBSTR" => Function::Substr,
+            "ABS" => Function::Abs,
+            "ROUND" => Function::Round,
+            _ => return None,
+        })
+    }
+
+    /// The name as a result column, lower-case like an aggregate's.
+    pub fn name(self) -> &'static str {
+        match self {
+            Function::Coalesce => "coalesce",
+            Function::Nullif => "nullif",
+            Function::Length => "length",
+            Function::Upper => "upper",
+            Function::Lower => "lower",
+            Function::Substr => "substr",
+            Function::Abs => "abs",
+            Function::Round => "round",
+        }
+    }
+
+    /// The fewest and most arguments it takes.
+    pub fn arity(self) -> (usize, usize) {
+        match self {
+            Function::Coalesce => (2, usize::MAX),
+            Function::Nullif => (2, 2),
+            Function::Substr => (2, 3),
+            Function::Round => (1, 2),
+            Function::Length | Function::Upper | Function::Lower | Function::Abs => (1, 1),
+        }
+    }
 }
 
 impl Expr {
@@ -292,6 +379,14 @@ impl Expr {
                 let left = Box::new(left.replace(f)?);
                 Expr::InSubquery(left, Box::new(query.try_map(&mut |e| e.replace(f))?), *negated)
             }
+            Expr::Case { operand, branches, otherwise } => Expr::Case {
+                operand: operand.as_deref().map(&mut sub).transpose()?,
+                branches: branches.iter().map(|(w, t)| Ok((w.replace(f)?, t.replace(f)?))).collect::<Result<_>>()?,
+                otherwise: otherwise.as_deref().map(|e| e.replace(f).map(Box::new)).transpose()?,
+            },
+            Expr::Function(function, args) => {
+                Expr::Function(*function, args.iter().map(|e| e.replace(f)).collect::<Result<_>>()?)
+            }
         })
     }
 
@@ -314,7 +409,36 @@ impl Expr {
                 left.visit(f);
                 query.exprs().into_iter().for_each(|e| e.visit(f));
             }
+            Expr::Case { .. } | Expr::Function(..) => self.parts().into_iter().for_each(|e| e.visit(f)),
         }
+    }
+
+    /// The expressions a CASE or a function call is made of, in order; none for others.
+    pub fn parts(&self) -> Vec<&Expr> {
+        match self {
+            Expr::Case { operand, branches, otherwise } => operand
+                .as_deref()
+                .into_iter()
+                .chain(branches.iter().flat_map(|(w, t)| [w, t]))
+                .chain(otherwise.as_deref())
+                .collect(),
+            Expr::Function(_, args) => args.iter().collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// A CASE or function call with each of its parts (in the order of
+    /// [`Expr::parts`]) replaced by `f`'s result; others as they are.
+    pub fn try_map_parts(&self, f: &mut dyn FnMut(&Expr) -> Result<Expr>) -> Result<Expr> {
+        Ok(match self {
+            Expr::Case { operand, branches, otherwise } => Expr::Case {
+                operand: operand.as_deref().map(|e| f(e).map(Box::new)).transpose()?,
+                branches: branches.iter().map(|(w, t)| Ok((f(w)?, f(t)?))).collect::<Result<_>>()?,
+                otherwise: otherwise.as_deref().map(|e| f(e).map(Box::new)).transpose()?,
+            },
+            Expr::Function(function, args) => Expr::Function(*function, args.iter().map(f).collect::<Result<_>>()?),
+            other => other.clone(),
+        })
     }
 
     /// Whether the expression has a subquery in it.
@@ -379,6 +503,11 @@ pub enum BinaryOp {
     Sub,
     Mul,
     Div,
+    /// `text LIKE pattern`: `%` matches any characters, `_` any one; ASCII
+    /// letters match in either case, as in SQLite.
+    Like,
+    /// `||`: two TEXTs joined.
+    Concat,
 }
 
 impl std::fmt::Display for Expr {
@@ -415,6 +544,23 @@ impl std::fmt::Display for Expr {
             Expr::Exists(query) => write!(f, "EXISTS ({query})"),
             Expr::InSubquery(left, query, negated) => {
                 write!(f, "{} {}IN ({query})", operand(left), if *negated { "NOT " } else { "" })
+            }
+            Expr::Case { operand, branches, otherwise } => {
+                f.write_str("CASE")?;
+                if let Some(operand) = operand {
+                    write!(f, " {operand}")?;
+                }
+                for (when, then) in branches {
+                    write!(f, " WHEN {when} THEN {then}")?;
+                }
+                if let Some(otherwise) = otherwise {
+                    write!(f, " ELSE {otherwise}")?;
+                }
+                f.write_str(" END")
+            }
+            Expr::Function(function, args) => {
+                let args = args.iter().map(Expr::to_string).collect::<Vec<_>>().join(", ");
+                write!(f, "{}({args})", function.name().to_uppercase())
             }
         }
     }
@@ -457,12 +603,18 @@ impl std::fmt::Display for Select {
         if let Some(having) = &self.having {
             write!(f, " HAVING {having}")?;
         }
+        for (all, part) in &self.compound {
+            write!(f, " UNION {}{part}", if *all { "ALL " } else { "" })?;
+        }
         if !self.order_by.is_empty() {
             let keys = self.order_by.iter().map(|o| format!("{}{}", o.expr, if o.desc { " DESC" } else { "" }));
             write!(f, " ORDER BY {}", list(&mut keys.into_iter()))?;
         }
         if let Some(limit) = self.limit {
             write!(f, " LIMIT {limit}")?;
+        }
+        if let Some(offset) = self.offset {
+            write!(f, " OFFSET {offset}")?;
         }
         Ok(())
     }
@@ -496,6 +648,8 @@ impl BinaryOp {
             BinaryOp::Sub => "-",
             BinaryOp::Mul => "*",
             BinaryOp::Div => "/",
+            BinaryOp::Like => "LIKE",
+            BinaryOp::Concat => "||",
         }
     }
 }
@@ -530,6 +684,12 @@ mod tests {
             "-(a - b) IS NULL",
             "NOT (NOT a)",
             "a = NULL OR b = TRUE",
+            "CASE WHEN a > 1 THEN 'x' WHEN b IS NULL THEN 'y' ELSE 'z' END = c",
+            "CASE a + 1 WHEN 2 THEN b END IS NULL",
+            "COALESCE(a, NULLIF(b, 2), 3) + ABS(-c) > LENGTH(UPPER(d || 'x'))",
+            "SUBSTR(LOWER(a), 2, -1) LIKE 'a%' AND NOT b LIKE '_'",
+            "ROUND(a * 2.5, 1) > 1e20 OR b < 0.1 OR c BETWEEN 1.5 AND 2",
+            "x IN (SELECT a FROM t UNION ALL SELECT b FROM u UNION SELECT c FROM v ORDER BY a LIMIT 3 OFFSET 1)",
         ] {
             let expr = where_clause(sql);
             assert_eq!(where_clause(&expr.to_string()), expr, "{sql} printed as {expr}");

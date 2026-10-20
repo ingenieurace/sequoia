@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use crate::catalog::table::Row;
 use crate::error::{Result, err};
 use crate::storage::io::medium::{FileMedium, Medium};
-use crate::types::Value;
+use crate::types::{Value, ordered_real, real_as_int};
 
 /// Default memory a sort may buffer rows in before writing runs out: 4 MB.
 pub const SORT_MEMORY: usize = 4 << 20;
@@ -337,18 +337,27 @@ const TRUE: u8 = 0x03;
 /// INT zero; a positive INT of n bytes is `INT + n`, a negative one `INT - n`.
 const INT: u8 = 0x14;
 const TEXT: u8 = 0x20;
+/// After an INT, or a REAL equal to one.
+const WHOLE: u8 = 0x00;
+/// After the INT below a REAL with a fraction, before the fraction.
+const FRACTION: u8 = 0x80;
 
 /// Appends a sort key's encoding, whose bytes compare as ORDER BY orders
-/// values: NULL first, then BOOL, INT and TEXT (as values of different types
-/// are never equal, those of one type all sort before those of another).
-/// Each value's encoding ends where it can be told to, so a key of several
-/// values compares like its values one after another:
+/// values: NULL first, then BOOL, the numbers (INT and REAL together, by
+/// value) and TEXT (as values of different types are never equal, those of
+/// one type all sort before those of another). Each value's encoding ends
+/// where it can be told to, so a key of several values compares like its
+/// values one after another:
 ///
 /// ```text
 /// NULL   01
 /// BOOL   02 for FALSE, 03 for TRUE
 /// INT    14 for zero; 14 + n, then its n big-endian bytes, for a positive one;
-///        14 - n, then the bytes of the complement of its magnitude, for a negative one
+///        14 - n, then the bytes of the complement of its magnitude, for a
+///        negative one; then 00
+/// REAL   as the INT it equals, if any; else, if an INT is below it, that INT
+///        as above but for 80 in place of 00, then its fraction's big-endian
+///        bits; else 0B (below every INT) or 1D (above), then its ordered bits
 /// TEXT   20, its UTF-8 bytes with each 00 as 00 FF, then 00 00
 /// ```
 ///
@@ -359,12 +368,26 @@ fn encode_key(value: &Value, desc: bool, out: &mut Vec<u8>) {
         Value::Null => out.push(NULL),
         Value::Bool(b) => out.push(if *b { TRUE } else { FALSE }),
         Value::Int(n) => {
-            let magnitude = n.unsigned_abs();
-            let len = 8 - magnitude.leading_zeros() as usize / 8;
-            let (tag, bits) = if *n < 0 { (INT - len as u8, !magnitude) } else { (INT + len as u8, magnitude) };
-            out.push(tag);
-            out.extend_from_slice(&bits.to_be_bytes()[8 - len..]);
+            encode_int(*n, out);
+            out.push(WHOLE);
         }
+        Value::Real(r) => match real_as_int(*r) {
+            Some(n) => {
+                encode_int(n, out);
+                out.push(WHOLE);
+            }
+            // Within the INTs, and not one: so it has a fraction, which is exact.
+            None if r.abs() < 9_223_372_036_854_775_808.0 => {
+                let floor = r.floor();
+                encode_int(floor as i64, out);
+                out.push(FRACTION);
+                out.extend_from_slice(&(r - floor).to_bits().to_be_bytes());
+            }
+            None => {
+                out.push(if *r < 0.0 { INT - 9 } else { INT + 9 });
+                out.extend_from_slice(&ordered_real(*r).to_be_bytes());
+            }
+        },
         Value::Text(s) => {
             out.push(TEXT);
             for (i, part) in s.as_bytes().split(|&b| b == 0).enumerate() {
@@ -379,6 +402,15 @@ fn encode_key(value: &Value, desc: bool, out: &mut Vec<u8>) {
     if desc {
         out[start..].iter_mut().for_each(|b| *b = !*b);
     }
+}
+
+/// Appends an INT's tag and bytes (see [`encode_key`]).
+fn encode_int(n: i64, out: &mut Vec<u8>) {
+    let magnitude = n.unsigned_abs();
+    let len = 8 - magnitude.leading_zeros() as usize / 8;
+    let (tag, bits) = if n < 0 { (INT - len as u8, !magnitude) } else { (INT + len as u8, magnitude) };
+    out.push(tag);
+    out.extend_from_slice(&bits.to_be_bytes()[8 - len..]);
 }
 
 // ---- runs ----
@@ -494,6 +526,10 @@ fn encode_value(value: &Value, out: &mut Vec<u8>) {
             out.extend_from_slice(&n.to_le_bytes());
         }
         Value::Bool(b) => out.extend_from_slice(&[2, *b as u8]),
+        Value::Real(r) => {
+            out.push(4);
+            out.extend_from_slice(&r.to_le_bytes());
+        }
         Value::Text(s) => {
             out.push(3);
             out.extend_from_slice(&(s.len() as u32).to_le_bytes());
@@ -512,6 +548,7 @@ fn decode_value(bytes: &[u8], pos: &mut usize) -> Result<Value> {
         0 => Value::Null,
         1 => Value::Int(i64::from_le_bytes(take(8)?.try_into().unwrap())),
         2 => Value::Bool(take(1)?[0] != 0),
+        4 => Value::Real(f64::from_le_bytes(take(8)?.try_into().unwrap())),
         3 => {
             let len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
             match String::from_utf8(take(len)?.to_vec()) {
@@ -781,7 +818,7 @@ mod tests {
         let rank = |v: &Value| match v {
             Value::Null => 0,
             Value::Bool(_) => 1,
-            Value::Int(_) => 2,
+            Value::Int(_) | Value::Real(_) => 2,
             Value::Text(_) => 3,
         };
         rank(a).cmp(&rank(b)).then_with(|| a.sort_cmp(b))
@@ -882,6 +919,10 @@ mod tests {
         for s in ["", "\0", "\0\0", "\0a", "a", "a\0", "a\0b", "ab", "b", "é", "世界"] {
             values.push(Value::Text(s.into()));
         }
+        // REALs among the INTs, some equal to one.
+        for r in [-1e300, -9.3e18, -65535.5, -256.0, -1.0, -0.75, -0.0, 0.25, 0.5, 1.0, 255.99, 1e15 + 0.5, 9.3e18, 1e300] {
+            values.push(Value::Real(r));
+        }
         let encode = |values: &[&Value], desc: bool| {
             let mut out = Vec::new();
             for value in values {
@@ -917,6 +958,8 @@ mod tests {
             Value::Int(-1),
             Value::Bool(true),
             Value::Bool(false),
+            Value::Real(-2.5),
+            Value::Real(1e300),
             Value::Text(String::new()),
             Value::Text("héllo, 世界".into()),
         ];

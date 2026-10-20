@@ -8,8 +8,8 @@
 //! Without `GROUP BY`, all rows form one group, which exists even when there
 //! are none. Aggregates skip NULLs, except `COUNT(*)`; over no values, `COUNT`
 //! is 0 and the others NULL. With `DISTINCT`, an aggregate remembers the
-//! values it has added in each group and adds each only once. There is no fractional type, so `AVG` truncates
-//! toward zero like `/`.
+//! values it has added in each group and adds each only once. `SUM` is an
+//! INT over INTs and a REAL once a REAL is added; `AVG` is a REAL.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -79,11 +79,13 @@ impl State {
 /// The running state of one aggregate in one group.
 enum Accumulator {
     Count(i64),
-    Sum(Option<i64>),
+    /// An INT while every value added is, a REAL once one is.
+    Sum(Option<Value>),
     Min(Option<Value>),
     Max(Option<Value>),
-    /// Summed wider than INT, so that only the average must fit in one.
-    Avg { sum: i128, count: i64 },
+    /// INTs summed wider than INT, so that only the average must fit in one;
+    /// REALs summed apart.
+    Avg { ints: i128, reals: f64, count: i64 },
 }
 
 impl Accumulator {
@@ -93,7 +95,7 @@ impl Accumulator {
             Aggregate::Sum => Accumulator::Sum(None),
             Aggregate::Min => Accumulator::Min(None),
             Aggregate::Max => Accumulator::Max(None),
-            Aggregate::Avg => Accumulator::Avg { sum: 0, count: 0 },
+            Aggregate::Avg => Accumulator::Avg { ints: 0, reals: 0.0, count: 0 },
         }
     }
 
@@ -112,11 +114,26 @@ impl Accumulator {
         match self {
             Accumulator::Count(n) => *n += 1,
             Accumulator::Sum(sum) => {
-                let n = int(&value, "SUM")?;
-                *sum = Some(sum.unwrap_or(0).checked_add(n).ok_or_else(|| Error("integer overflow".into()))?);
+                number(&value, "SUM")?;
+                *sum = Some(match (sum.take(), value) {
+                    (None, value) => value,
+                    (Some(Value::Int(a)), Value::Int(b)) => {
+                        Value::Int(a.checked_add(b).ok_or_else(|| Error("integer overflow".into()))?)
+                    }
+                    (Some(a), b) => {
+                        let total = a.as_real().expect("a number") + b.as_real().expect("a number");
+                        if !total.is_finite() {
+                            return err("REAL overflow");
+                        }
+                        Value::Real(total)
+                    }
+                });
             }
-            Accumulator::Avg { sum, count } => {
-                *sum += int(&value, "AVG")? as i128;
+            Accumulator::Avg { ints, reals, count } => {
+                match number(&value, "AVG")? {
+                    Value::Int(n) => *ints += *n as i128,
+                    other => *reals += other.as_real().expect("a number"),
+                }
                 *count += 1;
             }
             Accumulator::Min(best) => keep(best, value, Ordering::Less)?,
@@ -128,11 +145,10 @@ impl Accumulator {
     fn result(&self) -> Value {
         match self {
             Accumulator::Count(n) => Value::Int(*n),
-            Accumulator::Sum(sum) => sum.map_or(Value::Null, Value::Int),
+            Accumulator::Sum(sum) => sum.clone().unwrap_or(Value::Null),
             Accumulator::Min(best) | Accumulator::Max(best) => best.clone().unwrap_or(Value::Null),
             Accumulator::Avg { count: 0, .. } => Value::Null,
-            // |sum / count| <= max |value|, so the average fits.
-            Accumulator::Avg { sum, count } => Value::Int((sum / *count as i128) as i64),
+            Accumulator::Avg { ints, reals, count } => Value::Real((*ints as f64 + reals) / *count as f64),
         }
     }
 }
@@ -150,9 +166,9 @@ fn keep(best: &mut Option<Value>, value: Value, wanted: Ordering) -> Result<()> 
     Ok(())
 }
 
-fn int(value: &Value, function: &str) -> Result<i64> {
+fn number<'v>(value: &'v Value, function: &str) -> Result<&'v Value> {
     match value {
-        Value::Int(n) => Ok(*n),
-        other => err(format!("{function} expects INT, got {}", other.to_sql())),
+        Value::Int(_) | Value::Real(_) => Ok(value),
+        other => err(format!("{function} expects a number, got {}", other.to_sql())),
     }
 }

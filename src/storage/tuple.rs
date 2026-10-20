@@ -7,13 +7,14 @@
 //! INT          8 bytes, little-endian
 //! BOOL         1 byte, 0 or 1
 //! TEXT         u16 length (little-endian) + UTF-8 bytes
+//! REAL         8 bytes, little-endian
 //! ```
 //!
 //! The schema is not stored with the row: decoding needs the columns used to encode it.
 //! Values are copied out when decoding, so no alignment padding is needed.
 
 use crate::error::{Result, err};
-use crate::types::{Column, DataType, Value};
+use crate::types::{Column, DataType, Value, ordered_real};
 
 pub fn encode(columns: &[Column], row: &[Value]) -> Result<Vec<u8>> {
     if row.len() != columns.len() {
@@ -26,6 +27,7 @@ pub fn encode(columns: &[Column], row: &[Value]) -> Result<Vec<u8>> {
             (Value::Null, _) => bytes[i / 8] |= 1 << (i % 8),
             (Value::Int(n), DataType::Int) => bytes.extend_from_slice(&n.to_le_bytes()),
             (Value::Bool(b), DataType::Bool) => bytes.push(*b as u8),
+            (Value::Real(r), DataType::Real) => bytes.extend_from_slice(&r.to_le_bytes()),
             (Value::Text(s), DataType::Text) => {
                 let Ok(len) = u16::try_from(s.len()) else {
                     return err(format!("text in column {} is longer than {} bytes", column.name, u16::MAX));
@@ -63,7 +65,7 @@ fn decode_with(columns: &[Column], bytes: &[u8], needed: impl Fn(usize) -> bool)
         }
         if !needed(i) {
             match column.data_type {
-                DataType::Int => reader.take(8)?,
+                DataType::Int | DataType::Real => reader.take(8)?,
                 DataType::Bool => reader.take(1)?,
                 DataType::Text => {
                     let len = u16::from_le_bytes(reader.array()?) as usize;
@@ -75,6 +77,7 @@ fn decode_with(columns: &[Column], bytes: &[u8], needed: impl Fn(usize) -> bool)
         }
         let value = match column.data_type {
             DataType::Int => Value::Int(i64::from_le_bytes(reader.array()?)),
+            DataType::Real => Value::Real(f64::from_le_bytes(reader.array()?)),
             DataType::Bool => match reader.array::<1>()? {
                 [0] => Value::Bool(false),
                 [1] => Value::Bool(true),
@@ -100,12 +103,14 @@ fn decode_with(columns: &[Column], bytes: &[u8], needed: impl Fn(usize) -> bool)
 /// Encodes a key value so that comparing the bytes orders keys like the values.
 ///
 /// INT is 8 bytes big-endian with the sign bit flipped, TEXT its UTF-8 bytes,
-/// BOOL one byte. All keys of a table have the same type, so no tag is needed.
+/// BOOL one byte, REAL its [`ordered_real`] bits big-endian. All keys of a
+/// table have the same type, so no tag is needed.
 pub fn encode_key(value: &Value) -> Vec<u8> {
     match value {
         Value::Int(n) => ((*n as u64) ^ (1 << 63)).to_be_bytes().to_vec(),
         Value::Text(s) => s.as_bytes().to_vec(),
         Value::Bool(b) => vec![*b as u8],
+        Value::Real(r) => ordered_real(*r).to_be_bytes().to_vec(),
         Value::Null => panic!("NULL cannot be a key"),
     }
 }

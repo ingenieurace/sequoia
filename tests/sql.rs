@@ -852,7 +852,7 @@ fn aggregates_over_the_whole_table() {
     let mut db = setup_people("HEAP");
     assert_eq!(
         query(&mut db, "SELECT COUNT(*), COUNT(age), COUNT(city), SUM(age), MIN(age), MAX(age), AVG(age) FROM p"),
-        vec![vec![int(7), int(5), int(5), int(161), int(21), int(45), int(32)]]
+        vec![vec![int(7), int(5), int(5), int(161), int(21), int(45), Value::Real(32.2)]]
     );
     // Over no rows there is still one row: COUNT is 0, the others NULL.
     assert_eq!(
@@ -869,9 +869,9 @@ fn aggregates_over_the_whole_table() {
         query(&mut db, "SELECT SUM(age) - MIN(age) * 2, COUNT(*) + COUNT(*) FROM p WHERE vip"),
         vec![vec![int(115 - 60), int(6)]]
     );
-    // AVG truncates toward zero, as / does: there is no fractional type.
+    // AVG is a REAL, while / of INTs truncates toward zero.
     db.execute("CREATE TABLE n (x INT); INSERT INTO n VALUES (-3), (-4), (NULL)").unwrap();
-    assert_eq!(query(&mut db, "SELECT AVG(x), SUM(x) / COUNT(x) FROM n"), vec![vec![int(-3), int(-3)]]);
+    assert_eq!(query(&mut db, "SELECT AVG(x), SUM(x) / COUNT(x) FROM n"), vec![vec![Value::Real(-3.5), int(-3)]]);
 }
 
 #[test]
@@ -955,8 +955,8 @@ fn misplaced_aggregates_and_ungrouped_columns_are_rejected() {
         ("UPDATE p SET age = MAX(age)", "not allowed in UPDATE"),
         ("DELETE FROM p WHERE age = MIN(age)", "not allowed in WHERE"),
         ("INSERT INTO p (id) VALUES (COUNT(*))", "not allowed in VALUES"),
-        ("SELECT SUM(city) FROM p", "SUM expects INT"),
-        ("SELECT AVG(vip) FROM p", "AVG expects INT"),
+        ("SELECT SUM(city) FROM p", "SUM expects a number"),
+        ("SELECT AVG(vip) FROM p", "AVG expects a number"),
         ("SELECT MEDIAN(age) FROM p", "unknown function: MEDIAN"),
         ("SELECT COUNT(*) FROM p GROUP BY nope", "unknown column: nope"),
         ("SELECT nope FROM p GROUP BY city", "unknown column: nope"),
@@ -2018,4 +2018,181 @@ fn explain_analyze_tells_what_each_step_did() {
     db.execute("INSERT INTO stats VALUES (1)").unwrap();
     assert_eq!(query(&mut db, "SELECT analyze FROM stats"), [vec![int(1)]]);
     assert_eq!(analyzed(&mut db, "SELECT analyze FROM stats")[2], ("total".to_string(), "1 row".to_string()));
+}
+
+fn real(r: f64) -> Value {
+    Value::Real(r)
+}
+
+/// The first column of rows of INTs.
+fn numbers(rows: Vec<Vec<Value>>) -> Vec<i64> {
+    rows.into_iter()
+        .map(|row| match row[0] {
+            Value::Int(n) => n,
+            ref other => panic!("expected an INT, got {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn case_coalesce_and_scalar_functions() {
+    let mut db = setup();
+    assert_eq!(
+        query(
+            &mut db,
+            "SELECT id, CASE WHEN age IS NULL THEN 'unknown' WHEN age >= 30 THEN 'older' ELSE 'younger' END, \
+             CASE id WHEN 1 THEN 'one' WHEN 2 THEN 'two' END FROM users ORDER BY id"
+        ),
+        [
+            vec![int(1), text("older"), text("one")],
+            vec![int(2), text("younger"), text("two")],
+            vec![int(3), text("unknown"), Value::Null],
+        ]
+    );
+    // CASE and COALESCE evaluate only what they need.
+    assert_eq!(query(&mut db, "SELECT CASE WHEN id > 0 THEN 1 ELSE 1 / 0 END FROM users WHERE id = 1"), [vec![int(1)]]);
+    assert_eq!(query(&mut db, "SELECT COALESCE(age, 1 / 0) FROM users WHERE id = 1"), [vec![int(30)]]);
+    assert_eq!(
+        query(&mut db, "SELECT COALESCE(age, -1), NULLIF(age, 30), name || '!' FROM users ORDER BY id"),
+        [
+            vec![int(30), Value::Null, text("alice!")],
+            vec![int(25), int(25), text("bob!")],
+            vec![int(-1), Value::Null, text("carol!")],
+        ]
+    );
+    assert_eq!(
+        query(
+            &mut db,
+            "SELECT LENGTH(name), UPPER(name), LOWER('\u{c0}BC'), SUBSTR(name, 2, 3), SUBSTR(name, -2), ABS(-age) \
+             FROM users WHERE id = 1"
+        ),
+        [vec![int(5), text("ALICE"), text("\u{c0}bc"), text("lic"), text("ce"), int(30)]]
+    );
+    // SQLite's rules for SUBSTR's edges.
+    for (args, want) in [("'hello', 0, 2", "h"), ("'hello', 3, -2", "he"), ("'hello', -10, 7", "he"), ("'hello', 9", "")] {
+        assert_eq!(query(&mut db, &format!("SELECT SUBSTR({args}) FROM users WHERE id = 1")), [vec![text(want)]], "{args}");
+    }
+    for (sql, error) in [
+        ("SELECT COALESCE(age) FROM users", "wrong number of arguments to COALESCE: 1"),
+        ("SELECT LENGTH(age) FROM users", "LENGTH expects TEXT, got 30"),
+        ("SELECT name || age FROM users", "cannot apply Concat"),
+        ("SELECT CASE WHEN age THEN 1 END FROM users", "CASE WHEN must be boolean, got 30"),
+        ("SELECT NOPE(age) FROM users", "unknown function: NOPE"),
+    ] {
+        assert!(db.execute(sql).unwrap_err().0.contains(error), "{sql}");
+    }
+}
+
+#[test]
+fn between_and_like_filter_rows() {
+    let mut db = setup();
+    let ids = |db: &mut Database, filter: &str| {
+        numbers(query(db, &format!("SELECT id FROM users WHERE {filter} ORDER BY id")))
+    };
+    assert_eq!(ids(&mut db, "age BETWEEN 25 AND 29"), [2]);
+    assert_eq!(ids(&mut db, "age NOT BETWEEN 25 AND 29"), [1]);
+    // ASCII letters match in either case, as in SQLite.
+    assert_eq!(ids(&mut db, "name LIKE 'A%'"), [1]);
+    assert_eq!(ids(&mut db, "name LIKE '_o_'"), [2]);
+    assert_eq!(ids(&mut db, "name LIKE '%r%l'"), [3]);
+    assert_eq!(ids(&mut db, "name NOT LIKE '%o%'"), [1]);
+    // BETWEEN is a range the planner can read through an index.
+    assert_eq!(
+        plan(&mut db, "SELECT * FROM users WHERE id BETWEEN 2 AND 3"),
+        "SEARCH users USING INDEX users_pkey (id >= 2 AND id <= 3)"
+    );
+}
+
+#[test]
+fn offset_and_union() {
+    let mut db = setup();
+    db.execute("CREATE TABLE staff (id INT PRIMARY KEY, name TEXT); INSERT INTO staff VALUES (7, 'bob'), (8, 'dave')")
+        .unwrap();
+    assert_eq!(numbers(query(&mut db, "SELECT id FROM users ORDER BY id LIMIT 2 OFFSET 1")), [2, 3]);
+    assert_eq!(numbers(query(&mut db, "SELECT id FROM users ORDER BY id DESC LIMIT 5 OFFSET 2")), [1]);
+    assert_eq!(
+        query(&mut db, "SELECT name FROM users UNION SELECT name FROM staff ORDER BY name"),
+        [vec![text("alice")], vec![text("bob")], vec![text("carol")], vec![text("dave")]]
+    );
+    assert_eq!(query(&mut db, "SELECT name FROM users UNION ALL SELECT name FROM staff").len(), 5);
+    assert_eq!(
+        numbers(query(&mut db, "SELECT id AS n FROM users UNION ALL SELECT id FROM staff ORDER BY n DESC LIMIT 2 OFFSET 1")),
+        [7, 3]
+    );
+    assert_eq!(
+        numbers(query(&mut db, "SELECT id FROM staff WHERE name IN (SELECT name FROM users UNION SELECT 'dave' FROM users)")),
+        [7, 8]
+    );
+    assert_eq!(
+        explain(&mut db, "SELECT name FROM users UNION SELECT name FROM staff"),
+        "DISTINCT\n  UNION ALL\n    PROJECT name\n      SCAN users\n    PROJECT name\n      SCAN staff"
+    );
+    let error = db.execute("SELECT id, name FROM users UNION SELECT id FROM staff").unwrap_err();
+    assert_eq!(error.0, "each query of a UNION must return as many columns: 2 and 1");
+}
+
+#[test]
+fn real_numbers() {
+    let mut db = Database::in_memory();
+    for storage in ["HEAP", "LSM", "COLUMN"] {
+        let t = format!("prices_{storage}");
+        db.execute(&format!("CREATE TABLE {t} (id INT PRIMARY KEY, price REAL, qty INT) USING {storage}")).unwrap();
+        // An INT stored in a REAL column becomes a REAL; 2.0 in an INT column an INT.
+        db.execute(&format!("INSERT INTO {t} VALUES (1, 2.5, 4), (2, 10, 1), (3, -0.75, 2.0), (4, NULL, 3), (5, 1e20, 1)"))
+            .unwrap();
+        let error = db.execute(&format!("INSERT INTO {t} VALUES (6, 1.0, 2.5)")).unwrap_err();
+        assert!(error.0.contains("expects INT, got 2.5"), "{storage}: {error}");
+        let rows = query(&mut db, &format!("SELECT price, price * qty, qty / 2, qty / 2.0 FROM {t} ORDER BY id"));
+        assert!(matches!(rows[1][0], Value::Real(r) if r == 10.0), "{storage}: {:?}", rows[1]);
+        assert_eq!(rows[0], [real(2.5), real(10.0), int(2), real(2.0)], "{storage}");
+        assert_eq!(rows[2], [real(-0.75), real(-1.5), int(1), real(1.0)], "{storage}");
+        // INT 10 equals REAL 10.0, in a filter and in a pushed-down condition.
+        assert_eq!(numbers(query(&mut db, &format!("SELECT id FROM {t} WHERE price = 10 ORDER BY id"))), [2], "{storage}");
+        assert_eq!(numbers(query(&mut db, &format!("SELECT id FROM {t} WHERE price > 2 ORDER BY price"))), [1, 2, 5], "{storage}");
+        assert_eq!(
+            query(
+                &mut db,
+                &format!("SELECT SUM(price), AVG(qty), MIN(price), MAX(price), ROUND(AVG(price), 2) FROM {t} WHERE id < 4")
+            ),
+            [vec![real(11.75), real(7.0 / 3.0), real(-0.75), real(10.0), real(3.92)]],
+            "{storage}"
+        );
+    }
+    // An index on a REAL column, looked up with an INT.
+    db.execute("CREATE INDEX prices_heap_price ON prices_HEAP (price)").unwrap();
+    assert_eq!(
+        plan(&mut db, "SELECT * FROM prices_HEAP WHERE price >= 2"),
+        "SEARCH prices_HEAP USING INDEX prices_heap_price (price >= 2.0)"
+    );
+    assert_eq!(numbers(query(&mut db, "SELECT id FROM prices_HEAP WHERE price >= 2")), [1, 2, 5]);
+    // INTs and REALs sort, group and join by value.
+    assert_eq!(
+        query(&mut db, "SELECT x FROM (SELECT qty AS x FROM prices_HEAP UNION ALL SELECT price FROM prices_HEAP) d ORDER BY x"),
+        [Value::Null, real(-0.75), int(1), int(1), int(2), real(2.5), int(3), int(4), real(10.0), real(1e20)].map(|v| vec![v])
+    );
+    // 1, 2, 3, 4, then 2.0 four times, which is 2, and NULL.
+    assert_eq!(
+        query(&mut db, "SELECT COUNT(*) FROM (SELECT qty FROM prices_HEAP UNION SELECT price * 0 + 2 FROM prices_HEAP) d"),
+        [vec![int(5)]]
+    );
+    // A hash join of an INT with a REAL: qty 4 + 6 is price 10.0.
+    assert_eq!(numbers(query(&mut db, "SELECT a.id FROM prices_HEAP a JOIN prices_LSM b ON b.price = a.qty + 6")), [1]);
+    for (sql, want) in [("ROUND(2.5)", 3.0), ("ROUND(-2.5)", -3.0), ("ROUND(0.125, 2)", 0.13), ("ROUND(2.675, 2)", 2.67)] {
+        assert_eq!(query(&mut db, &format!("SELECT {sql} FROM prices_HEAP WHERE id = 1")), [vec![real(want)]], "{sql}");
+    }
+    for (sql, error) in [("1.5 / 0", "division by zero"), ("1e300 * 1e300", "REAL overflow"), ("ROUND('a')", "ROUND expects a number")] {
+        assert!(db.execute(&format!("SELECT {sql} FROM prices_HEAP")).unwrap_err().0.contains(error), "{sql}");
+    }
+    // A REAL is printed so that it reads back as the same value.
+    assert_eq!(explain(&mut db, "SELECT * FROM prices_LSM WHERE price < 0.1"), "FILTER price < 0.1\n  SCAN prices_LSM");
+
+    let file = TempDb::new("reals");
+    {
+        let mut db = Database::open(&file.0).unwrap();
+        db.execute("CREATE TABLE r (x REAL PRIMARY KEY) USING LSM; INSERT INTO r VALUES (0.5), (-1e-7), (3)").unwrap();
+    }
+    let mut db = Database::open(&file.0).unwrap();
+    assert_eq!(query(&mut db, "SELECT x FROM r WHERE x > -1 ORDER BY x DESC"), [vec![real(3.0)], vec![real(0.5)], vec![
+        real(-1e-7)
+    ]]);
 }

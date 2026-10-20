@@ -138,9 +138,13 @@ cargo bench --bench buffer_pool -- scans
 - Transactions: `BEGIN`, `COMMIT`, `ROLLBACK`, and `SAVEPOINT name`,
   `ROLLBACK TO name`, `RELEASE name` (each may add `TRANSACTION` or `SAVEPOINT`
   as in SQL)
-- Types: `INT`, `TEXT`, `BOOL`, and `NULL`
+- Types: `INT`, `REAL` (or `FLOAT`: a 64-bit floating-point number, written
+  `2.5` or `1e20`), `TEXT`, `BOOL`, and `NULL`. INTs and REALs compare, sort,
+  group and join by value (`1 = 1.0`); arithmetic with a REAL gives a REAL, and
+  a REAL that would be infinite is an error
 - Constraints: `PRIMARY KEY` (unique, not null), unique indexes (NULLs may repeat);
-  values are type-checked
+  values are type-checked, but an INT stored in a REAL column becomes a REAL,
+  and a REAL with no fraction stored in an INT column an INT
 - `FROM`: one table, or several joined: `[INNER] JOIN ... ON`, `LEFT [OUTER]
   JOIN ... ON`, `CROSS JOIN` or commas, with aliases (`users u`, `users AS u`)
   and qualified columns (`u.id`). A table may be a subquery with an alias,
@@ -148,13 +152,25 @@ cargo bench --bench buffer_pool -- scans
 - `SELECT [DISTINCT]`: `*` or expressions, each maybe named with `AS` (a name
   `ORDER BY` may use), `WHERE`, `GROUP BY` (expressions), `HAVING`,
   `ORDER BY ... ASC|DESC` (any expressions, NULL first, stable; with `DISTINCT`, only
-  ones in the select list), `LIMIT`
+  ones in the select list), `LIMIT n [OFFSET m]`
+- `UNION` and `UNION ALL` between queries that return as many columns, named
+  by the first; `UNION` drops repeated rows. An `ORDER BY`, `LIMIT` or `OFFSET`
+  after the last query applies to all of the rows
 - Aggregates: `COUNT(*)`, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, each also as
   `f(DISTINCT expr)`, which counts each distinct value once. They skip NULLs;
-  over no values `COUNT` is 0 and the rest NULL. `AVG` truncates toward zero, as
-  there is no fractional type. A selected column must be grouped or aggregated
-- Expressions: `+ - * /`, `= != <> < <= > >=`, `AND OR NOT`, `IS [NOT] NULL`,
-  `[NOT] IN (list)`, parentheses, with SQL three-valued logic for `NULL`
+  over no values `COUNT` is 0 and the rest NULL. `SUM` is an INT over INTs and a
+  REAL once a value is; `AVG` is a REAL. A selected column must be grouped or aggregated
+- Expressions: `+ - * /` (`/` of two INTs truncates toward zero), `||` (joins
+  TEXTs), `= != <> < <= > >=`, `AND OR NOT`, `IS [NOT] NULL`, `[NOT] IN (list)`,
+  `[NOT] BETWEEN a AND b`, `[NOT] LIKE pattern` (`%` any characters, `_` one;
+  ASCII letters match in either case, as in SQLite), `CASE [x] WHEN ... THEN ...
+  [ELSE ...] END`, parentheses, with SQL three-valued logic for `NULL`
+- Functions: `COALESCE(a, b, ...)`, `NULLIF(a, b)`, `LENGTH(text)`,
+  `UPPER(text)` and `LOWER(text)` (ASCII letters), `SUBSTR(text, start[, length])`,
+  `ABS(number)`, and `ROUND(number[, digits])`, which gives a REAL, halves away
+  from zero. These, `LIKE` and `BETWEEN` work as in SQLite, but values are not
+  converted between types: `LENGTH(5)` is an error. `CASE` and `COALESCE`
+  evaluate only the parts they need
 - Subqueries: `(SELECT ...)` as a value (one column, at most one row; NULL for
   none), `[NOT] EXISTS (SELECT ...)` and `expr [NOT] IN (SELECT ...)`, in the
   select list, `WHERE`, `HAVING`, `ORDER BY`, `UPDATE`, `DELETE` and `VALUES`.

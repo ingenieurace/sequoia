@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::error::{Error, Result, err};
-use crate::sql::ast::{BinaryOp, ColumnRef, Expr, UnaryOp};
+use crate::sql::ast::{BinaryOp, ColumnRef, Expr, Function, UnaryOp};
 use crate::types::{Column, Value};
 
 /// A column of the rows an expression is evaluated on: its name, and the
@@ -140,7 +140,167 @@ pub fn eval_with(expr: &Expr, fields: &[Field], row: &[Value], subqueries: &mut 
             };
             if *negated { unary(UnaryOp::Not, found) } else { Ok(found) }
         }
+        Expr::Case { operand, branches, otherwise } => {
+            let operand = operand.as_deref().map(&mut eval).transpose()?;
+            for (when, then) in branches {
+                let when = eval(when)?;
+                let taken = match &operand {
+                    Some(operand) => binary(operand.clone(), BinaryOp::Eq, when)? == Value::Bool(true),
+                    None => match when {
+                        Value::Bool(b) => b,
+                        Value::Null => false,
+                        other => return err(format!("CASE WHEN must be boolean, got {}", other.to_sql())),
+                    },
+                };
+                if taken {
+                    return eval(then);
+                }
+            }
+            otherwise.as_deref().map_or(Ok(Value::Null), eval)
+        }
+        Expr::Function(function, args) => call(*function, args, &mut eval),
     }
+}
+
+/// Calls a scalar function on its arguments, which `eval` evaluates.
+fn call(function: Function, args: &[Expr], eval: &mut dyn FnMut(&Expr) -> Result<Value>) -> Result<Value> {
+    use Value::{Int, Null, Real, Text};
+
+    if function == Function::Coalesce {
+        for arg in args {
+            let value = eval(arg)?;
+            if !value.is_null() {
+                return Ok(value);
+            }
+        }
+        return Ok(Null);
+    }
+    let values: Vec<Value> = args.iter().map(&mut *eval).collect::<Result<_>>()?;
+    let wrong = |value: &Value, expected: &str| {
+        err(format!("{} expects {expected}, got {}", function.name().to_uppercase(), value.to_sql()))
+    };
+    match (function, values.as_slice()) {
+        (Function::Nullif, [a, b]) => {
+            Ok(if binary(a.clone(), BinaryOp::Eq, b.clone())? == Value::Bool(true) { Null } else { a.clone() })
+        }
+        (_, values) if values.iter().any(Value::is_null) => Ok(Null),
+        (Function::Length, [Text(s)]) => Ok(Int(s.chars().count() as i64)),
+        (Function::Upper, [Text(s)]) => Ok(Text(s.to_ascii_uppercase())),
+        (Function::Lower, [Text(s)]) => Ok(Text(s.to_ascii_lowercase())),
+        (Function::Substr, [Text(s), Int(start)]) => Ok(Text(substr(s, *start, None))),
+        (Function::Substr, [Text(s), Int(start), Int(len)]) => Ok(Text(substr(s, *start, Some(*len)))),
+        (Function::Abs, [Int(n)]) => n.checked_abs().map(Int).ok_or_else(overflow),
+        (Function::Abs, [Real(r)]) => Ok(Real(r.abs())),
+        (Function::Round, [x]) if x.as_real().is_some() => Ok(Real(round(x.as_real().unwrap(), 0))),
+        (Function::Round, [x, Int(digits)]) if x.as_real().is_some() => Ok(Real(round(x.as_real().unwrap(), *digits))),
+        (Function::Length | Function::Upper | Function::Lower | Function::Substr, [value, ..])
+            if !matches!(value, Text(_)) =>
+        {
+            wrong(value, "TEXT")
+        }
+        (Function::Substr, [_, rest @ ..]) => {
+            wrong(rest.iter().find(|v| !matches!(v, Int(_))).expect("one is not INT"), "INT")
+        }
+        (Function::Abs, [value]) => wrong(value, "a number"),
+        (Function::Round, [x, ..]) if x.as_real().is_none() => wrong(x, "a number"),
+        (Function::Round, [_, digits]) => wrong(digits, "INT"),
+        _ => unreachable!("the parser checks how many arguments a function has"),
+    }
+}
+
+/// `SUBSTR`, as SQLite computes it: `start` counts characters from 1, or
+/// from the end if negative, and 0 is just before the first; a negative
+/// `len` takes the characters before `start` instead of from it.
+fn substr(s: &str, start: i64, len: Option<i64>) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let total = chars.len() as i64;
+    let backwards = len.is_some_and(|len| len < 0);
+    let (mut from, mut count) = (start, len.map_or(i64::MAX, i64::saturating_abs));
+    if from < 0 {
+        from += total;
+        if from < 0 {
+            count = count.saturating_add(from).max(0);
+            from = 0;
+        }
+    } else if from > 0 {
+        from -= 1;
+    } else if count > 0 {
+        count -= 1;
+    }
+    if backwards {
+        from -= count;
+        if from < 0 {
+            count += from;
+            from = 0;
+        }
+    }
+    let end = from.saturating_add(count).min(total);
+    if from >= end { String::new() } else { chars[from as usize..end as usize].iter().collect() }
+}
+
+/// `ROUND`, as SQLite computes it: to `digits` decimal places (none if
+/// negative, at most 30), halves away from zero, going by the REAL's exact
+/// decimal value, so 2.675, which is just below, rounds to 2.67.
+fn round(x: f64, digits: i64) -> f64 {
+    let digits = digits.clamp(0, 30) as usize;
+    if digits == 0 {
+        return x.round();
+    }
+    // 25 more places decide which way it goes, as the exact value's next digits would.
+    let exact = format!("{:.*}", digits + 25, x.abs());
+    let (whole, fraction) = exact.split_once('.').expect("formatted with places");
+    let mut kept: Vec<u8> = [whole.as_bytes(), &fraction.as_bytes()[..digits]].concat();
+    if fraction.as_bytes()[digits] >= b'5' {
+        // Add one in the last place kept, carrying.
+        let mut i = kept.len();
+        loop {
+            if i == 0 {
+                kept.insert(0, b'1');
+                break;
+            }
+            i -= 1;
+            if kept[i] == b'9' {
+                kept[i] = b'0';
+            } else {
+                kept[i] += 1;
+                break;
+            }
+        }
+    }
+    let (whole, fraction) = kept.split_at(kept.len() - digits);
+    let rounded: f64 = format!("{}.{}", String::from_utf8_lossy(whole), String::from_utf8_lossy(fraction)).parse().unwrap();
+    rounded.copysign(x)
+}
+
+/// Whether `text` matches a LIKE `pattern`: `%` matches any characters, `_`
+/// any one, and ASCII letters match in either case, as in SQLite.
+fn like(text: &str, pattern: &str) -> bool {
+    let (text, pattern): (Vec<char>, Vec<char>) = (text.chars().collect(), pattern.chars().collect());
+    let (mut t, mut p) = (0, 0);
+    // After the last `%` passed: where the pattern goes on, and the text
+    // position it was tried from.
+    let mut retry: Option<(usize, usize)> = None;
+    while t < text.len() {
+        match pattern.get(p) {
+            Some('%') => {
+                p += 1;
+                retry = Some((p, t));
+            }
+            Some(&c) if c == '_' || c.eq_ignore_ascii_case(&text[t]) => {
+                p += 1;
+                t += 1;
+            }
+            _ => match retry {
+                // Let the `%` take one more character, and try again from there.
+                Some((after, from)) => {
+                    retry = Some((after, from + 1));
+                    (p, t) = (after, from + 1);
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p..].iter().all(|&c| c == '%')
 }
 
 fn unary(op: UnaryOp, value: Value) -> Result<Value> {
@@ -148,13 +308,14 @@ fn unary(op: UnaryOp, value: Value) -> Result<Value> {
         (_, Value::Null) => Ok(Value::Null),
         (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
         (UnaryOp::Neg, Value::Int(n)) => n.checked_neg().map(Value::Int).ok_or_else(overflow),
+        (UnaryOp::Neg, Value::Real(r)) => Ok(Value::Real(-r)),
         (op, value) => err(format!("cannot apply {op:?} to {}", value.to_sql())),
     }
 }
 
 fn binary(left: Value, op: BinaryOp, right: Value) -> Result<Value> {
     use BinaryOp::*;
-    use Value::{Bool, Int, Null};
+    use Value::{Bool, Int, Null, Text};
 
     let type_error = |l: &Value, r: &Value| err(format!("cannot apply {op:?} to {} and {}", l.to_sql(), r.to_sql()));
 
@@ -198,8 +359,36 @@ fn binary(left: Value, op: BinaryOp, right: Value) -> Result<Value> {
                 };
                 result.map(Int).ok_or_else(overflow)
             }
+            // With a REAL, both as REALs.
+            (a, b) => match (a.as_real(), b.as_real()) {
+                (Some(_), Some(0.0)) if op == Div => err("division by zero"),
+                (Some(a), Some(b)) => real(match op {
+                    Add => a + b,
+                    Sub => a - b,
+                    Mul => a * b,
+                    _ => a / b,
+                }),
+                _ => type_error(&left, &right),
+            },
+        },
+        Like => match (&left, &right) {
+            (Null, _) | (_, Null) => Ok(Null),
+            (Text(text), Text(pattern)) => Ok(Bool(like(text, pattern))),
             _ => type_error(&left, &right),
         },
+        Concat => match (&left, &right) {
+            (Null, _) | (_, Null) => Ok(Null),
+            (Text(a), Text(b)) => Ok(Text(format!("{a}{b}"))),
+            _ => type_error(&left, &right),
+        },
+    }
+}
+
+/// A REAL result, or an error if it is too big to be one.
+fn real(r: f64) -> Result<Value> {
+    match r.is_finite() {
+        true => Ok(Value::Real(r)),
+        false => err("REAL overflow"),
     }
 }
 

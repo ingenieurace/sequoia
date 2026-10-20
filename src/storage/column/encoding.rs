@@ -57,7 +57,7 @@ use std::collections::BTreeSet;
 
 use crate::error::{Result, err};
 use crate::predicate::Compare;
-use crate::types::{DataType, Value};
+use crate::types::{DataType, Value, ordered_real, real_from_ordered};
 
 /// Most distinct values for which Bitmap encoding is tried.
 pub const BITMAP_MAX_VALUES: usize = 8;
@@ -121,13 +121,14 @@ pub fn encode(data_type: DataType, values: &[Value]) -> Result<Vec<u8>> {
         }
     }
     match data_type {
-        DataType::Int | DataType::Bool => {
+        DataType::Int | DataType::Bool | DataType::Real => {
             let ints = values
                 .iter()
                 .map(|value| match (value, data_type) {
                     (Value::Null, _) => Ok(0),
                     (Value::Int(n), DataType::Int) => Ok(*n),
                     (Value::Bool(b), DataType::Bool) => Ok(*b as i64),
+                    (Value::Real(r), DataType::Real) => Ok(real_to_int(*r)),
                     (value, _) => err(format!("expected {data_type}, got {}", value.to_sql())),
                 })
                 .collect::<Result<Vec<i64>>>()?;
@@ -165,6 +166,14 @@ pub fn decode_selected(data_type: DataType, bytes: &[u8], n: usize, selected: &[
             let ints = decode_ints(&mut reader, n)?;
             rows.map(|i| if nulls.is_some_and(|b| bit(b, i)) { Value::Null } else { Value::Int(ints[i]) }).collect()
         }
+        DataType::Real => {
+            let ints = decode_ints(&mut reader, n)?;
+            rows.map(|i| match nulls.is_some_and(|b| bit(b, i)) {
+                true => Value::Null,
+                false => Value::Real(int_to_real(ints[i])),
+            })
+            .collect()
+        }
         DataType::Bool => {
             let ints = decode_ints(&mut reader, n)?;
             rows.map(|i| match ints[i] {
@@ -195,6 +204,7 @@ pub fn filter(data_type: DataType, bytes: &[u8], n: usize, op: Compare, literal:
     let mut matching = match (data_type, literal) {
         (DataType::Int, Value::Int(v)) => filter_ints(&mut reader, n, op, *v)?,
         (DataType::Bool, Value::Bool(b)) => filter_ints(&mut reader, n, op, *b as i64)?,
+        (DataType::Real, Value::Real(r)) => filter_ints(&mut reader, n, op, real_to_int(*r))?,
         (DataType::Text, Value::Text(s)) => filter_texts(&mut reader, n, op, s)?,
         (_, literal) => return err(format!("cannot compare a {data_type} column with {}", literal.to_sql())),
     };
@@ -203,6 +213,17 @@ pub fn filter(data_type: DataType, bytes: &[u8], n: usize, op: Compare, literal:
         matching.iter_mut().zip(nulls).for_each(|(m, null)| *m &= !null);
     }
     Ok(matching)
+}
+
+/// A REAL as the INT a chunk stores it as: its [`ordered_real`] bits, which
+/// compare as the REALs do, as a signed number, so that a chunk of REALs is
+/// encoded and filtered as one of INTs.
+fn real_to_int(r: f64) -> i64 {
+    (ordered_real(r) ^ 1 << 63) as i64
+}
+
+fn int_to_real(n: i64) -> f64 {
+    real_from_ordered(n as u64 ^ 1 << 63)
 }
 
 /// Reads the null flag and, if there is one, the null bitmap.

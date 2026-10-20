@@ -12,8 +12,10 @@
 //! (SQLite reads `ORDER BY 2` as the second column), lets aggregates in a
 //! subquery read only the subquery's own tables (SQLite would compute one
 //! that reads only outer columns in the outer query), compares rows in
-//! order only when ORDER BY fixes it, and uses LIMIT only then. SQLite's
-//! `AVG` is cast to an integer, as Sequoia's truncates.
+//! order only when ORDER BY fixes it, and uses LIMIT and OFFSET only then.
+//! The columns of a UNION's queries have the same types. REALs are compared
+//! to 10 significant digits: summing in another order may change the last
+//! of the 17 SQLite prints.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -25,9 +27,13 @@ enum Type {
     Int,
     Text,
     Bool,
+    Real,
 }
 
-const TYPES: [Type; 3] = [Type::Int, Type::Text, Type::Bool];
+const TYPES: [Type; 4] = [Type::Int, Type::Text, Type::Bool, Type::Real];
+/// Exact in binary, so that sums of them are too.
+const REALS: [&str; 7] = ["-2.5", "-0.75", "0.0", "0.5", "1.25", "2.0", "3.75"];
+const PATTERNS: [&str; 7] = ["a%", "%b", "_", "%", "A_", "%a%", "b_"];
 const TEXTS: [&str; 8] = ["a", "b", "ab", "ba", "B", "", " a", "it''s"];
 
 /// A xorshift64* generator: small, and the same everywhere.
@@ -119,6 +125,7 @@ impl Gen {
             Type::Int => self.rng.range(-5, 5).to_string(),
             Type::Text => format!("'{}'", self.rng.pick(&TEXTS)),
             Type::Bool => self.rng.pick(&["TRUE", "FALSE"]).to_string(),
+            Type::Real => self.rng.pick(&REALS).to_string(),
         }
     }
 
@@ -143,24 +150,67 @@ impl Gen {
         let b = budget - 1;
         let subquery = s.subqueries && s.depth < 2;
         match ty {
-            Type::Int => match self.rng.below(8) {
+            Type::Int => match self.rng.below(13) {
                 0 => format!("({} + {})", self.expr(ty, s, b), self.expr(ty, s, b)),
                 1 => format!("({} - {})", self.expr(ty, s, b), self.expr(ty, s, b)),
                 2 => format!("({} * {})", self.expr(ty, s, b), self.expr(ty, s, b)),
                 3 => format!("({} / {})", self.expr(ty, s, b), self.rng.range(1, 3)),
                 4 => format!("(- {})", self.expr(ty, s, b)),
                 5 if subquery => self.scalar_subquery(ty, s),
+                6 => self.case_expr(ty, s, b),
+                7 => format!("COALESCE({}, {})", self.expr(ty, s, b), self.expr(ty, s, b)),
+                8 => format!("NULLIF({}, {})", self.expr(ty, s, b), self.expr(ty, s, b)),
+                9 => format!("LENGTH({})", self.expr(Type::Text, s, b)),
+                10 => format!("ABS({})", self.expr(ty, s, b)),
                 _ => self.leaf(ty, s),
             },
-            Type::Text => match self.rng.below(4) {
+            Type::Text => match self.rng.below(10) {
                 0 if subquery => self.scalar_subquery(ty, s),
+                1 => format!("({} || {})", self.expr(ty, s, b), self.expr(ty, s, b)),
+                2 => format!("{}({})", self.rng.pick(&["UPPER", "LOWER"]), self.expr(ty, s, b)),
+                3 => match self.rng.chance(50) {
+                    true => format!("SUBSTR({}, {})", self.expr(ty, s, b), self.rng.range(-3, 4)),
+                    false => format!("SUBSTR({}, {}, {})", self.expr(ty, s, b), self.rng.range(-3, 4), self.rng.range(-2, 3)),
+                },
+                4 => format!("COALESCE({}, {})", self.expr(ty, s, b), self.expr(ty, s, b)),
+                5 => self.case_expr(ty, s, b),
                 _ => self.leaf(ty, s),
             },
-            Type::Bool => match self.rng.below(12) {
+            Type::Real => match self.rng.below(12) {
+                0 => format!("({} + {})", self.expr(ty, s, b), self.expr(ty, s, b)),
+                1 => format!("({} - {})", self.expr(ty, s, b), self.expr(Type::Int, s, b)),
+                2 => format!("({} * {})", self.expr(Type::Int, s, b), self.expr(ty, s, b)),
+                3 => format!("({} / {})", self.expr(ty, s, b), self.rng.pick(&["2.0", "0.5", "4"])),
+                4 => format!("(- {})", self.expr(ty, s, b)),
+                5 => format!("ABS({})", self.expr(ty, s, b)),
+                6 => match self.rng.chance(50) {
+                    true => format!("ROUND({})", self.expr(ty, s, b)),
+                    false => format!("ROUND({}, {})", self.expr(ty, s, b), self.rng.range(0, 2)),
+                },
+                7 => self.case_expr(ty, s, b),
+                8 => format!("COALESCE({}, {})", self.expr(ty, s, b), self.expr(ty, s, b)),
+                9 if subquery => self.scalar_subquery(ty, s),
+                _ => self.leaf(ty, s),
+            },
+            Type::Bool => match self.rng.below(15) {
                 0..=2 => {
                     let t = *self.rng.pick(&TYPES);
+                    // INTs and REALs compare with each other too.
+                    let u = match t {
+                        Type::Int | Type::Real => *self.rng.pick(&[Type::Int, Type::Real]),
+                        t => t,
+                    };
                     let op = self.rng.pick(&["=", "!=", "<>", "<", "<=", ">", ">="]);
-                    format!("({} {op} {})", self.expr(t, s, b), self.expr(t, s, b))
+                    format!("({} {op} {})", self.expr(t, s, b), self.expr(u, s, b))
+                }
+                12 => {
+                    let t = *self.rng.pick(&[Type::Int, Type::Real, Type::Text]);
+                    let not = if self.rng.chance(30) { "NOT " } else { "" };
+                    format!("({} {not}BETWEEN {} AND {})", self.expr(t, s, b), self.expr(t, s, 0), self.expr(t, s, 0))
+                }
+                13 => {
+                    let not = if self.rng.chance(30) { "NOT " } else { "" };
+                    format!("({} {not}LIKE '{}')", self.expr(Type::Text, s, b), self.rng.pick(&PATTERNS))
                 }
                 3 => format!("({} AND {})", self.expr(ty, s, b), self.expr(ty, s, b)),
                 4 => format!("({} OR {})", self.expr(ty, s, b), self.expr(ty, s, b)),
@@ -190,6 +240,26 @@ impl Gen {
         }
     }
 
+    /// `CASE`, with or without an operand, of type `ty`.
+    fn case_expr(&mut self, ty: Type, s: &Scope, b: u32) -> String {
+        let mut sql = String::from("(CASE");
+        let operand = self.rng.chance(40).then(|| *self.rng.pick(&[Type::Int, Type::Text]));
+        if let Some(t) = operand {
+            sql += &format!(" {}", self.expr(t, s, b));
+        }
+        for _ in 0..1 + self.rng.below(2) {
+            let when = match operand {
+                Some(t) => self.expr(t, s, 0),
+                None => self.expr(Type::Bool, s, b),
+            };
+            sql += &format!(" WHEN {when} THEN {}", self.expr(ty, s, b));
+        }
+        if self.rng.chance(70) {
+            sql += &format!(" ELSE {}", self.expr(ty, s, b));
+        }
+        sql + " END)"
+    }
+
     /// An expression that reads a column: SQLite reads a constant integer in
     /// ORDER BY, even `(- 1)`, as a column number. That includes one SQLite
     /// folds to a constant, such as `(c1 AND ('b' IS NULL))`.
@@ -207,15 +277,22 @@ impl Gen {
         let rows = Scope { cols: s.cols.clone(), ..Scope::default() };
         let distinct = if self.rng.chance(25) { "DISTINCT " } else { "" };
         match ty {
-            Type::Int => match self.rng.below(6) {
+            Type::Int => match self.rng.below(5) {
                 0 => "COUNT(*)".into(),
                 1 => {
                     let t = *self.rng.pick(&TYPES);
                     format!("COUNT({distinct}{})", self.expr(t, &rows, 1))
                 }
                 2 => format!("SUM({distinct}{})", self.expr(ty, &rows, 1)),
-                3 => format!("AVG({distinct}{})", self.expr(ty, &rows, 1)),
-                4 => format!("MIN({})", self.expr(ty, &rows, 1)),
+                3 => format!("MIN({})", self.expr(ty, &rows, 1)),
+                _ => format!("MAX({distinct}{})", self.expr(ty, &rows, 1)),
+            },
+            // AVG is a REAL, of INTs too.
+            Type::Real => match self.rng.below(5) {
+                0 => format!("SUM({distinct}{})", self.expr(ty, &rows, 1)),
+                1 => format!("AVG({distinct}{})", self.expr(ty, &rows, 1)),
+                2 => format!("AVG({distinct}{})", self.expr(Type::Int, &rows, 1)),
+                3 => format!("MIN({})", self.expr(ty, &rows, 1)),
                 _ => format!("MAX({distinct}{})", self.expr(ty, &rows, 1)),
             },
             _ => format!("{}({distinct}{})", self.rng.pick(&["MIN", "MAX"]), self.expr(ty, &rows, 1)),
@@ -435,10 +512,13 @@ impl Gen {
             true => String::new(),
             false => format!(" ORDER BY {}", keys.join(", ")),
         };
-        let limit = match kind == Kind::Ordered && self.rng.chance(50) {
+        let mut limit = match kind == Kind::Ordered && self.rng.chance(50) {
             true => format!(" LIMIT {}", self.rng.below(8)),
             false => String::new(),
         };
+        if !limit.is_empty() && self.rng.chance(40) {
+            limit += &format!(" OFFSET {}", self.rng.below(5));
+        }
         let projection = match star {
             true => "*".into(),
             false => {
@@ -453,6 +533,45 @@ impl Gen {
             "SELECT {}{projection} FROM {from}{filter}{group_by}{having}{order_by}{limit}",
             if distinct { "DISTINCT " } else { "" }
         );
+        stmt(sql, kind)
+    }
+
+    /// Queries joined by UNION or UNION ALL, whose columns have the same
+    /// types, maybe sorted by every column (which fixes the order), then
+    /// limited and offset.
+    fn union(&mut self) -> Stmt {
+        let types: Vec<Type> = (0..1 + self.rng.below(2)).map(|_| *self.rng.pick(&TYPES)).collect();
+        let mut sql = String::new();
+        for part in 0..2 + self.rng.below(2) {
+            if part > 0 {
+                sql += if self.rng.chance(50) { " UNION ALL " } else { " UNION " };
+            }
+            let t = self.rng.below(self.tables.len());
+            let s = self.table_scope(t, Vec::new());
+            let items: Vec<String> = types
+                .iter()
+                .enumerate()
+                .map(|(i, ty)| {
+                    let e = self.expr(*ty, &s, 2);
+                    if part == 0 { format!("{e} AS u{i}") } else { e }
+                })
+                .collect();
+            let filter = self.where_clause(&s, 50);
+            sql += &format!("SELECT {} FROM {}{filter}", items.join(", "), self.tables[t].name);
+        }
+        let mut kind = Kind::Unordered;
+        if self.rng.chance(50) {
+            let keys: Vec<String> =
+                (0..types.len()).map(|i| if self.rng.chance(40) { format!("u{i} DESC") } else { format!("u{i}") }).collect();
+            sql += &format!(" ORDER BY {}", keys.join(", "));
+            kind = Kind::Ordered;
+            if self.rng.chance(60) {
+                sql += &format!(" LIMIT {}", self.rng.below(8));
+                if self.rng.chance(50) {
+                    sql += &format!(" OFFSET {}", self.rng.below(5));
+                }
+            }
+        }
         stmt(sql, kind)
     }
 
@@ -637,12 +756,17 @@ impl Gen {
                     Type::Int => "INT",
                     Type::Text => "TEXT",
                     Type::Bool => "BOOL",
+                    Type::Real => "REAL",
                 }, "PRIMARY KEY")
             );
             // STRICT, so that SQLite checks types; it has no BOOL, and lets a PRIMARY KEY be NULL unless told not to.
             let sqlite = format!(
                 "{} STRICT",
-                ddl(&|ty| if ty == Type::Text { "TEXT" } else { "INT" }, "NOT NULL PRIMARY KEY")
+                ddl(&|ty| match ty {
+                    Type::Text => "TEXT",
+                    Type::Real => "REAL",
+                    _ => "INT",
+                }, "NOT NULL PRIMARY KEY")
             );
             out.push(Stmt { sequoia, sqlite, kind: Kind::Other });
             g.tables.push(Table { name, columns, storage });
@@ -670,7 +794,8 @@ impl Gen {
         }
         for _ in 0..40 {
             match g.rng.below(20) {
-                0..=13 => out.push(g.select()),
+                0..=11 => out.push(g.select()),
+                12..=13 => out.push(g.union()),
                 14..=17 => g.change(&mut out),
                 _ => g.transaction(&mut out),
             }
@@ -680,35 +805,7 @@ impl Gen {
 }
 
 fn stmt(sequoia: String, kind: Kind) -> Stmt {
-    let sqlite = cast_averages(&sequoia);
-    Stmt { sequoia, sqlite, kind }
-}
-
-/// Rewrites each `AVG(...)` as `CAST(AVG(...) AS INTEGER)`.
-fn cast_averages(sql: &str) -> String {
-    let mut out = String::new();
-    let mut rest = sql;
-    while let Some(at) = rest.find("AVG(") {
-        out.push_str(&rest[..at]);
-        let start = at + 4;
-        let mut depth = 1;
-        let mut end = start;
-        for (i, c) in rest[start..].char_indices() {
-            match c {
-                '(' => depth += 1,
-                ')' => depth -= 1,
-                _ => {}
-            }
-            if depth == 0 {
-                end = start + i;
-                break;
-            }
-        }
-        out.push_str(&format!("CAST(AVG({}) AS INTEGER)", &rest[start..end]));
-        rest = &rest[end + 1..];
-    }
-    out.push_str(rest);
-    out
+    Stmt { sqlite: sequoia.clone(), sequoia, kind }
 }
 
 /// Whether an expression names a column (`id`, `c1` or a derived table's
@@ -757,7 +854,7 @@ fn folds_is_null(e: &str) -> bool {
 /// integer literal, its negation, or a test it folds to a constant. Operands
 /// are a single leaf or a parenthesized expression.
 fn never_null(e: &str) -> bool {
-    if e.starts_with('\'') || e.parse::<i64>().is_ok() {
+    if e.starts_with('\'') || e.parse::<f64>().is_ok() {
         return true;
     }
     let Some(inner) = e.strip_prefix('(').and_then(|e| e.strip_suffix(')')) else { return false };
@@ -783,7 +880,38 @@ fn quote(value: &Value) -> String {
         Value::Int(n) => n.to_string(),
         Value::Bool(b) => (*b as i64).to_string(),
         Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+        Value::Real(r) => real_text(*r),
     }
+}
+
+/// A REAL as the rows of both databases are compared: to 10 significant digits.
+fn real_text(r: f64) -> String {
+    format!("{:.9e}", if r == 0.0 { 0.0 } else { r })
+}
+
+/// A row as SQLite's quote mode prints it, with each REAL as [`real_text`] writes it.
+fn fold_reals(row: &str) -> String {
+    let mut out = String::new();
+    let mut token = String::new();
+    let mut quoted = false;
+    let flush = |token: &mut String, out: &mut String| {
+        match token.parse::<f64>() {
+            Ok(r) if !token.starts_with('\'') && token.contains(['.', 'e']) => out.push_str(&real_text(r)),
+            _ => out.push_str(token),
+        }
+        token.clear();
+    };
+    for c in row.chars() {
+        if c == ',' && !quoted {
+            flush(&mut token, &mut out);
+            out.push(',');
+        } else {
+            quoted ^= c == '\'';
+            token.push(c);
+        }
+    }
+    flush(&mut token, &mut out);
+    out
 }
 
 fn run_sequoia(script: &[Stmt]) -> Vec<Outcome> {
@@ -829,7 +957,7 @@ fn run_sqlite(script: &[Stmt]) -> Option<Vec<Outcome>> {
         if line == "'@@'" {
             outcomes.push(Outcome::Rows(std::mem::take(&mut rows)));
         } else {
-            rows.push(line.to_string());
+            rows.push(fold_reals(line));
         }
     }
     assert_eq!(outcomes.len(), script.len(), "sqlite3 output: {stdout}");

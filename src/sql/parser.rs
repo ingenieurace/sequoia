@@ -7,7 +7,7 @@
 //! OR, AND, NOT, comparison / IS NULL / IN, + -, * /, unary -, primary.
 
 use super::ast::{
-    Aggregate, BinaryOp, ColumnRef, Expr, From, Join, JoinKind, OrderBy, Projection, Select, SelectItem, Statement,
+    Aggregate, BinaryOp, ColumnRef, Expr, From, Function, Join, JoinKind, OrderBy, Projection, Select, SelectItem, Statement,
     TableRef, TableSource, UnaryOp,
 };
 use crate::error::{Error, Result};
@@ -126,6 +126,8 @@ impl Parser {
             DataType::Text
         } else if self.eat_keyword("BOOL") || self.eat_keyword("BOOLEAN") {
             DataType::Bool
+        } else if self.eat_keyword("REAL") || self.eat_keyword("FLOAT") {
+            DataType::Real
         } else {
             return Err(self.unexpected("a data type"));
         };
@@ -178,7 +180,36 @@ impl Parser {
         Ok(Statement::Insert { table, columns, rows })
     }
 
+    /// A query: one SELECT, or several joined by `UNION [ALL]`, then the
+    /// ORDER BY, LIMIT and OFFSET of all of them.
     fn select(&mut self) -> Result<Select> {
+        let mut query = self.select_core()?;
+        while self.eat_keyword("UNION") {
+            let all = self.eat_keyword("ALL");
+            query.compound.push((all, self.select_core()?));
+        }
+        if self.eat_keyword("ORDER") {
+            self.expect_keyword("BY")?;
+            query.order_by = self.comma_list(|p| {
+                let expr = p.expr()?;
+                let desc = p.eat_keyword("DESC");
+                if !desc {
+                    p.eat_keyword("ASC");
+                }
+                Ok(OrderBy { expr, desc })
+            })?;
+        }
+        if self.eat_keyword("LIMIT") {
+            query.limit = Some(self.number()? as usize);
+        }
+        if self.eat_keyword("OFFSET") {
+            query.offset = Some(self.number()? as usize);
+        }
+        Ok(query)
+    }
+
+    /// `SELECT ... [HAVING ...]`: a query up to its ORDER BY.
+    fn select_core(&mut self) -> Result<Select> {
         self.expect_keyword("SELECT")?;
         let distinct = self.eat_keyword("DISTINCT");
         let projection = if self.eat_symbol("*") {
@@ -206,25 +237,8 @@ impl Parser {
             true => Some(self.expr()?),
             false => None,
         };
-
-        let mut order_by = Vec::new();
-        if self.eat_keyword("ORDER") {
-            self.expect_keyword("BY")?;
-            order_by = self.comma_list(|p| {
-                let expr = p.expr()?;
-                let desc = p.eat_keyword("DESC");
-                if !desc {
-                    p.eat_keyword("ASC");
-                }
-                Ok(OrderBy { expr, desc })
-            })?;
-        }
-
-        let limit = match self.eat_keyword("LIMIT") {
-            true => Some(self.number()? as usize),
-            false => None,
-        };
-        Ok(Select { distinct, from, projection, filter, group_by, having, order_by, limit })
+        let (order_by, limit, offset, compound) = (Vec::new(), None, None, Vec::new());
+        Ok(Select { distinct, from, projection, filter, group_by, having, order_by, limit, offset, compound })
     }
 
     /// `table [, table | [INNER | LEFT [OUTER] | CROSS] JOIN table [ON expr]]...`
@@ -342,9 +356,20 @@ impl Parser {
             return Ok(Expr::IsNull(Box::new(left), negated));
         }
         let negated = self.peek() == Some(&Token::Keyword("NOT".into()))
-            && self.tokens.get(self.pos + 1) == Some(&Token::Keyword("IN".into()));
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Keyword(k)) if ["IN", "BETWEEN", "LIKE"].contains(&k.as_str()));
         if negated {
             self.pos += 1;
+        }
+        let not = |expr: Expr| if negated { Expr::Unary(UnaryOp::Not, Box::new(expr)) } else { expr };
+        if self.eat_keyword("BETWEEN") {
+            // `a BETWEEN x AND y` is `a >= x AND a <= y`, which the planner can push down.
+            let low = self.additive()?;
+            self.expect_keyword("AND")?;
+            let high = self.additive()?;
+            return Ok(not(binary(binary(left.clone(), BinaryOp::GtEq, low), BinaryOp::And, binary(left, BinaryOp::LtEq, high))));
+        }
+        if self.eat_keyword("LIKE") {
+            return Ok(not(binary(left, BinaryOp::Like, self.additive()?)));
         }
         if self.eat_keyword("IN") {
             self.expect_symbol("(")?;
@@ -383,7 +408,7 @@ impl Parser {
     }
 
     fn multiplicative(&mut self) -> Result<Expr> {
-        let mut left = self.unary()?;
+        let mut left = self.concat()?;
         loop {
             let op = match self.peek() {
                 Some(Token::Symbol("*")) => BinaryOp::Mul,
@@ -391,8 +416,17 @@ impl Parser {
                 _ => return Ok(left),
             };
             self.pos += 1;
-            left = binary(left, op, self.unary()?);
+            left = binary(left, op, self.concat()?);
         }
+    }
+
+    /// `||` binds tighter than any other operator but a sign, as in SQLite.
+    fn concat(&mut self) -> Result<Expr> {
+        let mut left = self.unary()?;
+        while self.eat_symbol("||") {
+            left = binary(left, BinaryOp::Concat, self.unary()?);
+        }
+        Ok(left)
     }
 
     fn unary(&mut self) -> Result<Expr> {
@@ -403,6 +437,9 @@ impl Parser {
     }
 
     fn primary(&mut self) -> Result<Expr> {
+        if self.eat_keyword("CASE") {
+            return self.case();
+        }
         if self.eat_keyword("EXISTS") {
             self.expect_symbol("(")?;
             let query = self.select()?;
@@ -421,6 +458,7 @@ impl Parser {
         }
         let expr = match self.peek() {
             Some(Token::Number(n)) => Expr::Literal(Value::Int(*n)),
+            Some(Token::Real(r)) => Expr::Literal(Value::Real(*r)),
             Some(Token::Str(s)) => Expr::Literal(Value::Text(s.clone())),
             Some(Token::Ident(name)) if self.tokens.get(self.pos + 1) == Some(&Token::Symbol("(")) => {
                 let name = name.clone();
@@ -442,10 +480,46 @@ impl Parser {
         Ok(expr)
     }
 
-    /// The rest of `name(...)` after its opening parenthesis.
+    /// The rest of `CASE ... END` after `CASE`.
+    fn case(&mut self) -> Result<Expr> {
+        let operand = match self.peek() == Some(&Token::Keyword("WHEN".into())) {
+            true => None,
+            false => Some(Box::new(self.expr()?)),
+        };
+        let mut branches = Vec::new();
+        while self.eat_keyword("WHEN") {
+            let when = self.expr()?;
+            self.expect_keyword("THEN")?;
+            branches.push((when, self.expr()?));
+        }
+        if branches.is_empty() {
+            return Err(self.unexpected("WHEN"));
+        }
+        let otherwise = match self.eat_keyword("ELSE") {
+            true => Some(Box::new(self.expr()?)),
+            false => None,
+        };
+        self.expect_keyword("END")?;
+        Ok(Expr::Case { operand, branches, otherwise })
+    }
+
+    /// The rest of `name(...)` after its opening parenthesis: an aggregate or a scalar function.
     fn aggregate(&mut self, name: &str) -> Result<Expr> {
         let Some(function) = Aggregate::from_name(name) else {
-            return Err(Error(format!("unknown function: {name}")));
+            let Some(function) = Function::from_name(name) else {
+                return Err(Error(format!("unknown function: {name}")));
+            };
+            let args = match self.peek() == Some(&Token::Symbol(")")) {
+                true => Vec::new(),
+                false => self.comma_list(Self::expr)?,
+            };
+            self.expect_symbol(")")?;
+            let (fewest, most) = function.arity();
+            if args.len() < fewest || args.len() > most {
+                let name = function.name().to_uppercase();
+                return Err(Error(format!("wrong number of arguments to {name}: {}", args.len())));
+            }
+            return Ok(Expr::Function(function, args));
         };
         let distinct = self.eat_keyword("DISTINCT");
         let arg = if function == Aggregate::Count && !distinct && self.eat_symbol("*") {

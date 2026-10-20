@@ -157,7 +157,7 @@ fn encode_value(value: &Value) -> Vec<u8> {
 /// The length of the value at the start of an index entry.
 fn value_len(key: &[u8], data_type: DataType) -> Result<usize> {
     let len = match data_type {
-        DataType::Int => 8,
+        DataType::Int | DataType::Real => 8,
         DataType::Bool => 1,
         DataType::Text => {
             let mut i = 0;
