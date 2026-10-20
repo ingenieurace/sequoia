@@ -63,6 +63,19 @@ to skip it:
 cargo bench --bench joins -- --no-sqlite
 ```
 
+`benches/sort.rs` times `ORDER BY` on 200,000 rows the same way: `memory`
+with a budget every row fits in, `spill` with budgets from 4 MB down to
+64 KB, so that more and more runs are written out and merged back, and `top`
+with a `LIMIT`. Group names and `--no-sqlite` work as for the joins:
+
+```bash
+cargo bench --bench sort
+```
+
+```bash
+cargo bench --bench sort -- spill
+```
+
 ## Supported SQL
 
 - Statements: `CREATE TABLE ... [USING HEAP | LSM | COLUMN]`, `DROP TABLE`,

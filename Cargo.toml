@@ -8,3 +8,7 @@ edition = "2024"
 [[bench]]
 name = "joins"
 harness = false
+
+[[bench]]
+name = "sort"
+harness = false
