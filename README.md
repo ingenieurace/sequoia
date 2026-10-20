@@ -121,11 +121,9 @@ time of each, `benches/lsm.rs` loads and reads LSM trees under level and
 universal compaction and prints their write amplification,
 `benches/column_encoding.rs` prints the encoding the column store picks for
 each kind of data, the bytes a value takes, and the time to encode, decode
-and filter it, and `benches/hash.rs` times the five hash tables of
-`src/hash` (linear probing, cuckoo, chained, extendible and linear hashing)
-against `std::collections::HashMap` on a million keys, and linear probing
-alone at three load factors, and in `pages` the hash files of
-`src/storage/hash` against a B+ tree, and `benches/trie.rs` times the tries of
+and filter it, `benches/hash.rs` times the hash files of
+`src/storage/hash` (extendible and linear hashing) against a B+ tree on
+200,000 index entries, and `benches/trie.rs` times the tries of
 `src/trie` (trie, radix tree and ART) against a `BTreeMap` and the skip list
 on INT-like and text keys, with the memory each takes, and loads LSM trees
 with each kind of MemTable. Group names work for all of them:
@@ -266,9 +264,6 @@ src/
     column/       column store
       store.rs    PAX row groups, delete bitmaps, delta store
       encoding.rs column compression: RLE, bit-packing, patching, delta, dictionary, bitmap
-  hash/           hash tables in memory, to compare with std's HashMap (storage/hash puts two on pages)
-    linear_probe.rs, cuckoo.rs       static: one array of slots
-    chained.rs, extendible.rs, linear_hash.rs   dynamic: buckets that split
   trie/           tries: sorted maps that branch on a byte of the key per level
     mod.rs        one tree for the trie, radix tree (paths compressed) and ART
     list.rs       children in a sorted list: the trie's and radix tree's

@@ -12,8 +12,8 @@
 //! being there already: the caller keeps them distinct.
 //!
 //! Two schemes, both made to grow one bucket at a time instead of hashing
-//! every entry again into a table twice the size, as `src/hash`'s in-memory
-//! tables do:
+//! every entry again into a table twice the size, as in-memory tables such
+//! as `HashMap` do:
 //!
 //! - [`Extendible`]: a directory, indexed by the low bits of a hash, points
 //!   to buckets, several slots to one; a full bucket splits in two, and only
