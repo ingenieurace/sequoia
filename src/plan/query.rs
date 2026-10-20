@@ -873,16 +873,42 @@ impl Node<'_> {
     /// Describes the tree as EXPLAIN prints it: one step per line, each
     /// indented below the one reading from it, a join's left side first.
     pub fn explain(&self) -> String {
+        self.explain_lines().join("\n")
+    }
+
+    /// The lines of [`Node::explain`]. Step `i` of the tree, counted in
+    /// this order from 0, is line `i`.
+    pub fn explain_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         self.explain_into(0, &mut lines);
-        lines.join("\n")
+        lines
+    }
+
+    /// How many steps the tree has, this one included: the lines it explains to.
+    pub fn steps(&self) -> usize {
+        1 + self.inputs().iter().map(|input| input.steps()).sum::<usize>()
+    }
+
+    /// The steps this one reads from, in the order EXPLAIN lists them.
+    fn inputs(&self) -> Vec<&Self> {
+        match self {
+            Node::Scan { .. } | Node::Lookup { .. } => vec![],
+            Node::Join { left, right, .. } => vec![left, right],
+            Node::Filter { input, .. }
+            | Node::Aggregate { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Distinct { input }
+            | Node::Limit { input, .. }
+            | Node::Project { input, .. }
+            | Node::Derived { input, .. } => vec![input],
+        }
     }
 
     fn explain_into(&self, depth: usize, lines: &mut Vec<String>) {
         let list = |exprs: &mut dyn Iterator<Item = String>| exprs.collect::<Vec<_>>().join(", ");
-        let (line, inputs): (String, Vec<&Node>) = match self {
+        let line = match self {
             Node::Scan { table, qualifier, predicates, access, .. } => {
-                (access::describe(table, &label(table, qualifier), predicates, access), vec![])
+                access::describe(table, &label(table, qualifier), predicates, access)
             }
             Node::Lookup { table, qualifier, column, key, left_key, .. } => {
                 let through = match key {
@@ -890,10 +916,10 @@ impl Node<'_> {
                     LookupKey::PrimaryKey => "PRIMARY KEY".into(),
                 };
                 let column = ColumnRef { table: Some(qualifier.clone()), name: table.columns[*column].name.clone() };
-                (format!("LOOKUP {} USING {through} ({column} = {left_key})", label(table, qualifier)), vec![])
+                format!("LOOKUP {} USING {through} ({column} = {left_key})", label(table, qualifier))
             }
-            Node::Filter { input, predicate } => (format!("FILTER {predicate}"), vec![input]),
-            Node::Join { left, right, kind, method, condition } => {
+            Node::Filter { predicate, .. } => format!("FILTER {predicate}"),
+            Node::Join { kind, method, condition, .. } => {
                 let kind = if *kind == JoinKind::Left { "LEFT " } else { "" };
                 let (name, mut on) = match method {
                     JoinMethod::Block => ("BLOCK NESTED LOOP", Vec::new()),
@@ -913,29 +939,27 @@ impl Node<'_> {
                     }
                     _ => String::new(),
                 };
-                (format!("{kind}{name} JOIN{on}{by}"), vec![left, right])
+                format!("{kind}{name} JOIN{on}{by}")
             }
-            Node::Aggregate { input, group_by, aggregates } => {
+            Node::Aggregate { group_by, aggregates, .. } => {
                 let mut line = format!("AGGREGATE {}", list(&mut aggregates.iter().map(aggregate_name)));
                 if !group_by.is_empty() {
                     line += &format!(" BY {}", list(&mut group_by.iter().map(Expr::to_string)));
                 }
-                (line, vec![input])
+                line
             }
-            Node::Sort { input, keys, limit } => {
+            Node::Sort { keys, limit, .. } => {
                 let keys = list(&mut keys.iter().map(|k| sort_key(&k.expr, k.desc)));
                 let top = limit.map_or(String::new(), |n| format!(" (TOP {n})"));
-                (format!("SORT BY {keys}{top}"), vec![input])
+                format!("SORT BY {keys}{top}")
             }
-            Node::Distinct { input } => ("DISTINCT".into(), vec![input]),
-            Node::Limit { input, count } => (format!("LIMIT {count}"), vec![input]),
-            Node::Project { input, exprs } => {
-                (format!("PROJECT {}", list(&mut exprs.iter().map(Expr::to_string))), vec![input])
-            }
-            Node::Derived { input, qualifier, .. } => (format!("SUBQUERY {qualifier}"), vec![input]),
+            Node::Distinct { .. } => "DISTINCT".into(),
+            Node::Limit { count, .. } => format!("LIMIT {count}"),
+            Node::Project { exprs, .. } => format!("PROJECT {}", list(&mut exprs.iter().map(Expr::to_string))),
+            Node::Derived { qualifier, .. } => format!("SUBQUERY {qualifier}"),
         };
         lines.push(format!("{}{line}", "  ".repeat(depth)));
-        for input in inputs {
+        for input in self.inputs() {
             input.explain_into(depth + 1, lines);
         }
     }

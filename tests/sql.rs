@@ -1935,3 +1935,87 @@ fn select_list_names_and_order_by_them() {
         [vec![int(1), int(2)], vec![Value::Null, int(1)]]
     );
 }
+
+/// What EXPLAIN ANALYZE says each step did, without its times: each line's
+/// step, and what follows it in parentheses, then the query's rows.
+fn analyzed(db: &mut Database, sql: &str) -> Vec<(String, String)> {
+    let plan = explain(db, &format!("ANALYZE {sql}"));
+    let mut lines: Vec<&str> = plan.lines().collect();
+    let total = lines.pop().unwrap();
+    let without_time = |did: &str| match did.rsplit_once(", ") {
+        Some((did, time)) if time.ends_with(" ms") => did.to_string(),
+        _ => did.to_string(),
+    };
+    let mut steps: Vec<(String, String)> = lines
+        .into_iter()
+        .map(|line| {
+            let (step, did) = line.rsplit_once("  (").unwrap();
+            (step.trim().to_string(), without_time(did.strip_suffix(')').unwrap()))
+        })
+        .collect();
+    let (rows, time) = total.split_once(" in ").unwrap();
+    assert!(time.ends_with(" ms"), "{total}");
+    steps.push(("total".into(), rows.into()));
+    steps
+}
+
+#[test]
+fn explain_analyze_tells_what_each_step_did() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, g INT)").unwrap();
+    db.execute("CREATE TABLE u (id INT PRIMARY KEY, g INT)").unwrap();
+    db.execute("CREATE INDEX u_g ON u (g)").unwrap();
+    let values: Vec<String> = (0..100).map(|i| format!("({i}, {})", i % 10)).collect();
+    db.execute(&format!("INSERT INTO t VALUES {}", values.join(", "))).unwrap();
+    db.execute(&format!("INSERT INTO u VALUES {}", values.join(", "))).unwrap();
+    let steps = |steps: &[(&str, &str)]| -> Vec<(String, String)> {
+        steps.iter().map(|(step, did)| (step.to_string(), did.to_string())).collect()
+    };
+
+    assert_eq!(
+        analyzed(&mut db, "SELECT g, COUNT(*) FROM t WHERE id < 50 AND g > 6 GROUP BY g ORDER BY g DESC"),
+        steps(&[
+            ("PROJECT g, COUNT(*)", "3 rows"),
+            ("SORT BY g DESC", "3 rows"),
+            ("AGGREGATE COUNT(*) BY g", "3 rows"),
+            ("FILTER (id < 50) AND (g > 6)", "15 rows"),
+            ("SEARCH t USING INDEX t_pkey (id < 50)", "50 rows"),
+            ("total", "3 rows"),
+        ])
+    );
+    // A LIMIT stops the scan below it.
+    assert_eq!(
+        analyzed(&mut db, "SELECT * FROM t LIMIT 2"),
+        steps(&[("LIMIT 2", "2 rows"), ("SCAN t", "2 rows"), ("total", "2 rows")])
+    );
+    // An index join looks rows up through its right side, which is not a step of its own.
+    assert_eq!(
+        analyzed(&mut db, "SELECT t.id, u.id FROM t JOIN u ON u.g = t.g WHERE t.id = 3"),
+        steps(&[
+            ("PROJECT t.id, u.id", "10 rows"),
+            ("INDEX JOIN", "10 rows"),
+            ("FILTER t.id = 3", "1 row"),
+            ("SEARCH t USING INDEX t_pkey (id = 3)", "1 row"),
+            ("LOOKUP u USING INDEX u_g (u.g = t.g)", "counted with the join above"),
+            ("total", "10 rows"),
+        ])
+    );
+    // With a small budget, a block nested loop join reads its right side once per block.
+    db.set_join_memory(1000);
+    let joined = analyzed(&mut db, "SELECT COUNT(*) FROM t JOIN u ON u.g < t.g");
+    assert_eq!(joined[2], ("BLOCK NESTED LOOP JOIN ON u.g < t.g".to_string(), "4500 rows".to_string()));
+    assert_eq!(joined[3], ("SCAN t".to_string(), "100 rows".to_string()));
+    // Its rows are counted over all of its runs.
+    let (step, did) = &joined[4];
+    let (rows, runs) = did.strip_suffix(" runs").and_then(|d| d.split_once(" rows in ")).unwrap_or_else(|| panic!("{did}"));
+    let (rows, runs): (u32, u32) = (rows.parse().unwrap(), runs.parse().unwrap());
+    assert!(step == "SCAN u" && runs > 1 && rows == 100 * runs, "{joined:?}");
+
+    let error = db.execute("EXPLAIN ANALYZE UPDATE t SET g = 0").unwrap_err();
+    assert_eq!(error.to_string(), "EXPLAIN ANALYZE supports only SELECT");
+    // ANALYZE is no keyword: it can still name a column.
+    db.execute("CREATE TABLE stats (analyze INT)").unwrap();
+    db.execute("INSERT INTO stats VALUES (1)").unwrap();
+    assert_eq!(query(&mut db, "SELECT analyze FROM stats"), [vec![int(1)]]);
+    assert_eq!(analyzed(&mut db, "SELECT analyze FROM stats")[2], ("total".to_string(), "1 row".to_string()));
+}

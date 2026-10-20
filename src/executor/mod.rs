@@ -8,6 +8,9 @@ pub mod operator;
 pub mod sort;
 pub mod subquery;
 
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
 use crate::catalog::Catalog;
 use crate::catalog::table::{Row, RowId, Table};
 use crate::error::{Result, err};
@@ -18,7 +21,7 @@ use crate::sql::ast::{Expr, Select, Statement};
 use crate::sql::eval::{Field, eval_with, matches_with};
 use crate::types::Value;
 use join::JOIN_MEMORY;
-use operator::Rows;
+use operator::{Profile, Rows, StepCount};
 use sort::SORT_MEMORY;
 use subquery::Runner;
 
@@ -57,7 +60,11 @@ pub fn execute(catalog: &mut Catalog, statement: Statement, settings: &Settings)
             catalog.drop_index(&name)?;
             Ok(message(format!("index {name} dropped")))
         }
-        Statement::Explain(statement) => explain(catalog, *statement),
+        Statement::Explain { statement, analyze: false } => explain(catalog, *statement),
+        Statement::Explain { statement, analyze: true } => match *statement {
+            Statement::Select(query) => explain_analyze(catalog, query, settings),
+            _ => err("EXPLAIN ANALYZE supports only SELECT"),
+        },
         Statement::Select(query) => {
             let query = select(catalog, query, settings)?;
             let columns = query.columns.clone();
@@ -111,6 +118,51 @@ fn explain(catalog: &Catalog, statement: Statement) -> Result<QueryResult> {
         _ => return err("EXPLAIN supports only SELECT, UPDATE and DELETE"),
     };
     Ok(message(plan.explain()))
+}
+
+/// Runs a SELECT, reading all of its rows, and describes its plan as
+/// EXPLAIN does, each step followed by what it did: the rows it returned and
+/// the time it took, the time of the steps below it included (and, if it
+/// ran more than once, how often). A last line gives the query's rows and time.
+fn explain_analyze(catalog: &Catalog, query: Select, settings: &Settings) -> Result<QueryResult> {
+    let root = query::select(catalog, query)?.root;
+    let lines = root.explain_lines();
+    let profile = Rc::new(Profile::new(lines.len()));
+    let start = Instant::now();
+    let mut returned = 0;
+    for row in operator::open_profiled(root, catalog, settings, &profile) {
+        row?;
+        returned += 1;
+    }
+    let time = start.elapsed();
+
+    let mut out: Vec<String> = lines
+        .into_iter()
+        .zip(profile.counts())
+        .map(|(line, count)| {
+            let did = match count {
+                StepCount { inside: true, .. } => "counted with the join above".to_string(),
+                StepCount { runs: 0, .. } => "never run".to_string(),
+                StepCount { runs: 1, rows, time, .. } => format!("{}, {}", rows_of(rows), ms(time)),
+                StepCount { runs, rows, time, .. } => format!("{} in {runs} runs, {}", rows_of(rows), ms(time)),
+            };
+            format!("{line}  ({did})")
+        })
+        .collect();
+    out.push(format!("{} in {}", rows_of(returned), ms(time)));
+    Ok(message(out.join("\n")))
+}
+
+fn rows_of(n: u64) -> String {
+    format!("{n} row{}", if n == 1 { "" } else { "s" })
+}
+
+/// A time in milliseconds, with more decimals under one.
+fn ms(time: Duration) -> String {
+    match time.as_secs_f64() * 1000.0 {
+        ms if ms < 1.0 => format!("{ms:.3} ms"),
+        ms => format!("{ms:.1} ms"),
+    }
 }
 
 fn insert(

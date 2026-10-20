@@ -135,7 +135,7 @@ impl Database {
     /// Runs a statement other than the transaction ones, atomically: commits
     /// it, or inside a transaction saves it, or else undoes it.
     fn statement(&mut self, statement: Statement) -> Result<QueryResult> {
-        let modifies = !matches!(statement, Statement::Select(_) | Statement::Explain(_));
+        let modifies = !matches!(statement, Statement::Select(_) | Statement::Explain { .. });
         let savepoint = (modifies && self.transaction.is_some()).then(|| self.pool.disk().savepoint());
         let result = executor::execute(&mut self.catalog, statement, &self.settings);
         if !modifies {

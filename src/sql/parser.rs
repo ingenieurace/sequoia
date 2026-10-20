@@ -53,7 +53,10 @@ impl Parser {
             "BEGIN" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" => self.transaction(),
             "EXPLAIN" => {
                 self.pos += 1;
-                Ok(Statement::Explain(Box::new(self.statement()?)))
+                // Not a keyword, so that it stays free as a name: no statement starts with it.
+                let analyze = matches!(self.peek(), Some(Token::Ident(word)) if word.eq_ignore_ascii_case("ANALYZE"));
+                self.pos += analyze as usize;
+                Ok(Statement::Explain { statement: Box::new(self.statement()?), analyze })
             }
             "INSERT" => self.insert(),
             "SELECT" => Ok(Statement::Select(self.select()?)),

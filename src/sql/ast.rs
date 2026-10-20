@@ -22,7 +22,9 @@ pub enum Statement {
         name: String,
     },
     /// `EXPLAIN statement`: describes how the statement would read its table.
-    Explain(Box<Statement>),
+    /// `EXPLAIN ANALYZE` (of a SELECT) also runs it, and tells how many rows
+    /// each step returned and how long it took.
+    Explain { statement: Box<Statement>, analyze: bool },
     /// Copies the committed pages from the write-ahead log into the database file.
     Checkpoint,
     /// `BEGIN [TRANSACTION]`: the statements up to COMMIT or ROLLBACK form one transaction.

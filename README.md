@@ -133,7 +133,8 @@ cargo bench --bench buffer_pool -- scans
 - Statements: `CREATE TABLE ... [USING HEAP | LSM | COLUMN]`, `DROP TABLE`,
   `CREATE [UNIQUE] INDEX name ON table (column)`, `DROP INDEX`, `INSERT`, `SELECT`,
   `UPDATE`, `DELETE`, `CHECKPOINT`, and `EXPLAIN` before a `SELECT`, `UPDATE` or
-  `DELETE` to see its plan
+  `DELETE` to see its plan, or `EXPLAIN ANALYZE` before a `SELECT` to run it
+  and see what each step of its plan did
 - Transactions: `BEGIN`, `COMMIT`, `ROLLBACK`, and `SAVEPOINT name`,
   `ROLLBACK TO name`, `RELEASE name` (each may add `TRANSACTION` or `SAVEPOINT`
   as in SQL)
@@ -335,6 +336,27 @@ Scans, filters, limits and projections hand rows on one at a time, so a
 `Database::query` returns a `SELECT`'s rows as they are made instead of
 collecting them (`execute` collects them). Sorts and aggregates need all of
 their input before their first row.
+
+`EXPLAIN ANALYZE` runs a `SELECT`, reading all of its rows, and shows each
+step of its plan with the rows it returned and the time it took, the time of
+the steps below it included, and a last line with the query's rows and time:
+
+```
+EXPLAIN ANALYZE SELECT g, COUNT(*) FROM a WHERE k < 5000 GROUP BY g ORDER BY g;
+
+PROJECT g, COUNT(*)  (10 rows, 4.0 ms)
+  SORT BY g  (10 rows, 4.0 ms)
+    AGGREGATE COUNT(*) BY g  (10 rows, 4.0 ms)
+      FILTER k < 5000  (9993 rows, 2.9 ms)
+        SCAN a  (20000 rows, 1.4 ms)
+10 rows in 4.0 ms
+```
+
+A step that runs more than once, as the right side of a block nested loop
+join does for each block of left rows, says how often, with its rows counted
+over all of its runs; an index join's lookups are counted with the join. Each
+step's time includes timing it, about the cost of reading the clock twice for
+each row it returns.
 
 **Joins**: the tables of `FROM` are joined left to right. Every column
 reference is first bound to its table; an unqualified name that several
