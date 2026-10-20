@@ -656,22 +656,23 @@ impl Iterator for MergeJoin<'_> {
     }
 }
 
-/// Sorts rows by the values of `keys`, in the order [`compare`] puts them,
-/// then by `then`, as ORDER BY would.
+/// Sorts rows by the values of `keys`, in the order [`compare`] puts them
+/// (which is how the sorter orders values of different types too), then by
+/// `then`, as ORDER BY would.
 fn sort(rows: Rows, fields: &[Field], keys: &[Expr], desc: &[bool], then: &[OrderBy], budget: usize) -> Result<Sorted> {
-    // Each key sorts as two: its type's rank, then its value.
-    let directions = desc.iter().flat_map(|&d| [d, d]).chain(then.iter().map(|o| o.desc)).collect();
+    let directions = desc.iter().copied().chain(then.iter().map(|o| o.desc)).collect();
     let mut sorter = Sorter::new(directions, None, budget);
+    let mut sort_keys = Vec::new();
     for row in rows {
         let row = row?;
-        let mut sort_keys = Vec::new();
-        for value in self::keys(keys, fields, &row)? {
-            sort_keys.extend([Value::Int(rank(&value)), value]);
+        sort_keys.clear();
+        for e in keys {
+            sort_keys.push(eval(e, fields, &row)?);
         }
         for o in then {
             sort_keys.push(eval(&o.expr, fields, &row)?);
         }
-        sorter.push(sort_keys, row)?;
+        sorter.push(&sort_keys, row)?;
     }
     sorter.finish()
 }

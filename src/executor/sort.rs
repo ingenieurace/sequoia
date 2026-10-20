@@ -3,25 +3,35 @@
 //!
 //! ```text
 //! rows --> buffer (in memory) --full--> sorted run --+
-//!          buffer             --full--> sorted run --+--> merge 16 at a time --> ... --> one sorted stream
-//!          buffer             --end---> sorted run --+
+//!          buffer             --full--> sorted run --+--> merge --> ... --> one sorted stream
+//!          buffer             --end---> sorted, kept in memory --+
 //! ```
 //!
+//! Each row's sort keys are encoded as one byte string that compares, byte
+//! by byte, as the keys do (see [`encode_key`]), and rows with equal keys
+//! by the order they came in: the sort is stable. Its first eight bytes are
+//! kept as a number, beside the rest and the row's arrival number, so a key
+//! of up to eight bytes, as most INT keys are, takes no memory of its own,
+//! and comparing two such rows compares only numbers.
+//!
 //! Rows are buffered until they take more than the budget, then sorted and
-//! written out as a run to a temporary file. At the end, the runs are merged:
-//! a heap holds the next row of each run and hands out the smallest. If there
-//! are more than [`FAN_IN`] runs, groups of them are first merged into longer
-//! runs, pass after pass, so that each merge reads only a few runs at once.
-//! When nothing was written out, the buffer is just sorted in memory.
+//! written out as a run to a temporary file. At the end, the last buffer is
+//! sorted and kept in memory, and merged with the runs: a tournament tree
+//! holds the next row of each and hands out the smallest. A merge reads at
+//! most a fan-in of runs at once, more with a larger budget. If there are
+//! more, the smallest runs are first merged into longer ones, as few at the
+//! start as it takes for every later merge to be a full one, so that rows
+//! are copied as few times as they can be. A merge before the last copies
+//! records whole, without decoding them. When nothing was written out, the
+//! buffer is just sorted in memory.
 //!
 //! With `LIMIT n`, only the first `n` rows can be in the result, so the
 //! buffer is a heap of at most `n` rows whose top is the last of them: a new
 //! row either replaces it or is dropped at once. Sorting `m` rows then takes
 //! O(m log n) time and memory for `n` rows. A run, too, keeps only its first
-//! `n` rows, and the merge stops after `n`.
-//!
-//! The sort is stable: each row is numbered as it arrives, and rows with
-//! equal keys come out in that order.
+//! `n` rows, and the merge stops after `n`. Once a run of `n` rows is
+//! written, a row that sorts after its last can never be in the result
+//! either, and is dropped as it arrives.
 //!
 //! The temporary file is removed as soon as it is created, so it disappears
 //! when the sort ends, even if the process does not. It does not go through
@@ -40,14 +50,17 @@ use crate::types::Value;
 
 /// Default memory a sort may buffer rows in before writing runs out: 4 MB.
 pub const SORT_MEMORY: usize = 4 << 20;
-/// Runs a merge reads at once.
+/// Fewest runs a merge reads at once. With a larger budget, it reads one per
+/// [`IO_CHUNK`] of the budget, up to [`MAX_FAN_IN`].
 pub const FAN_IN: usize = 16;
+/// Most runs a merge reads at once.
+const MAX_FAN_IN: usize = 256;
 /// Bytes read or written to the temporary file at a time.
 const IO_CHUNK: usize = 64 << 10;
 
 pub struct Sorter {
     /// For each sort key, whether it is descending.
-    desc: Arc<[bool]>,
+    desc: Box<[bool]>,
     limit: Option<usize>,
     budget: usize,
     fan_in: usize,
@@ -56,6 +69,11 @@ pub struct Sorter {
     bytes: usize,
     /// Number of the next row pushed.
     seq: u64,
+    /// The key being encoded, kept to reuse its memory.
+    scratch: Vec<u8>,
+    /// With a limit, the smallest last key of a run of `limit` rows: rows
+    /// with keys from it on can be dropped.
+    cutoff: Option<Key>,
     /// Created when the first run is written out.
     spill: Option<Spill>,
 }
@@ -67,19 +85,37 @@ enum Buffer {
     Top(BinaryHeap<Keyed>),
 }
 
-/// A row with its sort keys and arrival number.
+/// A row with its sort key.
 struct Keyed {
-    keys: Vec<Value>,
-    seq: u64,
+    key: Key,
     row: Row,
-    desc: Arc<[bool]>,
+}
+
+/// A row's encoded sort key, split so that most comparisons need only look
+/// at numbers: its first eight bytes (padded with zeros), the rest, and the
+/// row's arrival number. The fields compare in that order, as the bytes of
+/// the key would: as no key's encoding begins with another's, two keys
+/// whose first eight bytes match are both longer than eight bytes, or equal.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Key {
+    prefix: u64,
+    rest: Box<[u8]>,
+    seq: u64,
+}
+
+/// A [`Key`] whose bytes are borrowed: from a key being encoded, or a run's record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct KeyRef<'a> {
+    prefix: u64,
+    rest: &'a [u8],
+    seq: u64,
 }
 
 impl Sorter {
     /// A sorter for rows ordered by keys with these directions, keeping the
     /// first `limit` rows if given, and buffering about `budget` bytes.
     pub fn new(desc: Vec<bool>, limit: Option<usize>, budget: usize) -> Self {
-        Self::with_fan_in(desc, limit, budget, FAN_IN)
+        Self::with_fan_in(desc, limit, budget, (budget / IO_CHUNK).clamp(FAN_IN, MAX_FAN_IN))
     }
 
     pub fn with_fan_in(desc: Vec<bool>, limit: Option<usize>, budget: usize, fan_in: usize) -> Self {
@@ -88,16 +124,37 @@ impl Sorter {
             Some(_) => Buffer::Top(BinaryHeap::new()),
             None => Buffer::All(Vec::new()),
         };
-        Sorter { desc: desc.into(), limit, budget, fan_in, buffer, bytes: 0, seq: 0, spill: None }
+        Sorter {
+            desc: desc.into(),
+            limit,
+            budget,
+            fan_in,
+            buffer,
+            bytes: 0,
+            seq: 0,
+            scratch: Vec::new(),
+            cutoff: None,
+            spill: None,
+        }
     }
 
     /// Adds a row with its sort keys, one per direction given to `new`.
-    pub fn push(&mut self, keys: Vec<Value>, row: Row) -> Result<()> {
+    pub fn push(&mut self, keys: &[Value], row: Row) -> Result<()> {
         assert_eq!(keys.len(), self.desc.len());
-        let item = Keyed { keys, seq: self.seq, row, desc: self.desc.clone() };
+        self.scratch.clear();
+        for (value, &desc) in keys.iter().zip(&self.desc) {
+            encode_key(value, desc, &mut self.scratch);
+        }
+        let key = KeyRef::new(&self.scratch, self.seq);
         self.seq += 1;
+        if let Some(cutoff) = &self.cutoff
+            && key >= cutoff.as_ref()
+        {
+            return Ok(());
+        }
         match &mut self.buffer {
             Buffer::All(rows) => {
+                let item = Keyed { key: key.to_owned(), row };
                 self.bytes += item.size();
                 rows.push(item);
             }
@@ -108,11 +165,12 @@ impl Sorter {
                 }
                 if heap.len() == limit {
                     // Arrives later than every row kept, so it loses ties.
-                    if item >= *heap.peek().expect("not empty") {
+                    if key >= heap.peek().expect("not empty").key.as_ref() {
                         return Ok(());
                     }
                     self.bytes -= heap.pop().expect("not empty").size();
                 }
+                let item = Keyed { key: key.to_owned(), row };
                 self.bytes += item.size();
                 heap.push(item);
             }
@@ -130,21 +188,28 @@ impl Sorter {
 
     /// Returns the rows in order.
     pub fn finish(mut self) -> Result<Sorted> {
-        if self.spill.is_none() {
-            return Ok(Sorted { inner: Inner::Memory(self.take_sorted().into_iter()) });
+        let rows = self.take_sorted();
+        let Some(mut spill) = self.spill.take() else {
+            return Ok(Sorted { inner: Inner::Memory(rows.into_iter()) });
+        };
+        // The last rows stay in memory, as one more input of the last merge.
+        let memory = (!rows.is_empty()).then(|| Source::Memory(Memory::new(rows)));
+        let inputs = |spill: &Spill| spill.runs.len() + memory.is_some() as usize;
+        while inputs(&spill) > self.fan_in {
+            // Merging k runs leaves k - 1 fewer. Merge as few as it takes for
+            // every merge after this one to merge fan_in, the smallest first.
+            let take = (inputs(&spill) - 2) % (self.fan_in - 1) + 2;
+            spill.runs.sort_unstable_by_key(|run| Reverse(run.end - run.start));
+            let group = spill.runs.split_off(spill.runs.len() - take);
+            let sources = group.iter().map(|&run| Source::run(&spill.file, run)).collect::<Result<_>>()?;
+            let mut merge = Merge::new(sources, self.limit);
+            let run = spill.write_merged(&mut merge)?;
+            spill.runs.push(run);
         }
-        self.write_run()?;
-        let mut spill = self.spill.take().expect("spilled");
-        while spill.runs.len() > self.fan_in {
-            let runs = std::mem::take(&mut spill.runs);
-            for group in runs.chunks(self.fan_in) {
-                let merged = Merge::new(&spill.file, group, &self.desc, self.limit)?;
-                let run = spill.write(merged)?;
-                spill.runs.push(run);
-            }
-        }
-        let merge = Merge::new(&spill.file, &spill.runs, &self.desc, self.limit)?;
-        Ok(Sorted { inner: Inner::Merge(merge) })
+        let mut sources: Vec<Source> =
+            spill.runs.iter().map(|&run| Source::run(&spill.file, run)).collect::<Result<_>>()?;
+        sources.extend(memory);
+        Ok(Sorted { inner: Inner::Merge(Merge::new(sources, self.limit)) })
     }
 
     /// Empties the buffer into a sorted vector, keeping only the first `limit` rows.
@@ -167,14 +232,21 @@ impl Sorter {
     /// Sorts the buffer and writes it out as a run.
     fn write_run(&mut self) -> Result<()> {
         let rows = self.take_sorted();
-        if rows.is_empty() {
+        let Some(last) = rows.last() else {
             return Ok(());
+        };
+        if Some(rows.len()) == self.limit && self.cutoff.as_ref().is_none_or(|cutoff| last.key < *cutoff) {
+            self.cutoff = Some(last.key.clone());
         }
         let spill = match &mut self.spill {
             Some(spill) => spill,
             None => self.spill.insert(Spill { file: temp_file()?, end: 0, runs: Vec::new() }),
         };
-        let run = spill.write(rows.into_iter().map(Ok))?;
+        let mut writer = RunWriter::new(spill);
+        for row in &rows {
+            writer.keyed(row)?;
+        }
+        let run = writer.finish()?;
         spill.runs.push(run);
         Ok(())
     }
@@ -194,18 +266,38 @@ impl Iterator for Sorted {
     type Item = Result<Row>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let item = match &mut self.inner {
-            Inner::Memory(rows) => Ok(rows.next()?),
-            Inner::Merge(merge) => merge.next()?,
-        };
-        Some(item.map(|keyed| keyed.row))
+        match &mut self.inner {
+            Inner::Memory(rows) => Some(Ok(rows.next()?.row)),
+            Inner::Merge(merge) => merge.next(),
+        }
     }
 }
 
 impl Keyed {
     /// A rough count of the bytes the row takes in memory.
     fn size(&self) -> usize {
-        64 + self.keys.iter().chain(&self.row).map(value_size).sum::<usize>()
+        56 + self.key.rest.len() + self.row.iter().map(value_size).sum::<usize>()
+    }
+}
+
+impl Key {
+    fn as_ref(&self) -> KeyRef<'_> {
+        KeyRef { prefix: self.prefix, rest: &self.rest, seq: self.seq }
+    }
+}
+
+impl<'a> KeyRef<'a> {
+    /// The key of a row with this encoding and number.
+    fn new(encoded: &'a [u8], seq: u64) -> Self {
+        let n = encoded.len().min(8);
+        let mut prefix = [0; 8];
+        prefix[..n].copy_from_slice(&encoded[..n]);
+        KeyRef { prefix: u64::from_be_bytes(prefix), rest: &encoded[n..], seq }
+    }
+
+    fn to_owned(self) -> Key {
+        // An empty box takes no memory.
+        Key { prefix: self.prefix, rest: self.rest.into(), seq: self.seq }
     }
 }
 
@@ -219,13 +311,7 @@ pub fn value_size(value: &Value) -> usize {
 
 impl Ord for Keyed {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.desc
-            .iter()
-            .zip(self.keys.iter().zip(&other.keys))
-            .map(|(&desc, (a, b))| if desc { b.sort_cmp(a) } else { a.sort_cmp(b) })
-            .find(|ord| ord.is_ne())
-            .unwrap_or(Ordering::Equal)
-            .then(self.seq.cmp(&other.seq))
+        self.key.cmp(&other.key)
     }
 }
 
@@ -243,6 +329,58 @@ impl PartialEq for Keyed {
 
 impl Eq for Keyed {}
 
+// ---- keys ----
+
+const NULL: u8 = 0x01;
+const FALSE: u8 = 0x02;
+const TRUE: u8 = 0x03;
+/// INT zero; a positive INT of n bytes is `INT + n`, a negative one `INT - n`.
+const INT: u8 = 0x14;
+const TEXT: u8 = 0x20;
+
+/// Appends a sort key's encoding, whose bytes compare as ORDER BY orders
+/// values: NULL first, then BOOL, INT and TEXT (as values of different types
+/// are never equal, those of one type all sort before those of another).
+/// Each value's encoding ends where it can be told to, so a key of several
+/// values compares like its values one after another:
+///
+/// ```text
+/// NULL   01
+/// BOOL   02 for FALSE, 03 for TRUE
+/// INT    14 for zero; 14 + n, then its n big-endian bytes, for a positive one;
+///        14 - n, then the bytes of the complement of its magnitude, for a negative one
+/// TEXT   20, its UTF-8 bytes with each 00 as 00 FF, then 00 00
+/// ```
+///
+/// A descending key has every byte of its encoding inverted.
+fn encode_key(value: &Value, desc: bool, out: &mut Vec<u8>) {
+    let start = out.len();
+    match value {
+        Value::Null => out.push(NULL),
+        Value::Bool(b) => out.push(if *b { TRUE } else { FALSE }),
+        Value::Int(n) => {
+            let magnitude = n.unsigned_abs();
+            let len = 8 - magnitude.leading_zeros() as usize / 8;
+            let (tag, bits) = if *n < 0 { (INT - len as u8, !magnitude) } else { (INT + len as u8, magnitude) };
+            out.push(tag);
+            out.extend_from_slice(&bits.to_be_bytes()[8 - len..]);
+        }
+        Value::Text(s) => {
+            out.push(TEXT);
+            for (i, part) in s.as_bytes().split(|&b| b == 0).enumerate() {
+                if i > 0 {
+                    out.extend_from_slice(&[0, 0xFF]);
+                }
+                out.extend_from_slice(part);
+            }
+            out.extend_from_slice(&[0, 0]);
+        }
+    }
+    if desc {
+        out[start..].iter_mut().for_each(|b| *b = !*b);
+    }
+}
+
 // ---- runs ----
 
 /// The temporary file and the runs written to it, one after another.
@@ -256,7 +394,7 @@ struct Spill {
 /// Where a run is in the temporary file: rows in order, each one a record
 ///
 /// ```text
-/// u32 length of the rest | u64 number | u16 key count | keys, then the row's values
+/// u32 length of the rest | key: u64 prefix | u64 number | u32 length, rest of the key | the row's values
 /// value: 0 = NULL | 1, i64 | 2, bool byte | 3, u32 length, UTF-8 bytes   (little-endian)
 /// ```
 #[derive(Debug, Clone, Copy)]
@@ -265,31 +403,76 @@ struct Run {
     end: u64,
 }
 
+/// Where the rest of the key starts in a record: after the record's length,
+/// the key's prefix and number, and the rest's length.
+const KEY_REST: usize = 4 + 8 + 8 + 4;
+
 impl Spill {
-    /// Appends rows, which must be in order, as a new run.
-    fn write(&mut self, rows: impl Iterator<Item = Result<Keyed>>) -> Result<Run> {
-        let start = self.end;
-        let mut chunk = Vec::with_capacity(IO_CHUNK);
-        for row in rows {
-            let row = row?;
-            let len_at = chunk.len();
-            chunk.extend_from_slice(&[0; 4]);
-            chunk.extend_from_slice(&row.seq.to_le_bytes());
-            chunk.extend_from_slice(&(row.keys.len() as u16).to_le_bytes());
-            for value in row.keys.iter().chain(&row.row) {
-                encode_value(value, &mut chunk);
+    /// Appends the rows a merge hands out as a new run.
+    fn write_merged(&mut self, merge: &mut Merge) -> Result<Run> {
+        let mut writer = RunWriter::new(self);
+        while let Some(i) = merge.winner() {
+            match &merge.sources[i] {
+                Source::Run(reader) => writer.record(reader.record())?,
+                Source::Memory(memory) => writer.keyed(memory.current.as_ref().expect("has a key"))?,
             }
-            let len = (chunk.len() - len_at - 4) as u32;
-            chunk[len_at..len_at + 4].copy_from_slice(&len.to_le_bytes());
-            if chunk.len() >= IO_CHUNK {
-                self.file.write_at(self.end, &chunk)?;
-                self.end += chunk.len() as u64;
-                chunk.clear();
-            }
+            merge.advance()?;
         }
-        self.file.write_at(self.end, &chunk)?;
-        self.end += chunk.len() as u64;
-        Ok(Run { start, end: self.end })
+        writer.finish()
+    }
+}
+
+/// Appends records to the temporary file as a new run, a chunk at a time.
+struct RunWriter<'a> {
+    spill: &'a mut Spill,
+    start: u64,
+    chunk: Vec<u8>,
+}
+
+impl<'a> RunWriter<'a> {
+    fn new(spill: &'a mut Spill) -> Self {
+        let start = spill.end;
+        RunWriter { spill, start, chunk: Vec::with_capacity(IO_CHUNK) }
+    }
+
+    fn keyed(&mut self, row: &Keyed) -> Result<()> {
+        let at = self.chunk.len();
+        self.chunk.extend_from_slice(&[0; 4]);
+        self.chunk.extend_from_slice(&row.key.prefix.to_le_bytes());
+        self.chunk.extend_from_slice(&row.key.seq.to_le_bytes());
+        self.chunk.extend_from_slice(&(row.key.rest.len() as u32).to_le_bytes());
+        self.chunk.extend_from_slice(&row.key.rest);
+        for value in &row.row {
+            encode_value(value, &mut self.chunk);
+        }
+        let len = (self.chunk.len() - at - 4) as u32;
+        self.chunk[at..at + 4].copy_from_slice(&len.to_le_bytes());
+        self.flush_if_full()
+    }
+
+    /// Appends a whole record as a run reader read it.
+    fn record(&mut self, record: &[u8]) -> Result<()> {
+        self.chunk.extend_from_slice(record);
+        self.flush_if_full()
+    }
+
+    fn flush_if_full(&mut self) -> Result<()> {
+        if self.chunk.len() >= IO_CHUNK {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.spill.file.write_at(self.spill.end, &self.chunk)?;
+        self.spill.end += self.chunk.len() as u64;
+        self.chunk.clear();
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Run> {
+        self.flush()?;
+        Ok(Run { start: self.start, end: self.spill.end })
     }
 }
 
@@ -319,72 +502,6 @@ fn encode_value(value: &Value, out: &mut Vec<u8>) {
     }
 }
 
-/// Reads a run's records in order, a chunk of the file at a time.
-struct RunReader {
-    file: Arc<dyn Medium>,
-    /// Next byte of the run to read from the file.
-    pos: u64,
-    end: u64,
-    chunk: Vec<u8>,
-    /// Next unread byte of `chunk`.
-    at: usize,
-    desc: Arc<[bool]>,
-}
-
-impl RunReader {
-    fn new(file: &Arc<dyn Medium>, run: Run, desc: &Arc<[bool]>) -> Self {
-        RunReader { file: file.clone(), pos: run.start, end: run.end, chunk: Vec::new(), at: 0, desc: desc.clone() }
-    }
-
-    fn next(&mut self) -> Result<Option<Keyed>> {
-        if !self.fill(4)? {
-            return Ok(None);
-        }
-        let len = u32::from_le_bytes(self.take(4).try_into().unwrap()) as usize;
-        if !self.fill(len)? {
-            return err("corrupted sort run: a record is cut short");
-        }
-        let record = self.take(len);
-        let seq = u64::from_le_bytes(record[0..8].try_into().unwrap());
-        let key_count = u16::from_le_bytes(record[8..10].try_into().unwrap()) as usize;
-        let mut values = Vec::new();
-        let mut pos = 10;
-        while pos < record.len() {
-            values.push(decode_value(record, &mut pos)?);
-        }
-        let row = values.split_off(key_count);
-        Ok(Some(Keyed { keys: values, seq, row, desc: self.desc.clone() }))
-    }
-
-    /// Makes sure `n` unread bytes are in the chunk. Returns false if the run
-    /// has no bytes left at all.
-    fn fill(&mut self, n: usize) -> Result<bool> {
-        let unread = self.chunk.len() - self.at;
-        if unread >= n {
-            return Ok(true);
-        }
-        if unread == 0 && self.pos == self.end {
-            return Ok(false);
-        }
-        let read = (n - unread).max(IO_CHUNK).min((self.end - self.pos) as usize);
-        if unread + read < n {
-            return err("corrupted sort run: a record is cut short");
-        }
-        self.chunk.drain(..self.at);
-        self.at = 0;
-        let old = self.chunk.len();
-        self.chunk.resize(old + read, 0);
-        self.file.read_at(self.pos, &mut self.chunk[old..])?;
-        self.pos += read as u64;
-        Ok(true)
-    }
-
-    fn take(&mut self, n: usize) -> &[u8] {
-        self.at += n;
-        &self.chunk[self.at - n..self.at]
-    }
-}
-
 fn decode_value(bytes: &[u8], pos: &mut usize) -> Result<Value> {
     let mut take = |n: usize| -> Result<&[u8]> {
         let slice = bytes.get(*pos..*pos + n).ok_or_else(|| crate::error::Error("corrupted sort run".into()))?;
@@ -406,44 +523,227 @@ fn decode_value(bytes: &[u8], pos: &mut usize) -> Result<Value> {
     })
 }
 
-/// Merges sorted runs: a heap holds the next row of each and hands out the smallest.
+/// Reads a run's records in order, a chunk of the file at a time. The
+/// current record stays in the chunk until the reader moves past it.
+struct RunReader {
+    file: Arc<dyn Medium>,
+    /// Next byte of the run to read from the file.
+    pos: u64,
+    end: u64,
+    chunk: Vec<u8>,
+    /// Where the current record starts in `chunk`.
+    at: usize,
+    /// Its length, with the length before it; 0 once the run is read.
+    len: usize,
+}
+
+impl RunReader {
+    fn new(file: &Arc<dyn Medium>, run: Run) -> Result<Self> {
+        let mut reader = RunReader { file: file.clone(), pos: run.start, end: run.end, chunk: Vec::new(), at: 0, len: 0 };
+        reader.advance()?;
+        Ok(reader)
+    }
+
+    /// Moves to the next record, if there is one.
+    fn advance(&mut self) -> Result<()> {
+        self.at += self.len;
+        self.len = 0;
+        if !self.fill(4)? {
+            return Ok(());
+        }
+        let len = 4 + u32::from_le_bytes(self.chunk[self.at..self.at + 4].try_into().unwrap()) as usize;
+        if len < KEY_REST || !self.fill(len)? {
+            return err("corrupted sort run: a record is cut short");
+        }
+        self.len = len;
+        if self.row_at() > len {
+            self.len = 0;
+            return err("corrupted sort run: a key runs past its record");
+        }
+        Ok(())
+    }
+
+    /// The current record, whole; empty once the run is read.
+    fn record(&self) -> &[u8] {
+        &self.chunk[self.at..self.at + self.len]
+    }
+
+    /// Where the current record's row starts in it, after the key.
+    fn row_at(&self) -> usize {
+        let record = self.record();
+        KEY_REST + u32::from_le_bytes(record[KEY_REST - 4..KEY_REST].try_into().unwrap()) as usize
+    }
+
+    /// The current record's key, if there is a current record.
+    fn key(&self) -> Option<KeyRef<'_>> {
+        let record = self.record();
+        if record.is_empty() {
+            return None;
+        }
+        let number = |at: usize| u64::from_le_bytes(record[at..at + 8].try_into().unwrap());
+        Some(KeyRef { prefix: number(4), rest: &record[KEY_REST..self.row_at()], seq: number(12) })
+    }
+
+    /// Decodes the current record's row.
+    fn row(&self) -> Result<Row> {
+        let record = self.record();
+        let mut pos = self.row_at();
+        let mut row = Vec::new();
+        while pos < record.len() {
+            row.push(decode_value(record, &mut pos)?);
+        }
+        Ok(row)
+    }
+
+    /// Makes sure `n` unread bytes are in the chunk from `at`. Returns false
+    /// if the run has no bytes left at all.
+    fn fill(&mut self, n: usize) -> Result<bool> {
+        let unread = self.chunk.len() - self.at;
+        if unread >= n {
+            return Ok(true);
+        }
+        if unread == 0 && self.pos == self.end {
+            return Ok(false);
+        }
+        let read = (n - unread).max(IO_CHUNK).min((self.end - self.pos) as usize);
+        if unread + read < n {
+            return err("corrupted sort run: a record is cut short");
+        }
+        self.chunk.drain(..self.at);
+        self.at = 0;
+        let old = self.chunk.len();
+        self.chunk.resize(old + read, 0);
+        self.file.read_at(self.pos, &mut self.chunk[old..])?;
+        self.pos += read as u64;
+        Ok(true)
+    }
+}
+
+/// The sorted rows kept in memory at the end.
+struct Memory {
+    rows: std::vec::IntoIter<Keyed>,
+    current: Option<Keyed>,
+}
+
+impl Memory {
+    fn new(rows: Vec<Keyed>) -> Self {
+        let mut rows = rows.into_iter();
+        Memory { current: rows.next(), rows }
+    }
+}
+
+/// An input of a merge.
+enum Source {
+    Run(RunReader),
+    Memory(Memory),
+}
+
+impl Source {
+    fn run(file: &Arc<dyn Medium>, run: Run) -> Result<Source> {
+        Ok(Source::Run(RunReader::new(file, run)?))
+    }
+
+    /// The key of the next row, if any rows are left.
+    fn key(&self) -> Option<KeyRef<'_>> {
+        match self {
+            Source::Run(reader) => reader.key(),
+            Source::Memory(memory) => memory.current.as_ref().map(|row| row.key.as_ref()),
+        }
+    }
+
+    fn advance(&mut self) -> Result<()> {
+        match self {
+            Source::Run(reader) => reader.advance(),
+            Source::Memory(memory) => {
+                memory.current = memory.rows.next();
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Merges sorted inputs with a tournament tree of losers: each inner node
+/// holds the input that lost the match there, and `tree[0]` the winner, the
+/// input with the smallest next row. Once the winner moves on, it plays only
+/// the matches on its way up again: log2(inputs) comparisons per row.
 struct Merge {
-    readers: Vec<RunReader>,
-    heap: BinaryHeap<Reverse<(Keyed, usize)>>,
+    sources: Vec<Source>,
+    /// Node `i` has children `2i` and `2i + 1`; input `j` is leaf `len + j`.
+    tree: Vec<usize>,
     /// Rows left to return, if there is a limit.
     remaining: Option<usize>,
 }
 
 impl Merge {
-    fn new(file: &Arc<dyn Medium>, runs: &[Run], desc: &Arc<[bool]>, limit: Option<usize>) -> Result<Self> {
-        let mut readers: Vec<RunReader> = runs.iter().map(|&run| RunReader::new(file, run, desc)).collect();
-        let mut heap = BinaryHeap::new();
-        for (i, reader) in readers.iter_mut().enumerate() {
-            if let Some(row) = reader.next()? {
-                heap.push(Reverse((row, i)));
-            }
+    fn new(sources: Vec<Source>, limit: Option<usize>) -> Self {
+        let n = sources.len();
+        let mut tree = vec![0; n.max(1)];
+        let mut winners = vec![0; 2 * n];
+        for (i, winner) in winners[n..].iter_mut().enumerate() {
+            *winner = i;
         }
-        Ok(Merge { readers, heap, remaining: limit })
+        for node in (1..n).rev() {
+            let (a, b) = (winners[2 * node], winners[2 * node + 1]);
+            let (winner, loser) = if before(&sources, b, a) { (b, a) } else { (a, b) };
+            winners[node] = winner;
+            tree[node] = loser;
+        }
+        if n > 1 {
+            tree[0] = winners[1];
+        }
+        Merge { sources, tree, remaining: limit }
+    }
+
+    /// The input with the next row, if the merge has rows left.
+    fn winner(&self) -> Option<usize> {
+        if self.remaining == Some(0) {
+            return None;
+        }
+        let winner = self.tree[0];
+        self.sources.get(winner)?.key().map(|_| winner)
+    }
+
+    /// Moves the winner past its row and finds the next one.
+    fn advance(&mut self) -> Result<()> {
+        let mut winner = self.tree[0];
+        self.sources[winner].advance()?;
+        let mut node = (self.sources.len() + winner) / 2;
+        while node > 0 {
+            if before(&self.sources, self.tree[node], winner) {
+                std::mem::swap(&mut self.tree[node], &mut winner);
+            }
+            node /= 2;
+        }
+        self.tree[0] = winner;
+        if let Some(n) = &mut self.remaining {
+            *n -= 1;
+        }
+        Ok(())
+    }
+}
+
+/// Whether input `a`'s next row comes before input `b`'s; an input with no
+/// rows left comes after every other.
+fn before(sources: &[Source], a: usize, b: usize) -> bool {
+    match (sources[a].key(), sources[b].key()) {
+        (Some(a), Some(b)) => a < b,
+        (a, _) => a.is_some(),
     }
 }
 
 impl Iterator for Merge {
-    type Item = Result<Keyed>;
+    type Item = Result<Row>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == Some(0) {
-            return None;
+        let i = self.winner()?;
+        let row = match &mut self.sources[i] {
+            Source::Run(reader) => reader.row(),
+            Source::Memory(memory) => Ok(memory.current.take().expect("has a key").row),
+        };
+        if let Err(e) = self.advance() {
+            return Some(Err(e));
         }
-        let Reverse((row, i)) = self.heap.pop()?;
-        match self.readers[i].next() {
-            Ok(Some(next)) => self.heap.push(Reverse((next, i))),
-            Ok(None) => {}
-            Err(e) => return Some(Err(e)),
-        }
-        if let Some(n) = &mut self.remaining {
-            *n -= 1;
-        }
-        Some(Ok(row))
+        Some(row)
     }
 }
 
@@ -476,13 +776,24 @@ mod tests {
             .collect()
     }
 
+    /// The order of [`encode_key`]: by type, NULL first, then by value.
+    fn compare(a: &Value, b: &Value) -> Ordering {
+        let rank = |v: &Value| match v {
+            Value::Null => 0,
+            Value::Bool(_) => 1,
+            Value::Int(_) => 2,
+            Value::Text(_) => 3,
+        };
+        rank(a).cmp(&rank(b)).then_with(|| a.sort_cmp(b))
+    }
+
     /// The expected result: a stable in-memory sort, then the limit.
     fn expected(rows: &[(Vec<Value>, Row)], desc: &[bool], limit: Option<usize>) -> Vec<Row> {
         let mut sorted: Vec<&(Vec<Value>, Row)> = rows.iter().collect();
         sorted.sort_by(|(a, _), (b, _)| {
             desc.iter()
                 .zip(a.iter().zip(b))
-                .map(|(&d, (x, y))| if d { y.sort_cmp(x) } else { x.sort_cmp(y) })
+                .map(|(&d, (x, y))| if d { compare(y, x) } else { compare(x, y) })
                 .find(|o| o.is_ne())
                 .unwrap_or(Ordering::Equal)
         });
@@ -498,7 +809,7 @@ mod tests {
     ) -> (Vec<Row>, bool) {
         let mut sorter = Sorter::with_fan_in(desc.to_vec(), limit, budget, fan_in);
         for (keys, row) in rows {
-            sorter.push(keys.clone(), row.clone()).unwrap();
+            sorter.push(keys, row.clone()).unwrap();
         }
         let spilled = sorter.spilled();
         (sorter.finish().unwrap().collect::<Result<_>>().unwrap(), spilled)
@@ -522,8 +833,10 @@ mod tests {
             assert_eq!(sorted, expected(&rows, &desc, None), "{desc:?}");
         }
         // A budget smaller than any row writes a run per row.
-        let (sorted, _) = sort(&rows[..200], &[true, true], None, 1, 2);
-        assert_eq!(sorted, expected(&rows[..200], &[true, true], None));
+        for fan_in in [2, 3, 7, 16] {
+            let (sorted, _) = sort(&rows[..200], &[true, true], None, 1, fan_in);
+            assert_eq!(sorted, expected(&rows[..200], &[true, true], None), "fan-in {fan_in}");
+        }
     }
 
     #[test]
@@ -536,8 +849,62 @@ mod tests {
                 assert!(!spilled);
                 assert_eq!(sorted, want, "limit {limit}, {desc:?}");
                 // The top rows themselves overflow a small budget: runs of at most `limit` rows.
-                let (sorted, _) = sort(&rows, &desc, Some(limit), 3000, 4);
-                assert_eq!(sorted, want, "limit {limit}, {desc:?}, spilled");
+                for fan_in in [2, 4] {
+                    let (sorted, _) = sort(&rows, &desc, Some(limit), 3000, fan_in);
+                    assert_eq!(sorted, want, "limit {limit}, {desc:?}, spilled, fan-in {fan_in}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_full_run_cuts_off_later_rows() {
+        let rows: Vec<(Vec<Value>, Row)> = (0..1000).map(|i| (vec![Value::Int(i % 100)], vec![Value::Int(i)])).collect();
+        let mut sorter = Sorter::with_fan_in(vec![false], Some(10), 700, 4);
+        for (keys, row) in &rows {
+            sorter.push(keys, row.clone()).unwrap();
+        }
+        // The first run holds keys 0 to 9: only rows with smaller keys, or
+        // equal ones that came earlier, which none did, are kept after it.
+        assert!(sorter.spilled());
+        let runs = sorter.spill.as_ref().unwrap().runs.len();
+        assert!(runs < 15, "{runs} runs");
+        let sorted: Vec<Row> = sorter.finish().unwrap().collect::<Result<_>>().unwrap();
+        assert_eq!(sorted, expected(&rows, &[false], Some(10)));
+    }
+
+    #[test]
+    fn keys_compare_as_values_do() {
+        let mut values = vec![Value::Null, Value::Bool(false), Value::Bool(true)];
+        for n in [i64::MIN, i64::MIN + 1, -(1 << 40), -65536, -65535, -256, -255, -1, 0, 1, 255, 256, 1 << 40, i64::MAX] {
+            values.push(Value::Int(n));
+        }
+        for s in ["", "\0", "\0\0", "\0a", "a", "a\0", "a\0b", "ab", "b", "é", "世界"] {
+            values.push(Value::Text(s.into()));
+        }
+        let encode = |values: &[&Value], desc: bool| {
+            let mut out = Vec::new();
+            for value in values {
+                encode_key(value, desc, &mut out);
+            }
+            out
+        };
+        for a in &values {
+            for b in &values {
+                for desc in [false, true] {
+                    let want = if desc { compare(b, a) } else { compare(a, b) };
+                    assert_eq!(encode(&[a], desc).cmp(&encode(&[b], desc)), want, "{a:?} {b:?} {desc}");
+                    // A key of two values: the first decides unless equal.
+                    for c in [&values[0], &values[12], &values[20]] {
+                        let (x, y) = (encode(&[a, c], desc), encode(&[b, &values[5]], desc));
+                        // Split into prefix and rest, keys of every length around
+                        // eight bytes compare as their bytes do.
+                        assert_eq!(KeyRef::new(&x, 0).cmp(&KeyRef::new(&y, 0)), x.cmp(&y), "{x:?} {y:?}");
+                        let got = x.cmp(&y);
+                        let want = want.then_with(|| if desc { compare(&values[5], c) } else { compare(c, &values[5]) });
+                        assert_eq!(got, want, "{a:?},{c:?} {b:?} {desc}");
+                    }
+                }
             }
         }
     }

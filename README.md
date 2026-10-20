@@ -336,12 +336,19 @@ read; without `GROUP BY` all rows form one group, even when there are none.
 **Sorting**: `ORDER BY` buffers rows in memory up to a budget (4 MB by
 default; `Database::set_sort_memory` changes it). Past that, it sorts what it
 holds and writes it to a temporary file as a sorted run, and at the end
-merges the runs through a heap, at most 16 at a time, in several passes if
-there are more. The temporary file is removed as soon as it is opened, so it
-vanishes with the sort, and it bypasses the write-ahead log. With `LIMIT n`,
-the buffer is instead a heap of the best `n` rows so far, so sorting `m` rows
-takes O(m log n) time and memory for `n` rows. Rows with equal keys keep the
-order they were read in.
+merges the runs, with the last rows still in memory, through a tournament
+tree. A merge reads 16 runs at once, or one per 64 KB of the budget (up to
+256); if there are more, the smallest are merged first, as few as it takes
+for every later pass to merge a full set. Sort keys are encoded as bytes
+that compare as the values do (NULL first, then each type's values apart),
+so comparing rows compares bytes, and a key of up to eight bytes, as most
+INT keys are, compares as one number. The temporary file is removed as soon
+as it is opened, so it vanishes with the sort, and it bypasses the
+write-ahead log. With `LIMIT n`, the buffer is instead a heap of the best `n`
+rows so far, so sorting `m` rows takes O(m log n) time and memory for `n`
+rows, and once a run of `n` rows is written, later rows that sort after its
+last are dropped as they arrive. Rows with equal keys keep the order they
+were read in.
 
 **The write-ahead log** (`<file>-wal`) makes every statement atomic. The
 DiskManager never writes the database file directly: each page write, the

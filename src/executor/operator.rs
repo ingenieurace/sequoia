@@ -103,13 +103,14 @@ pub fn open<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings) -> Ro
             let mut subqueries = Runner::new(catalog, settings);
             deferred(move || {
                 let mut sorter = Sorter::new(keys.iter().map(|k| k.desc).collect(), limit, budget);
+                let mut values = Vec::new();
                 for row in input {
                     let row = row?;
-                    let values = keys
-                        .iter()
-                        .map(|k| eval_with(&k.expr, &columns, &row, &mut subqueries))
-                        .collect::<Result<_>>()?;
-                    sorter.push(values, row)?;
+                    values.clear();
+                    for k in &keys {
+                        values.push(eval_with(&k.expr, &columns, &row, &mut subqueries)?);
+                    }
+                    sorter.push(&values, row)?;
                 }
                 Ok(Box::new(sorter.finish()?))
             })
