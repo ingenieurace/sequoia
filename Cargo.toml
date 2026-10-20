@@ -12,3 +12,7 @@ harness = false
 [[bench]]
 name = "sort"
 harness = false
+
+[[bench]]
+name = "aggregate"
+harness = false

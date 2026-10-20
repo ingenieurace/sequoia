@@ -76,6 +76,20 @@ cargo bench --bench sort
 cargo bench --bench sort -- spill
 ```
 
+`benches/aggregate.rs` times aggregation on 200,000 rows the same way:
+`groups` with from one group to one per row, by int, text, two and
+expression keys, `functions` each aggregate over the same 100 groups,
+`distinct` `COUNT(DISTINCT ...)` and `SELECT DISTINCT`, and `around` an
+aggregate under `HAVING`, `ORDER BY` and `LIMIT`, or over a `WHERE`:
+
+```bash
+cargo bench --bench aggregate
+```
+
+```bash
+cargo bench --bench aggregate -- distinct
+```
+
 ## Supported SQL
 
 - Statements: `CREATE TABLE ... [USING HEAP | LSM | COLUMN]`, `DROP TABLE`,
