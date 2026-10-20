@@ -53,6 +53,16 @@ cargo bench --bench joins
 cargo bench --bench joins -- index merge
 ```
 
+If there is a `sqlite3` command, the same tables are filled in SQLite and
+every query is timed there as well (by the shell's `.timer`; SQLite counts
+each query's rows instead of returning them), printed beside Sequoia's time
+with the ratio, and the row counts are checked to agree. Pass `--no-sqlite`
+to skip it:
+
+```bash
+cargo bench --bench joins -- --no-sqlite
+```
+
 ## Supported SQL
 
 - Statements: `CREATE TABLE ... [USING HEAP | LSM | COLUMN]`, `DROP TABLE`,
