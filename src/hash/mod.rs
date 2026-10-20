@@ -1,6 +1,9 @@
 //! Hash tables, five ways, to compare with each other and with
-//! `std::collections::HashMap` (see `benches/hash.rs`). Nothing else uses
-//! them yet: the executor's hash joins and aggregates still use `HashMap`.
+//! `std::collections::HashMap` (see `benches/hash.rs`). In memory, none
+//! beats `HashMap` (a SwissTable, which probes 16 slots at once by a byte
+//! of each key's hash), so the executor's hash joins and aggregates use it.
+//! The two dynamic schemes made for disks, extendible and linear hashing,
+//! are put to work in pages by `storage/hash`, for indexes `USING HASH`.
 //!
 //! Static schemes keep entries in one array of slots. When it fills up, the
 //! only way to grow is a new array twice the size, with every entry hashed

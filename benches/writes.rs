@@ -31,7 +31,9 @@ fn main() {
             vec![
                 load("heap, no key", table("HEAP", "id INT")),
                 load("heap, primary key", table("HEAP", "id INT PRIMARY KEY")),
-                load("heap, key + 2 indexes", [table("HEAP", "id INT PRIMARY KEY"), indexes()].concat()),
+                load("heap, key + 2 indexes", [table("HEAP", "id INT PRIMARY KEY"), indexes("")].concat()),
+                // SQLite has no hash indexes: B-trees there.
+                load("heap, key + 2 hash indexes", [table("HEAP", "id INT PRIMARY KEY"), indexes(" USING HASH")].concat()),
                 // Keys in no order: each insert lands in a different leaf of the key's index.
                 batch("heap, keys out of order", rows(ROWS, scattered), &[])
                     .setup(table("HEAP", "id INT PRIMARY KEY")),
@@ -123,8 +125,9 @@ fn table(engine: &str, id: &str) -> Vec<String> {
     vec![format!("CREATE TABLE t ({id}, k INT, g INT, name TEXT) USING {engine}")]
 }
 
-fn indexes() -> Vec<String> {
-    vec!["CREATE INDEX t_k ON t (k)".into(), "CREATE INDEX t_name ON t (name)".into()]
+/// Indexes on `k` and `name`, `using` B+ trees or hash files.
+fn indexes(using: &str) -> Vec<String> {
+    vec![format!("CREATE INDEX t_k ON t{using} (k)"), format!("CREATE INDEX t_name ON t{using} (name)")]
 }
 
 /// Statements inserting `count` rows made by `row`, a thousand a statement.

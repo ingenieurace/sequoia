@@ -18,6 +18,7 @@ UPDATE users SET active = NOT active WHERE id = 2;
 DELETE FROM users WHERE name = 'alice';
 CREATE INDEX users_name ON users (name);
 EXPLAIN SELECT * FROM users WHERE name = 'bob';  -- the plan, ending in SEARCH users USING INDEX users_name
+CREATE INDEX users_active ON users USING HASH (active);
 DROP INDEX users_name;
 DROP TABLE users;
 ```
@@ -43,7 +44,8 @@ SEQUOIA_DIFF_CASES=2000 SEQUOIA_DIFF_SEED=7 cargo test --release --test differen
 `benches/joins.rs` times every join method on 200,000 rows joined with
 50,000, mostly against another method on the same rows, checks that each
 query's plan uses the join it means to time, and prints the fastest of five
-runs of each. Name groups (`hash`, `index`, `block`, `merge`) to run only those:
+runs of each (`hash` also with budgets too small for the right side, which
+spills). Name groups (`hash`, `index`, `block`, `merge`) to run only those:
 
 ```bash
 cargo bench --bench joins
@@ -78,7 +80,8 @@ cargo bench --bench sort -- spill
 
 `benches/aggregate.rs` times aggregation on 200,000 rows the same way:
 `groups` with from one group to one per row, by int, text, two and
-expression keys, `functions` each aggregate over the same 100 groups,
+expression keys, and one per row with more or less memory than they take,
+`functions` each aggregate over the same 100 groups,
 `distinct` `COUNT(DISTINCT ...)` and `SELECT DISTINCT`, and `around` an
 aggregate under `HAVING`, `ORDER BY` and `LIMIT`, or over a `WHERE`:
 
@@ -121,7 +124,8 @@ each kind of data, the bytes a value takes, and the time to encode, decode
 and filter it, and `benches/hash.rs` times the five hash tables of
 `src/hash` (linear probing, cuckoo, chained, extendible and linear hashing)
 against `std::collections::HashMap` on a million keys, and linear probing
-alone at three load factors, and `benches/trie.rs` times the tries of
+alone at three load factors, and in `pages` the hash files of
+`src/storage/hash` against a B+ tree, and `benches/trie.rs` times the tries of
 `src/trie` (trie, radix tree and ART) against a `BTreeMap` and the skip list
 on INT-like and text keys, with the memory each takes, and loads LSM trees
 with each kind of MemTable. Group names work for all of them:
@@ -137,9 +141,10 @@ cargo bench --bench buffer_pool -- scans
 ## Supported SQL
 
 - Statements: `CREATE TABLE ... [USING HEAP | LSM | COLUMN]`, `DROP TABLE`,
-  `CREATE [UNIQUE] INDEX name ON table (key, ...) [INCLUDE (column, ...)]
-  [WHERE condition]` (keys are columns or expressions of them, like
-  `LOWER(name)`; `WHERE` makes a partial index), `DROP INDEX`, `INSERT`, `SELECT`,
+  `CREATE [UNIQUE] INDEX name ON table [USING BTREE | HASH] (key, ...)
+  [INCLUDE (column, ...)] [WHERE condition]` (keys are columns or expressions
+  of them, like `LOWER(name)`; `WHERE` makes a partial index; `HASH` makes a
+  hash index, which finds only rows whose every key equals a value), `DROP INDEX`, `INSERT`, `SELECT`,
   `UPDATE`, `DELETE`, `CHECKPOINT`, and `EXPLAIN` before a `SELECT`, `UPDATE` or
   `DELETE` to see its plan, or `EXPLAIN ANALYZE` before a `SELECT` to run it
   and see what each step of its plan did
@@ -211,8 +216,10 @@ src/
     mod.rs        statement execution; a SELECT's rows as a stream (`Database::query`)
     operator.rs   each plan step as an iterator pulling rows from the one below
     join.rs       block nested loop, hash, index and sort-merge joins; LEFT JOIN padding
+    hash_join.rs  a hash join's right side: hybrid hash join, partitions spilled past the budget
     sort.rs       ORDER BY: external merge sort, top-N heap for LIMIT
-    aggregate.rs  hash aggregation: one row per group, and the aggregate functions
+    spill.rs      temporary files of rows, and the partitions hash joins and aggregates spill
+    aggregate.rs  hash aggregation: one row per group, partitions of new groups past the budget, the functions
     subquery.rs   runs subqueries for each row, with outer references replaced by its values
   types.rs        values, data types, columns
   predicate.rs    `column op literal` conditions, shared by the planner and storage
@@ -230,7 +237,7 @@ src/
   catalog/        tables and indexes
     mod.rs        Catalog: table and index schemas and where their pages live
     table.rs      a table: schema + storage + indexes, constraint checks
-    index.rs      secondary index: B+ tree entries of (keys, included columns, row id)
+    index.rs      secondary index: entries of (keys, included columns, row id) in a B+ tree or hash file
   storage/
     io/           durable pages
       medium.rs   byte-addressed files: on disk, in memory, or crashing (for tests)
@@ -244,6 +251,12 @@ src/
     sort_key.rs   values <-> bytes that sort like them: sort keys and index keys
     heap.rs       table heap: linked list of pages, free-space map, RecordId
     btree.rs      B+ tree: sorted byte-string keys, splits, merges, range scans, latch crabbing
+    hash/         hash files, for indexes USING HASH
+      mod.rs      the hash of a key, as stored; picks the scheme (`HASH_SCHEME`)
+      extendible.rs  extendible hashing: a directory of slots that doubles and halves
+      linear.rs   linear hashing: buckets split in turn, by the load
+      directory.rs   slots in the root page, or in directory pages it lists
+      bucket.rs   a bucket: a chain of pages of entries, overflow pages
     lsm/          log-structured merge tree
       tree.rs     log + MemTable, SSTables, level/universal compaction
       memtable.rs the MemTable: a skip list or a trie, as `MEMTABLE` says
@@ -253,7 +266,7 @@ src/
     column/       column store
       store.rs    PAX row groups, delete bitmaps, delta store
       encoding.rs column compression: RLE, bit-packing, patching, delta, dictionary, bitmap
-  hash/           hash tables to compare with std's HashMap (nothing uses them yet)
+  hash/           hash tables in memory, to compare with std's HashMap (storage/hash puts two on pages)
     linear_probe.rs, cuckoo.rs       static: one array of slots
     chained.rs, extendible.rs, linear_hash.rs   dynamic: buckets that split
   trie/           tries: sorted maps that branch on a byte of the key per level
@@ -344,11 +357,38 @@ A database is a single file of 4 KB pages:
   `<table>_pkey` on it, which enforces the key and is dropped only with the
   table. Column tables cannot have indexes: migrating rows into a row group
   moves them, which would change their ids.
+- **A hash index** (`USING HASH`) holds the same entries in a hash file,
+  each hashed by its keys' encoding (with a hash function of its own, fixed
+  as it is stored: an INT and the REAL it equals hash alike). Its root page
+  leads straight to the one bucket that a hash picks, a chain of pages whose
+  entries are compared by their 32-bit hashes first, so it finds the rows
+  whose every key equals a value without searching a tree, and nothing
+  else: no ranges, no first keys alone, no order. A bucket's first page
+  takes new entries; when it is full and the bucket cannot be split apart,
+  its entries move to an overflow page after it. There are two schemes, and
+  `HASH_SCHEME` in `src/storage/hash/mod.rs` picks the one new indexes use
+  (a file's root page says which it was made with, so both open):
+  **extendible hashing** (default), where a directory of 2^d slots, indexed
+  by the low `d` bits of a hash, points to buckets: a full bucket splits by
+  the next bit, the directory doubling (copying page ids, not entries) only
+  when it has no slot to tell the halves apart by, and a bucket a delete
+  empties merges back into its buddy, the directory halving when it can;
+  and **linear hashing**, where buckets split one at a time in order,
+  whichever overflowed, whenever the entries outgrow 75% of the buckets'
+  first pages, and the last split is undone below 35%. The slots stay in
+  the root page while they fit (about 800), so a small index finds a bucket
+  from its root alone. Lookups latch the root and then the bucket, as the
+  B+ tree crabs; an extendible file's inserts and deletes write-latch only
+  the bucket unless they split or merge, a linear file's the root too, which
+  holds the bytes its load is measured by. A hash index suits keys with few
+  rows each: deleting one of many rows with one key searches a long chain.
 - **Finding rows**: a WHERE clause's conditions of the form `expression op
   literal` (joined by AND) choose how a statement reads its table. A heap or
   LSM table uses the index those conditions narrow down most: equalities on
   its first keys, then a range on the next key (an equality counts more than
-  a range with two ends, which counts more than one with one end). A partial
+  a range with two ends, which counts more than one with one end). A hash
+  index serves only equalities on every one of its keys, and wins a tie
+  with a B+ tree that does not hold more of the columns read. A partial
   index serves only a WHERE that implies its condition: each of the
   condition's conjuncts is one of the WHERE's, or follows from one of its
   comparisons (`x > 5` gives `x > 0`), or is `e IS NOT NULL` for an `e` it
@@ -424,7 +464,8 @@ parts of its `ON` about the right table alone are pushed down, and `WHERE`
 conditions on its right table are checked after it, on the NULL-padded rows
 too. Each join then finds the right rows that may match a left row from its
 equalities `left = right column`: an **index join** looks them up in an
-index of the right table on that column (or an LSM primary key), once per
+index of the right table on that column (a hash index on it alone before
+a B+ tree it is the first key of, or an LSM primary key), once per
 left row, when that is cheaper than a hash join; otherwise a **hash join**
 reads the right table once into a hash table keyed by the equalities;
 failing any equality, a **block nested loop join** reads the left rows a
@@ -433,9 +474,23 @@ block at a time, as many as fit in its budget (4 MB by default;
 for each block, unless its rows fit in the budget too and are kept from the
 first read, trying every pair. The rest of the condition is checked on each
 pair. Keys are compared as values, so a NULL key matches nothing, and
-neither do keys of different types, where `=` would report an error. The
-right side of a hash join is held in memory; a block nested loop join holds
-one block of left rows, and the right rows if it keeps them.
+neither do keys of different types, where `=` would report an error. A
+block nested loop join holds one block of left rows, and the right rows if
+it keeps them.
+
+A hash join holds its right side in a hash table up to a budget (16 MB by
+default; `Database::set_hash_memory` changes it). Past it, the join is a
+**hybrid hash join**: the table splits into 16 partitions by a hash of the
+keys, and the largest are written to temporary files until the rest fit,
+later right rows of those partitions following them. A left row of a
+partition in memory is joined at once; one of a partition on disk is
+written after it. Once the left side runs out, each partition on disk is
+joined in turn: its right rows are read into a table, split again by the
+next bits of the hash if they still do not fit (up to 8 times; past that,
+or if every row has one key, the table is held whole), and its left rows
+read back to probe it. So left rows of spilled partitions come out last,
+and a hash join that must keep its left side's order (after a merge join,
+below) sorts its rows back into it by their left rows' numbers.
 
 Whether lookups are cheaper depends on how many there are against how many
 rows a hash join would read. The planner counts each table's rows the first
@@ -465,8 +520,16 @@ aggregate's rows: a `GROUP BY` expression and each distinct aggregate become
 columns named by their SQL text (`city`, `COUNT(*)`), and any column left
 over is an error, since it is neither grouped nor aggregated. The step folds
 each row into its group's accumulators, in a hash table with one entry per
-group, held in memory. Groups come out in the order their first row was
-read; without `GROUP BY` all rows form one group, even when there are none.
+group, held in memory up to the hash join's budget. Past it, rows of the
+groups in memory still add to them, but a row of a new group is written
+out (its key and aggregate arguments) to one of 16 partitions by a hash of
+its key; after the last row, the groups in memory come out, then each
+partition is aggregated in turn the same way, spilling into partitions of
+its own if it too outgrows the budget. Groups come out in the order their
+first row was read, those of rows written out after the others; without
+`GROUP BY` all rows form one group, even when there are none. The values
+that `DISTINCT` aggregates remember cannot be written out, and grow the
+groups past the budget.
 
 **Sorting**: `ORDER BY` buffers rows in memory up to a budget (4 MB by
 default; `Database::set_sort_memory` changes it). Past that, it sorts what it

@@ -5,9 +5,11 @@
 //! `LIMIT` stops the scan once it has enough, and a query's rows can be read
 //! without holding them all. A sort and an aggregate are blocking: they read
 //! all of their input when their first row is asked for. So is the right side
-//! of a hash join (see `join.rs`); the left side streams. A block nested loop
-//! join reads its left side a block at a time, and its right side again for
-//! each block. A merge join sorts both sides when its first row is asked for.
+//! of a hash join (see `join.rs`); the left side streams, but for the rows of
+//! partitions it writes out past its budget, which come at the end. A block
+//! nested loop join reads its left side a block at a time, and its right side
+//! again for each block. A merge join sorts both sides when its first row is
+//! asked for.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -135,9 +137,12 @@ fn open_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step
                     let sort = MergeSort { left_keys, right_keys, desc, then, budget: settings.sort_memory };
                     return Box::new(MergeJoin::new(left, left_fields, right, right_fields, sort, kind, condition));
                 }
-                JoinMethod::Hash { left_keys, right_keys } => {
+                JoinMethod::Hash { left_keys, right_keys, keep_order } => {
                     let source = open(*right, right_step);
-                    Right::hash(source, left_keys, right_keys, &left_fields, right_fields.clone())
+                    let budget = settings.hash_memory;
+                    let right = Right::hash(source, left_keys, right_keys, &left_fields, right_fields.clone(), budget);
+                    let join = Join::new(left, left_fields, right, right_fields, kind, condition);
+                    return Box::new(if keep_order { join.keeping_order(settings.sort_memory) } else { join });
                 }
                 JoinMethod::Index => {
                     if let Some((profile, first)) = &right_step {
@@ -231,10 +236,8 @@ fn open_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step
         Node::Aggregate { input, group_by, aggregates } => {
             let columns = input.columns();
             let input = open(*input, below(step, 0));
-            deferred(move || {
-                let groups = aggregate::fold(input, &columns, &group_by, &aggregates)?;
-                Ok(Box::new(groups.into_iter().map(Ok)))
-            })
+            let budget = settings.hash_memory;
+            deferred(move || Ok(Box::new(aggregate::fold(input, &columns, &group_by, &aggregates, budget)?)))
         }
     }
 }

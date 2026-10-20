@@ -18,8 +18,10 @@ use crate::types::StorageKind;
 /// An index narrows the rows down by 3 for each of its first keys that a
 /// condition fixes, then by 1 for each end of a range its next key is in;
 /// and a partial index by 3 more, as its condition leaves out rows as an
-/// equality would (`WHERE status = 'open'`). An LSM tree's key range
-/// wins a tie, then an index that holds every column needed, then the
+/// equality would (`WHERE status = 'open'`). A hash index serves only
+/// conditions that fix every one of its keys. An LSM tree's key range
+/// wins a tie, then an index that holds every column needed, then a hash
+/// index, which goes to its rows without searching a tree, then the
 /// earliest index. A partial index serves only a WHERE that implies its
 /// condition, so that it holds every row the WHERE may match: when each of
 /// its condition's conjuncts is one of the WHERE's, or is implied by one of
@@ -27,7 +29,7 @@ use crate::types::StorageKind;
 /// is `e IS NOT NULL` for an `e` the WHERE compares with a value.
 pub fn choose(table: &Table, qualifier: &str, filter: &Option<Expr>, conditions: &[Condition], needed: &[bool]) -> Access {
     let mut own = None; // the WHERE's conjuncts, once a partial index needs them
-    let mut best: Option<((usize, bool), Access)> = None;
+    let mut best: Option<((usize, bool, bool), Access)> = None;
     match table.storage_kind() {
         StorageKind::Column => return Access::Scan,
         StorageKind::Lsm => {
@@ -39,7 +41,7 @@ pub fn choose(table: &Table, qualifier: &str, filter: &Option<Expr>, conditions:
                 let (equal, lower, upper) = range(conditions, &key);
                 let score = equal as usize + lower.is_some() as usize + upper.is_some() as usize;
                 if score > 0 {
-                    best = Some(((score, true), Access::KeyRange { lower, upper }));
+                    best = Some(((score, true, true), Access::KeyRange { lower, upper }));
                 }
             }
         }
@@ -66,8 +68,11 @@ pub fn choose(table: &Table, qualifier: &str, filter: &Option<Expr>, conditions:
                 }
             }
         }
+        if index.is_hash() && equal.len() < index.keys.len() {
+            continue;
+        }
         score += 3 * index.predicate.is_some() as usize;
-        let rank = (score, index.covers(needed));
+        let rank = (score, index.covers(needed), index.is_hash());
         if score > 0 && best.as_ref().is_none_or(|(best, _)| rank > *best) {
             best = Some((rank, Access::Index { index: i, equal, lower, upper, covering: rank.1 }));
         }
@@ -153,7 +158,12 @@ pub fn describe(table: &Table, name: &str, predicates: &[Predicate], access: &Ac
         }
         Access::Index { index, equal, lower, upper, covering } => {
             let index = &table.indexes()[index];
-            let kind = if covering { "COVERING INDEX" } else { "INDEX" };
+            let kind = match (covering, index.is_hash()) {
+                (false, false) => "INDEX",
+                (true, false) => "COVERING INDEX",
+                (false, true) => "HASH INDEX",
+                (true, true) => "COVERING HASH INDEX",
+            };
             let key = |i: usize| key_name(index, i);
             let mut parts: Vec<String> =
                 equal.iter().enumerate().map(|(i, value)| format!("{} = {}", key(i), value.to_sql())).collect();

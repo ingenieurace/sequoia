@@ -4,6 +4,9 @@
 //! Needs the `sqlite3` command, and is skipped without it. Runs
 //! `SEQUOIA_DIFF_CASES` cases (default 40) from seed `SEQUOIA_DIFF_SEED`
 //! (default 1). A mismatch prints the case as a script for Sequoia's shell.
+//! Each case runs on Sequoia twice: as it is, and with memory budgets so
+//! small (`SPILL_MEMORY`) that its sorts, joins and aggregations write to
+//! temporary files, which must not change what it returns either.
 //!
 //! The generator writes only SQL whose meaning the two databases share, so
 //! any difference is a bug in one of them. In particular, it keeps
@@ -124,6 +127,8 @@ struct Index {
     include: Vec<String>,
     /// A partial index's condition.
     predicate: Option<String>,
+    /// Whether it is a hash index (Sequoia only: SQLite's are B-trees).
+    hash: bool,
 }
 
 impl Gen {
@@ -712,7 +717,7 @@ impl Gen {
 
     /// Drops an index, or creates one: on one column, or on several keys,
     /// each a column or an expression, maybe with included columns, maybe
-    /// partial.
+    /// partial, maybe a hash index.
     fn index(&mut self) -> Stmt {
         if !self.indexes.is_empty() && self.rng.chance(30) {
             let i = self.rng.below(self.indexes.len());
@@ -746,36 +751,44 @@ impl Gen {
             2 => Some(format!("({} IS NOT NULL)", self.rng.pick(&columns[1..]).0)),
             _ => None,
         };
+        let hash = self.rng.chance(30);
         let name = format!("ix{}", self.rng.next() % 1_000_000);
         let list = keys.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(", ");
-        let sqlite = format!("CREATE INDEX {name} ON {} ({list})", self.tables[t].name);
+        let table = &self.tables[t].name;
+        let sqlite = format!("CREATE INDEX {name} ON {table} ({list})");
+        let using = if hash { " USING HASH" } else { "" };
         let filter = predicate.as_ref().map_or(String::new(), |p| format!(" WHERE {p}"));
         let sequoia = match include.is_empty() {
-            true => format!("{sqlite}{filter}"),
-            false => format!("{sqlite} INCLUDE ({}){filter}", include.join(", ")),
+            true => format!("CREATE INDEX {name} ON {table}{using} ({list}){filter}"),
+            false => format!("CREATE INDEX {name} ON {table}{using} ({list}) INCLUDE ({}){filter}", include.join(", ")),
         };
-        self.indexes.push(Index { name, table: t, keys, include, predicate });
+        self.indexes.push(Index { name, table: t, keys, include, predicate, hash });
         Stmt { sequoia, sqlite: format!("{sqlite}{filter}"), kind: Kind::Other }
     }
 
     /// A query on one table meant to use one of its indexes: conditions on
-    /// its first keys, and a partial index's condition, reading its keys and
-    /// included columns, or every column.
+    /// its first keys (mostly equalities on every key of a hash index), and
+    /// a partial index's condition, reading its keys and included columns,
+    /// or every column.
     fn index_select(&mut self) -> Stmt {
         if self.indexes.is_empty() {
             return self.select();
         }
         let index = self.rng.below(self.indexes.len());
-        let Index { table, keys, include, predicate, .. } = &self.indexes[index];
-        let (table, keys, include, predicate) = (*table, keys.clone(), include.clone(), predicate.clone());
+        let Index { table, keys, include, predicate, hash, .. } = &self.indexes[index];
+        let (table, keys, include, predicate, hash) = (*table, keys.clone(), include.clone(), predicate.clone(), *hash);
         let mut conditions = Vec::new();
         for (i, (key, ty)) in keys.iter().enumerate() {
-            let op = match i + 1 < keys.len() && self.rng.chance(70) {
+            let equal = match hash {
+                true => self.rng.chance(90),
+                false => i + 1 < keys.len() && self.rng.chance(70),
+            };
+            let op = match equal {
                 true => "=",
                 false => *self.rng.pick(&["=", "<", "<=", ">", ">=", "!="]),
             };
             conditions.push(format!("({key} {op} {})", self.literal(*ty)));
-            if op != "=" || self.rng.chance(30) {
+            if op != "=" || (!hash && self.rng.chance(30)) {
                 break;
             }
         }
@@ -995,8 +1008,16 @@ fn fold_reals(row: &str) -> String {
     out
 }
 
-fn run_sequoia(script: &[Stmt]) -> Vec<Outcome> {
+/// Runs the script on a database in memory, with every memory budget (of
+/// sorts, joins and hash tables) at `memory` bytes if given, to make them
+/// spill to temporary files.
+fn run_sequoia(script: &[Stmt], memory: Option<usize>) -> Vec<Outcome> {
     let mut db = Database::in_memory();
+    if let Some(bytes) = memory {
+        db.set_sort_memory(bytes);
+        db.set_join_memory(bytes);
+        db.set_hash_memory(bytes);
+    }
     script
         .iter()
         .map(|s| match db.execute(&s.sequoia) {
@@ -1072,6 +1093,9 @@ fn env(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+/// The memory budgets of the second run of each case, which spills.
+const SPILL_MEMORY: usize = 64;
+
 #[test]
 fn sequoia_agrees_with_sqlite() {
     let (cases, first) = (env("SEQUOIA_DIFF_CASES", 40), env("SEQUOIA_DIFF_SEED", 1));
@@ -1083,21 +1107,26 @@ fn sequoia_agrees_with_sqlite() {
             eprintln!("skipped: no sqlite3 command");
             return;
         };
-        let found = run_sequoia(&script);
+        let found = run_sequoia(&script, None);
         statements += script.len();
         queries += script.iter().filter(|s| s.kind != Kind::Other).count();
         failed += found.iter().zip(&expected).filter(|(a, b)| matches!((a, b), (Outcome::Error(_), Outcome::Error(_)))).count();
-        if let Some(i) = (0..script.len()).find(|&i| !agree(script[i].kind, &found[i], &expected[i])) {
-            let setup: Vec<String> = script[..i].iter().map(|s| format!("{};", s.sequoia)).collect();
-            mismatches.push(format!(
-                "seed {seed}, statement {i}:\n  {}\n  sequoia: {:?}\n  sqlite:  {:?}\n  sqlite statement: {}\n  script:\n{}\n{};",
-                script[i].sequoia,
-                found[i],
-                expected[i],
-                script[i].sqlite,
-                setup.join("\n"),
-                script[i].sequoia
-            ));
+        // Again with budgets so small that every sort, join and aggregation spills.
+        for (found, memory) in [(found, None), (run_sequoia(&script, Some(SPILL_MEMORY)), Some(SPILL_MEMORY))] {
+            if let Some(i) = (0..script.len()).find(|&i| !agree(script[i].kind, &found[i], &expected[i])) {
+                let setup: Vec<String> = script[..i].iter().map(|s| format!("{};", s.sequoia)).collect();
+                let budgets = memory.map_or(String::new(), |bytes| format!(" (memory budgets of {bytes} bytes)"));
+                mismatches.push(format!(
+                    "seed {seed}, statement {i}{budgets}:\n  {}\n  sequoia: {:?}\n  sqlite:  {:?}\n  sqlite statement: {}\n  script:\n{}\n{};",
+                    script[i].sequoia,
+                    found[i],
+                    expected[i],
+                    script[i].sqlite,
+                    setup.join("\n"),
+                    script[i].sequoia
+                ));
+                break;
+            }
         }
     }
     eprintln!(

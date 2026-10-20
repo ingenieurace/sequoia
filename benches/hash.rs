@@ -14,6 +14,10 @@
 //!   up all of both: lookups after removes, past tombstones for linear probing.
 //! - `load`: linear probing alone, filled to just under max loads of 50%,
 //!   70% (the default) and 90%: how much longer walks get as it fills up.
+//! - `pages`: the hash files of `sequoia::storage::hash` (extendible and
+//!   linear hashing), against a B+ tree, on 200,000 index entries (an
+//!   8-byte key, then an 8-byte id) in pages, through a buffer pool of 256
+//!   frames, as the database has: inserted, found, missed and deleted.
 //!
 //! Each prints the fastest of a few runs.
 
@@ -21,9 +25,12 @@ mod common;
 
 use std::collections::HashMap;
 use std::hint::black_box;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sequoia::hash::{Chained, Cuckoo, Extendible, HashTable, LinearHash, LinearProbe};
+use sequoia::storage::hash::{self as disk_hash, HashFile, HashScheme};
+use sequoia::storage::{BPlusTree, BufferPool, DiskManager};
 
 const KEYS: usize = 1_000_000;
 const RUNS: usize = 5;
@@ -65,6 +72,89 @@ fn main() {
 
     if common::wanted("load") {
         load(&keys);
+    }
+    if common::wanted("pages") {
+        pages(&keys);
+    }
+}
+
+/// Entries on pages: in a B+ tree, and in a hash file of each scheme.
+const PAGE_KEYS: usize = 200_000;
+
+/// What the `pages` group times: a B+ tree or a hash file, through a pool.
+enum Paged {
+    Tree(BPlusTree),
+    Hash(HashFile),
+}
+
+impl Paged {
+    fn new(scheme: Option<HashScheme>) -> Paged {
+        let pool = Arc::new(BufferPool::new(Arc::new(DiskManager::in_memory()), 256));
+        match scheme {
+            None => Paged::Tree(BPlusTree::create(pool).unwrap()),
+            Some(scheme) => Paged::Hash(HashFile::create(pool, scheme).unwrap()),
+        }
+    }
+
+    fn insert(&self, key: u64) {
+        match self {
+            Paged::Tree(tree) => _ = tree.insert(&entry(key)).unwrap(),
+            Paged::Hash(file) => file.insert(disk_hash::hash(&key.to_be_bytes()), &entry(key)).unwrap(),
+        }
+    }
+
+    fn find(&self, key: u64) -> usize {
+        let key = key.to_be_bytes();
+        match self {
+            Paged::Tree(tree) => tree.range(&key).take_while(|e| e.as_ref().unwrap().starts_with(&key)).count(),
+            Paged::Hash(file) => file.find(disk_hash::hash(&key), &key).unwrap().len(),
+        }
+    }
+
+    fn delete(&self, key: u64) {
+        match self {
+            Paged::Tree(tree) => _ = tree.delete(&entry(key)).unwrap(),
+            Paged::Hash(file) => _ = file.delete(disk_hash::hash(&key.to_be_bytes()), &entry(key)).unwrap(),
+        }
+    }
+}
+
+/// An index entry for `key`: the key, then a row id.
+fn entry(key: u64) -> [u8; 16] {
+    let mut entry = [0; 16];
+    entry[..8].copy_from_slice(&key.to_be_bytes());
+    entry[8..].copy_from_slice(&key.rotate_left(17).to_le_bytes());
+    entry
+}
+
+fn pages(keys: &Keys) {
+    let present = &keys.present[..PAGE_KEYS];
+    let shuffled = shuffled(present);
+    let absent = &keys.absent[..PAGE_KEYS];
+    let filled = |scheme| {
+        let paged = Paged::new(scheme);
+        for &key in present {
+            paged.insert(key);
+        }
+        paged
+    };
+    println!("\n{:<12}{:>13}{:>13}{:>13}", format!("{PAGE_KEYS} entries"), "B+ tree", "Extendible", "Linear");
+    let schemes = [None, Some(HashScheme::Extendible), Some(HashScheme::Linear)];
+    let full: Vec<Paged> = schemes.iter().map(|&scheme| filled(scheme)).collect();
+    // Times a group on the scheme of each column, by its number.
+    type Timer<'a> = Box<dyn Fn(usize) -> Duration + 'a>;
+    let rows: [(&str, Timer); 4] = [
+        ("insert", Box::new(|i| fastest(|| Paged::new(schemes[i]), |paged| present.iter().for_each(|&k| paged.insert(k))))),
+        ("hit", Box::new(|i| fastest(|| (), |_| shuffled.iter().for_each(|&k| assert_eq!(full[i].find(k), 1))))),
+        ("miss", Box::new(|i| fastest(|| (), |_| absent.iter().for_each(|&k| assert_eq!(full[i].find(k), 0))))),
+        ("delete", Box::new(|i| fastest(|| filled(schemes[i]), |paged| shuffled.iter().for_each(|&k| paged.delete(k))))),
+    ];
+    for (name, time) in rows {
+        print!("  {name:<10}");
+        for i in 0..schemes.len() {
+            print!("{:>13}", common::shown(time(i)).trim());
+        }
+        println!();
     }
 }
 

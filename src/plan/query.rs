@@ -163,8 +163,10 @@ pub enum Node<'a> {
 pub enum JoinMethod {
     /// Tries every right row, reading them again for each block of left rows.
     Block,
-    /// Those whose `right_keys` equal the left row's `left_keys`, from a hash table.
-    Hash { left_keys: Vec<Expr>, right_keys: Vec<Expr> },
+    /// Those whose `right_keys` equal the left row's `left_keys`, from a hash
+    /// table. `keep_order` if the rows must come out in the left side's
+    /// order (after a merge join), even if the table spills.
+    Hash { left_keys: Vec<Expr>, right_keys: Vec<Expr>, keep_order: bool },
     /// Those the right side, a `Lookup` (maybe under filters), finds for the left row.
     Index,
     /// Those whose `right_keys` equal the left row's `left_keys`, found by
@@ -515,6 +517,8 @@ fn joins<'a>(
         }
     }
     let ordered = merge.is_some();
+    // The joins after the merge join keep its order.
+    let merge_at = merge.as_ref().map(|(at, _)| *at);
 
     let mut node = sources[0].read(and(std::mem::take(&mut pushed[0])), needed[0].clone());
     for i in 1..n {
@@ -562,7 +566,8 @@ fn joins<'a>(
                     residual.remove(*at);
                 }
                 let (left_keys, right_keys) = keys.into_iter().map(|(_, l, r)| (l, r)).unzip();
-                (JoinMethod::Hash { left_keys, right_keys }, right)
+                let keep_order = merge_at.is_some_and(|at| i > at);
+                (JoinMethod::Hash { left_keys, right_keys, keep_order }, right)
             }
         };
         node = Node::Join {
@@ -647,11 +652,13 @@ fn merge_order(
 }
 
 /// What the planner's choices cost, in rows read by a scan, as measured with
-/// `benches/joins.rs`: a lookup through an index, then of the row it finds;
+/// `benches/joins.rs`: a lookup through a B+ tree index or a hash index,
+/// then of the row it finds;
 /// a lookup of an LSM table's primary key; reading a right row into a hash
 /// join's hash table; and looking a left row up in it. Worth measuring again
 /// when one of them gets faster.
 const INDEX_LOOKUP_COST: f64 = 6.0;
+const HASH_INDEX_LOOKUP_COST: f64 = 4.0;
 const KEY_LOOKUP_COST: f64 = 2.0;
 const HASH_BUILD_COST: f64 = 2.0;
 const HASH_PROBE_COST: f64 = 0.4;
@@ -668,6 +675,7 @@ const OTHER_KEEPS: f64 = 1.0 / 3.0;
 fn lookups_win(left: f64, table: &Table, key: LookupKey) -> bool {
     let right = table.row_count().map_or(f64::INFINITY, |rows| rows as f64);
     let lookup = match key {
+        LookupKey::Index(i) if table.indexes()[i].is_hash() => HASH_INDEX_LOOKUP_COST,
         LookupKey::Index(_) => INDEX_LOOKUP_COST,
         LookupKey::PrimaryKey => KEY_LOOKUP_COST,
     };
@@ -721,11 +729,14 @@ fn estimate(node: &Node) -> f64 {
 }
 
 /// How a lookup on this column of the table can find rows, if it can: through
-/// an index whose first key it is and that holds every row, or the primary
-/// key of an LSM table.
+/// an index whose first key it is and that holds every row, a hash index
+/// only if it is the only key (and before a B+ tree), or the primary key of
+/// an LSM table.
 fn lookup_key(table: &Table, column: usize) -> Option<LookupKey> {
     let first = |index: &Index| index.keys.first() == Some(&Key::Column(column)) && index.predicate.is_none();
-    if let Some(i) = table.indexes().iter().position(first) {
+    let hash = |index: &Index| index.is_hash() && first(index) && index.keys.len() == 1;
+    let tree = |index: &Index| !index.is_hash() && first(index);
+    if let Some(i) = table.indexes().iter().position(hash).or_else(|| table.indexes().iter().position(tree)) {
         return Some(LookupKey::Index(i));
     }
     (table.storage_kind() == StorageKind::Lsm && table.primary_key() == Some(column)).then_some(LookupKey::PrimaryKey)
@@ -978,7 +989,10 @@ impl Node<'_> {
             }
             Node::Lookup { table, qualifier, column, key, left_key, .. } => {
                 let through = match key {
-                    LookupKey::Index(i) => format!("INDEX {}", table.indexes()[*i].name),
+                    LookupKey::Index(i) => {
+                        let index = &table.indexes()[*i];
+                        format!("{}INDEX {}", if index.is_hash() { "HASH " } else { "" }, index.name)
+                    }
                     LookupKey::PrimaryKey => "PRIMARY KEY".into(),
                 };
                 let column = ColumnRef { table: Some(qualifier.clone()), name: table.columns[*column].name.clone() };
@@ -990,7 +1004,7 @@ impl Node<'_> {
                 let (name, mut on) = match method {
                     JoinMethod::Block => ("BLOCK NESTED LOOP", Vec::new()),
                     JoinMethod::Index => ("INDEX", Vec::new()),
-                    JoinMethod::Hash { left_keys, right_keys } | JoinMethod::Merge { left_keys, right_keys, .. } => {
+                    JoinMethod::Hash { left_keys, right_keys, .. } | JoinMethod::Merge { left_keys, right_keys, .. } => {
                         let name = if matches!(method, JoinMethod::Hash { .. }) { "HASH" } else { "MERGE" };
                         (name, left_keys.iter().zip(right_keys).map(|(l, r)| format!("{l} = {r}")).collect())
                     }

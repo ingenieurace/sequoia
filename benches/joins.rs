@@ -40,6 +40,11 @@ fn main() {
                 case("two keys", "SELECT COUNT(*) FROM a JOIN b ON b.k = a.k AND b.name = a.name", &["HASH JOIN"]),
                 case("rest of condition", "SELECT COUNT(*) FROM a JOIN b ON b.k = a.k AND b.name > a.name", &["HASH JOIN"]),
                 case("left join, 10% match", "SELECT COUNT(*) FROM a LEFT JOIN b ON b.k = a.k + 45000", &["HASH JOIN"]),
+                // Past its budget the right side is partitioned: most of b and of a go to disk and back.
+                case("int key, 1 MB of b held", "SELECT COUNT(*) FROM a JOIN b ON b.k = a.k", &["HASH JOIN"])
+                    .hash_memory(1 << 20),
+                case("int key, 64 KB of b held", "SELECT COUNT(*) FROM a JOIN b ON b.k = a.k", &["HASH JOIN"])
+                    .hash_memory(64 << 10),
             ],
         ),
         (

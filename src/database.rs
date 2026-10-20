@@ -219,6 +219,13 @@ impl Database {
         self.settings.join_memory = bytes;
     }
 
+    /// Sets how many bytes of right rows a hash join, or of groups a hash
+    /// aggregation, may hold ([`executor::join::HASH_MEMORY`] by default)
+    /// before it writes partitions of them to temporary files.
+    pub fn set_hash_memory(&mut self, bytes: usize) {
+        self.settings.hash_memory = bytes;
+    }
+
     pub fn table_names(&self) -> Vec<&str> {
         self.catalog.table_names()
     }

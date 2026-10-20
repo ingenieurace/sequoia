@@ -13,7 +13,7 @@
 //! `sqlite_schema` table). A table's `USING` clause says how the rows are
 //! stored: for a heap the two pages are its first and last page, for an LSM
 //! tree or a column store both are its manifest page. For an index the first
-//! is the root page of its B+ tree, which never moves, and the second is
+//! is the root page of its B+ tree or hash file, which never moves, and the second is
 //! [`INDEX_FORMAT`]. In files from before indexes had several keys, included
 //! columns and NULL keys, the second was the root page again: such an index
 //! is built again, in the format of today, when the catalog is opened.
@@ -28,7 +28,7 @@ pub mod index;
 pub mod table;
 
 use crate::error::{Error, Result, err};
-use crate::sql::ast::{ColumnRef, CreateIndex, Expr, Statement};
+use crate::sql::ast::{ColumnRef, CreateIndex, Expr, IndexKind, Statement};
 use crate::sql::parse;
 use crate::storage::{BPlusTree, BufferPool, PageId, RecordId, TableHeap, tuple};
 use table::{Table, primary_key, validate_schema};
@@ -132,6 +132,7 @@ impl Catalog {
             (StorageKind::Heap, Some(pk)) => Some(CreateIndex {
                 name: pk_index_name(&name),
                 table: name.clone(),
+                using: IndexKind::BTree,
                 keys: vec![Expr::Column(ColumnRef::bare(&columns[pk].name))],
                 include: Vec::new(),
                 predicate: None,

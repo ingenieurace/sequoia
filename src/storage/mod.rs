@@ -11,11 +11,13 @@
 //!   lsm     a log-structured merge tree of SSTables, never updated in place
 //!   column  row groups stored column by column, compressed, plus a heap as the delta store
 //! btree     a B+ tree of byte-string keys, which indexes are built on
+//! hash      a hash file of byte-string entries: extendible or linear hashing, for indexes USING HASH
 //! ```
 
 pub mod btree;
 pub mod buffer;
 pub mod column;
+pub mod hash;
 pub mod heap;
 pub mod io;
 pub mod lsm;
@@ -27,6 +29,7 @@ pub use btree::BPlusTree;
 pub use buffer::pool::{BufferPool, PageReadGuard, PageWriteGuard, REPLACEMENT_POLICY};
 pub use buffer::replacer::{ArcReplacer, ClockReplacer, LruKReplacer, Policy, Replacer};
 pub use column::store::{ColumnConfig, ColumnStore, Position};
+pub use hash::{HASH_SCHEME, HashFile, HashScheme};
 pub use heap::{RecordId, TableHeap};
 pub use io::disk::{CHECKPOINT_BYTES, DiskManager, PAGE_SIZE, PAGE_USABLE, Page, PageId};
 pub use lsm::tree::{LsmConfig, LsmTree};

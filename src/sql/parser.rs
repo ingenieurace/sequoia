@@ -7,7 +7,7 @@
 //! OR, AND, NOT, comparison / IS NULL / IN, + -, * /, unary -, primary.
 
 use super::ast::{
-    Aggregate, BinaryOp, ColumnRef, CreateIndex, Expr, From, Function, Join, JoinKind, OrderBy, Projection, Select, SelectItem, Statement,
+    Aggregate, BinaryOp, ColumnRef, CreateIndex, Expr, From, Function, IndexKind, Join, JoinKind, OrderBy, Projection, Select, SelectItem, Statement,
     TableRef, TableSource, UnaryOp,
 };
 use crate::error::{Error, Result};
@@ -144,6 +144,15 @@ impl Parser {
         let name = self.ident()?;
         self.expect_keyword("ON")?;
         let table = self.ident()?;
+        let mut using = IndexKind::default();
+        if self.eat_keyword("USING") {
+            // BTREE and HASH are not keywords, so they stay usable as names.
+            using = match self.ident()?.to_uppercase().as_str() {
+                "BTREE" => IndexKind::BTree,
+                "HASH" => IndexKind::Hash,
+                other => return Err(Error(format!("unknown index kind: {other}, expected BTREE or HASH"))),
+            };
+        }
         self.expect_symbol("(")?;
         let keys = self.comma_list(Self::expr)?;
         self.expect_symbol(")")?;
@@ -159,7 +168,7 @@ impl Parser {
             _ => Vec::new(),
         };
         let predicate = if self.eat_keyword("WHERE") { Some(self.expr()?) } else { None };
-        Ok(Statement::CreateIndex(CreateIndex { name, table, keys, include, predicate, unique }))
+        Ok(Statement::CreateIndex(CreateIndex { name, table, using, keys, include, predicate, unique }))
     }
 
     fn drop(&mut self) -> Result<Statement> {

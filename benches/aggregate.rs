@@ -4,7 +4,8 @@
 //! compare changes to the aggregate step by, and checks that each query's
 //! plan aggregates as it means to.
 //!
-//! `groups` counts rows into more and more groups, by int and text keys,
+//! `groups` counts rows into more and more groups, by int and text keys
+//! (and into 200,000 with more and less memory than they take),
 //! `functions` times each aggregate over the same 100 groups, `distinct`
 //! times `COUNT(DISTINCT ...)` and `SELECT DISTINCT`, and `around` the steps
 //! above an aggregate: HAVING, ORDER BY and a top 10.
@@ -38,6 +39,10 @@ fn main() {
                 case("200,000 groups, text key", "SELECT name, COUNT(*) FROM t GROUP BY name", &["BY name"]),
                 case("10,000 groups, two keys", "SELECT g, h, COUNT(*) FROM t GROUP BY g, h", &["BY g, h"]),
                 case("1,001 groups, expression", "SELECT k / 1000, COUNT(*) FROM t GROUP BY k / 1000", &["BY k / 1000"]),
+                // Groups held in memory whatever their number, then with less
+                // than they take: rows of new groups go to disk and back.
+                case("200,000 groups, all held", "SELECT k, COUNT(*) FROM t GROUP BY k", &["BY k"]).hash_memory(usize::MAX),
+                case("200,000 groups, 1 MB held", "SELECT k, COUNT(*) FROM t GROUP BY k", &["BY k"]).hash_memory(1 << 20),
             ],
         ),
         (

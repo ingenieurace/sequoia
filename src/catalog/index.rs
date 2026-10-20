@@ -1,4 +1,5 @@
-//! Secondary indexes: a B+ tree over the keys of a table's rows.
+//! Secondary indexes: a B+ tree, or a hash file (`USING HASH`), over the
+//! keys of a table's rows.
 //!
 //! An index's keys are columns, or expressions of the row's columns
 //! (`lower(name)`), one or several. Each entry is one key of the tree:
@@ -18,6 +19,12 @@
 //! share their keys. The index stores row ids as bytes; the table decides
 //! what they mean.
 //!
+//! A hash index holds the same entries in a hash file (see
+//! `storage/hash/mod.rs`), each hashed by its keys' encoding, which equal
+//! values share (an INT and the REAL it equals included). It finds the
+//! entries whose every key equals a value, in no order, and nothing else:
+//! no first keys alone, and no ranges.
+//!
 //! A partial index has a condition (`WHERE`), and holds only the rows it is
 //! true for. Every other row has an entry, NULL keys included.
 //!
@@ -27,8 +34,9 @@
 use std::sync::Arc;
 
 use crate::error::{Error, Result, err};
-use crate::sql::ast::{ColumnRef, CreateIndex, Expr};
+use crate::sql::ast::{ColumnRef, CreateIndex, Expr, IndexKind};
 use crate::sql::eval::{Field, eval, matches};
+use crate::storage::hash::{self, HASH_SCHEME, HashFile};
 use crate::storage::{BPlusTree, BufferPool, PageId, btree::MAX_KEY_SIZE, sort_key, tuple};
 use crate::types::{Column, DataType, Value, column_index};
 
@@ -66,24 +74,37 @@ pub struct Index {
     included: Vec<Column>,
     /// Every column the keys, included columns and predicate read.
     reads: Vec<usize>,
-    tree: BPlusTree,
+    store: Store,
+}
+
+/// Where an index's entries are kept.
+enum Store {
+    BTree(BPlusTree),
+    Hash(HashFile),
 }
 
 impl Index {
-    /// Creates an empty index on a table with these columns; the table adds its rows.
+    /// Creates an empty index on a table with these columns; the table adds
+    /// its rows. A hash index's file is of the scheme [`HASH_SCHEME`] says.
     pub fn create(pool: Arc<BufferPool>, definition: &CreateIndex, columns: &[Column]) -> Result<Self> {
-        Self::new(definition, columns, || BPlusTree::create(pool))
+        Self::new(definition, columns, || match definition.using {
+            IndexKind::BTree => Ok(Store::BTree(BPlusTree::create(pool)?)),
+            IndexKind::Hash => Ok(Store::Hash(HashFile::create(pool, HASH_SCHEME)?)),
+        })
     }
 
     /// Opens an index the catalog recorded, whose root page is `root`.
     pub fn open(pool: Arc<BufferPool>, definition: &CreateIndex, columns: &[Column], root: PageId) -> Result<Self> {
-        Self::new(definition, columns, || Ok(BPlusTree::open(pool, root)))
+        Self::new(definition, columns, || match definition.using {
+            IndexKind::BTree => Ok(Store::BTree(BPlusTree::open(pool, root))),
+            IndexKind::Hash => Ok(Store::Hash(HashFile::open(pool, root)?)),
+        })
     }
 
     /// Checks a definition against the table's columns, and only then makes
-    /// the index's tree with `tree`.
-    fn new(definition: &CreateIndex, columns: &[Column], tree: impl FnOnce() -> Result<BPlusTree>) -> Result<Self> {
-        let CreateIndex { name, table, keys, include, predicate, unique } = definition;
+    /// the index's tree or file with `store`.
+    fn new(definition: &CreateIndex, columns: &[Column], store: impl FnOnce() -> Result<Store>) -> Result<Self> {
+        let CreateIndex { name, table, using: _, keys, include, predicate, unique } = definition;
         let own = |expr: &Expr, what: &str| own_expr(expr, table, columns, what);
         let keys: Vec<Key> = keys
             .iter()
@@ -129,12 +150,27 @@ impl Index {
             fields: columns.iter().map(|c| Field::named(&c.name)).collect(),
             types: columns.iter().map(|c| c.data_type).collect(),
             reads,
-            tree: tree()?,
+            store: store()?,
         })
     }
 
     pub fn root_page(&self) -> PageId {
-        self.tree.root_page()
+        match &self.store {
+            Store::BTree(tree) => tree.root_page(),
+            Store::Hash(file) => file.root_page(),
+        }
+    }
+
+    pub fn kind(&self) -> IndexKind {
+        match &self.store {
+            Store::BTree(_) => IndexKind::BTree,
+            Store::Hash(_) => IndexKind::Hash,
+        }
+    }
+
+    /// Whether it is a hash index, which finds only rows whose every key equals a value.
+    pub fn is_hash(&self) -> bool {
+        self.kind() == IndexKind::Hash
     }
 
     /// The columns that the index's entries are made from: a row's other
@@ -199,7 +235,7 @@ impl Index {
     /// Adds a row's entry, if it is indexed.
     pub fn insert(&mut self, row: &[Value], id: &[u8]) -> Result<()> {
         if let Some(entry) = self.entry(row, id)? {
-            self.tree.insert(&entry)?;
+            self.insert_entry(&entry)?;
         }
         Ok(())
     }
@@ -207,39 +243,64 @@ impl Index {
     /// Removes a row's entry, if it is indexed.
     pub fn delete(&mut self, row: &[Value], id: &[u8]) -> Result<()> {
         if let Some(entry) = self.entry(row, id)? {
-            self.tree.delete(&entry)?;
+            self.delete_entry(&entry)?;
         }
         Ok(())
     }
 
     /// Adds an entry made by [`Index::entry`].
     pub fn insert_entry(&mut self, entry: &[u8]) -> Result<()> {
-        self.tree.insert(entry).map(|_| ())
+        match &self.store {
+            Store::BTree(tree) => tree.insert(entry).map(|_| ()),
+            Store::Hash(file) => file.insert(hash::hash(&entry[..self.keys_end(entry)?]), entry),
+        }
     }
 
     /// Removes an entry made by [`Index::entry`].
     pub fn delete_entry(&mut self, entry: &[u8]) -> Result<()> {
-        self.tree.delete(entry).map(|_| ())
+        match &self.store {
+            Store::BTree(tree) => tree.delete(entry).map(|_| ()),
+            Store::Hash(file) => file.delete(hash::hash(&entry[..self.keys_end(entry)?]), entry).map(|_| ()),
+        }
     }
 
-    /// The ids of the rows whose keys are these, encoded by [`encode_keys`].
+    /// The ids of the rows whose first keys are these, encoded by
+    /// [`encode_keys`]; for a hash index, every key.
     pub fn find(&self, keys: &[u8]) -> Result<Vec<Vec<u8>>> {
-        let mut ids = Vec::new();
-        for entry in self.tree.range(keys) {
-            let entry = entry?;
-            if !entry.starts_with(keys) {
-                break;
+        let entries = match &self.store {
+            Store::BTree(tree) => {
+                let mut entries = Vec::new();
+                for entry in tree.range(keys) {
+                    let entry = entry?;
+                    if !entry.starts_with(keys) {
+                        break;
+                    }
+                    entries.push(entry);
+                }
+                entries
             }
-            ids.push(self.row_id(&entry)?.to_vec());
-        }
-        Ok(ids)
+            Store::Hash(file) => file.find(hash::hash(keys), keys)?,
+        };
+        entries.iter().map(|entry| Ok(self.row_id(entry)?.to_vec())).collect()
     }
 
     /// The entries whose first keys equal `equal`, and whose next key lies
     /// between the bounds, in index order. A missing bound leaves that end
     /// open; a range with a bound leaves out NULL, which no comparison matches.
+    ///
+    /// A hash index takes only values for every key and no bounds, and
+    /// returns its entries in no order.
     pub fn scan(&self, equal: &[Value], lower: Option<&Bound>, upper: Option<&Bound>) -> Result<Vec<Vec<u8>>> {
         let prefix = encode_keys(equal);
+        let tree = match &self.store {
+            Store::BTree(tree) => tree,
+            Store::Hash(file) => {
+                if equal.len() < self.keys.len() || lower.is_some() || upper.is_some() {
+                    return err(format!("hash index {} finds only rows whose every key equals a value", self.name));
+                }
+                return file.find(hash::hash(&prefix), &prefix);
+            }
+        };
         let encode = |b: &Bound| (encode_keys(std::slice::from_ref(&b.value)), b.inclusive);
         let (lower, upper) = (lower.map(encode), upper.map(encode));
         let mut start = prefix.clone();
@@ -250,7 +311,7 @@ impl Index {
         }
 
         let mut entries = Vec::new();
-        for entry in self.tree.range(&start) {
+        for entry in tree.range(&start) {
             let entry = entry?;
             if !entry.starts_with(&prefix) {
                 break;
@@ -310,7 +371,10 @@ impl Index {
 
     /// Frees all of the index's pages.
     pub fn destroy(self) -> Result<()> {
-        self.tree.destroy()
+        match self.store {
+            Store::BTree(tree) => tree.destroy(),
+            Store::Hash(file) => file.destroy(),
+        }
     }
 }
 

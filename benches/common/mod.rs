@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use sequoia::executor::join::JOIN_MEMORY;
+use sequoia::executor::join::{HASH_MEMORY, JOIN_MEMORY};
 use sequoia::executor::sort::SORT_MEMORY;
 use sequoia::{Database, QueryResult};
 
@@ -32,12 +32,13 @@ pub struct Case {
     plan: &'static [&'static str],
     join_memory: usize,
     sort_memory: usize,
+    hash_memory: usize,
     /// Whether to time it in SQLite too.
     sqlite: bool,
 }
 
 pub fn case(name: &'static str, sql: &'static str, plan: &'static [&'static str]) -> Case {
-    Case { name, sql, plan, join_memory: JOIN_MEMORY, sort_memory: SORT_MEMORY, sqlite: true }
+    Case { name, sql, plan, join_memory: JOIN_MEMORY, sort_memory: SORT_MEMORY, hash_memory: HASH_MEMORY, sqlite: true }
 }
 
 impl Case {
@@ -51,6 +52,10 @@ impl Case {
 
     pub fn sort_memory(self, bytes: usize) -> Case {
         Case { sort_memory: bytes, ..self }
+    }
+
+    pub fn hash_memory(self, bytes: usize) -> Case {
+        Case { hash_memory: bytes, ..self }
     }
 }
 
@@ -81,6 +86,7 @@ pub fn run(groups: Vec<(&'static str, Vec<Case>)>, setup: &[String], rows: &str)
         for case in cases {
             db.set_join_memory(case.join_memory);
             db.set_sort_memory(case.sort_memory);
+            db.set_hash_memory(case.hash_memory);
             let plan = explain(&mut db, case.sql);
             for word in case.plan {
                 assert!(plan.contains(word), "{}: no {word} in\n{plan}", case.sql);
@@ -205,13 +211,13 @@ fn explain(db: &mut Database, sql: &str) -> String {
     }
 }
 
-/// Rewrites a statement for SQLite, which has no storage engines to pick
-/// and checkpoints by a pragma.
+/// Rewrites a statement for SQLite, which has no storage engines to pick,
+/// makes every index a B-tree and checkpoints by a pragma.
 fn for_sqlite(sql: &str) -> String {
     if sql == "CHECKPOINT" {
         return "PRAGMA wal_checkpoint(TRUNCATE)".into();
     }
-    sql.replace(" USING HEAP", "").replace(" USING LSM", "").replace(" USING COLUMN", "")
+    ["HEAP", "LSM", "COLUMN", "HASH"].iter().fold(sql.to_string(), |sql, using| sql.replace(&format!(" USING {using}"), ""))
 }
 
 /// Statements timed together, and the words that the plan of the first

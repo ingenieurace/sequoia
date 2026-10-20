@@ -14,8 +14,12 @@
 //! ```
 //!
 //! A LEFT JOIN also returns each left row that no right row matched, with a
-//! NULL for every right column. The right side of a hash join is held in
-//! memory; its first row is read when the first left row is.
+//! NULL for every right column. The right side of a hash join is read into
+//! a hash table when the first left row is, within a memory budget
+//! ([`HASH_MEMORY`] by default) past which it is partitioned and partly
+//! written out (see `hash_join.rs`): then the left rows of the partitions
+//! written out come after the others, out of order. A hash join that must
+//! keep its left side's order then sorts its rows back into it.
 //!
 //! A block nested loop join holds left rows instead: a block of as many as
 //! fit in its memory budget ([`JOIN_MEMORY`] by default). For each block it
@@ -32,8 +36,8 @@
 //! ORDER BY that starts with its keys, the sort is already done.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
 
+use super::hash_join::HashSide;
 use super::operator::Rows;
 use super::sort::{Sorted, Sorter, value_size};
 use crate::catalog::table::{Access, Row, Table};
@@ -46,6 +50,9 @@ use crate::types::Value;
 
 /// Default memory a block nested loop join may hold left rows in: 4 MB.
 pub const JOIN_MEMORY: usize = 4 << 20;
+/// Default memory a hash join may hold right rows in, and a hash
+/// aggregation its groups, before they write partitions out: 16 MB.
+pub const HASH_MEMORY: usize = 16 << 20;
 
 pub struct Join<'a> {
     left: Rows<'a>,
@@ -56,29 +63,29 @@ pub struct Join<'a> {
     condition: Option<Expr>,
     /// The left fields, then the right ones: the fields of a joined row.
     fields: Vec<Field>,
-    /// The left row being joined, how many right rows may match it (see
-    /// [`Right::candidate`]), and the next of them to try.
+    /// The left row being joined, its number among the left rows, how
+    /// many right rows may match it (see [`Right::candidate`]), and the next
+    /// of them to try.
     current: Option<Row>,
+    number: u64,
     candidates: usize,
     next: usize,
     matched: bool,
+    /// Whether the left side has run out, and how many rows it gave.
+    left_done: bool,
+    left_rows: u64,
+    /// Whether the rows must come out in their left rows' order. If the
+    /// right side spills, they are sorted back into it, in `sorted`, with
+    /// this budget; a left row written out carries its number with it.
+    keep_order: Option<usize>,
+    sorted: Option<Sorted>,
 }
 
 /// How a join finds the right rows that may match a left row.
 pub enum Right<'a> {
-    /// Right rows grouped by their keys, read on first use. Rows with a NULL key are dropped: they match nothing.
-    Hash {
-        source: Option<Rows<'a>>,
-        /// Each key's position in `buckets`, which holds the rows with that key.
-        index: HashMap<Vec<Value>, usize>,
-        buckets: Vec<Vec<Row>>,
-        left_keys: Vec<Key>,
-        right_keys: Vec<Key>,
-        right_fields: Vec<Field>,
-        /// The current left row's keys, and its bucket, if any.
-        probe: Vec<Value>,
-        bucket: Option<usize>,
-    },
+    /// Right rows grouped by their keys, read on first use, partly written
+    /// out past a budget. Rows with a NULL key are dropped: they match nothing.
+    Hash(HashSide<'a>),
     /// The right rows a lookup finds for the current left row.
     Index { lookup: Lookup<'a>, rows: Vec<Row> },
 }
@@ -119,28 +126,45 @@ impl<'a> Join<'a> {
             fields: [left_fields.clone(), right_fields].concat(),
             left_fields,
             current: None,
+            number: 0,
             candidates: 0,
             next: 0,
             matched: false,
+            left_done: false,
+            left_rows: 0,
+            keep_order: None,
+            sorted: None,
         }
     }
-}
 
-impl Iterator for Join<'_> {
-    type Item = Result<Row>;
+    /// Makes the rows come out in their left rows' order even if a hash
+    /// join's right side spills, by sorting them back into it within `budget`.
+    pub fn keeping_order(self, budget: usize) -> Self {
+        Join { keep_order: Some(budget), ..self }
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
+    /// The next joined row, and the number of the left row in it.
+    fn step(&mut self) -> Option<Result<(u64, Row)>> {
         loop {
             if self.current.is_none() {
-                let row = match self.left.next()? {
-                    Ok(row) => row,
+                let (mut row, number) = match self.next_left() {
+                    Ok(Some(row)) => row,
+                    Ok(None) => return None,
                     Err(e) => return Some(Err(e)),
                 };
+                // A row that may be written out takes its number along.
+                if self.keep_order.is_some() {
+                    row.push(Value::Int(number as i64));
+                }
                 match self.right.find(&row, &self.left_fields) {
-                    Ok(candidates) => self.candidates = candidates,
+                    Ok(Some(candidates)) => self.candidates = candidates,
+                    Ok(None) => continue, // comes back from `deferred`
                     Err(e) => return Some(Err(e)),
                 }
-                (self.current, self.next, self.matched) = (Some(row), 0, false);
+                if self.keep_order.is_some() {
+                    row.pop();
+                }
+                (self.current, self.number, self.next, self.matched) = (Some(row), number, 0, false);
             }
             let left = self.current.as_ref().expect("set above");
             while self.next < self.candidates {
@@ -150,7 +174,7 @@ impl Iterator for Join<'_> {
                 match matches(&self.condition, &self.fields, &joined) {
                     Ok(true) => {
                         self.matched = true;
-                        return Some(Ok(joined));
+                        return Some(Ok((self.number, joined)));
                     }
                     Ok(false) => {}
                     Err(e) => return Some(Err(e)),
@@ -159,64 +183,92 @@ impl Iterator for Join<'_> {
             let mut left = self.current.take().expect("set above");
             if self.kind == JoinKind::Left && !self.matched {
                 left.extend(std::iter::repeat_n(Value::Null, self.right_width));
-                return Some(Ok(left));
+                return Some(Ok((self.number, left)));
             }
+        }
+    }
+
+    /// The next left row and its number: from the left side, then those a
+    /// hash join wrote out, which carry their numbers if order is kept.
+    fn next_left(&mut self) -> Result<Option<(Row, u64)>> {
+        if !self.left_done {
+            match self.left.next() {
+                Some(row) => {
+                    self.left_rows += 1;
+                    return Ok(Some((row?, self.left_rows - 1)));
+                }
+                None => self.left_done = true,
+            }
+        }
+        let Some(mut row) = self.right.deferred()? else { return Ok(None) };
+        let number = match self.keep_order {
+            Some(_) => match row.pop() {
+                Some(Value::Int(n)) => n as u64,
+                _ => unreachable!("a left row written out carries its number"),
+            },
+            None => 0,
+        };
+        Ok(Some((row, number)))
+    }
+}
+
+impl Iterator for Join<'_> {
+    type Item = Result<Row>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(sorted) = &mut self.sorted {
+            return sorted.next();
+        }
+        let first = self.step();
+        let Some(budget) = self.keep_order.filter(|_| self.right.spilled()) else {
+            return first.map(|item| item.map(|(_, row)| row));
+        };
+        // The right side spilled, before any row came out: sort them all
+        // by their left rows' numbers, stably, which keeps their order within one.
+        let mut sorter = Sorter::new(vec![false], None, budget);
+        let mut item = first;
+        while let Some(result) = item {
+            match result {
+                Ok((number, row)) => {
+                    if let Err(e) = sorter.push(&[Value::Int(number as i64)], row) {
+                        return Some(Err(e));
+                    }
+                }
+                Err(e) => return Some(Err(e)),
+            }
+            item = self.step();
+        }
+        match sorter.finish() {
+            Ok(sorted) => self.sorted.insert(sorted).next(),
+            Err(e) => Some(Err(e)),
         }
     }
 }
 
 impl<'a> Right<'a> {
     /// A hash join's right side: the rows of `source`, by `right_keys`, for
-    /// left rows to find by `left_keys`.
+    /// left rows to find by `left_keys`, held within `budget`.
     pub fn hash(
         source: Rows<'a>,
         left_keys: Vec<Expr>,
         right_keys: Vec<Expr>,
         left_fields: &[Field],
         right_fields: Vec<Field>,
+        budget: usize,
     ) -> Self {
-        Right::Hash {
-            source: Some(source),
-            index: HashMap::new(),
-            buckets: Vec::new(),
-            left_keys: Key::all(left_keys, left_fields),
-            right_keys: Key::all(right_keys, &right_fields),
-            right_fields,
-            probe: Vec::new(),
-            bucket: None,
-        }
+        let (left_keys, right_keys) = (Key::all(left_keys, left_fields), Key::all(right_keys, &right_fields));
+        Right::Hash(HashSide::new(source, left_keys, right_keys, left_fields.to_vec(), right_fields, budget))
     }
 
     /// Finds the right rows that may match `left`, and returns how many there
-    /// are: [`candidate`](Self::candidate) gives each.
-    fn find(&mut self, left: &Row, left_fields: &[Field]) -> Result<usize> {
+    /// are, which [`candidate`](Self::candidate) gives, or `None` if a hash
+    /// join wrote `left` out, to come back from [`deferred`](Self::deferred).
+    fn find(&mut self, left: &Row, left_fields: &[Field]) -> Result<Option<usize>> {
         match self {
-            Right::Hash { source, index, buckets, left_keys, right_keys, right_fields, probe, bucket } => {
-                if let Some(source) = source.take() {
-                    for row in source {
-                        let row = row?;
-                        Key::eval_all(right_keys, right_fields, &row, probe)?;
-                        if probe.iter().any(Value::is_null) {
-                            continue;
-                        }
-                        let at = match index.get(probe.as_slice()) {
-                            Some(&at) => at,
-                            None => {
-                                index.insert(probe.clone(), buckets.len());
-                                buckets.push(Vec::new());
-                                buckets.len() - 1
-                            }
-                        };
-                        buckets[at].push(row);
-                    }
-                }
-                Key::eval_all(left_keys, left_fields, left, probe)?;
-                *bucket = index.get(probe.as_slice()).copied(); // a NULL key is in no bucket
-                Ok(bucket.map_or(0, |at| buckets[at].len()))
-            }
+            Right::Hash(side) => side.find(left),
             Right::Index { lookup, rows } => {
                 *rows = lookup.find(&eval(&lookup.left_key, left_fields, left)?)?;
-                Ok(rows.len())
+                Ok(Some(rows.len()))
             }
         }
     }
@@ -224,8 +276,23 @@ impl<'a> Right<'a> {
     /// The `i`th right row [`find`](Self::find) found.
     fn candidate(&self, i: usize) -> &Row {
         match self {
-            Right::Hash { buckets, bucket, .. } => &buckets[bucket.expect("found a bucket")][i],
+            Right::Hash(side) => side.candidate(i),
             Right::Index { rows, .. } => &rows[i],
+        }
+    }
+
+    /// Once the left side has run out, the left rows a hash join wrote out.
+    fn deferred(&mut self) -> Result<Option<Row>> {
+        match self {
+            Right::Hash(side) => side.deferred(),
+            Right::Index { .. } => Ok(None),
+        }
+    }
+
+    fn spilled(&self) -> bool {
+        match self {
+            Right::Hash(side) => side.spilled(),
+            Right::Index { .. } => false,
         }
     }
 }
@@ -243,7 +310,7 @@ impl Key {
     }
 
     /// Puts the values of `keys` on `row` in `values`.
-    fn eval_all(keys: &[Key], fields: &[Field], row: &Row, values: &mut Vec<Value>) -> Result<()> {
+    pub(super) fn eval_all(keys: &[Key], fields: &[Field], row: &Row, values: &mut Vec<Value>) -> Result<()> {
         values.clear();
         for key in keys {
             values.push(match key {

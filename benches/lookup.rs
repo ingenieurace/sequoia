@@ -5,10 +5,11 @@
 //! plan of its first query must find rows as the batch means to.
 //!
 //! The same rows are in a heap (`t`), with indexes on `k`, `g` and `name`
-//! besides its primary key, in an LSM tree (`l`), keyed by `id`, and in a
-//! column store (`c`), which has no indexes. `point` looks up one row at a
-//! time, by each index and against reading every row, and `range` reads
-//! more and more rows by an index, against reading every row.
+//! besides its primary key, in another heap (`h`) with hash indexes on `k`
+//! and `name` instead, in an LSM tree (`l`), keyed by `id`, and in a column
+//! store (`c`), which has no indexes. `point` looks up one row at a time,
+//! by each index and against reading every row, and `range` reads more and
+//! more rows by an index, against reading every row.
 //!
 //! With a `sqlite3` command, the same statements fill the same tables in
 //! SQLite, with the same indexes, and every batch is timed there too;
@@ -32,6 +33,10 @@ fn main() {
                 points("heap, primary key", 1000, |i| format!("SELECT * FROM t WHERE id = {i}"), &["USING INDEX t_pkey"]),
                 points("heap, INT index", 1000, |i| format!("SELECT * FROM t WHERE k = {}", k(i)), &["USING INDEX t_k"]),
                 points("heap, TEXT index", 1000, |i| format!("SELECT * FROM t WHERE name = '{}'", name(i)), &["t_name"]),
+                // SQLite has no hash indexes: B-trees there.
+                points("heap, INT hash", 1000, |i| format!("SELECT * FROM h WHERE k = {}", k(i)), &["USING HASH INDEX h_k"]),
+                points("heap, TEXT hash", 1000, |i| format!("SELECT * FROM h WHERE name = '{}'", name(i)), &["HASH INDEX h_name"]),
+                points("heap, no such hash", 1000, |i| format!("SELECT * FROM h WHERE k = -1 - {i}"), &["HASH INDEX h_k"]),
                 points("heap, no such key", 1000, |i| format!("SELECT * FROM t WHERE id = {}", ROWS + i), &["t_pkey"]),
                 points("LSM, primary key", 1000, |i| format!("SELECT * FROM l WHERE id = {i}"), &["USING PRIMARY KEY"]),
                 // Every SSTable's key range holds the key: its Bloom filter rules it out.
@@ -62,7 +67,7 @@ fn main() {
         ),
     ];
 
-    common::run_queries(groups, &setup(), &format!("{ROWS} rows in each of three tables"));
+    common::run_queries(groups, &setup(), &format!("{ROWS} rows in each of four tables"));
 }
 
 /// A batch of `count` queries made by `query` from row numbers spread out
@@ -93,13 +98,13 @@ fn name(i: i64) -> String {
     format!("customer {:07}", i * 69_621 % P)
 }
 
-/// The statements that fill `t`, `l` and `c` with the same rows, in `id`
-/// order, and index `t`. `k` and `name` are scattered over the rows, and
-/// every one differs; `g` has 100 values, each in every hundredth row.
-/// `l` holds only the even ids, so that odd ones fall between its keys.
+/// The statements that fill `t`, `h`, `l` and `c` with the same rows, in
+/// `id` order, and index `t` and `h`. `k` and `name` are scattered over the
+/// rows, and every one differs; `g` has 100 values, each in every hundredth
+/// row. `l` holds only the even ids, so that odd ones fall between its keys.
 fn setup() -> Vec<String> {
     let mut sql = Vec::new();
-    for (table, engine) in [("t", "HEAP"), ("l", "LSM"), ("c", "COLUMN")] {
+    for (table, engine) in [("t", "HEAP"), ("h", "HEAP"), ("l", "LSM"), ("c", "COLUMN")] {
         sql.push(format!("CREATE TABLE {table} (id INT PRIMARY KEY, k INT, g INT, name TEXT, note TEXT) USING {engine}"));
         let id = |i: i64| if table == "l" { i * 2 } else { i };
         insert(&mut sql, table, ROWS, |i| {
@@ -107,5 +112,6 @@ fn setup() -> Vec<String> {
         });
     }
     sql.extend(["CREATE UNIQUE INDEX t_k ON t (k)", "CREATE INDEX t_g ON t (g)", "CREATE INDEX t_name ON t (name)"].map(String::from));
+    sql.extend(["CREATE UNIQUE INDEX h_k ON h USING HASH (k)", "CREATE INDEX h_name ON h USING HASH (name)"].map(String::from));
     sql
 }

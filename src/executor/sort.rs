@@ -33,19 +33,17 @@
 //! written, a row that sorts after its last can never be in the result
 //! either, and is dropped as it arrives.
 //!
-//! The temporary file is removed as soon as it is created, so it disappears
-//! when the sort ends, even if the process does not. It does not go through
-//! the write-ahead log: nothing in it needs to survive a crash.
+//! The temporary file (see `spill.rs`) is removed as soon as it is created,
+//! so it disappears when the sort ends, even if the process does not.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
-use std::fs::OpenOptions;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
+use super::spill::{IO_CHUNK, decode_value, encode_value, temp_file};
 use crate::catalog::table::Row;
 use crate::error::{Result, err};
-use crate::storage::io::medium::{FileMedium, Medium};
+use crate::storage::io::medium::Medium;
 use crate::storage::sort_key::encode as encode_key;
 use crate::types::Value;
 
@@ -56,8 +54,6 @@ pub const SORT_MEMORY: usize = 4 << 20;
 pub const FAN_IN: usize = 16;
 /// Most runs a merge reads at once.
 const MAX_FAN_IN: usize = 256;
-/// Bytes read or written to the temporary file at a time.
-const IO_CHUNK: usize = 64 << 10;
 
 pub struct Sorter {
     /// For each sort key, whether it is descending.
@@ -344,8 +340,9 @@ struct Spill {
 ///
 /// ```text
 /// u32 length of the rest | key: u64 prefix | u64 number | u32 length, rest of the key | the row's values
-/// value: 0 = NULL | 1, i64 | 2, bool byte | 3, u32 length, UTF-8 bytes   (little-endian)
 /// ```
+///
+/// with each value as `spill::encode_value` writes it.
 #[derive(Debug, Clone, Copy)]
 struct Run {
     start: u64,
@@ -423,58 +420,6 @@ impl<'a> RunWriter<'a> {
         self.flush()?;
         Ok(Run { start: self.start, end: self.spill.end })
     }
-}
-
-/// Opens a temporary file that is removed at once, so it lives only as long as it is open.
-fn temp_file() -> Result<Arc<dyn Medium>> {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let name = format!("sequoia-sort-{}-{}", std::process::id(), NEXT.fetch_add(1, AtomicOrdering::Relaxed));
-    let path = std::env::temp_dir().join(name);
-    let file = OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
-    std::fs::remove_file(&path)?;
-    Ok(Arc::new(FileMedium(file)))
-}
-
-fn encode_value(value: &Value, out: &mut Vec<u8>) {
-    match value {
-        Value::Null => out.push(0),
-        Value::Int(n) => {
-            out.push(1);
-            out.extend_from_slice(&n.to_le_bytes());
-        }
-        Value::Bool(b) => out.extend_from_slice(&[2, *b as u8]),
-        Value::Real(r) => {
-            out.push(4);
-            out.extend_from_slice(&r.to_le_bytes());
-        }
-        Value::Text(s) => {
-            out.push(3);
-            out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-            out.extend_from_slice(s.as_bytes());
-        }
-    }
-}
-
-fn decode_value(bytes: &[u8], pos: &mut usize) -> Result<Value> {
-    let mut take = |n: usize| -> Result<&[u8]> {
-        let slice = bytes.get(*pos..*pos + n).ok_or_else(|| crate::error::Error("corrupted sort run".into()))?;
-        *pos += n;
-        Ok(slice)
-    };
-    Ok(match take(1)?[0] {
-        0 => Value::Null,
-        1 => Value::Int(i64::from_le_bytes(take(8)?.try_into().unwrap())),
-        2 => Value::Bool(take(1)?[0] != 0),
-        4 => Value::Real(f64::from_le_bytes(take(8)?.try_into().unwrap())),
-        3 => {
-            let len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
-            match String::from_utf8(take(len)?.to_vec()) {
-                Ok(s) => Value::Text(s),
-                Err(_) => return err("corrupted sort run: invalid UTF-8"),
-            }
-        }
-        tag => return err(format!("corrupted sort run: value tag {tag}")),
-    })
 }
 
 /// Reads a run's records in order, a chunk of the file at a time. The
@@ -865,29 +810,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn values_round_trip_through_a_run() {
-        let values = vec![
-            Value::Null,
-            Value::Int(i64::MIN),
-            Value::Int(-1),
-            Value::Bool(true),
-            Value::Bool(false),
-            Value::Real(-2.5),
-            Value::Real(1e300),
-            Value::Text(String::new()),
-            Value::Text("héllo, 世界".into()),
-        ];
-        let mut bytes = Vec::new();
-        for value in &values {
-            encode_value(value, &mut bytes);
-        }
-        let mut pos = 0;
-        let decoded: Vec<Value> = values.iter().map(|_| decode_value(&bytes, &mut pos).unwrap()).collect();
-        assert_eq!((decoded, pos), (values, bytes.len()));
-        assert!(decode_value(&[9], &mut 0).is_err());
-        assert!(decode_value(&[3, 5, 0, 0, 0, b'a'], &mut 0).is_err(), "cut short");
     }
 }

@@ -876,16 +876,21 @@ fn indexes_of_every_kind_answer_like_no_index() {
         "CREATE INDEX {t}_d ON {t} (score, city) WHERE nights IS NOT NULL",
         "CREATE INDEX {t}_e ON {t} (vip) INCLUDE (id)",
     ];
-    let tables = ["heap_plain", "heap_indexed", "lsm_plain", "lsm_indexed"];
+    let tables = ["heap_plain", "heap_indexed", "heap_hashed", "lsm_plain", "lsm_indexed", "lsm_hashed"];
     for t in tables {
         let storage = if t.starts_with("lsm") { "LSM" } else { "HEAP" };
         db.execute(&format!(
             "CREATE TABLE {t} (id INT PRIMARY KEY, city TEXT, nights INT, score REAL, vip BOOL) USING {storage}"
         ))
         .unwrap();
-        if t.ends_with("indexed") {
+        if !t.ends_with("plain") {
             for index in indexes {
-                db.execute(&index.replace("{t}", t)).unwrap();
+                let index = index.replace("{t}", t);
+                let index = match t.ends_with("hashed") {
+                    true => index.replacen(&format!("ON {t} "), &format!("ON {t} USING HASH "), 1),
+                    false => index,
+                };
+                db.execute(&index).unwrap();
             }
         }
         let values: Vec<String> = (0..1500i64)
@@ -911,6 +916,12 @@ fn indexes_of_every_kind_answer_like_no_index() {
         "SELECT city FROM {t} WHERE score >= 1 AND city > 'a' AND nights != 3",
         "SELECT id FROM {t} WHERE vip = TRUE",
         "SELECT * FROM {t} WHERE vip = FALSE AND id > 1400",
+        // Every key of each index fixed, for hash indexes.
+        "SELECT * FROM {t} WHERE LOWER(city) = 'oslo' AND nights * 2 + 1 = 3",
+        "SELECT city, score FROM {t} WHERE nights = 1 AND score > 0.5",
+        "SELECT * FROM {t} WHERE score = 1.25 AND city = 'rome' AND nights IS NOT NULL",
+        "SELECT * FROM {t} WHERE score = 1 AND city = 'rome' AND nights IS NOT NULL",
+        "SELECT * FROM {t} WHERE city = 'a\0b' AND nights = -3.0",
     ];
     let changes = [
         "UPDATE {t} SET nights = nights + 1 WHERE city = 'oslo'",
@@ -943,13 +954,92 @@ fn indexes_of_every_kind_answer_like_no_index() {
             }
         }
     }
-    for t in ["heap_indexed", "lsm_indexed"] {
+    for t in ["heap_indexed", "lsm_indexed", "heap_hashed", "lsm_hashed"] {
         let plans: Vec<String> = queries.iter().map(|sql| plan(&mut db, &sql.replace("{t}", t))).collect();
         for index in ["a", "b", "c", "d", "e"] {
             assert!(plans.iter().any(|p| p.contains(&format!("INDEX {t}_{index} "))), "{t}_{index} unused: {plans:#?}");
         }
-        assert!(plans.iter().any(|p| p.contains("COVERING INDEX")));
+        assert!(plans.iter().any(|p| p.contains("COVERING ")));
+        assert_eq!(plans.iter().any(|p| p.contains("HASH INDEX")), t.ends_with("hashed"));
     }
+}
+
+#[test]
+fn hash_indexes_find_rows_whose_every_key_is_fixed() {
+    let file = TempDb::new("hash-index");
+    let mut db = Database::open(&file.0).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, n INT, x REAL);
+         CREATE INDEX t_name ON t USING HASH (name);
+         CREATE INDEX t_name_n ON t USING hash (name, n) INCLUDE (x);
+         CREATE INDEX t_n_tree ON t (n);
+         CREATE INDEX t_n ON t USING HASH (n);",
+    )
+    .unwrap();
+    let values: Vec<String> = (0..3000)
+        .map(|i| {
+            let name = if i % 50 == 0 { "NULL".to_string() } else { format!("'name {}'", i % 400) };
+            format!("({i}, {name}, {}, {}.5)", i % 9, i % 4)
+        })
+        .collect();
+    db.execute(&format!("INSERT INTO t VALUES {}", values.join(", "))).unwrap();
+
+    assert_eq!(plan(&mut db, "SELECT * FROM t WHERE name = 'name 7'"), "SEARCH t USING HASH INDEX t_name (name = 'name 7')");
+    assert_eq!(
+        plan(&mut db, "SELECT x FROM t WHERE n = 3 AND name = 'name 7'"),
+        "SEARCH t USING COVERING HASH INDEX t_name_n (name = 'name 7' AND n = 3)"
+    );
+    assert_eq!(plan(&mut db, "SELECT * FROM t WHERE n = 3"), "SEARCH t USING HASH INDEX t_n (n = 3)", "before the B+ tree");
+    assert_eq!(plan(&mut db, "SELECT * FROM t WHERE n > 3"), "SEARCH t USING INDEX t_n_tree (n > 3)", "no ranges");
+    assert_eq!(plan(&mut db, "SELECT * FROM t WHERE name > 'name 7'"), "SCAN t");
+    assert_eq!(plan(&mut db, "SELECT * FROM t WHERE name IS NULL"), "SCAN t");
+    assert_eq!(query(&mut db, "SELECT COUNT(*) FROM t WHERE name = 'name 7'"), [[int(8)]]);
+    assert_eq!(query(&mut db, "SELECT id FROM t WHERE name = 'name 7' AND n = 7"), [[int(7)]]);
+    assert_eq!(query(&mut db, "SELECT COUNT(*) FROM t WHERE n = 3.0"), [[int(333)]], "a REAL finds the INT it equals");
+    assert_eq!(query(&mut db, "SELECT COUNT(*) FROM t WHERE n = 3.5"), [[int(0)]]);
+
+    // Lookups for an index join go through the hash index.
+    db.execute("CREATE TABLE l (k INT); INSERT INTO l VALUES (1), (2), (NULL)").unwrap();
+    let join = "SELECT COUNT(*) FROM l JOIN t ON t.n = l.k";
+    assert!(explain(&mut db, join).contains("LOOKUP t USING HASH INDEX t_n (t.n = l.k)"), "{}", explain(&mut db, join));
+    assert_eq!(query(&mut db, join), [[int(334 + 334)]]);
+
+    // Changes, and a failed statement, leave the indexes matching the rows.
+    db.execute("UPDATE t SET name = 'renamed', n = n + 100 WHERE id < 1000").unwrap();
+    db.execute("DELETE FROM t WHERE id >= 2500").unwrap();
+    assert!(db.execute("INSERT INTO t VALUES (5000, 'new', 1, 1.0), (1, 'dup', 1, 1.0)").is_err());
+    db.execute("BEGIN; DELETE FROM t WHERE n = 103; ROLLBACK").unwrap();
+    drop(db);
+    let mut db = Database::open(&file.0).unwrap();
+    for (sql, count) in [
+        ("SELECT COUNT(*) FROM t WHERE name = 'renamed'", 1000),
+        ("SELECT COUNT(*) FROM t WHERE name = 'name 207'", 4),
+        ("SELECT COUNT(*) FROM t WHERE name = 'name 7'", 4),
+        ("SELECT COUNT(*) FROM t WHERE name = 'new'", 0),
+        ("SELECT COUNT(*) FROM t WHERE n = 103", 111),
+        ("SELECT COUNT(*) FROM t WHERE n = 3", 167),
+        ("SELECT COUNT(*) FROM t WHERE name = 'renamed' AND n = 105", 111),
+    ] {
+        assert!(plan(&mut db, sql).contains("HASH INDEX"), "{sql}");
+        let scanned = query(&mut db, &(sql.replace("WHERE", "WHERE id < 0 OR (") + ")"));
+        assert_eq!(query(&mut db, sql), scanned, "{sql}");
+        assert_eq!(query(&mut db, sql), [[int(count)]], "{sql}");
+    }
+
+    // A unique hash index rejects duplicates, NULLs aside.
+    db.execute("CREATE TABLE u (id INT PRIMARY KEY, email TEXT); CREATE UNIQUE INDEX u_email ON u USING HASH (email)").unwrap();
+    db.execute("INSERT INTO u VALUES (1, 'a'), (2, 'b'), (3, NULL), (4, NULL)").unwrap();
+    let error = db.execute("INSERT INTO u VALUES (5, 'a')").unwrap_err();
+    assert!(format!("{error:?}").contains("duplicate value in unique index u_email"), "{error:?}");
+    db.execute("UPDATE u SET email = 'c' WHERE id = 1; INSERT INTO u VALUES (5, 'a')").unwrap();
+    assert!(db.execute("CREATE UNIQUE INDEX u_bad ON u USING HASH (id - id)").is_err());
+    assert!(db.execute("CREATE INDEX u_bad ON u USING ROPE (email)").is_err());
+
+    // Dropping a hash index frees its pages for the next one.
+    let size = file_size(&mut db, &file.0);
+    db.execute("DROP INDEX t_name; DROP INDEX t_name_n; CREATE INDEX t_name ON t USING HASH (name)").unwrap();
+    db.execute("CREATE INDEX t_name_n ON t USING HASH (name, n) INCLUDE (x)").unwrap();
+    assert_eq!(file_size(&mut db, &file.0), size);
 }
 
 #[test]
@@ -1656,8 +1746,11 @@ fn merge_join_agrees_with_a_hash_join_and_a_sort() {
             .collect::<Vec<_>>()
             .join(", ")
     };
+    // With little memory, sorts spill, and hash joins after a merge join
+    // spill too, and must keep its order.
     for memory in [usize::MAX, 300] {
         db.set_sort_memory(memory);
+        db.set_hash_memory(memory);
         for (from, order, others, merged) in cases {
             let keys: Vec<&str> = order.split(", ").map(|k| k.trim_end_matches(" DESC")).collect();
             let sql = |order: &str| format!("SELECT {}, {others} FROM {from} ORDER BY {order}", keys.join(", "));
@@ -1718,6 +1811,65 @@ fn block_nested_loop_join_agrees_for_every_block_size() {
             assert_eq!(rows, whole, "{sql}, {memory} bytes");
         }
     }
+}
+
+#[test]
+fn hash_joins_and_aggregates_spill_partitions_past_their_budget() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE a (id INT PRIMARY KEY, k INT, s TEXT);
+         CREATE TABLE b (id INT PRIMARY KEY, k REAL, one INT, t TEXT);",
+    )
+    .unwrap();
+    let a: Vec<String> = (0..3000i64)
+        .map(|i| {
+            let k = if i % 13 == 0 { "NULL".to_string() } else { (i * 7 % 1100).to_string() };
+            format!("({i}, {k}, 'a{}')", i % 37)
+        })
+        .collect();
+    // Keys as REALs, which match the INTs they equal; one key of many rows.
+    let b: Vec<String> = (0..2500i64)
+        .map(|i| {
+            let k = match i % 10 {
+                0 => "NULL".to_string(),
+                1 => "500.0".to_string(),
+                _ => format!("{}.0", i * 3 % 1300),
+            };
+            format!("({i}, {k}, 1, '{}')", "x".repeat(i as usize % 40))
+        })
+        .collect();
+    db.execute(&format!("INSERT INTO a VALUES {}", a.join(", "))).unwrap();
+    db.execute(&format!("INSERT INTO b VALUES {}", b.join(", "))).unwrap();
+
+    let queries = [
+        "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k",
+        "SELECT a.id, b.id, b.t FROM a LEFT JOIN b ON b.k = a.k AND b.id > a.id",
+        "SELECT a.s, COUNT(*), SUM(b.id) FROM a JOIN b ON b.k = a.k GROUP BY a.s",
+        "SELECT k, COUNT(*), COUNT(DISTINCT t), MIN(t), AVG(id) FROM b GROUP BY k",
+        "SELECT a.k, a.s, MAX(a.id), COUNT(DISTINCT a.id - a.id / 3 * 3) FROM a GROUP BY a.k, a.s",
+        "SELECT one, COUNT(*) FROM b GROUP BY one",
+        "SELECT DISTINCT a.k FROM a JOIN b ON b.one = 1 AND b.k = a.k",
+    ];
+    let sorted = |mut rows: Vec<Vec<Value>>| {
+        rows.sort_by(|x, y| x.iter().zip(y).map(|(a, b)| a.sort_cmp(b)).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal));
+        rows
+    };
+    for sql in queries {
+        db.set_hash_memory(usize::MAX);
+        let whole = sorted(query(&mut db, sql));
+        assert!(!whole.is_empty(), "{sql}");
+        // From partitions of a few rows, split again and again, to more than fit.
+        for memory in [0, 2000, 50_000, 300_000] {
+            db.set_hash_memory(memory);
+            assert_eq!(sorted(query(&mut db, sql)), whole, "{sql}, {memory} bytes");
+        }
+    }
+    db.set_hash_memory(0);
+    // Every row of one key: a table that cannot be split is held whole.
+    assert_eq!(query(&mut db, "SELECT COUNT(*) FROM b x JOIN b y ON y.one = x.one WHERE x.id < 300"), [[int(300 * 2500)]]);
+    // An error in a partition read back ends the query.
+    let error = db.execute("SELECT a.id / (b.id - 2402) FROM a JOIN b ON b.k = a.k").unwrap_err();
+    assert!(error.0.contains("division by zero"), "{error:?}");
 }
 
 #[test]

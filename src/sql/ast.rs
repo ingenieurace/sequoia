@@ -48,11 +48,13 @@ pub enum Statement {
     },
 }
 
-/// `CREATE [UNIQUE] INDEX name ON table (key, ...) [INCLUDE (column, ...)] [WHERE condition]`
+/// `CREATE [UNIQUE] INDEX name ON table [USING BTREE | HASH] (key, ...) [INCLUDE (column, ...)] [WHERE condition]`
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateIndex {
     pub name: String,
     pub table: String,
+    /// What the index is stored in.
+    pub using: IndexKind,
     /// What the index is sorted by: columns, or expressions of the table's columns.
     pub keys: Vec<Expr>,
     /// Columns stored in each entry besides the keys, so a query that reads
@@ -64,12 +66,35 @@ pub struct CreateIndex {
     pub unique: bool,
 }
 
+/// How an index is stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndexKind {
+    /// A B+ tree: finds keys equal to values, or in a range, in order. The default.
+    #[default]
+    BTree,
+    /// A hash file: finds only keys equal to values, of every key of the index.
+    Hash,
+}
+
+impl std::fmt::Display for IndexKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(match self {
+            IndexKind::BTree => "BTREE",
+            IndexKind::Hash => "HASH",
+        })
+    }
+}
+
 impl std::fmt::Display for CreateIndex {
     /// Writes the statement as SQL that parses back to it, as the catalog stores it.
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let keys = self.keys.iter().map(Expr::to_string).collect::<Vec<_>>().join(", ");
         let unique = if self.unique { "UNIQUE " } else { "" };
-        write!(f, "CREATE {unique}INDEX {} ON {} ({keys})", self.name, self.table)?;
+        write!(f, "CREATE {unique}INDEX {} ON {}", self.name, self.table)?;
+        if self.using != IndexKind::BTree {
+            write!(f, " USING {}", self.using)?;
+        }
+        write!(f, " ({keys})")?;
         if !self.include.is_empty() {
             write!(f, " INCLUDE ({})", self.include.join(", "))?;
         }

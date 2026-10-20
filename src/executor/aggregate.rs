@@ -10,11 +10,27 @@
 //! is 0 and the others NULL. With `DISTINCT`, an aggregate remembers the
 //! values it has added in each group and adds each only once. `SUM` is an
 //! INT over INTs and a REAL once a REAL is added; `AVG` is a REAL.
+//!
+//! The groups may take a budget of memory ([`HASH_MEMORY`] by default).
+//! Once they do, a row of a group already in memory still adds to it, but
+//! a row of a new group is written out, its key and aggregates' arguments
+//! only, to one of [`FANOUT`] partitions by a hash of its key (see
+//! `spill.rs`). After the last row, the groups in memory come out, and then
+//! each partition's are folded in turn the same way, a partition that
+//! outgrows the budget too spilling into partitions of its own, by the next
+//! bits of the hash. Groups of rows written out come after the others,
+//! then, not in the order of their first rows. The values `DISTINCT`
+//! remembers grow the groups in memory past the budget: they cannot be
+//! written out.
+//!
+//! [`HASH_MEMORY`]: super::join::HASH_MEMORY
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use super::operator::Rows;
+use super::sort::value_size;
+use super::spill::{FANOUT, MAX_LEVEL, RowFile, partition};
 use crate::catalog::table::Row;
 use crate::error::{Error, Result, err};
 use crate::plan::query::AggregateCall;
@@ -23,42 +39,153 @@ use crate::sql::eval::{Field, eval};
 use crate::types::Value;
 
 /// Reads every row of `input` (whose columns are `columns`) and returns one
-/// row per group: its `group_by` values, then the result of each aggregate.
-pub fn fold(input: Rows, columns: &[Field], group_by: &[Expr], aggregates: &[AggregateCall]) -> Result<Vec<Row>> {
-    let fresh = || aggregates.iter().map(|(function, _, distinct)| State::new(*function, *distinct)).collect::<Vec<_>>();
-    let mut groups: Vec<(Row, Vec<State>)> = Vec::new();
-    let mut index: HashMap<Row, usize> = HashMap::new();
+/// row per group: its `group_by` values, then the result of each aggregate,
+/// holding groups within `budget` bytes, about.
+pub fn fold(input: Rows, columns: &[Field], group_by: &[Expr], aggregates: &[AggregateCall], budget: usize) -> Result<Groups> {
+    let mut table = Table::new(0);
+    let mut scratch = Vec::new();
     for row in input {
         let row = row?;
         let key: Row = group_by.iter().map(|e| eval(e, columns, &row)).collect::<Result<_>>()?;
-        let i = match index.get(&key) {
+        let args = aggregates.iter().map(|(_, arg, _)| arg.as_ref().map(|arg| eval(arg, columns, &row)).transpose());
+        table.add(key, args, aggregates, budget, &mut scratch)?;
+    }
+    if group_by.is_empty() && table.groups.is_empty() {
+        table.groups.push((Vec::new(), fresh(aggregates)));
+    }
+    let mut groups = Groups { aggregates: aggregates.to_vec(), keys: group_by.len(), budget, rows: Vec::new().into_iter(), pending: Vec::new() };
+    groups.start(table);
+    Ok(groups)
+}
+
+/// The rows of the groups: those in memory, then those of each partition
+/// written out, folded when their turn comes.
+pub struct Groups {
+    aggregates: Vec<AggregateCall>,
+    /// How many group keys each row written out starts with.
+    keys: usize,
+    budget: usize,
+    rows: std::vec::IntoIter<Row>,
+    /// Partitions written out, and the level to split each at if it must be.
+    pending: Vec<(RowFile, u32)>,
+}
+
+impl Groups {
+    /// Makes the groups of `table` the next to come out, and its partitions pending.
+    fn start(&mut self, table: Table) {
+        let level = table.level + 1;
+        self.pending.extend(table.spilled.into_iter().filter(|file| file.rows() > 0).map(|file| (file, level)));
+        let rows: Vec<Row> = table
+            .groups
+            .into_iter()
+            .map(|(mut row, states)| {
+                row.extend(states.iter().map(|state| state.accumulator.result()));
+                row
+            })
+            .collect();
+        self.rows = rows.into_iter();
+    }
+
+    /// Folds the rows of a partition written out, each its key and then
+    /// the arguments of the aggregates that have one.
+    fn fold_partition(&mut self, file: RowFile, level: u32) -> Result<()> {
+        let mut table = Table::new(level);
+        let mut scratch = Vec::new();
+        for record in file.read() {
+            let mut values = record?.into_iter();
+            let key: Row = values.by_ref().take(self.keys).collect();
+            let args: Vec<Option<Value>> =
+                self.aggregates.iter().map(|(_, arg, _)| arg.as_ref().map(|_| values.next().expect("written"))).collect();
+            table.add(key, args.into_iter().map(Ok), &self.aggregates, self.budget, &mut scratch)?;
+        }
+        self.start(table);
+        Ok(())
+    }
+}
+
+impl Iterator for Groups {
+    type Item = Result<Row>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(row) = self.rows.next() {
+                return Some(Ok(row));
+            }
+            let (file, level) = self.pending.pop()?;
+            if let Err(e) = self.fold_partition(file, level) {
+                self.pending.clear();
+                return Some(Err(e));
+            }
+        }
+    }
+}
+
+/// Groups by their keys, and the partitions the rows of new groups were
+/// written to once they took the budget.
+struct Table {
+    level: u32,
+    groups: Vec<(Row, Vec<State>)>,
+    index: HashMap<Row, usize>,
+    /// Bytes the groups take, about.
+    bytes: usize,
+    /// [`FANOUT`] partitions once rows were written out; none before.
+    spilled: Vec<RowFile>,
+}
+
+impl Table {
+    fn new(level: u32) -> Self {
+        Table { level, groups: Vec::new(), index: HashMap::new(), bytes: 0, spilled: Vec::new() }
+    }
+
+    /// Adds a row with this key and these aggregate arguments (`None` for
+    /// `COUNT(*)`) to its group; writes it out instead if it is the first of
+    /// its group and the groups take `budget` (unless there are no hash bits
+    /// left to partition by).
+    fn add(
+        &mut self,
+        key: Row,
+        args: impl Iterator<Item = Result<Option<Value>>>,
+        aggregates: &[AggregateCall],
+        budget: usize,
+        scratch: &mut Vec<u8>,
+    ) -> Result<()> {
+        let i = match self.index.get(&key) {
             Some(&i) => i,
+            None if self.bytes > budget && self.level <= MAX_LEVEL => {
+                if self.spilled.is_empty() {
+                    self.spilled = (0..FANOUT).map(|_| RowFile::new()).collect();
+                }
+                let p = partition(&key, self.level, scratch);
+                let mut record = key;
+                for arg in args {
+                    record.extend(arg?);
+                }
+                return self.spilled[p].push(&record);
+            }
             None => {
-                index.insert(key.clone(), groups.len());
-                groups.push((key, fresh()));
-                groups.len() - 1
+                self.bytes += 2 * (24 + key.iter().map(value_size).sum::<usize>()) + 16 + 48 * aggregates.len();
+                self.index.insert(key.clone(), self.groups.len());
+                self.groups.push((key, fresh(aggregates)));
+                self.groups.len() - 1
             }
         };
-        for ((_, arg, _), state) in aggregates.iter().zip(&mut groups[i].1) {
-            let value = arg.as_ref().map(|arg| eval(arg, columns, &row)).transpose()?;
-            if let (Some(seen), Some(value)) = (&mut state.seen, &value)
-                && !seen.insert(value.clone())
-            {
-                continue;
+        for (state, value) in self.groups[i].1.iter_mut().zip(args) {
+            let value = value?;
+            if let (Some(seen), Some(value)) = (&mut state.seen, &value) {
+                if !seen.insert(value.clone()) {
+                    continue;
+                }
+                self.bytes += 16 + value_size(value);
             }
             state.accumulator.add(value)?;
         }
+        Ok(())
     }
-    if group_by.is_empty() && groups.is_empty() {
-        groups.push((Vec::new(), fresh()));
-    }
-    Ok(groups
-        .into_iter()
-        .map(|(mut row, states)| {
-            row.extend(states.iter().map(|state| state.accumulator.result()));
-            row
-        })
-        .collect())
+}
+
+/// The states of a new group's aggregates.
+fn fresh(aggregates: &[AggregateCall]) -> Vec<State> {
+    aggregates.iter().map(|(function, _, distinct)| State::new(*function, *distinct)).collect()
 }
 
 /// One aggregate in one group: its accumulator, and for `DISTINCT` the

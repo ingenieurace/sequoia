@@ -3,9 +3,11 @@
 //! groups them, and `subquery` runs the subqueries of their expressions.
 
 pub mod aggregate;
+pub mod hash_join;
 pub mod join;
 pub mod operator;
 pub mod sort;
+pub mod spill;
 pub mod subquery;
 
 use std::rc::Rc;
@@ -20,7 +22,7 @@ use crate::result::QueryResult;
 use crate::sql::ast::{Expr, Select, Statement};
 use crate::sql::eval::{Field, eval_with, matches_with};
 use crate::types::Value;
-use join::JOIN_MEMORY;
+use join::{HASH_MEMORY, JOIN_MEMORY};
 use operator::{Profile, Rows, StepCount};
 use sort::SORT_MEMORY;
 use subquery::Runner;
@@ -34,11 +36,14 @@ pub struct Settings {
     /// Bytes of left rows a block nested loop join may hold at once; it reads
     /// its right side once for each block of them.
     pub join_memory: usize,
+    /// Bytes of right rows a hash join, or of groups a hash aggregation, may
+    /// hold before it writes partitions of them to temporary files.
+    pub hash_memory: usize,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { sort_memory: SORT_MEMORY, join_memory: JOIN_MEMORY }
+        Settings { sort_memory: SORT_MEMORY, join_memory: JOIN_MEMORY, hash_memory: HASH_MEMORY }
     }
 }
 
