@@ -44,3 +44,7 @@ harness = false
 [[bench]]
 name = "column_encoding"
 harness = false
+
+[[bench]]
+name = "hash"
+harness = false

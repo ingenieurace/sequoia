@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod database;
 pub mod error;
 pub mod executor;
+pub mod hash;
 pub mod plan;
 pub mod predicate;
 pub mod result;
