@@ -111,14 +111,17 @@ with more indexes, `commit` single-row statements against one transaction,
 `checkpoint`. SQLite runs in WAL mode with `synchronous = FULL`, so it syncs
 its log at each commit as Sequoia does.
 
-Three benchmarks time the storage layer alone, with no SQL or SQLite:
-`benches/buffer_pool.rs` reads pages in five patterns through 256 frames
-under each replacement policy and prints the hit rate and time of each,
-`benches/lsm.rs` loads and reads LSM trees under level and universal
-compaction and prints their write amplification, and
+Four benchmarks time the storage layer and its data structures alone, with
+no SQL or SQLite: `benches/buffer_pool.rs` reads pages in five patterns
+through 256 frames under each replacement policy and prints the hit rate and
+time of each, `benches/lsm.rs` loads and reads LSM trees under level and
+universal compaction and prints their write amplification,
 `benches/column_encoding.rs` prints the encoding the column store picks for
 each kind of data, the bytes a value takes, and the time to encode, decode
-and filter it. Group names work for all of them:
+and filter it, and `benches/hash.rs` times the five hash tables of
+`src/hash` (linear probing, cuckoo, chained, extendible and linear hashing)
+against `std::collections::HashMap` on a million keys, and linear probing
+alone at three load factors. Group names work for all of them:
 
 ```bash
 cargo bench --bench writes -- commit
