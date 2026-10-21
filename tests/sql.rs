@@ -2993,6 +2993,84 @@ fn a_failing_returning_list_undoes_its_statement() {
     assert_eq!(totals(&mut db), [vec![int(4), int(55)]]);
 }
 
+/// The Halloween problem: an UPDATE that reads its rows through an index (or
+/// an LSM tree's keys) and changes the column it is ordered by may meet the
+/// rows it changed again further on, and change them again. Every update
+/// here does that, where the plan shows it reads that way, and must change
+/// each row once, as if every row were read before any was written.
+#[test]
+fn updates_change_each_row_once_though_they_move_it_along_their_scan() {
+    const ROWS: i64 = 2000;
+    let long = "y".repeat(300);
+    for storage in ["HEAP", "LSM", "COLUMN"] {
+        let mut db = in_memory();
+        db.execute(&format!("CREATE TABLE t (id INT PRIMARY KEY, n INT, g INT, body TEXT) USING {storage}")).unwrap();
+        if storage != "COLUMN" {
+            db.execute("CREATE INDEX t_n ON t (n); CREATE INDEX t_g ON t USING HASH (g)").unwrap();
+        }
+        // Enough rows for many heap pages, LSM flushes and column row groups.
+        let values: Vec<String> = (0..ROWS).map(|i| format!("({i}, {i}, {}, 'x')", i % 10)).collect();
+        db.execute(&format!("INSERT INTO t VALUES {}", values.join(", "))).unwrap();
+        // What the table should hold: each row's id, n, g and the length of its body.
+        let mut want: Vec<[i64; 4]> = (0..ROWS).map(|i| [i, i, i % 10, 1]).collect();
+
+        let mut check = |db: &mut Database, sql: &str, path: &str, change: &dyn Fn(&mut [i64; 4]) -> bool| {
+            let found = plan(db, sql);
+            assert!(found.starts_with(path), "{storage}: {sql} reads by {found}");
+            let changed = want.iter_mut().map(|row| change(row) as usize).sum::<usize>();
+            let done = db.execute(sql).unwrap().pop().unwrap();
+            assert_eq!(done, QueryResult::Message(format!("{changed} row(s) updated")), "{storage}: {sql}");
+            want.sort();
+            let rows = query(db, "SELECT id, n, g, LENGTH(body) FROM t ORDER BY id");
+            let expected: Vec<Vec<Value>> = want.iter().map(|row| row.iter().map(|&v| int(v)).collect()).collect();
+            assert!(rows == expected, "{storage}: {sql} left rows other than expected");
+        };
+
+        // Each row moves up by 500, within the range still to be read, and
+        // a heap row grows, so it moves to another page and another id too.
+        let sql = format!("UPDATE t SET n = n + 500, body = '{long}' WHERE n < 1500");
+        let path = match storage {
+            "COLUMN" => "SCAN t",
+            _ => "SEARCH t USING INDEX t_n (n < 1500)",
+        };
+        check(&mut db, &sql, path, &|row| {
+            let hit = row[1] < 1500;
+            if hit {
+                row[1] += 500;
+                row[3] = 300;
+            }
+            hit
+        });
+
+        // A row stays in the hash bucket being read, under a new entry if it moved.
+        let sql = format!("UPDATE t SET n = n + 1, body = '{long}{long}' WHERE g = 3");
+        let path = match storage {
+            "COLUMN" => "SCAN t",
+            _ => "SEARCH t USING HASH INDEX t_g (g = 3)",
+        };
+        check(&mut db, &sql, path, &|row| {
+            let hit = row[2] == 3;
+            if hit {
+                row[1] += 1;
+                row[3] = 600;
+            }
+            hit
+        });
+
+        // Every primary key moves up by 1000, into the range still to be read.
+        let sql = "UPDATE t SET id = id + 1000 WHERE id >= 0";
+        let path = match storage {
+            "HEAP" => "SEARCH t USING INDEX t_pkey (id >= 0)",
+            "LSM" => "SEARCH t USING PRIMARY KEY (id >= 0)",
+            _ => "SCAN t",
+        };
+        check(&mut db, sql, path, &|row| {
+            row[0] += 1000;
+            true
+        });
+    }
+}
+
 #[test]
 fn returning_is_no_keyword() {
     let mut db = in_memory();
