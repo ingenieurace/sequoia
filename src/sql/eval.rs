@@ -103,6 +103,11 @@ pub fn locate(expr: &Expr, fields: &[Field]) -> Expr {
     located.expect("locating columns cannot fail")
 }
 
+/// Each of the expressions as [`locate`] makes it.
+pub fn locate_all(exprs: &[Expr], fields: &[Field]) -> Vec<Expr> {
+    exprs.iter().map(|e| locate(e, fields)).collect()
+}
+
 /// Evaluates a WHERE clause; NULL counts as false.
 pub fn matches(filter: &Option<Expr>, fields: &[Field], row: &[Value]) -> Result<bool> {
     matches_with(filter, fields, row, &mut NoSubqueries)

@@ -27,7 +27,7 @@ use crate::catalog::table::Row;
 use crate::error::Result;
 use crate::plan::query::{JoinMethod, Node};
 use crate::sql::ast::{Expr, JoinKind, OrderBy};
-use crate::sql::eval::{Field, eval_with, matches_with};
+use crate::sql::eval::{Field, eval_with, locate, locate_all, matches_with};
 
 /// Rows produced by an operator, or the error that stopped it.
 pub type Rows<'a> = Box<dyn Iterator<Item = Result<Row>> + 'a>;
@@ -128,7 +128,7 @@ fn open_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step
         }
         Node::Filter { input, predicate } => {
             let columns = input.columns();
-            let predicate = Some(predicate);
+            let predicate = Some(locate(&predicate, &columns));
             let mut subqueries = Runner::new(catalog, settings);
             Box::new(open(*input, below(step, 0)).filter_map(move |item| {
                 match item.and_then(|row| Ok((matches_with(&predicate, &columns, &row, &mut subqueries)?, row))) {
@@ -171,6 +171,7 @@ fn open_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step
         Node::Derived { input, .. } => open(*input, below(step, 0)),
         Node::Project { input, exprs } => {
             let columns = input.columns();
+            let exprs = locate_all(&exprs, &columns);
             let mut subqueries = Runner::new(catalog, settings);
             Box::new(open(*input, below(step, 0)).map(move |item| {
                 let row = item?;
@@ -241,6 +242,7 @@ pub(super) fn join<'a>(
                 unreachable!("an index join reads its right side through a lookup");
             };
             let fields = Field::of_table(&qualifier, &table.columns);
+            let (left_key, filter) = (locate(&left_key, &left_fields), filter.map(|f| locate(&f, &fields)));
             let lookup = Lookup { table, needed, column, key, left_key, filter, fields };
             Right::Index { lookup, rows: Vec::new() }
         }
@@ -259,12 +261,13 @@ pub(super) fn sort(
     subqueries: &mut Runner,
 ) -> Result<Sorted> {
     let mut sorter = Sorter::new(keys.iter().map(|k| k.desc).collect(), limit, budget);
+    let exprs: Vec<Expr> = keys.iter().map(|k| locate(&k.expr, columns)).collect();
     let mut values = Vec::new();
     for row in input {
         let row = row?;
         values.clear();
-        for k in keys {
-            values.push(eval_with(&k.expr, columns, &row, subqueries)?);
+        for e in &exprs {
+            values.push(eval_with(e, columns, &row, subqueries)?);
         }
         sorter.push(&values, row)?;
     }

@@ -45,7 +45,7 @@ use crate::error::Result;
 use crate::plan::query::LookupKey;
 use crate::predicate::{Compare, Predicate};
 use crate::sql::ast::{Expr, JoinKind, OrderBy};
-use crate::sql::eval::{Field, eval, matches, resolve};
+use crate::sql::eval::{Field, eval, locate, locate_all, matches, resolve};
 use crate::types::Value;
 
 /// Default memory a block nested loop join may hold left rows in: 4 MB.
@@ -117,13 +117,14 @@ impl<'a> Join<'a> {
         kind: JoinKind,
         condition: Option<Expr>,
     ) -> Self {
+        let fields = [left_fields.clone(), right_fields].concat();
         Join {
             left,
             right,
-            right_width: right_fields.len(),
+            right_width: fields.len() - left_fields.len(),
             kind,
-            condition,
-            fields: [left_fields.clone(), right_fields].concat(),
+            condition: condition.map(|c| locate(&c, &fields)),
+            fields,
             left_fields,
             current: None,
             number: 0,
@@ -303,9 +304,8 @@ impl Key {
         exprs
             .into_iter()
             .map(|expr| match &expr {
-                Expr::Slot(i, _) => Key::Column(*i),
                 Expr::Column(column) => resolve(fields, column).map_or(Key::Expr(expr), Key::Column),
-                _ => Key::Expr(expr),
+                _ => Key::Expr(locate(&expr, fields)),
             })
             .collect()
     }
@@ -423,13 +423,15 @@ impl<'a> BlockJoin<'a> {
         condition: Option<Expr>,
         budget: usize,
     ) -> Self {
+        let right_width = right_fields.len();
+        let fields = [left_fields, right_fields].concat();
         BlockJoin {
             left: Some(left),
             right,
-            right_width: right_fields.len(),
+            right_width,
             kind,
-            condition,
-            fields: [left_fields, right_fields].concat(),
+            condition: condition.map(|c| locate(&c, &fields)),
+            fields,
             budget,
             block: Vec::new(),
             matched: Vec::new(),
@@ -613,12 +615,21 @@ impl<'a> MergeJoin<'a> {
         kind: JoinKind,
         condition: Option<Expr>,
     ) -> Self {
+        let fields = [left_fields.clone(), right_fields.clone()].concat();
+        let condition = condition.map(|c| locate(&c, &fields));
+        // The left side sorts by its keys, then by `then`; the right one by its keys.
+        let sort = MergeSort {
+            left_keys: locate_all(&sort.left_keys, &left_fields),
+            right_keys: locate_all(&sort.right_keys, &right_fields),
+            then: sort.then.iter().map(|o| OrderBy { expr: locate(&o.expr, &left_fields), desc: o.desc }).collect(),
+            ..sort
+        };
         MergeJoin {
             left_input: Some(left),
             right_input: Some(right),
             left: None,
             right: None,
-            fields: [left_fields.clone(), right_fields.clone()].concat(),
+            fields,
             left_fields,
             right_width: right_fields.len(),
             right_fields,

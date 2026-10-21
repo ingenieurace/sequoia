@@ -119,7 +119,7 @@ use crate::predicate::{Compare, Predicate};
 use crate::sql::ast::{
     Aggregate, BinaryOp, ColumnRef, Expr, From, JoinKind, OrderBy, Projection, Select, SelectItem, TableRef, TableSource,
 };
-use crate::sql::eval::{self, Field, resolve};
+use crate::sql::eval::{Field, resolve};
 use crate::types::{StorageKind, Value};
 
 /// A SELECT's plan: the tree, and the names of the columns it returns.
@@ -916,89 +916,6 @@ fn conjuncts(expr: &Expr, out: &mut Vec<Expr>) {
 /// The conditions joined by AND, if there are any.
 fn and(parts: Vec<Expr>) -> Option<Expr> {
     parts.into_iter().reduce(|a, b| Expr::Binary(Box::new(a), BinaryOp::And, Box::new(b)))
-}
-
-impl<'a> Node<'a> {
-    /// The plan with every expression's columns found among those of the
-    /// rows it is evaluated on (see [`eval::locate`]), so that no step looks
-    /// a column up by name for each row: what the execution models run,
-    /// once EXPLAIN has printed the plan. Each step's columns stay as they
-    /// were, as a located column prints as it did.
-    pub fn locate(self) -> Node<'a> {
-        let all = |exprs: Vec<Expr>, fields: &[Field]| -> Vec<Expr> {
-            exprs.iter().map(|e| eval::locate(e, fields)).collect()
-        };
-        let keys = |keys: Vec<OrderBy>, fields: &[Field]| -> Vec<OrderBy> {
-            keys.into_iter().map(|o| OrderBy { expr: eval::locate(&o.expr, fields), desc: o.desc }).collect()
-        };
-        match self {
-            Node::Scan { .. } => self,
-            // Its key is the left side's, which the join above locates.
-            Node::Lookup { .. } => self,
-            Node::Filter { input, predicate } => {
-                let predicate = eval::locate(&predicate, &input.columns());
-                Node::Filter { input: Box::new(input.locate()), predicate }
-            }
-            Node::Join { left, right, kind, method, condition } => {
-                let (left_fields, right_fields) = (left.columns(), right.columns());
-                let condition = condition.map(|c| eval::locate(&c, &[left_fields.clone(), right_fields.clone()].concat()));
-                let mut right = right.locate();
-                let method = match method {
-                    JoinMethod::Block => JoinMethod::Block,
-                    JoinMethod::Index => {
-                        right = right.locate_left_key(&left_fields);
-                        JoinMethod::Index
-                    }
-                    JoinMethod::Hash { left_keys, right_keys, keep_order } => JoinMethod::Hash {
-                        left_keys: all(left_keys, &left_fields),
-                        right_keys: all(right_keys, &right_fields),
-                        keep_order,
-                    },
-                    // The left side sorts by its keys, then by `then`.
-                    JoinMethod::Merge { left_keys, right_keys, desc, then } => JoinMethod::Merge {
-                        left_keys: all(left_keys, &left_fields),
-                        right_keys: all(right_keys, &right_fields),
-                        desc,
-                        then: keys(then, &left_fields),
-                    },
-                };
-                Node::Join { left: Box::new(left.locate()), right: Box::new(right), kind, method, condition }
-            }
-            Node::Aggregate { input, group_by, aggregates } => {
-                let fields = input.columns();
-                let group_by = all(group_by, &fields);
-                let aggregates = aggregates
-                    .into_iter()
-                    .map(|(function, arg, distinct)| (function, arg.map(|arg| eval::locate(&arg, &fields)), distinct))
-                    .collect();
-                Node::Aggregate { input: Box::new(input.locate()), group_by, aggregates }
-            }
-            Node::Sort { input, keys: sort_keys, limit } => {
-                let sort_keys = keys(sort_keys, &input.columns());
-                Node::Sort { input: Box::new(input.locate()), keys: sort_keys, limit }
-            }
-            Node::Project { input, exprs } => {
-                let exprs = all(exprs, &input.columns());
-                Node::Project { input: Box::new(input.locate()), exprs }
-            }
-            Node::Union { inputs } => Node::Union { inputs: inputs.into_iter().map(Node::locate).collect() },
-            Node::Distinct { input } => Node::Distinct { input: Box::new(input.locate()) },
-            Node::Limit { input, count, offset } => Node::Limit { input: Box::new(input.locate()), count, offset },
-            Node::Derived { input, qualifier, names } => Node::Derived { input: Box::new(input.locate()), qualifier, names },
-        }
-    }
-
-    /// An index join's right side, a lookup maybe under filters, with the
-    /// lookup's key located among the left side's columns, which it reads.
-    fn locate_left_key(self, left: &[Field]) -> Node<'a> {
-        match self {
-            Node::Lookup { table, qualifier, needed, column, key, left_key } => {
-                Node::Lookup { left_key: eval::locate(&left_key, left), table, qualifier, needed, column, key }
-            }
-            Node::Filter { input, predicate } => Node::Filter { input: Box::new(input.locate_left_key(left)), predicate },
-            other => other,
-        }
-    }
 }
 
 impl Node<'_> {

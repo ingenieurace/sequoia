@@ -505,12 +505,12 @@ their input before their first row.
 **Expressions** are evaluated by walking their tree (`sql/eval.rs`): in the
 iterator and materialization models once per row, in the vectorized model
 once per batch, each node a loop over a column (`vectorized/expr.rs`).
-There is no compilation to machine code. Before a plan runs, every
-expression's columns are found among the columns of the rows its step reads,
-and replaced by their positions (`Node::locate`), so no step looks a column
-up by name for each row; `EXPLAIN` shows the plan before, by name. The
-expressions of `UPDATE`, `DELETE`, `RETURNING` and of index keys are located
-once too.
+There is no compilation to machine code. When a step starts, the columns of
+its expressions are found among the columns of the rows it reads, which it
+works out then anyway, and replaced by their positions (`sql::eval::locate`),
+so no step looks a column up by name for each row; the plan itself, as
+`EXPLAIN` shows it, keeps their names. The expressions of `UPDATE`,
+`DELETE`, `RETURNING` and of index keys are located once too.
 
 `EXPLAIN ANALYZE` runs a `SELECT`, reading all of its rows, and shows each
 step of its plan with the rows it returned and the time it took, the time of

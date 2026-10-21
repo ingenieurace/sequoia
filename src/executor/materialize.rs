@@ -41,7 +41,7 @@ use crate::catalog::Catalog;
 use crate::catalog::table::Row;
 use crate::error::{Error, Result};
 use crate::plan::query::Node;
-use crate::sql::eval::{eval_with, matches_with};
+use crate::sql::eval::{eval_with, locate, locate_all, matches_with};
 
 /// A step's rows, and the error that stopped it after them, if one did.
 struct Output {
@@ -109,7 +109,7 @@ fn run_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step:
             let fields = input.columns();
             let input = run(*input, below(step, 0), None);
             let mut subqueries = Runner::new(catalog, settings);
-            let predicate = Some(predicate);
+            let predicate = Some(locate(&predicate, &fields));
             let mut rows = Vec::new();
             for row in input.rows {
                 if enough(&rows) {
@@ -125,6 +125,7 @@ fn run_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step:
         }
         Node::Project { input, exprs } => {
             let fields = input.columns();
+            let exprs = locate_all(&exprs, &fields);
             let input = run(*input, below(step, 0), wanted);
             let mut subqueries = Runner::new(catalog, settings);
             let mut rows = Vec::with_capacity(input.rows.len());

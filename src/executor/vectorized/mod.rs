@@ -35,7 +35,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use super::Settings;
-use super::aggregate::{Folder, Groups};
+use super::aggregate::{self, Folder, Groups};
 use super::operator::{self, Profile, Rows, Step, below, deferred};
 use super::subquery::Runner;
 use crate::catalog::Catalog;
@@ -44,7 +44,7 @@ use crate::error::{Error, Result};
 use crate::plan::query::{AggregateCall, Node};
 use crate::predicate::Predicate;
 use crate::sql::ast::Expr;
-use crate::sql::eval::{Field, NoSubqueries, eval_with, matches_with};
+use crate::sql::eval::{Field, NoSubqueries, eval_with, locate, locate_all, matches_with};
 use crate::types::Value;
 use batch::{BATCH_SIZE, Batch, Vector};
 
@@ -93,7 +93,7 @@ fn open_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step
         Node::Filter { input, predicate } => {
             let fields = input.columns();
             let mut subqueries = Runner::new(catalog, settings);
-            let predicate = Some(predicate);
+            let predicate = Some(locate(&predicate, &fields));
             each_batch(open(*input, below(step, 0)), move |batch| {
                 let filter = predicate.as_ref().expect("a filter has a predicate");
                 if let Ok(keep) = expr::select(filter, &fields, &batch, &mut subqueries) {
@@ -112,6 +112,7 @@ fn open_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step
         }
         Node::Project { input, exprs } => {
             let fields = input.columns();
+            let exprs = locate_all(&exprs, &fields);
             let mut subqueries = Runner::new(catalog, settings);
             each_batch(open(*input, below(step, 0)), move |batch| {
                 let columns = exprs.iter().map(|e| expr::eval(e, &fields, &batch, &mut subqueries));
@@ -205,6 +206,8 @@ fn aggregate(
     aggregates: &[AggregateCall],
     budget: usize,
 ) -> Result<Groups> {
+    let (group_by, aggregates) = (locate_all(group_by, fields), aggregate::locate(aggregates, fields));
+    let (group_by, aggregates) = (&group_by[..], &aggregates[..]);
     let mut folder = Folder::new(group_by.len(), aggregates, budget);
     for batch in input {
         let batch = batch?;

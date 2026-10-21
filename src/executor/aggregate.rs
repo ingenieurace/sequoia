@@ -48,11 +48,21 @@ use crate::types::Value;
 /// row per group: its `group_by` values, then the result of each aggregate,
 /// holding groups within `budget` bytes, about.
 pub fn fold(input: Rows, columns: &[Field], group_by: &[Expr], aggregates: &[AggregateCall], budget: usize) -> Result<Groups> {
-    let mut folder = Folder::new(group_by.len(), aggregates, budget);
+    let (group_by, aggregates) = (crate::sql::eval::locate_all(group_by, columns), locate(aggregates, columns));
+    let mut folder = Folder::new(group_by.len(), &aggregates, budget);
     for row in input {
-        folder.add_row(&row?, columns, group_by)?;
+        folder.add_row(&row?, columns, &group_by)?;
     }
     Ok(folder.finish())
+}
+
+/// The aggregates with the columns of their arguments found among `columns`
+/// (see [`crate::sql::eval::locate`]).
+pub fn locate(aggregates: &[AggregateCall], columns: &[Field]) -> Vec<AggregateCall> {
+    aggregates
+        .iter()
+        .map(|(function, arg, distinct)| (*function, arg.as_ref().map(|arg| crate::sql::eval::locate(arg, columns)), *distinct))
+        .collect()
 }
 
 /// Folds rows into their groups, which [`Folder::finish`] returns.
