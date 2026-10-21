@@ -9,9 +9,13 @@
 //! - [`ClockReplacer`]: CLOCK, an approximation of LRU.
 //!
 //! [`Policy`] names one of them; the buffer pool's default is set by
-//! `REPLACEMENT_POLICY` in `pool.rs`.
+//! `REPLACEMENT_POLICY` in `pool.rs`, and [`BufferPool::set_policy`] switches
+//! a pool to another while it runs (the shell's `--replacer` and `.replacer`).
+//!
+//! [`BufferPool::set_policy`]: super::pool::BufferPool::set_policy
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fmt;
 
 use crate::storage::io::disk::PageId;
 
@@ -47,6 +51,32 @@ impl Policy {
             Policy::Arc => Box::new(ArcReplacer::new(capacity)),
             Policy::LruK(k) => Box::new(LruKReplacer::new(capacity, k)),
             Policy::Clock => Box::new(ClockReplacer::new(capacity)),
+        }
+    }
+
+    /// The policy with this name, in any case: `arc`, `clock`, `lru`
+    /// (LRU-1), or `lru-K` for a K of 1 or more (`lru-2`).
+    pub fn from_name(name: &str) -> Option<Policy> {
+        match name.to_ascii_lowercase().as_str() {
+            "arc" => Some(Policy::Arc),
+            "clock" => Some(Policy::Clock),
+            "lru" => Some(Policy::LruK(1)),
+            name => match name.strip_prefix("lru-")?.parse() {
+                Ok(0) | Err(_) => None,
+                Ok(k) => Some(Policy::LruK(k)),
+            },
+        }
+    }
+}
+
+/// The name [`Policy::from_name`] reads back.
+impl fmt::Display for Policy {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Policy::Arc => f.write_str("arc"),
+            Policy::LruK(1) => f.write_str("lru"),
+            Policy::LruK(k) => write!(f, "lru-{k}"),
+            Policy::Clock => f.write_str("clock"),
         }
     }
 }
@@ -492,6 +522,18 @@ mod tests {
         simulate(&mut clock, 3, &[1, 2, 3, 4, 3, 5]);
         let resident: HashSet<PageId> = clock.slots.keys().copied().collect();
         assert_eq!(resident, HashSet::from([p(3), p(4), p(5)]));
+    }
+
+    #[test]
+    fn policies_are_named() {
+        for policy in [Policy::Arc, Policy::LruK(1), Policy::LruK(2), Policy::LruK(10), Policy::Clock] {
+            assert_eq!(Policy::from_name(&policy.to_string()), Some(policy));
+        }
+        assert_eq!(Policy::from_name("LRU-3"), Some(Policy::LruK(3)));
+        assert_eq!(Policy::from_name("lru-1"), Some(Policy::LruK(1)));
+        for wrong in ["", "lru-0", "lru-", "lru-x", "lru2", "fifo"] {
+            assert_eq!(Policy::from_name(wrong), None, "{wrong}");
+        }
     }
 
     #[test]

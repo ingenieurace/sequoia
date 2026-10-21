@@ -29,7 +29,7 @@ use crate::sql::ast::Statement;
 use crate::storage::io::disk::Savepoint;
 use crate::sql::parse;
 use crate::result::QueryResult;
-use crate::storage::{BufferPool, DiskManager};
+use crate::storage::{BufferPool, DiskManager, Policy, Stats};
 
 /// Frames in the buffer pool: 256 x 4 KB = 1 MB of cached pages.
 const BUFFER_POOL_FRAMES: usize = 256;
@@ -236,6 +236,23 @@ impl Database {
 
     pub fn execution_model(&self) -> Option<Model> {
         self.settings.model
+    }
+
+    /// Switches the buffer pool to another page replacement policy, keeping
+    /// the pages it holds (see [`BufferPool::set_policy`]). The default is
+    /// [`crate::storage::REPLACEMENT_POLICY`].
+    pub fn set_replacement_policy(&mut self, policy: Policy) {
+        self.pool.set_policy(policy);
+    }
+
+    pub fn replacement_policy(&self) -> Policy {
+        self.pool.policy().expect("the database's pool is made with a policy")
+    }
+
+    /// The buffer pool's hits and misses since its policy was last set, and
+    /// how many frames it has.
+    pub fn buffer_stats(&self) -> (Stats, usize) {
+        (self.pool.stats(), self.pool.capacity())
     }
 
     pub fn table_names(&self) -> Vec<&str> {

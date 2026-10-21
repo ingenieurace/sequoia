@@ -26,7 +26,7 @@ pub mod sort_key;
 pub mod tuple;
 
 pub use btree::BPlusTree;
-pub use buffer::pool::{BufferPool, PageReadGuard, PageWriteGuard, REPLACEMENT_POLICY};
+pub use buffer::pool::{BufferPool, PageReadGuard, PageWriteGuard, REPLACEMENT_POLICY, Stats};
 pub use buffer::replacer::{ArcReplacer, ClockReplacer, LruKReplacer, Policy, Replacer};
 pub use column::store::{ColumnChunk, ColumnConfig, ColumnStore, Position};
 pub use hash::{HASH_SCHEME, HashFile, HashScheme};

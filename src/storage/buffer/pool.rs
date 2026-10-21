@@ -14,7 +14,10 @@
 //!   the guard unpins it. A write guard that was written through marks the
 //!   frame dirty.
 //! - When no frame is free, a [`Replacer`] picks an unpinned victim, using
-//!   the policy set by [`REPLACEMENT_POLICY`] (see `replacer.rs`).
+//!   the policy set by [`REPLACEMENT_POLICY`] (see `replacer.rs`), or the
+//!   one [`BufferPool::set_policy`] switched to. The pool counts how many
+//!   fetches found their page cached ([`BufferPool::stats`]), to compare
+//!   policies by.
 //! - Write-back: a dirty page reaches the disk only when it is evicted or
 //!   flushed, and is durable only once the disk commits (see `storage/io/disk.rs`).
 //!   Dropping the pool writes nothing back.
@@ -33,8 +36,9 @@ use crate::storage::io::disk::{DiskManager, PAGE_SIZE, Page, PageId};
 use super::replacer::{Policy, Replacer};
 use crate::error::{Error, Result, err};
 
-/// The page replacement policy of `BufferPool::new`. Edit this line to switch,
-/// like a `#define` in C:
+/// The page replacement policy of `BufferPool::new`. Edit this line to
+/// change the default, like a `#define` in C, or switch a running pool with
+/// [`BufferPool::set_policy`] (the shell's `--replacer` and `.replacer`):
 ///
 /// - `Policy::Arc`: Adaptive Replacement Cache
 /// - `Policy::LruK(2)`: LRU-K, here K = 2 (K = 1 is plain LRU)
@@ -54,6 +58,26 @@ struct State {
     /// Frames that hold no page.
     free: Vec<usize>,
     replacer: Box<dyn Replacer>,
+    /// The policy `replacer` follows, if the pool was given it by name.
+    policy: Option<Policy>,
+    /// Fetches since the policy was set.
+    stats: Stats,
+}
+
+/// How many fetches of a page found it in the pool, and how many read it
+/// from disk. Allocating a new page is neither.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stats {
+    pub hits: u64,
+    pub misses: u64,
+}
+
+impl Stats {
+    /// The share of fetches that were hits, from 0 to 1; None before any.
+    pub fn hit_rate(&self) -> Option<f64> {
+        let fetches = self.hits + self.misses;
+        (fetches > 0).then(|| self.hits as f64 / fetches as f64)
+    }
 }
 
 #[derive(Default)]
@@ -68,11 +92,18 @@ impl BufferPool {
     /// Callers that pin several pages at once (e.g. the table heap pins two)
     /// need at least that many.
     pub fn new(disk: Arc<DiskManager>, capacity: usize) -> Self {
-        Self::with_replacer(disk, capacity, REPLACEMENT_POLICY.replacer(capacity))
+        Self::with_policy(disk, capacity, REPLACEMENT_POLICY)
     }
 
-    /// Creates a pool with a given replacement policy, which must be able to
-    /// track `capacity` resident pages.
+    /// Creates a pool of `capacity` frames using `policy`.
+    pub fn with_policy(disk: Arc<DiskManager>, capacity: usize, policy: Policy) -> Self {
+        let pool = Self::with_replacer(disk, capacity, policy.replacer(capacity));
+        pool.state.lock().unwrap().policy = Some(policy);
+        pool
+    }
+
+    /// Creates a pool with a given replacer, which must be able to track
+    /// `capacity` resident pages.
     pub fn with_replacer(disk: Arc<DiskManager>, capacity: usize, replacer: Box<dyn Replacer>) -> Self {
         assert!(capacity > 0, "a buffer pool needs at least one frame");
         let state = State {
@@ -80,9 +111,35 @@ impl BufferPool {
             meta: (0..capacity).map(|_| FrameMeta::default()).collect(),
             free: (0..capacity).rev().collect(),
             replacer,
+            policy: None,
+            stats: Stats::default(),
         };
         let frames = (0..capacity).map(|_| RwLock::new([0; PAGE_SIZE])).collect();
         Self { disk, frames, state: Mutex::new(state) }
+    }
+
+    /// Switches to another replacement policy. The pages cached stay, and
+    /// the new policy learns of each as accessed once, in frame order: what
+    /// the old one knew of them (how recently and often they were used, the
+    /// pages it evicted) is lost. The counts of [`BufferPool::stats`] start
+    /// over.
+    pub fn set_policy(&self, policy: Policy) {
+        let mut state = self.state.lock().unwrap();
+        let mut replacer = policy.replacer(self.capacity());
+        state.meta.iter().filter_map(|meta| meta.page).for_each(|page| replacer.record_access(page));
+        state.replacer = replacer;
+        state.policy = Some(policy);
+        state.stats = Stats::default();
+    }
+
+    /// The replacement policy, unless the pool was given a replacer of its own.
+    pub fn policy(&self) -> Option<Policy> {
+        self.state.lock().unwrap().policy
+    }
+
+    /// Hits and misses since the pool was made or its policy last set.
+    pub fn stats(&self) -> Stats {
+        self.state.lock().unwrap().stats
     }
 
     /// The underlying disk, for file-level operations (root page, sync).
@@ -212,9 +269,11 @@ impl BufferPool {
         if let Some(&frame) = state.page_table.get(&id) {
             state.meta[frame].pins += 1;
             state.replacer.record_access(id);
+            state.stats.hits += 1;
             return Ok(frame);
         }
 
+        state.stats.misses += 1;
         let frame = self.take_frame(&mut state)?;
         if let Err(e) = self.disk.read_page(id, &mut self.frames[frame].write().unwrap()) {
             state.free.push(frame);
@@ -453,6 +512,49 @@ mod tests {
         // The disk reuses the page; its old contents were never written.
         let page = pool.new_page().unwrap();
         assert_eq!((page.id(), *page), (a, filled(0)));
+    }
+
+    #[test]
+    fn fetches_are_counted_as_hits_or_misses() {
+        let pool = pool(2);
+        let [a, b, c] = [1, 2, 3].map(|byte| new_filled(&pool, byte));
+        assert_eq!((pool.stats(), pool.stats().hit_rate()), (Stats::default(), None), "allocating is no fetch");
+        drop(pool.fetch_read(c).unwrap());
+        drop(pool.fetch_read(a).unwrap()); // read back after b and c pushed it out
+        drop(pool.fetch_write(a).unwrap());
+        assert_eq!(pool.stats(), Stats { hits: 2, misses: 1 });
+        drop(pool.fetch_read(b).unwrap());
+        assert_eq!(pool.stats().hit_rate(), Some(0.5));
+    }
+
+    #[test]
+    fn the_policy_can_change_while_pages_are_cached() {
+        let pool = pool(3);
+        assert_eq!(pool.policy(), Some(REPLACEMENT_POLICY));
+        let ids: Vec<PageId> = (1..=3).map(|byte| new_filled(&pool, byte)).collect();
+        let pinned = pool.fetch_read(ids[0]).unwrap();
+        drop(pool.fetch_read(ids[1]).unwrap());
+        let cached = |pool: &BufferPool| {
+            let mut pages: Vec<PageId> = pool.state.lock().unwrap().page_table.keys().copied().collect();
+            pages.sort();
+            pages
+        };
+        for policy in [Policy::Clock, Policy::LruK(2), Policy::Arc, Policy::LruK(1)] {
+            let before = cached(&pool);
+            pool.set_policy(policy);
+            assert_eq!((pool.policy(), pool.stats()), (Some(policy), Stats::default()));
+            // The pages stay cached, dirty ones too, and the new policy can evict them.
+            assert_eq!(cached(&pool), before);
+            for byte in 4..=8 {
+                let id = new_filled(&pool, byte);
+                assert_eq!(*pool.fetch_read(id).unwrap(), filled(byte));
+            }
+            assert!(pool.is_cached(ids[0]), "pinned");
+        }
+        drop(pinned);
+        for (byte, &id) in (1..=3).zip(&ids) {
+            assert_eq!(*pool.fetch_read(id).unwrap(), filled(byte), "written back when evicted");
+        }
     }
 
     #[test]

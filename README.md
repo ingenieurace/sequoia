@@ -8,7 +8,14 @@ It is meant to be small and easy to read, not fast.
 ```bash
 cargo run                # in-memory database
 cargo run -- my.db       # persisted to my.db (and its log, my.db-wal, while open)
+cargo run -- my.db --replacer lru-2   # with another page replacement policy
 ```
+
+The buffer pool caches 256 pages, evicting by ARC unless `--replacer` (or
+`.replacer` in the shell) picks another: `arc`, `lru`, `lru-K` (LRU-K, e.g.
+`lru-2`) or `clock`. Switching keeps the pages cached; `.replacer` alone
+shows the policy and its hit rate since it was set, to compare them on the
+same queries.
 
 ```sql
 CREATE TABLE users (id INT PRIMARY KEY, name TEXT, active BOOL);
@@ -24,7 +31,9 @@ DROP TABLE users;
 ```
 
 Shell commands: `.tables`, `.model [auto | iterator | materialization |
-vectorized]` (shows, or sets, the execution model queries run in), `.exit`.
+vectorized]` (shows, or sets, the execution model queries run in),
+`.replacer [arc | lru | lru-K | clock]` (shows the page replacement policy
+and its hits and misses, or sets it), `.exit`.
 
 ## Execution models
 
