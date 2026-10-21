@@ -10,8 +10,8 @@
 //! ```
 //!
 //! What a step does once per row in the iterator model (a call down the
-//! tree, an expression walked, a column found by name, a `Value` matched) it
-//! does once per batch here, and the work per row is a loop over arrays.
+//! tree, an expression walked, a `Value` matched) it does once per batch
+//! here, and the work per row is a loop over arrays.
 //! An aggregate without `GROUP BY` folds a whole column into each
 //! aggregate at once (see `aggregate.rs`).
 //!

@@ -27,7 +27,7 @@ pub fn needed_columns<'a>(table: &Table, qualifier: &str, exprs: impl IntoIterat
 pub fn visit_columns(expr: &Expr, f: &mut impl FnMut(&ColumnRef)) {
     match expr {
         Expr::Literal(_) | Expr::Aggregate(_, None, _) => {}
-        Expr::Column(column) | Expr::Outer(column) => f(column),
+        Expr::Column(column) | Expr::Outer(column) | Expr::Slot(_, column) => f(column),
         Expr::Unary(_, inner) | Expr::IsNull(inner, _) | Expr::Aggregate(_, Some(inner), _) => visit_columns(inner, f),
         Expr::Binary(left, _, right) => {
             visit_columns(left, f);
@@ -183,7 +183,7 @@ fn constant(expr: &Expr) -> Option<Value> {
     fn reads_columns(expr: &Expr) -> bool {
         match expr {
             Expr::Literal(_) => false,
-            Expr::Column(_) | Expr::Outer(_) => true,
+            Expr::Column(_) | Expr::Outer(_) | Expr::Slot(..) => true,
             Expr::Unary(_, inner) | Expr::IsNull(inner, _) => reads_columns(inner),
             Expr::InList(left, items, _) => reads_columns(left) || items.iter().any(reads_columns),
             Expr::Aggregate(..) | Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(..) => true,

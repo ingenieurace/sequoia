@@ -339,6 +339,12 @@ pub enum Expr {
     Case { operand: Option<Box<Expr>>, branches: Vec<(Expr, Expr)>, otherwise: Option<Box<Expr>> },
     /// A scalar function of its arguments.
     Function(Function, Vec<Expr>),
+    /// A column found already among the columns of the rows the expression
+    /// is evaluated on, at this position: what `sql::eval::locate` makes of
+    /// a `Column` when a plan step starts, so that it is not looked up by
+    /// name for every row. The parser and planner never make one. It prints
+    /// as the column, so a step's columns are named as before.
+    Slot(usize, ColumnRef),
 }
 
 /// The scalar functions, which take values and give one.
@@ -417,7 +423,7 @@ impl Expr {
         }
         let mut sub = |e: &Expr| e.replace(f).map(Box::new);
         Ok(match self {
-            Expr::Literal(_) | Expr::Column(_) | Expr::Outer(_) => self.clone(),
+            Expr::Literal(_) | Expr::Column(_) | Expr::Outer(_) | Expr::Slot(..) => self.clone(),
             Expr::Unary(op, inner) => Expr::Unary(*op, sub(inner)?),
             Expr::Binary(left, op, right) => Expr::Binary(sub(left)?, *op, sub(right)?),
             Expr::IsNull(inner, negated) => Expr::IsNull(sub(inner)?, *negated),
@@ -449,7 +455,7 @@ impl Expr {
     pub fn visit(&self, f: &mut dyn FnMut(&Expr)) {
         f(self);
         match self {
-            Expr::Literal(_) | Expr::Column(_) | Expr::Outer(_) | Expr::Aggregate(_, None, _) => {}
+            Expr::Literal(_) | Expr::Column(_) | Expr::Outer(_) | Expr::Slot(..) | Expr::Aggregate(_, None, _) => {}
             Expr::Unary(_, inner) | Expr::IsNull(inner, _) | Expr::Aggregate(_, Some(inner), _) => inner.visit(f),
             Expr::Binary(left, _, right) => {
                 left.visit(f);
@@ -579,7 +585,7 @@ impl std::fmt::Display for Expr {
         };
         match self {
             Expr::Literal(value) => f.write_str(&value.to_sql()),
-            Expr::Column(column) | Expr::Outer(column) => write!(f, "{column}"),
+            Expr::Column(column) | Expr::Outer(column) | Expr::Slot(_, column) => write!(f, "{column}"),
             Expr::Unary(UnaryOp::Not, inner) => write!(f, "NOT {}", operand(inner)),
             Expr::Unary(UnaryOp::Neg, inner) => match operand(inner) {
                 // Not `--`, which starts a comment.

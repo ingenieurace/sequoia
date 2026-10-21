@@ -26,7 +26,7 @@ use crate::plan::query::{self, forbid};
 use crate::plan::{access, filter};
 use crate::result::QueryResult;
 use crate::sql::ast::{ColumnRef, Expr, Projection, Select, SelectItem, Statement};
-use crate::sql::eval::{Field, eval_with, matches_with};
+use crate::sql::eval::{Field, eval_with, locate, matches_with};
 use crate::types::Value;
 use join::{HASH_MEMORY, JOIN_MEMORY};
 use model::Model;
@@ -266,11 +266,14 @@ fn update(
         // Collect every change before writing, so the scan never sees its own
         // updates, and subqueries see the table as it was.
         let fields = Field::of_table(&table.name, &table.columns);
+        // Found once among the table's columns, not by name for each row.
+        let located = filter.as_ref().map(|f| locate(f, &fields));
+        let assignments: Vec<(usize, Expr)> = assignments.iter().map(|(i, e)| (*i, locate(e, &fields))).collect();
         let mut subqueries = Runner::new(catalog, settings);
         let mut changes = Vec::new();
         for item in scan(table, &vec![true; table.columns.len()], &filter) {
             let (rid, old) = item?;
-            if !matches_with(&filter, &fields, &old, &mut subqueries)? {
+            if !matches_with(&located, &fields, &old, &mut subqueries)? {
                 continue;
             }
             // All right-hand sides see the old row values.
@@ -321,10 +324,11 @@ fn delete(
             None => filter::needed_columns(table, &table.name, &filter),
         };
         needed.iter_mut().zip(table.indexed_columns()).for_each(|(needed, indexed)| *needed |= indexed);
+        let located = filter.as_ref().map(|f| locate(f, &fields));
         let mut rows = Vec::new();
         for item in scan(table, &needed, &filter) {
             let (rid, row) = item?;
-            if matches_with(&filter, &fields, &row, &mut subqueries)? {
+            if matches_with(&located, &fields, &row, &mut subqueries)? {
                 rows.push((rid, row));
             }
         }
@@ -368,8 +372,12 @@ impl Returning {
             return err("subqueries are not allowed in RETURNING");
         }
         let columns = items.iter().map(query::item_name).collect();
-        let exprs = items.iter().map(|item| query::bind(catalog, Some(table), &item.expr)).collect::<Result<_>>()?;
-        Ok(Some(Returning { columns, exprs, fields: Field::of_table(&table.name, &table.columns) }))
+        let fields = Field::of_table(&table.name, &table.columns);
+        let exprs = items
+            .iter()
+            .map(|item| Ok(locate(&query::bind(catalog, Some(table), &item.expr)?, &fields)))
+            .collect::<Result<_>>()?;
+        Ok(Some(Returning { columns, exprs, fields }))
     }
 
     /// The rows it gives for these rows of its table, in their order.

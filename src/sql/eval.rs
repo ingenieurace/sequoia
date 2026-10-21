@@ -1,6 +1,11 @@
 //! What an expression means: evaluates it against one row, with SQL's
 //! three-valued logic for NULL.
 //!
+//! `AND` and `OR` evaluate their right side only if their left one does not
+//! decide: `x <> 0 AND 10 / x > 1` fails on no row. `CASE` and `COALESCE`
+//! evaluate only the parts they need. Columns are found by name, unless
+//! [`locate`] has found them already, as plan steps have it do when they start.
+//!
 //! Subqueries are run by whoever evaluates the expression, through
 //! [`Subqueries`]: this layer cannot read tables. `x IN (list)` means
 //! `x = a OR x = b ...`; `x IN (SELECT ...)` looks the value up among the
@@ -77,6 +82,27 @@ pub fn resolve(fields: &[Field], column: &ColumnRef) -> Result<usize> {
     }
 }
 
+/// The expression with each column replaced by its position in `fields`
+/// (an [`Expr::Slot`]), so that evaluating it on many rows finds each
+/// column once rather than by name for every row. A column `fields` does
+/// not have, or has more than once, stays as it is, to fail as it would
+/// have when evaluated. Subqueries stay as they are: their own columns are
+/// their tables', and their outer ones are found when they run.
+pub fn locate(expr: &Expr, fields: &[Field]) -> Expr {
+    let located = expr.replace(&mut |e| match e {
+        Expr::Column(column) => Some(Ok(match resolve(fields, column) {
+            Ok(i) => Expr::Slot(i, column.clone()),
+            Err(_) => e.clone(),
+        })),
+        Expr::Subquery(_) | Expr::Exists(_) => Some(Ok(e.clone())),
+        Expr::InSubquery(left, query, negated) => {
+            Some(Ok(Expr::InSubquery(Box::new(locate(left, fields)), query.clone(), *negated)))
+        }
+        _ => None,
+    });
+    located.expect("locating columns cannot fail")
+}
+
 /// Evaluates a WHERE clause; NULL counts as false.
 pub fn matches(filter: &Option<Expr>, fields: &[Field], row: &[Value]) -> Result<bool> {
     matches_with(filter, fields, row, &mut NoSubqueries)
@@ -107,11 +133,21 @@ pub fn eval_with(expr: &Expr, fields: &[Field], row: &[Value], subqueries: &mut 
     let mut eval = |e: &Expr| eval_with(e, fields, row, subqueries);
     match expr {
         Expr::Literal(value) => Ok(value.clone()),
+        Expr::Slot(i, _) => Ok(row[*i].clone()),
         Expr::Column(column) => Ok(row[resolve(fields, column)?].clone()),
         Expr::IsNull(inner, negated) => Ok(Value::Bool(eval(inner)?.is_null() != *negated)),
         // Grouped queries replace aggregates by their results before evaluating.
         Expr::Aggregate(function, ..) => err(format!("{} is not allowed here", function.name().to_uppercase())),
         Expr::Unary(op, inner) => unary(*op, eval(inner)?),
+        // FALSE AND x is FALSE, and TRUE OR x TRUE, whatever x: x is not
+        // evaluated, so it fails on no row the left side decides.
+        Expr::Binary(left, op @ (BinaryOp::And | BinaryOp::Or), right) => {
+            let left = eval(left)?;
+            if left == Value::Bool(*op == BinaryOp::Or) {
+                return Ok(left);
+            }
+            binary(left, *op, eval(right)?)
+        }
         Expr::Binary(left, op, right) => binary(eval(left)?, *op, eval(right)?),
         Expr::InList(left, items, negated) => {
             let value = eval(left)?;
@@ -403,4 +439,74 @@ pub(crate) fn real(r: f64) -> Result<Value> {
 
 pub(crate) fn overflow() -> Error {
     Error("integer overflow".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::ast::{Projection, SelectItem, Statement};
+    use crate::sql::parse;
+
+    /// The expression of `SELECT <sql> FROM t`.
+    fn expr(sql: &str) -> Expr {
+        let Statement::Select(select) = parse(&format!("SELECT {sql} FROM t")).unwrap().pop().unwrap() else { panic!() };
+        let Projection::Exprs(mut items) = select.projection else { panic!() };
+        let SelectItem { expr, .. } = items.remove(0);
+        expr
+    }
+
+    #[test]
+    fn located_columns_evaluate_and_print_as_named_ones() {
+        let fields = vec![Field { table: Some("t".into()), name: "a".into() }, Field { table: Some("t".into()), name: "b".into() }];
+        let row = [Value::Int(6), Value::Int(-2)];
+        for sql in ["a + b", "t.b * 2 > a", "CASE WHEN a > 0 THEN b END", "COALESCE(NULL, t.a)", "a IN (b, 6)", "-a"] {
+            let named = expr(sql);
+            let located = locate(&named, &fields);
+            assert_ne!(located, named, "{sql}");
+            assert_eq!(located.to_string(), named.to_string(), "{sql}");
+            assert_eq!(eval(&located, &fields, &row).unwrap(), eval(&named, &fields, &row).unwrap(), "{sql}");
+        }
+        assert!(matches!(locate(&expr("t.b"), &fields), Expr::Slot(1, _)));
+        // A subquery's columns are its own tables', found when it runs.
+        let sub = expr("(SELECT MAX(a) FROM u WHERE EXISTS (SELECT b FROM v))");
+        assert_eq!(locate(&sub, &fields), sub);
+        // Of `x IN (SELECT ...)`, x is located, not the subquery.
+        let (Expr::InSubquery(left, query, _), Expr::InSubquery(_, original, _)) =
+            (locate(&expr("b IN (SELECT a FROM u)"), &fields), expr("b IN (SELECT a FROM u)"))
+        else {
+            panic!()
+        };
+        assert!(matches!(*left, Expr::Slot(1, _)));
+        assert_eq!(query, original);
+        // A column not found once is left to fail when evaluated, as before.
+        let twice = vec![Field::named("a"), Field::named("a")];
+        assert_eq!(locate(&expr("a + 1"), &twice), expr("a + 1"));
+        assert_eq!(locate(&expr("c"), &fields), expr("c"));
+        assert!(eval(&locate(&expr("c"), &fields), &fields, &row).is_err());
+    }
+
+    #[test]
+    fn and_or_skip_their_right_side_where_the_left_decides() {
+        use Value::{Bool, Int, Null};
+        let fields = vec![Field::named("x")];
+        let at = |sql: &str, x: Value| eval(&expr(sql), &fields, &[x]);
+        assert_eq!(at("x <> 0 AND 10 / x > 1", Int(0)).unwrap(), Bool(false));
+        assert_eq!(at("x <> 0 AND 10 / x > 1", Int(5)).unwrap(), Bool(true));
+        assert_eq!(at("x = 0 OR 10 / x > 1", Int(0)).unwrap(), Bool(true));
+        assert_eq!(at("x = 0 OR 10 / x > 1", Int(20)).unwrap(), Bool(false));
+        // NULL decides neither, nor does TRUE for AND or FALSE for OR: the right side runs.
+        assert!(at("NULLIF(x, x) = 1 AND 1 / 0 = 1", Int(1)).is_err());
+        assert!(at("x = 1 AND 1 / 0 = 1", Int(1)).is_err());
+        assert!(at("x = 0 OR 1 / 0 = 1", Int(1)).is_err());
+        assert_eq!(at("NULLIF(x, x) = 1 AND x = 2", Int(1)).unwrap(), Bool(false));
+        assert_eq!(at("NULLIF(x, x) = 1 OR x = 1", Int(1)).unwrap(), Bool(true));
+        assert_eq!(at("NULLIF(x, x) = 1 OR x = 2", Int(1)).unwrap(), Null);
+        // A right side of the wrong type fails only where it is evaluated.
+        assert_eq!(at("FALSE AND x", Int(1)).unwrap(), Bool(false));
+        assert_eq!(at("TRUE OR x", Int(1)).unwrap(), Bool(true));
+        assert!(at("TRUE AND x", Int(1)).is_err());
+        // A left side that is no BOOL fails, whatever the right side.
+        assert!(at("x AND FALSE", Int(1)).is_err());
+        assert!(at("x OR TRUE", Int(1)).is_err());
+    }
 }

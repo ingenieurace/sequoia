@@ -3087,3 +3087,65 @@ fn returning_is_no_keyword() {
     );
     assert_eq!(returned(&mut db, "delete from returning returning returning * 2").1, [vec![int(6)]]);
 }
+
+/// `AND` and `OR` evaluate their right side only where the left one does
+/// not decide, in every model and every kind of step: a division by zero on
+/// a row whose left side decides is no error, and one on any other row is.
+#[test]
+fn and_or_skip_their_right_side_alike_in_every_model() {
+    const ROWS: i64 = 3000;
+    // x is 0 on every seventh row; NULL on every eleventh.
+    let x = |i: i64| (i % 11 != 5).then_some(i % 7 - 3);
+    for storage in ["HEAP", "COLUMN"] {
+        let mut db = in_memory();
+        db.execute(&format!("CREATE TABLE t (id INT PRIMARY KEY, x INT) USING {storage}")).unwrap();
+        let values: Vec<String> =
+            (0..ROWS).map(|i| format!("({i}, {})", x(i).map_or("NULL".into(), |x| x.to_string()))).collect();
+        db.execute(&format!("INSERT INTO t VALUES {}", values.join(", "))).unwrap();
+
+        // What each query should return, worked out here.
+        let big = |x: Option<i64>| x.map(|x| x != 0 && 12 / x > 3); // x <> 0 AND 12 / x > 3
+        let ids: Vec<Value> = (0..ROWS).filter(|&i| big(x(i)) == Some(true)).map(int).collect();
+        let small = (0..ROWS).filter(|&i| x(i).is_some_and(|x| x == 0 || 12 / x < 5)).count() as i64;
+        let queries: Vec<(&str, Vec<Vec<Value>>)> = vec![
+            ("SELECT id FROM t WHERE x <> 0 AND 12 / x > 3 ORDER BY id", ids.iter().map(|id| vec![id.clone()]).collect()),
+            ("SELECT COUNT(*) FROM t WHERE x = 0 OR 12 / x < 5", vec![vec![int(small)]]),
+            (
+                "SELECT id, x <> 0 AND 12 / x > 3 FROM t WHERE id < 30 ORDER BY id",
+                (0..30).map(|i| vec![int(i), big(x(i)).map_or(Value::Null, Value::Bool)]).collect(),
+            ),
+            (
+                "SELECT x <> 0 AND 12 / x > 3 AS b, COUNT(*) FROM t GROUP BY x <> 0 AND 12 / x > 3 ORDER BY b",
+                [None, Some(false), Some(true)]
+                    .into_iter()
+                    .map(|b| {
+                        let n = (0..ROWS).filter(|&i| big(x(i)) == b).count() as i64;
+                        vec![b.map_or(Value::Null, Value::Bool), int(n)]
+                    })
+                    .collect(),
+            ),
+            (
+                "SELECT SUM(CASE WHEN x <> 0 AND 12 / x > 3 THEN 1 ELSE 0 END) FROM t",
+                vec![vec![int(ids.len() as i64)]],
+            ),
+        ];
+        for model in Model::ALL {
+            db.set_execution_model(Some(model));
+            for (sql, want) in &queries {
+                assert_eq!(&query(&mut db, sql), want, "{storage}, {model}: {sql}");
+            }
+            // Rows the left side leaves open (x = 0 with x >= 0, or NULL) still fail.
+            for sql in ["SELECT id FROM t WHERE x >= 0 AND 12 / x > 3", "SELECT x IS NULL OR 12 / x > 0 FROM t"] {
+                let e = db.execute(sql).unwrap_err().to_string();
+                assert!(e.contains("division by zero"), "{storage}, {model}: {sql}: {e}");
+            }
+        }
+        db.set_execution_model(None);
+        // Writes evaluate alike.
+        let done = db.execute("UPDATE t SET x = 100 WHERE x <> 0 AND 12 / x > 3").unwrap().pop().unwrap();
+        assert_eq!(done, QueryResult::Message(format!("{} row(s) updated", ids.len())), "{storage}");
+        // x = 0, or 100 since the update, where 12 / x is 0.
+        let gone = (0..ROWS).filter(|&i| x(i) == Some(0) || big(x(i)) == Some(true)).count();
+        assert_eq!(returned(&mut db, "DELETE FROM t WHERE x = 0 OR 12 / x = 0 RETURNING id").1.len(), gone, "{storage}");
+    }
+}

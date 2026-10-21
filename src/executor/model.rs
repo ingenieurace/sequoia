@@ -141,7 +141,9 @@ pub fn open<'a>(root: Node<'a>, catalog: &'a Catalog, settings: &Settings) -> Ro
 }
 
 /// Opens a plan in `model`, counting what its steps do in `step` if given.
+/// Its expressions' columns are found first, once (see [`Node::locate`]).
 pub(super) fn open_in<'a>(model: Model, root: Node<'a>, catalog: &'a Catalog, settings: &Settings, step: Step) -> Rows<'a> {
+    let root = root.locate();
     match model {
         Model::Iterator => operator::open_step(root, catalog, settings, step),
         Model::Materialization => materialize::open(root, catalog, settings, step),

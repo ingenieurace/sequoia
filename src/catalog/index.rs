@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use crate::error::{Error, Result, err};
 use crate::sql::ast::{ColumnRef, CreateIndex, Expr, IndexKind};
-use crate::sql::eval::{Field, eval, matches};
+use crate::sql::eval::{Field, eval, locate, matches};
 use crate::storage::hash::{self, HASH_SCHEME, HashFile};
 use crate::storage::{BPlusTree, BufferPool, PageId, btree::MAX_KEY_SIZE, sort_key, tuple};
 use crate::types::{Column, DataType, Value, column_index};
@@ -69,6 +69,9 @@ pub struct Index {
     pub predicate: Option<Expr>,
     /// The table's columns, unqualified, to evaluate keys and the predicate on a row.
     fields: Vec<Field>,
+    /// `keys` and `predicate` with their columns found among `fields`
+    /// already (see [`locate`]), as each row's entry is made from them.
+    located: (Vec<Key>, Option<Expr>),
     types: Vec<DataType>,
     /// The included columns, to encode and decode them.
     included: Vec<Column>,
@@ -139,6 +142,15 @@ impl Index {
                 Key::Expr(expr) => expr.clone(),
             })
             .collect();
+        let fields: Vec<Field> = columns.iter().map(|c| Field::named(&c.name)).collect();
+        let located_keys = keys
+            .iter()
+            .map(|key| match key {
+                Key::Expr(expr) => Key::Expr(locate(expr, &fields)),
+                key => key.clone(),
+            })
+            .collect();
+        let located = (located_keys, predicate.as_ref().map(|p| locate(p, &fields)));
         Ok(Index {
             name: name.clone(),
             unique: *unique,
@@ -147,7 +159,8 @@ impl Index {
             exprs,
             include,
             predicate,
-            fields: columns.iter().map(|c| Field::named(&c.name)).collect(),
+            fields,
+            located,
             types: columns.iter().map(|c| c.data_type).collect(),
             reads,
             store: store()?,
@@ -201,10 +214,11 @@ impl Index {
     /// The row's keys, or `None` if the row is not indexed: the predicate
     /// is not true for it.
     pub fn key_values(&self, row: &[Value]) -> Result<Option<Vec<Value>>> {
-        if !matches(&self.predicate, &self.fields, row)? {
+        let (keys, predicate) = &self.located;
+        if !matches(predicate, &self.fields, row)? {
             return Ok(None);
         }
-        let keys = self.keys.iter().map(|key| match key {
+        let keys = keys.iter().map(|key| match key {
             Key::Column(i) => Ok(row[*i].clone()),
             Key::Expr(expr) => eval(expr, &self.fields, row),
         });

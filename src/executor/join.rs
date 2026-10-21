@@ -303,6 +303,7 @@ impl Key {
         exprs
             .into_iter()
             .map(|expr| match &expr {
+                Expr::Slot(i, _) => Key::Column(*i),
                 Expr::Column(column) => resolve(fields, column).map_or(Key::Expr(expr), Key::Column),
                 _ => Key::Expr(expr),
             })

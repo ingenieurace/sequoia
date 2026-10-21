@@ -7,7 +7,8 @@
 //! value with the functions of `sql::eval`, so it means exactly what it
 //! does there: an INT compared with a REAL, values of mixed types, `CASE`
 //! and `COALESCE` (which evaluate only some of their parts), and subqueries,
-//! which run once per row.
+//! which run once per row. `AND` and `OR` evaluate their right side only on
+//! the rows their left one does not decide, as `sql::eval` does row by row.
 //!
 //! The results are those of `sql::eval` row by row, but errors may differ:
 //! a column of an expression is evaluated for every row before the next
@@ -33,6 +34,7 @@ pub fn eval(expr: &Expr, fields: &[Field], batch: &Batch, subqueries: &mut dyn S
     }
     Ok(match expr {
         Expr::Literal(value) => Rc::new(Vector::Const(value.clone(), n)),
+        Expr::Slot(i, _) => batch.column(*i),
         Expr::Column(column) => batch.column(resolve(fields, column)?),
         Expr::IsNull(inner, negated) => {
             let inner = eval(inner, fields, batch, subqueries)?;
@@ -44,6 +46,10 @@ pub fn eval(expr: &Expr, fields: &[Field], batch: &Batch, subqueries: &mut dyn S
         Expr::Unary(op, inner) => {
             let inner = eval(inner, fields, batch, subqueries)?;
             Rc::new(unary(*op, &inner)?)
+        }
+        Expr::Binary(left, op @ (BinaryOp::And | BinaryOp::Or), right) => {
+            let left = eval(left, fields, batch, subqueries)?;
+            logic_lazily(&left, *op, right, fields, batch, subqueries)?
         }
         Expr::Binary(left, op, right) => {
             let left = eval(left, fields, batch, subqueries)?;
@@ -80,6 +86,61 @@ pub fn eval(expr: &Expr, fields: &[Field], batch: &Batch, subqueries: &mut dyn S
             Rc::new(Vector::from_values(values.collect::<Result<_>>()?))
         }
     })
+}
+
+/// `left AND right` or `left OR right` on the rows of `batch`, `left`
+/// evaluated already, `right` only on the rows `left` does not decide (FALSE
+/// for AND, TRUE for OR), as `sql::eval` evaluates it row by row: so it
+/// fails on no row that does not, and does no work for them. Those rows
+/// are picked by narrowing the batch's selection, which copies no row.
+fn logic_lazily(
+    left: &Rc<Vector>,
+    op: BinaryOp,
+    right: &Expr,
+    fields: &[Field],
+    batch: &Batch,
+    subqueries: &mut dyn Subqueries,
+) -> Result<Rc<Vector>> {
+    let n = batch.rows();
+    let decides = op == BinaryOp::Or;
+    let Some(lefts) = bools(left) else {
+        // Not BOOLs, which is an error, unless all are NULL: as row by row.
+        let right = eval(right, fields, batch, subqueries)?;
+        return Ok(Rc::new(binary(left, op, &right)?));
+    };
+    let open: Vec<usize> = (0..n).filter(|&i| lefts.get(i) != Some(&decides)).collect();
+    if open.is_empty() {
+        return Ok(left.clone());
+    }
+    let right = match open.len() == n {
+        true => eval(right, fields, batch, subqueries)?,
+        false => {
+            let part = eval(right, fields, &batch.clone().keep(&open), subqueries)?;
+            Rc::new(spread(&part, &open, n, decides))
+        }
+    };
+    Ok(Rc::new(binary(left, op, &right)?))
+}
+
+/// The values of `part`, one for each of the rows `at` of `n`, in a vector
+/// of `n` with `fill` in the other rows.
+fn spread(part: &Vector, at: &[usize], n: usize, fill: bool) -> Vector {
+    if let Some(bools) = bools(part) {
+        let mut values = vec![fill; n];
+        let mut nulls: Nulls = None;
+        for (j, &i) in at.iter().enumerate() {
+            match bools.get(j) {
+                Some(&value) => values[i] = value,
+                None => nulls.get_or_insert_with(|| vec![false; n])[i] = true,
+            }
+        }
+        return Vector::Bool(values, nulls);
+    }
+    let mut values = vec![Value::Bool(fill); n];
+    for (j, &i) in at.iter().enumerate() {
+        values[i] = part.get(j);
+    }
+    Vector::from_values(values)
 }
 
 /// The rows of `batch` a WHERE clause is true for: their numbers, in order.
@@ -356,6 +417,37 @@ mod tests {
         // INTs and REALs compare exactly, as values do.
         let numbers = vec![vec![Int(9_007_199_254_740_993), Real(9_007_199_254_740_992.0)]];
         assert_eq!(both("a > b", &numbers).unwrap(), [Bool(true)]);
+    }
+
+    #[test]
+    fn and_or_evaluate_their_right_side_only_where_the_left_does_not_decide() {
+        use Value::{Bool, Int, Null};
+        let (t, f) = (Bool(true), Bool(false));
+        let rows = vec![vec![Int(0), Int(1)], vec![Int(2), Int(0)], vec![Null, Int(5)], vec![Int(5), Int(3)]];
+        // Each divides by zero on a row whose left side decides: a column at
+        // a time, as a row at a time, it fails on none.
+        for (sql, want) in [
+            ("a <> 0 AND 10 / a > 1", [f.clone(), t.clone(), Null, t.clone()]),
+            ("b = 0 OR a / b > 0", [f.clone(), t.clone(), Null, t.clone()]),
+            ("a <> 0 AND (b = 0 OR 10 / a / b > 0)", [f.clone(), t.clone(), Null, f.clone()]),
+            ("NOT (a = 0 OR 10 / a < 3)", [f.clone(), t.clone(), Null, f.clone()]),
+            // Decided on every row: the right side runs on none.
+            ("COALESCE(a, 0) >= 0 OR 1 / 0 = 1", [t.clone(), t.clone(), t.clone(), t.clone()]),
+            ("COALESCE(a, 0) < -1 AND 1 / 0 = 1", [f.clone(), f.clone(), f.clone(), f.clone()]),
+            // CASE on the right side, row by row, only on the rows left open.
+            ("a <> 0 AND CASE WHEN 10 / a > 1 THEN TRUE END", [f.clone(), t.clone(), Null, t.clone()]),
+        ] {
+            assert_eq!(both(sql, &rows).unwrap_or_else(|e| panic!("{sql}: {e}")), want, "{sql}");
+        }
+        // Where the left side leaves a row open, NULL included, its error is an error.
+        assert!(both("a <> 0 AND 10 / b > 1", &rows).is_err());
+        assert!(both("a < -1 AND 1 / 0 = 1", &rows).is_err());
+        assert!(both("a < -1 AND 1 / 0 = 1", &[vec![Int(-5), Int(0)]]).is_err());
+        // A right side of the wrong type, only where it is evaluated.
+        assert!(both("a = 0 AND b", &rows[..1]).unwrap_err().to_string().contains("cannot apply"));
+        let no_nulls = [rows[0].clone(), rows[1].clone(), rows[3].clone()];
+        assert_eq!(both("a = 7 AND b", &no_nulls).unwrap(), [f.clone(), f.clone(), f.clone()]);
+        assert!(both("a = 7 AND b", &rows).is_err(), "NULL = 7 leaves the row open");
     }
 
     #[test]

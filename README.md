@@ -60,7 +60,9 @@ cargo bench --bench models
 
 In the vectorized model, a column table's rows go from its decoded chunks to
 the steps above in columns, never put together into rows before the top;
-expressions on columns of one type run as loops over arrays, and an
+expressions on columns of one type run as loops over arrays, `AND` and `OR`
+evaluate their right side only on the rows their left one leaves open (by
+narrowing the batch's selection, which copies nothing), and an
 aggregate without `GROUP BY` folds a whole column at once. On 200,000 rows
 of a column table it aggregates 5 to 10 times faster than the iterator model.
 The materialization model passes a `LIMIT` down to the steps below it, but a
@@ -230,7 +232,10 @@ cargo bench --bench buffer_pool -- scans
   TEXTs), `= != <> < <= > >=`, `AND OR NOT`, `IS [NOT] NULL`, `[NOT] IN (list)`,
   `[NOT] BETWEEN a AND b`, `[NOT] LIKE pattern` (`%` any characters, `_` one;
   ASCII letters match in either case, as in SQLite), `CASE [x] WHEN ... THEN ...
-  [ELSE ...] END`, parentheses, with SQL three-valued logic for `NULL`
+  [ELSE ...] END`, parentheses, with SQL three-valued logic for `NULL`.
+  `AND` and `OR` evaluate their right side only where the left one does not
+  decide (`FALSE AND x` is FALSE, `TRUE OR x` TRUE, whatever `x`), so
+  `x <> 0 AND 10 / x > 1` fails on no row, and `FALSE AND 5` is FALSE
 - Functions: `COALESCE(a, b, ...)`, `NULLIF(a, b)`, `LENGTH(text)`,
   `UPPER(text)` and `LOWER(text)` (ASCII letters), `SUBSTR(text, start[, length])`,
   `ABS(number)`, and `ROUND(number[, digits])`, which gives a REAL, halves away
@@ -496,6 +501,16 @@ Scans, filters, limits and projections hand rows on one at a time, so a
 `Database::query` returns a `SELECT`'s rows as they are made instead of
 collecting them (`execute` collects them). Sorts and aggregates need all of
 their input before their first row.
+
+**Expressions** are evaluated by walking their tree (`sql/eval.rs`): in the
+iterator and materialization models once per row, in the vectorized model
+once per batch, each node a loop over a column (`vectorized/expr.rs`).
+There is no compilation to machine code. Before a plan runs, every
+expression's columns are found among the columns of the rows its step reads,
+and replaced by their positions (`Node::locate`), so no step looks a column
+up by name for each row; `EXPLAIN` shows the plan before, by name. The
+expressions of `UPDATE`, `DELETE`, `RETURNING` and of index keys are located
+once too.
 
 `EXPLAIN ANALYZE` runs a `SELECT`, reading all of its rows, and shows each
 step of its plan with the rows it returned and the time it took, the time of
