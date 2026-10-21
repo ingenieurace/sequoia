@@ -2862,3 +2862,150 @@ fn explain_analyze_shows_how_each_model_reads() {
     let iterator = right(steps(&mut db, Model::Iterator, join));
     assert!(iterator.ends_with(" runs") && iterator.starts_with("1500 rows in 5"), "{iterator}");
 }
+
+/// Runs one statement and returns its column names and rows.
+fn returned(db: &mut Database, sql: &str) -> (Vec<String>, Vec<Vec<Value>>) {
+    match db.execute(sql).unwrap().pop() {
+        Some(QueryResult::Rows { columns, rows }) => (columns, rows),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+fn names(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| name.to_string()).collect()
+}
+
+/// Rows sorted by their first value, an INT.
+fn by_first(mut rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+    rows.sort_by_key(|row| match row[0] {
+        Value::Int(n) => n,
+        _ => panic!("{row:?}"),
+    });
+    rows
+}
+
+#[test]
+fn returning_gives_the_rows_each_write_changed() {
+    let mut db = setup();
+    let (t, f, n) = (Value::Bool(true), Value::Bool(false), Value::Null);
+    // INSERT: the rows as stored, in the order of VALUES, omitted columns NULL.
+    let (columns, rows) =
+        returned(&mut db, "INSERT INTO users VALUES (5, 'eve', 40, TRUE), (4, 'dan', NULL, FALSE) RETURNING *");
+    assert_eq!(columns, names(&["id", "name", "age", "active"]));
+    assert_eq!(rows, [vec![int(5), text("eve"), int(40), t.clone()], vec![int(4), text("dan"), n.clone(), f.clone()]]);
+    let (columns, rows) = returned(
+        &mut db,
+        "INSERT INTO users (id, name) VALUES (6, 'fay') RETURNING id * 10 AS tens, age IS NULL, UPPER(users.name), name",
+    );
+    assert_eq!(columns, names(&["tens", "?column?", "upper", "name"]));
+    assert_eq!(rows, [vec![int(60), t.clone(), text("FAY"), text("fay")]]);
+
+    // UPDATE: the new values, every right-hand side having seen the old row.
+    let (columns, rows) =
+        returned(&mut db, "UPDATE users SET age = age + 1, name = name || '!' WHERE age > 30 RETURNING id, name, age");
+    assert_eq!(columns, names(&["id", "name", "age"]));
+    assert_eq!(rows, [vec![int(5), text("eve!"), int(41)]]);
+    let (_, rows) = returned(&mut db, "UPDATE users SET active = NOT active WHERE id = 1 RETURNING active, age");
+    assert_eq!(rows, [vec![f.clone(), int(30)]]);
+
+    // DELETE: the rows as they were, every column of them, though the WHERE reads only one.
+    let (columns, rows) = returned(&mut db, "DELETE FROM users WHERE id = 2 RETURNING *");
+    assert_eq!(columns, names(&["id", "name", "age", "active"]));
+    assert_eq!(rows, [vec![int(2), text("bob"), int(25), f.clone()]]);
+    assert_eq!(returned(&mut db, "DELETE FROM users WHERE active RETURNING name").1, [vec![text("eve!")]]);
+
+    // No rows written: no rows returned, but still the columns.
+    let (columns, rows) = returned(&mut db, "UPDATE users SET age = 0 WHERE id = 99 RETURNING id, age");
+    assert_eq!((columns, rows.len()), (names(&["id", "age"]), 0));
+    assert_eq!(returned(&mut db, "DELETE FROM users WHERE id = 99 RETURNING *").1.len(), 0);
+
+    // The writes happened, and without RETURNING a write still reports a count.
+    assert_eq!(ints(query(&mut db, "SELECT id FROM users ORDER BY id")), [int(1), int(3), int(4), int(6)]);
+    let done = db.execute("DELETE FROM users WHERE id = 6").unwrap().pop().unwrap();
+    assert_eq!(done, QueryResult::Message("1 row(s) deleted".into()));
+}
+
+#[test]
+fn returning_shows_values_as_their_columns_store_them() {
+    let mut db = in_memory();
+    db.execute("CREATE TABLE r (id INT PRIMARY KEY, x REAL)").unwrap();
+    // An INT stored in a REAL column is a REAL, a REAL with no fraction in an INT column an INT.
+    assert_eq!(returned(&mut db, "INSERT INTO r VALUES (2.0, 3) RETURNING id, x").1, [vec![int(2), Value::Real(3.0)]]);
+    assert_eq!(returned(&mut db, "UPDATE r SET x = 7, id = 4.0 RETURNING *").1, [vec![int(4), Value::Real(7.0)]]);
+    assert_eq!(returned(&mut db, "DELETE FROM r RETURNING x / 2").1, [vec![Value::Real(3.5)]]);
+}
+
+#[test]
+fn every_storage_returns_the_rows_it_wrote() {
+    for storage in ["HEAP", "LSM", "COLUMN"] {
+        let mut db = in_memory();
+        db.execute(&format!("CREATE TABLE t (id INT PRIMARY KEY, tag TEXT, n INT, body TEXT) USING {storage}")).unwrap();
+        if storage != "COLUMN" {
+            db.execute("CREATE INDEX t_tag ON t (tag)").unwrap();
+        }
+        // Enough rows for an LSM tree to flush and a column store to migrate into row groups.
+        let values: Vec<String> =
+            (0..1500).map(|i| format!("({i}, 'tag{}', {i}, '{}')", i % 7, "b".repeat(i % 50))).collect();
+        let (_, rows) = returned(&mut db, &format!("INSERT INTO t VALUES {} RETURNING id", values.join(", ")));
+        assert_eq!(rows.len(), 1500, "{storage}");
+        assert_eq!(rows[1499], [int(1499)], "{storage}");
+
+        // The primary key changes too: an LSM row moves to a new key.
+        let sql = "UPDATE t SET id = id + 10000, n = n * 2 WHERE tag = 'tag3' AND id < 30 RETURNING id, n, tag";
+        let want: Vec<Vec<Value>> = [3, 10, 17, 24].iter().map(|&i| vec![int(10000 + i), int(2 * i), text("tag3")]).collect();
+        assert_eq!(by_first(returned(&mut db, sql).1), want, "{storage}");
+
+        // A DELETE through the index returns the columns the index does not have.
+        let sql = "DELETE FROM t WHERE tag = 'tag5' AND n < 20 RETURNING id, body, n";
+        let want: Vec<Vec<Value>> =
+            [5, 12, 19].iter().map(|&i| vec![int(i), text(&"b".repeat(i as usize % 50)), int(i)]).collect();
+        assert_eq!(by_first(returned(&mut db, sql).1), want, "{storage}");
+        assert_eq!(query(&mut db, "SELECT COUNT(*) FROM t"), [vec![int(1497)]], "{storage}");
+        assert_eq!(query(&mut db, "SELECT COUNT(*) FROM t WHERE id >= 10000"), [vec![int(4)]], "{storage}");
+    }
+}
+
+#[test]
+fn a_failing_returning_list_undoes_its_statement() {
+    let mut db = setup();
+    let totals = |db: &mut Database| query(db, "SELECT COUNT(*), SUM(age) FROM users");
+    let before = totals(&mut db);
+    for (sql, error) in [
+        ("INSERT INTO users (id) VALUES (7) RETURNING nope", "unknown column: nope"),
+        ("UPDATE users SET age = 1 RETURNING COUNT(*)", "aggregate functions are not allowed in RETURNING"),
+        ("DELETE FROM users RETURNING (SELECT MAX(id) FROM users)", "subqueries are not allowed in RETURNING"),
+        ("DELETE FROM users WHERE id = 1 RETURNING EXISTS (SELECT 1 FROM users)", "subqueries are not allowed in RETURNING"),
+        // Evaluated once the rows are written: a division by zero undoes the update.
+        ("UPDATE users SET age = 0 RETURNING 1 / age", "division by zero"),
+        ("INSERT INTO users VALUES (1, 'dup', 1, TRUE) RETURNING *", "duplicate primary key"),
+        ("DELETE FROM users RETURNING", "expected an expression"),
+        ("DELETE FROM users RETURNING *, id", "expected ';'"),
+    ] {
+        let e = db.execute(sql).unwrap_err().to_string();
+        assert!(e.contains(error), "{sql}: {e}");
+        assert_eq!(totals(&mut db), before, "{sql}");
+    }
+    // In a transaction, only the failing statement is undone.
+    db.execute("BEGIN").unwrap();
+    assert_eq!(returned(&mut db, "INSERT INTO users (id) VALUES (8) RETURNING id").1, [vec![int(8)]]);
+    assert!(db.execute("UPDATE users SET age = 0 RETURNING 1 / age").is_err());
+    db.execute("COMMIT").unwrap();
+    assert_eq!(totals(&mut db), [vec![int(4), int(55)]]);
+}
+
+#[test]
+fn returning_is_no_keyword() {
+    let mut db = in_memory();
+    // It stays free as the name of a table or a column.
+    db.execute("CREATE TABLE returning (returning INT, x INT)").unwrap();
+    let (columns, rows) = returned(&mut db, "INSERT INTO returning VALUES (1, 2) RETURNING returning");
+    assert_eq!((columns, rows), (names(&["returning"]), vec![vec![int(1)]]));
+    let sql = "UPDATE returning SET returning = returning + x WHERE x = returning + 1 RETURNING returning, x";
+    assert_eq!(returned(&mut db, sql).1, [vec![int(3), int(2)]]);
+    // EXPLAIN shows how the rows are found, as without RETURNING.
+    assert_eq!(
+        explain(&mut db, "DELETE FROM returning WHERE x = 2 RETURNING *"),
+        explain(&mut db, "DELETE FROM returning WHERE x = 2")
+    );
+    assert_eq!(returned(&mut db, "delete from returning returning returning * 2").1, [vec![int(6)]]);
+}

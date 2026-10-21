@@ -21,8 +21,8 @@ same queries.
 CREATE TABLE users (id INT PRIMARY KEY, name TEXT, active BOOL);
 INSERT INTO users VALUES (1, 'alice', TRUE), (2, 'bob', FALSE);
 SELECT name FROM users WHERE active AND id > 0 ORDER BY name DESC LIMIT 10;
-UPDATE users SET active = NOT active WHERE id = 2;
-DELETE FROM users WHERE name = 'alice';
+UPDATE users SET active = NOT active WHERE id = 2 RETURNING id, active;
+DELETE FROM users WHERE name = 'alice' RETURNING *;
 CREATE INDEX users_name ON users (name);
 EXPLAIN SELECT * FROM users WHERE name = 'bob';  -- the plan, ending in SEARCH users USING INDEX users_name
 CREATE INDEX users_active ON users USING HASH (active);
@@ -74,7 +74,7 @@ cargo test
 ```
 
 Besides unit and end-to-end tests, `tests/differential.rs` generates random
-schemas, rows, queries, changes and transactions, runs them on Sequoia and on
+schemas, rows, queries, changes (some with `RETURNING`) and transactions, runs them on Sequoia and on
 SQLite (through the `sqlite3` command; skipped if there is none), and fails if
 the two disagree, printing the case as a script for the shell. Each case runs
 in every execution model, which must also return exactly what the iterator
@@ -196,7 +196,8 @@ cargo bench --bench buffer_pool -- scans
   [INCLUDE (column, ...)] [WHERE condition]` (keys are columns or expressions
   of them, like `LOWER(name)`; `WHERE` makes a partial index; `HASH` makes a
   hash index, which finds only rows whose every key equals a value), `DROP INDEX`, `INSERT`, `SELECT`,
-  `UPDATE`, `DELETE`, `CHECKPOINT`, and `EXPLAIN` before a `SELECT`, `UPDATE` or
+  `UPDATE`, `DELETE` (each of the last three maybe ending in `RETURNING`, below),
+  `CHECKPOINT`, and `EXPLAIN` before a `SELECT`, `UPDATE` or
   `DELETE` to see its plan, or `EXPLAIN ANALYZE` before a `SELECT` to run it
   and see what each step of its plan did
 - Transactions: `BEGIN`, `COMMIT`, `ROLLBACK`, and `SAVEPOINT name`,
@@ -241,6 +242,15 @@ cargo bench --bench buffer_pool -- scans
   select list, `WHERE`, `HAVING`, `ORDER BY`, `UPDATE`, `DELETE` and `VALUES`.
   They may be correlated (refer to the columns of the query around them) and
   nested; each runs once per distinct set of outer values it is given
+- `RETURNING * | expr [AS name], ...` after an `INSERT`, `UPDATE` or `DELETE`
+  makes it return a row for each row it wrote, instead of a count: of the
+  values stored (an INT put in a REAL column comes back a REAL), for `UPDATE`
+  the new ones, for `DELETE` those of the rows deleted. The expressions read
+  the table's columns, with no aggregates or subqueries; columns are named as
+  a select list's are. The rows come once the statement's changes are made
+  (an error evaluating them undoes the statement), in no promised order:
+  `INSERT`'s follow its `VALUES`, the others the order the rows were found
+  in. `RETURNING` is not a keyword, so it may still name a table or column
 
 Every statement is atomic and, outside a transaction, durable once it returns.
 A transaction is durable once `COMMIT` returns; until then a crash, `ROLLBACK`

@@ -598,8 +598,8 @@ impl Table {
 
     /// Rows with each value made one of its column's type where it equals
     /// one (an INT stored in a REAL column, 2.0 in an INT one); others are
-    /// left for encoding to reject.
-    fn coerce_all(&self, mut rows: Vec<Row>) -> Vec<Row> {
+    /// left for encoding to reject. These are the values a row is stored with.
+    pub fn coerce_all(&self, mut rows: Vec<Row>) -> Vec<Row> {
         for row in &mut rows {
             for (value, column) in row.iter_mut().zip(&self.columns) {
                 if !value.fits(column.data_type)

@@ -19,7 +19,9 @@
 //! subquery read only the subquery's own tables (SQLite would compute one
 //! that reads only outer columns in the outer query), compares rows in
 //! order only when ORDER BY fixes it, and uses LIMIT and OFFSET only then.
-//! The columns of a UNION's queries have the same types. REALs are compared
+//! The columns of a UNION's queries have the same types. Some changes have a
+//! RETURNING list, without subqueries, whose rows are compared in any order,
+//! every number as a REAL (see `Kind::Returned`). REALs are compared
 //! to 10 significant digits: summing in another order may change the last
 //! of the 17 SQLite prints.
 
@@ -111,6 +113,10 @@ enum Kind {
     Ordered,
     /// A query whose rows must be equal as a multiset.
     Unordered,
+    /// A change with RETURNING, whose rows must be equal as a multiset,
+    /// every number read as a REAL: SQLite returns the whole values of a REAL
+    /// column as INTs there (`2` for 2.0), through COALESCE or CASE too.
+    Returned,
     /// Anything else: both must succeed or both fail.
     Other,
 }
@@ -674,7 +680,32 @@ impl Gen {
             true => String::new(),
             false => format!(" ({})", named.iter().map(|&i| columns[i].0.as_str()).collect::<Vec<_>>().join(", ")),
         };
-        stmt(format!("INSERT INTO {}{list} VALUES {}", self.tables[t].name, rows.join(", ")), Kind::Other)
+        let s = self.table_scope(t, Vec::new());
+        let (returning, kind) = self.returning(&s);
+        stmt(format!("INSERT INTO {}{list} VALUES {}{returning}", self.tables[t].name, rows.join(", ")), kind)
+    }
+
+    /// Maybe a RETURNING list for a change to the table of `s`, and the
+    /// change's kind: `*`, or expressions of the table's columns, with no
+    /// subqueries (Sequoia allows none). SQLite returns the rows in no set
+    /// order, so they are compared as a multiset (see [`Kind::Returned`]).
+    fn returning(&mut self, s: &Scope) -> (String, Kind) {
+        if !self.rng.chance(30) {
+            return (String::new(), Kind::Other);
+        }
+        let s = Scope { subqueries: false, sub_tables: Vec::new(), ..s.clone() };
+        let list = match self.rng.chance(25) {
+            true => "*".to_string(),
+            false => (0..1 + self.rng.below(3))
+                .map(|i| {
+                    let ty = *self.rng.pick(&TYPES);
+                    let e = self.expr(ty, &s, 2);
+                    if self.rng.chance(30) { format!("{e} AS r{i}") } else { e }
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        };
+        (format!(" RETURNING {list}"), Kind::Returned)
     }
 
     fn update(&mut self) -> Stmt {
@@ -690,7 +721,8 @@ impl Gen {
             }
         }
         let filter = self.where_clause(&s, 75);
-        stmt(format!("UPDATE {} SET {}{filter}", self.tables[t].name, sets.join(", ")), Kind::Other)
+        let (returning, kind) = self.returning(&s);
+        stmt(format!("UPDATE {} SET {}{filter}{returning}", self.tables[t].name, sets.join(", ")), kind)
     }
 
     fn delete(&mut self) -> Stmt {
@@ -698,7 +730,8 @@ impl Gen {
         let all = (0..self.tables.len()).collect();
         let s = self.table_scope(t, all);
         let filter = self.where_clause(&s, 85);
-        stmt(format!("DELETE FROM {}{filter}", self.tables[t].name), Kind::Other)
+        let (returning, kind) = self.returning(&s);
+        stmt(format!("DELETE FROM {}{filter}{returning}", self.tables[t].name), kind)
     }
 
     fn contents(&self, t: usize) -> Stmt {
@@ -989,12 +1022,22 @@ fn real_text(r: f64) -> String {
 
 /// A row as SQLite's quote mode prints it, with each REAL as [`real_text`] writes it.
 fn fold_reals(row: &str) -> String {
+    fold(row, |token| token.contains(['.', 'e']))
+}
+
+/// A row as [`fold_reals`] writes it, with each INT written as a REAL too.
+fn fold_numbers(row: &str) -> String {
+    fold(row, |_| true)
+}
+
+/// A row with each number that `real` picks written as [`real_text`] writes it.
+fn fold(row: &str, real: impl Fn(&str) -> bool) -> String {
     let mut out = String::new();
     let mut token = String::new();
     let mut quoted = false;
     let flush = |token: &mut String, out: &mut String| {
         match token.parse::<f64>() {
-            Ok(r) if !token.starts_with('\'') && token.contains(['.', 'e']) => out.push_str(&real_text(r)),
+            Ok(r) if !token.starts_with('\'') && real(token) => out.push_str(&real_text(r)),
             _ => out.push_str(token),
         }
         token.clear();
@@ -1089,6 +1132,14 @@ fn agree(kind: Kind, a: &Outcome, b: &Outcome) -> bool {
                 b.sort();
                 a == b
             }
+            Kind::Returned => {
+                let fold = |rows: &[String]| {
+                    let mut rows: Vec<String> = rows.iter().map(|row| fold_numbers(row)).collect();
+                    rows.sort();
+                    rows
+                };
+                fold(a) == fold(b)
+            }
         },
         _ => false,
     }
@@ -1105,7 +1156,7 @@ const SPILL_MEMORY: usize = 64;
 fn sequoia_agrees_with_sqlite() {
     let (cases, first) = (env("SEQUOIA_DIFF_CASES", 40), env("SEQUOIA_DIFF_SEED", 1));
     let mut mismatches = Vec::new();
-    let (mut statements, mut queries, mut failed) = (0, 0, 0);
+    let (mut statements, mut queries, mut returning, mut failed) = (0, 0, 0, 0);
     for seed in first..first + cases {
         let script = Gen::case(seed);
         let Some(expected) = run_sqlite(&script) else {
@@ -1113,7 +1164,8 @@ fn sequoia_agrees_with_sqlite() {
             return;
         };
         statements += script.len();
-        queries += script.iter().filter(|s| s.kind != Kind::Other).count();
+        queries += script.iter().filter(|s| matches!(s.kind, Kind::Ordered | Kind::Unordered)).count();
+        returning += script.iter().filter(|s| s.kind == Kind::Returned).count();
         // Again with budgets so small that every sort, join and aggregation spills.
         'runs: for memory in [None, Some(SPILL_MEMORY)] {
             let iterator = run_sequoia(&script, Some(Model::Iterator), memory);
@@ -1154,7 +1206,7 @@ fn sequoia_agrees_with_sqlite() {
         }
     }
     eprintln!(
-        "{cases} cases, {statements} statements ({queries} queries; {failed} failed in both), {} mismatches",
+        "{cases} cases, {statements} statements ({queries} queries, {returning} changes with RETURNING; {failed} failed in both), {} mismatches",
         mismatches.len()
     );
     if let Some(first) = mismatches.first() {

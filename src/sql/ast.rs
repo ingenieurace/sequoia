@@ -35,16 +35,19 @@ pub enum Statement {
         table: String,
         columns: Option<Vec<String>>,
         rows: Vec<Vec<Expr>>,
+        returning: Option<Projection>,
     },
     Select(Select),
     Update {
         table: String,
         assignments: Vec<(String, Expr)>,
         filter: Option<Expr>,
+        returning: Option<Projection>,
     },
     Delete {
         table: String,
         filter: Option<Expr>,
+        returning: Option<Projection>,
     },
 }
 
@@ -286,9 +289,10 @@ impl std::fmt::Display for ColumnRef {
     }
 }
 
+/// A select list, or the `RETURNING` list of an INSERT, UPDATE or DELETE.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Projection {
-    /// `SELECT *`
+    /// `SELECT *`, or `RETURNING *`
     All,
     Exprs(Vec<SelectItem>),
 }

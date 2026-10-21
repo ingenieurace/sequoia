@@ -1075,7 +1075,7 @@ fn is_grouped(projection: &Projection, group_by: &[Expr], having: &Option<Expr>,
 }
 
 /// The name of a select list item's column: its AS name, or else its expression's.
-fn item_name(item: &SelectItem) -> String {
+pub fn item_name(item: &SelectItem) -> String {
     item.alias.clone().unwrap_or_else(|| output_name(&item.expr))
 }
 

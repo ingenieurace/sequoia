@@ -198,7 +198,35 @@ impl Parser {
             p.expect_symbol(")")?;
             Ok(values)
         })?;
-        Ok(Statement::Insert { table, columns, rows })
+        let returning = self.returning()?;
+        Ok(Statement::Insert { table, columns, rows, returning })
+    }
+
+    /// `[RETURNING * | expr [AS name], ...]` at the end of an INSERT, UPDATE or DELETE.
+    fn returning(&mut self) -> Result<Option<Projection>> {
+        // Not a keyword, so that it stays free as a name.
+        match self.peek() {
+            Some(Token::Ident(word)) if word.eq_ignore_ascii_case("RETURNING") => {
+                self.pos += 1;
+                Ok(Some(self.projection()?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// `* | expr [AS name], ...`: a select list, or a RETURNING one.
+    fn projection(&mut self) -> Result<Projection> {
+        if self.eat_symbol("*") {
+            return Ok(Projection::All);
+        }
+        Ok(Projection::Exprs(self.comma_list(|p| {
+            let expr = p.expr()?;
+            let alias = match p.eat_keyword("AS") {
+                true => Some(p.ident()?),
+                false => None,
+            };
+            Ok(SelectItem { expr, alias })
+        })?))
     }
 
     /// A query: one SELECT, or several joined by `UNION [ALL]`, then the
@@ -233,18 +261,7 @@ impl Parser {
     fn select_core(&mut self) -> Result<Select> {
         self.expect_keyword("SELECT")?;
         let distinct = self.eat_keyword("DISTINCT");
-        let projection = if self.eat_symbol("*") {
-            Projection::All
-        } else {
-            Projection::Exprs(self.comma_list(|p| {
-                let expr = p.expr()?;
-                let alias = match p.eat_keyword("AS") {
-                    true => Some(p.ident()?),
-                    false => None,
-                };
-                Ok(SelectItem { expr, alias })
-            })?)
-        };
+        let projection = self.projection()?;
         self.expect_keyword("FROM")?;
         let from = self.from()?;
         let filter = self.where_clause()?;
@@ -322,7 +339,8 @@ impl Parser {
             Ok((column, p.expr()?))
         })?;
         let filter = self.where_clause()?;
-        Ok(Statement::Update { table, assignments, filter })
+        let returning = self.returning()?;
+        Ok(Statement::Update { table, assignments, filter, returning })
     }
 
     fn delete(&mut self) -> Result<Statement> {
@@ -330,7 +348,8 @@ impl Parser {
         self.expect_keyword("FROM")?;
         let table = self.ident()?;
         let filter = self.where_clause()?;
-        Ok(Statement::Delete { table, filter })
+        let returning = self.returning()?;
+        Ok(Statement::Delete { table, filter, returning })
     }
 
     fn where_clause(&mut self) -> Result<Option<Expr>> {

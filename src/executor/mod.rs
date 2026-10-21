@@ -25,7 +25,7 @@ use crate::error::{Result, err};
 use crate::plan::query::{self, forbid};
 use crate::plan::{access, filter};
 use crate::result::QueryResult;
-use crate::sql::ast::{Expr, Select, Statement};
+use crate::sql::ast::{ColumnRef, Expr, Projection, Select, SelectItem, Statement};
 use crate::sql::eval::{Field, eval_with, matches_with};
 use crate::types::Value;
 use join::{HASH_MEMORY, JOIN_MEMORY};
@@ -95,9 +95,13 @@ pub fn execute(catalog: &mut Catalog, statement: Statement, settings: &Settings)
         | Statement::Rollback { .. }
         | Statement::Savepoint { .. }
         | Statement::Release { .. } => err("transaction statements are run by the database"),
-        Statement::Insert { table, columns, rows } => insert(catalog, &table, columns, rows, settings),
-        Statement::Update { table, assignments, filter } => update(catalog, &table, assignments, filter, settings),
-        Statement::Delete { table, filter } => delete(catalog, &table, filter, settings),
+        Statement::Insert { table, columns, rows, returning } => {
+            insert(catalog, &table, columns, rows, returning, settings)
+        }
+        Statement::Update { table, assignments, filter, returning } => {
+            update(catalog, &table, assignments, filter, returning, settings)
+        }
+        Statement::Delete { table, filter, returning } => delete(catalog, &table, filter, returning, settings),
     }
 }
 
@@ -126,7 +130,7 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, settings: &Settings) -> R
 fn explain(catalog: &Catalog, statement: Statement) -> Result<QueryResult> {
     let plan = match statement {
         Statement::Select(query) => query::select(catalog, query)?.root,
-        Statement::Update { table, filter, .. } | Statement::Delete { table, filter } => {
+        Statement::Update { table, filter, .. } | Statement::Delete { table, filter, .. } => {
             let table = catalog.get(&table)?;
             let filter = filter.map(|f| query::bind(catalog, Some(table), &f)).transpose()?;
             query::scan(table, &table.name, &filter, vec![true; table.columns.len()])
@@ -202,11 +206,13 @@ fn insert(
     table: &str,
     columns: Option<Vec<String>>,
     rows: Vec<Vec<Expr>>,
+    returning: Option<Projection>,
     settings: &Settings,
 ) -> Result<QueryResult> {
-    let new_rows = {
+    let (new_rows, returned) = {
         let catalog: &Catalog = catalog;
         let table = catalog.get(table)?;
+        let returning = Returning::bind(catalog, table, returning)?;
         // Which column each supplied value goes to; omitted columns become NULL.
         let targets: Vec<usize> = match columns {
             Some(names) => names.iter().map(|n| table.column_index(n)).collect::<Result<_>>()?,
@@ -225,12 +231,16 @@ fn insert(
             }
             new_rows.push(row);
         }
-        new_rows
+        let returned = returning.map(|returning| (returning, table.coerce_all(new_rows.clone())));
+        (new_rows, returned)
     };
 
     let count = new_rows.len();
     catalog.get_mut(table)?.insert(new_rows)?;
-    Ok(message(format!("{count} row(s) inserted")))
+    match returned {
+        Some((returning, rows)) => returning.rows(catalog, &rows, settings),
+        None => Ok(message(format!("{count} row(s) inserted"))),
+    }
 }
 
 fn update(
@@ -238,13 +248,15 @@ fn update(
     table: &str,
     assignments: Vec<(String, Expr)>,
     filter: Option<Expr>,
+    returning: Option<Projection>,
     settings: &Settings,
 ) -> Result<QueryResult> {
     forbid(&filter, "WHERE")?;
     forbid(assignments.iter().map(|(_, e)| e), "UPDATE")?;
-    let changes = {
+    let (changes, returned) = {
         let catalog: &Catalog = catalog;
         let table = catalog.get(table)?;
+        let returning = Returning::bind(catalog, table, returning)?;
         let filter = filter.map(|f| query::bind(catalog, Some(table), &f)).transpose()?;
         let assignments: Vec<(usize, Expr)> = assignments
             .into_iter()
@@ -272,24 +284,42 @@ fn update(
             }
             changes.push((rid, old, row));
         }
-        changes
+        let returned = returning.map(|returning| {
+            let new_rows = changes.iter().map(|(_, _, new)| new.clone()).collect();
+            (returning, table.coerce_all(new_rows))
+        });
+        (changes, returned)
     };
 
     let count = changes.len();
     catalog.get_mut(table)?.update(changes)?;
-    Ok(message(format!("{count} row(s) updated")))
+    match returned {
+        Some((returning, rows)) => returning.rows(catalog, &rows, settings),
+        None => Ok(message(format!("{count} row(s) updated"))),
+    }
 }
 
-fn delete(catalog: &mut Catalog, table: &str, filter: Option<Expr>, settings: &Settings) -> Result<QueryResult> {
+fn delete(
+    catalog: &mut Catalog,
+    table: &str,
+    filter: Option<Expr>,
+    returning: Option<Projection>,
+    settings: &Settings,
+) -> Result<QueryResult> {
     forbid(&filter, "WHERE")?;
-    let rows = {
+    let (rows, returning) = {
         let catalog: &Catalog = catalog;
         let table = catalog.get(table)?;
+        let returning = Returning::bind(catalog, table, returning)?;
         let filter = filter.map(|f| query::bind(catalog, Some(table), &f)).transpose()?;
         let fields = Field::of_table(&table.name, &table.columns);
         let mut subqueries = Runner::new(catalog, settings);
-        // The filter's columns, and the indexed ones, whose entries the delete removes.
-        let mut needed = filter::needed_columns(table, &table.name, &filter);
+        // The filter's columns, and the indexed ones, whose entries the delete
+        // removes; every column if RETURNING may show them.
+        let mut needed = match returning {
+            Some(_) => vec![true; table.columns.len()],
+            None => filter::needed_columns(table, &table.name, &filter),
+        };
         needed.iter_mut().zip(table.indexed_columns()).for_each(|(needed, indexed)| *needed |= indexed);
         let mut rows = Vec::new();
         for item in scan(table, &needed, &filter) {
@@ -298,10 +328,59 @@ fn delete(catalog: &mut Catalog, table: &str, filter: Option<Expr>, settings: &S
                 rows.push((rid, row));
             }
         }
-        rows
+        (rows, returning)
     };
     catalog.get_mut(table)?.delete(&rows)?;
-    Ok(message(format!("{} row(s) deleted", rows.len())))
+    match returning {
+        Some(returning) => {
+            let rows: Vec<Row> = rows.into_iter().map(|(_, row)| row).collect();
+            returning.rows(catalog, &rows, settings)
+        }
+        None => Ok(message(format!("{} row(s) deleted", rows.len()))),
+    }
+}
+
+/// The RETURNING list of an INSERT, UPDATE or DELETE, bound to its table:
+/// what it gives for each row written, as it was stored (or for DELETE, as
+/// it was before).
+struct Returning {
+    /// The names of its columns, as a select list's are named.
+    columns: Vec<String>,
+    exprs: Vec<Expr>,
+    /// The table's columns, which the expressions read.
+    fields: Vec<Field>,
+}
+
+impl Returning {
+    /// Binds a RETURNING list to `table`, if there is one. `*` is every column of the table.
+    fn bind(catalog: &Catalog, table: &Table, projection: Option<Projection>) -> Result<Option<Returning>> {
+        let items = match projection {
+            None => return Ok(None),
+            Some(Projection::All) => table
+                .columns
+                .iter()
+                .map(|column| SelectItem { expr: Expr::Column(ColumnRef::bare(column.name.clone())), alias: None })
+                .collect(),
+            Some(Projection::Exprs(items)) => items,
+        };
+        forbid(items.iter().map(|item| &item.expr), "RETURNING")?;
+        if items.iter().any(|item| item.expr.has_subquery()) {
+            return err("subqueries are not allowed in RETURNING");
+        }
+        let columns = items.iter().map(query::item_name).collect();
+        let exprs = items.iter().map(|item| query::bind(catalog, Some(table), &item.expr)).collect::<Result<_>>()?;
+        Ok(Some(Returning { columns, exprs, fields: Field::of_table(&table.name, &table.columns) }))
+    }
+
+    /// The rows it gives for these rows of its table, in their order.
+    fn rows(self, catalog: &Catalog, rows: &[Row], settings: &Settings) -> Result<QueryResult> {
+        let mut subqueries = Runner::new(catalog, settings);
+        let rows = rows
+            .iter()
+            .map(|row| self.exprs.iter().map(|e| eval_with(e, &self.fields, row, &mut subqueries)).collect())
+            .collect::<Result<_>>()?;
+        Ok(QueryResult::Rows { columns: self.columns, rows })
+    }
 }
 
 /// Reads the rows of `table` that `filter` may match, the way the planner chooses.
