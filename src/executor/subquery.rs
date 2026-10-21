@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use super::{Settings, operator};
+use super::{Settings, model};
 use crate::catalog::Catalog;
 use crate::error::{Result, err};
 use crate::plan::{filter, query};
@@ -53,7 +53,7 @@ impl Subqueries for Runner<'_> {
             Ok(values[i].clone())
         })?;
         let plan = query::select(self.catalog, bound)?;
-        let mut rows = operator::open(plan.root, self.catalog, &self.settings);
+        let mut rows = model::open(plan.root, self.catalog, &self.settings);
         let answer = match subquery {
             Expr::Exists(_) => Answer::Exists(rows.next().transpose()?.is_some()),
             Expr::Subquery(_) => {

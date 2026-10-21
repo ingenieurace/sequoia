@@ -23,7 +23,40 @@ DROP INDEX users_name;
 DROP TABLE users;
 ```
 
-Shell commands: `.tables`, `.exit`.
+Shell commands: `.tables`, `.model [auto | iterator | materialization |
+vectorized]` (shows, or sets, the execution model queries run in), `.exit`.
+
+## Execution models
+
+A query's plan runs in one of three execution models, which differ in how
+its steps hand rows to each other, and return the same rows and errors:
+
+| model | a step returns | suits |
+|---|---|---|
+| iterator (Volcano) | one row per `next()` | joins; anything, holding few rows |
+| materialization | all of its rows, in one call | few rows at every step (OLTP lookups) |
+| vectorized | a batch of 1024 rows, a column at a time | scans and aggregates of many rows (OLAP) |
+
+By default each query runs in the one that suits it, from the planner's
+estimates of how many rows each step reads: materialization if no step has
+more than 100, vectorized from 4,096 when there is no join or subquery, the
+iterator model otherwise. `EXPLAIN ANALYZE` names the model a query ran in,
+and why; `Database::set_execution_model` (or `.model` in the shell) runs
+every query in one. `src/executor/model.rs` explains the choice, and
+`benches/models.rs` times the same queries in each:
+
+```bash
+cargo bench --bench models
+```
+
+In the vectorized model, a column table's rows go from its decoded chunks to
+the steps above in columns, never put together into rows before the top;
+expressions on columns of one type run as loops over arrays, and an
+aggregate without `GROUP BY` folds a whole column at once. On 200,000 rows
+of a column table it aggregates 5 to 10 times faster than the iterator model.
+The materialization model passes a `LIMIT` down to the steps below it, but a
+filter must make all of its rows first, which is why only small queries run
+in it.
 
 ## Testing
 
@@ -34,11 +67,20 @@ cargo test
 Besides unit and end-to-end tests, `tests/differential.rs` generates random
 schemas, rows, queries, changes and transactions, runs them on Sequoia and on
 SQLite (through the `sqlite3` command; skipped if there is none), and fails if
-the two disagree, printing the case as a script for the shell. It runs 40
-cases by default; run more, or other ones, with:
+the two disagree, printing the case as a script for the shell. Each case runs
+in every execution model, which must also return exactly what the iterator
+model does, errors included. It runs 40 cases by default; run more, or other
+ones, with:
 
 ```bash
 SEQUOIA_DIFF_CASES=2000 SEQUOIA_DIFF_SEED=7 cargo test --release --test differential -- --nocapture
+```
+
+`tests/sql.rs` runs each query in the model chosen for it; with
+`SEQUOIA_MODEL` set, all in that one:
+
+```bash
+SEQUOIA_MODEL=vectorized cargo test --test sql
 ```
 
 `benches/joins.rs` times every join method on 200,000 rows joined with
@@ -212,7 +254,13 @@ src/
   database.rs     entry point; runs SQL, commits or rolls back each statement or transaction
   executor/       runs statements
     mod.rs        statement execution; a SELECT's rows as a stream (`Database::query`)
-    operator.rs   each plan step as an iterator pulling rows from the one below
+    model.rs      the three execution models, and which one runs each query
+    operator.rs   iterator model: each plan step as an iterator pulling rows from the one below
+    materialize.rs  materialization model: each step runs to completion, returns all its rows
+    vectorized/   vectorized model
+      mod.rs      each plan step passing on batches of rows; joins and sorts on rows between them
+      batch.rs    batches: typed column vectors and a selection of the rows still in them
+      expr.rs     expressions a column at a time: loops over arrays, row by row for the rest
     join.rs       block nested loop, hash, index and sort-merge joins; LEFT JOIN padding
     hash_join.rs  a hash join's right side: hybrid hash join, partitions spilled past the budget
     sort.rs       ORDER BY: external merge sort, top-N heap for LIMIT

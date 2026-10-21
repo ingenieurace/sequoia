@@ -686,7 +686,7 @@ fn lookups_win(left: f64, table: &Table, key: LookupKey) -> bool {
 /// by the guesses above for what conditions keep. A join with equalities
 /// returns about as many rows as its larger side (as if each row of that
 /// side matched one of the other), and one without, a third of every pair.
-fn estimate(node: &Node) -> f64 {
+pub fn estimate(node: &Node) -> f64 {
     match node {
         Node::Scan { table, predicates, .. } => {
             let rows = table.row_count().map_or(1000.0, |rows| rows as f64);
@@ -966,7 +966,7 @@ impl Node<'_> {
     }
 
     /// The steps this one reads from, in the order EXPLAIN lists them.
-    fn inputs(&self) -> Vec<&Self> {
+    pub fn inputs(&self) -> Vec<&Self> {
         match self {
             Node::Scan { .. } | Node::Lookup { .. } => vec![],
             Node::Join { left, right, .. } => vec![left, right],

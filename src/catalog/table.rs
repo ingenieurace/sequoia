@@ -8,7 +8,7 @@ use crate::error::{Error, Result, err};
 use crate::predicate::Predicate;
 use crate::sql::ast::CreateIndex;
 use crate::storage::{
-    BufferPool, ColumnConfig, ColumnStore, LsmConfig, LsmTree, MAX_TUPLE_SIZE, PageId, Position,
+    BufferPool, ColumnChunk, ColumnConfig, ColumnStore, LsmConfig, LsmTree, MAX_TUPLE_SIZE, PageId, Position,
     RecordId, TableHeap, tuple,
 };
 use crate::types::{Column, StorageKind, Value, column_index};
@@ -286,6 +286,21 @@ impl Table {
                     Ok((id, row))
                 }))
             }
+        }
+    }
+
+    /// The rows [`Table::scan_filtered`] reads, left in their columns, if the
+    /// table keeps them so: a column table does (see
+    /// [`ColumnStore::scan_by_column`]), the others do not.
+    pub fn scan_by_column(
+        &self,
+        needed: &[bool],
+        predicates: &[Predicate],
+        chunk: usize,
+    ) -> Option<Box<dyn Iterator<Item = Result<ColumnChunk>> + '_>> {
+        match &self.storage {
+            Storage::Column(store) => Some(Box::new(store.scan_by_column(needed.to_vec(), predicates.to_vec(), chunk))),
+            _ => None,
         }
     }
 

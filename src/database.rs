@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result, err};
+use crate::executor::model::Model;
 use crate::executor::{self, Query, Settings};
 use crate::sql::ast::Statement;
 use crate::storage::io::disk::Savepoint;
@@ -224,6 +225,17 @@ impl Database {
     /// before it writes partitions of them to temporary files.
     pub fn set_hash_memory(&mut self, bytes: usize) {
         self.settings.hash_memory = bytes;
+    }
+
+    /// Sets the execution model every query runs in, or with `None`, lets
+    /// each query run in the one that suits it, as by default (see
+    /// [`executor::model`]).
+    pub fn set_execution_model(&mut self, model: Option<Model>) {
+        self.settings.model = model;
+    }
+
+    pub fn execution_model(&self) -> Option<Model> {
+        self.settings.model
     }
 
     pub fn table_names(&self) -> Vec<&str> {

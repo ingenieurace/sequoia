@@ -50,6 +50,10 @@
 //! [`encoding::filter`]), ANDs the bitmaps they return with the live rows, and
 //! decodes the other columns only for the rows left (late materialization). A
 //! group with no row left is skipped without decoding anything.
+//!
+//! [`ColumnStore::scan`] then puts each row together from its columns' values;
+//! [`ColumnStore::scan_by_column`] leaves them in their columns, for the
+//! vectorized executor, which works on columns itself.
 
 use std::sync::Arc;
 
@@ -75,6 +79,14 @@ impl Default for ColumnConfig {
     fn default() -> Self {
         ColumnConfig { group_rows: 1024 }
     }
+}
+
+/// Rows handed over a column at a time: how many, and each column's values
+/// for them, if it was read.
+#[derive(Debug)]
+pub struct ColumnChunk {
+    pub rows: usize,
+    pub columns: Vec<Option<Vec<Value>>>,
 }
 
 /// Where a row of a column store is.
@@ -190,7 +202,7 @@ impl ColumnStore {
         needed: Vec<bool>,
         predicates: Vec<Predicate>,
     ) -> impl Iterator<Item = Result<(Position, Vec<Value>)>> + '_ {
-        let delta_predicates = predicates.clone();
+        let delta = self.delta_rows(predicates.clone());
         let groups = self.groups.iter().flat_map(move |group| {
             let rows = group.read(&self.pool, &self.columns, &needed, &predicates);
             let (rows, error) = match rows {
@@ -199,17 +211,67 @@ impl ColumnStore {
             };
             rows.into_iter().map(Ok).chain(error)
         });
-        let delta = self.delta.scan().filter_map(move |item| {
+        groups.chain(delta)
+    }
+
+    /// The rows [`ColumnStore::scan`] returns, in its order, left in their
+    /// columns: each row group's as it decodes them, then the delta store's
+    /// `chunk` rows at a time, taken apart into columns. A chunk holds at
+    /// least one row.
+    pub fn scan_by_column(
+        &self,
+        needed: Vec<bool>,
+        predicates: Vec<Predicate>,
+        chunk: usize,
+    ) -> impl Iterator<Item = Result<ColumnChunk>> + '_ {
+        let mut delta = self.delta_rows(predicates.clone());
+        let width = self.columns.len();
+        let (mut error, mut done) = (None, false);
+        let delta = std::iter::from_fn(move || {
+            if done {
+                return error.take().map(Err);
+            }
+            let mut columns: Vec<Vec<Value>> = vec![Vec::new(); width];
+            let mut rows = 0;
+            while rows < chunk {
+                match delta.next() {
+                    Some(Ok((_, row))) => {
+                        columns.iter_mut().zip(row).for_each(|(column, value)| column.push(value));
+                        rows += 1;
+                    }
+                    Some(Err(e)) => {
+                        (error, done) = (Some(e), true);
+                        break;
+                    }
+                    None => {
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            match rows {
+                0 => error.take().map(Err),
+                rows => Some(Ok(ColumnChunk { rows, columns: columns.into_iter().map(Some).collect() })),
+            }
+        });
+        let groups = self.groups.iter().filter_map(move |group| {
+            group.read_columns(&self.pool, &self.columns, &needed, &predicates).transpose()
+        });
+        groups.chain(delta)
+    }
+
+    /// The delta store's rows that satisfy every one of `predicates`, whole.
+    fn delta_rows(&self, predicates: Vec<Predicate>) -> impl Iterator<Item = Result<(Position, Vec<Value>)>> + '_ {
+        self.delta.scan().filter_map(move |item| {
             let read = || {
                 let (rid, bytes) = item?;
                 Ok((Position::Delta(rid), tuple::decode(&self.columns, &bytes)?))
             };
             match read() {
-                Ok((_, row)) if !delta_predicates.iter().all(|p| p.matches(&row)) => None,
+                Ok((_, row)) if !predicates.iter().all(|p| p.matches(&row)) => None,
                 result => Some(result),
             }
-        });
-        groups.chain(delta)
+        })
     }
 
     /// Frees every page of the store.
@@ -318,6 +380,44 @@ impl RowGroup {
         needed: &[bool],
         predicates: &[Predicate],
     ) -> Result<Vec<(Position, Vec<Value>)>> {
+        let Some((rows, values)) = self.select(pool, columns, needed, predicates)? else { return Ok(Vec::new()) };
+        let mut values: Vec<Option<std::vec::IntoIter<Value>>> =
+            values.into_iter().map(|column| column.map(Vec::into_iter)).collect();
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let values = values
+                    .iter_mut()
+                    .map(|column| column.as_mut().map_or(Value::Null, |c| c.next().expect("one value per row")))
+                    .collect();
+                (Position::Group { header: self.header, row: row as u32 }, values)
+            })
+            .collect())
+    }
+
+    /// Like [`RowGroup::read`], but leaves the rows' values in their columns;
+    /// None if no row is left.
+    fn read_columns(
+        &self,
+        pool: &BufferPool,
+        columns: &[Column],
+        needed: &[bool],
+        predicates: &[Predicate],
+    ) -> Result<Option<ColumnChunk>> {
+        let selected = self.select(pool, columns, needed, predicates)?;
+        Ok(selected.map(|(rows, columns)| ColumnChunk { rows: rows.len(), columns }))
+    }
+
+    /// The positions of the rows not deleted that satisfy every predicate,
+    /// and the needed columns' values for them; None if no row is left.
+    #[allow(clippy::type_complexity)]
+    fn select(
+        &self,
+        pool: &BufferPool,
+        columns: &[Column],
+        needed: &[bool],
+        predicates: &[Predicate],
+    ) -> Result<Option<(Vec<usize>, Vec<Option<Vec<Value>>>)>> {
         let mut chunks: Vec<Option<Vec<u8>>> = vec![None; columns.len()];
         let mut selected: Vec<u8> = self.deleted.iter().map(|b| !b).collect();
         if !self.rows.is_multiple_of(8) {
@@ -337,32 +437,23 @@ impl RowGroup {
         }
         let rows: Vec<usize> = (0..self.rows).filter(|&row| encoding::bit(&selected, row)).collect();
         if rows.is_empty() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
 
         // Then decode the needed columns, materializing only those rows.
-        let mut values: Vec<Option<std::vec::IntoIter<Value>>> = Vec::with_capacity(columns.len());
+        let mut values = Vec::with_capacity(columns.len());
         for (i, column) in columns.iter().enumerate() {
             values.push(if needed[i] {
                 let bytes = match chunks[i].take() {
                     Some(bytes) => bytes,
                     None => read_chunk(pool, self.chunks[i])?,
                 };
-                Some(encoding::decode_selected(column.data_type, &bytes, self.rows, &selected)?.into_iter())
+                Some(encoding::decode_selected(column.data_type, &bytes, self.rows, &selected)?)
             } else {
                 None
             });
         }
-        Ok(rows
-            .into_iter()
-            .map(|row| {
-                let values = values
-                    .iter_mut()
-                    .map(|column| column.as_mut().map_or(Value::Null, |c| c.next().expect("one value per row")))
-                    .collect();
-                (Position::Group { header: self.header, row: row as u32 }, values)
-            })
-            .collect())
+        Ok(Some((rows, values)))
     }
 
     fn destroy(self, pool: &BufferPool) -> Result<()> {

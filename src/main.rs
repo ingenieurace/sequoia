@@ -3,6 +3,7 @@
 use std::io::{self, BufRead, Write};
 
 use sequoia::Database;
+use sequoia::executor::model::Model;
 use sequoia::sql::parse;
 
 fn main() {
@@ -15,7 +16,7 @@ fn main() {
         std::process::exit(1);
     });
 
-    println!("Sequoia. End statements with ';'. Commands: .tables, .exit");
+    println!("Sequoia. End statements with ';'. Commands: .tables, .model, .exit");
     let mut buffer = String::new();
     let mut lines = io::stdin().lock().lines();
 
@@ -35,7 +36,18 @@ fn main() {
             match trimmed {
                 ".exit" | ".quit" => break,
                 ".tables" => db.table_names().iter().for_each(|name| println!("{name}")),
-                _ => println!("unknown command: {trimmed}"),
+                ".model" => match db.execution_model() {
+                    Some(model) => println!("{model}"),
+                    None => println!("auto (each query in the model that suits it)"),
+                },
+                _ => match trimmed.strip_prefix(".model ").map(str::trim) {
+                    Some("auto") => db.set_execution_model(None),
+                    Some(name) => match Model::from_name(name) {
+                        Some(model) => db.set_execution_model(Some(model)),
+                        None => println!("unknown model: {name} (auto, iterator, materialization or vectorized)"),
+                    },
+                    None => println!("unknown command: {trimmed}"),
+                },
             }
             continue;
         }

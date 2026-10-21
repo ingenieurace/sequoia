@@ -4,9 +4,12 @@
 //! Needs the `sqlite3` command, and is skipped without it. Runs
 //! `SEQUOIA_DIFF_CASES` cases (default 40) from seed `SEQUOIA_DIFF_SEED`
 //! (default 1). A mismatch prints the case as a script for Sequoia's shell.
-//! Each case runs on Sequoia twice: as it is, and with memory budgets so
-//! small (`SPILL_MEMORY`) that its sorts, joins and aggregations write to
-//! temporary files, which must not change what it returns either.
+//! Each case runs on Sequoia in each execution model, and with each model
+//! choosing per query, both as it is and with memory budgets so small
+//! (`SPILL_MEMORY`) that its sorts, joins and aggregations write to
+//! temporary files, which must not change what it returns either. Every
+//! model must agree with SQLite, and return exactly what the iterator model
+//! does: the same rows in the same order, and the same errors.
 //!
 //! The generator writes only SQL whose meaning the two databases share, so
 //! any difference is a bug in one of them. In particular, it keeps
@@ -23,6 +26,7 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+use sequoia::executor::model::Model;
 use sequoia::{Database, QueryResult, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1008,11 +1012,12 @@ fn fold_reals(row: &str) -> String {
     out
 }
 
-/// Runs the script on a database in memory, with every memory budget (of
-/// sorts, joins and hash tables) at `memory` bytes if given, to make them
-/// spill to temporary files.
-fn run_sequoia(script: &[Stmt], memory: Option<usize>) -> Vec<Outcome> {
+/// Runs the script on a database in memory, in `model` (or each query in the
+/// one chosen for it), with every memory budget (of sorts, joins and hash
+/// tables) at `memory` bytes if given, to make them spill to temporary files.
+fn run_sequoia(script: &[Stmt], model: Option<Model>, memory: Option<usize>) -> Vec<Outcome> {
     let mut db = Database::in_memory();
+    db.set_execution_model(model);
     if let Some(bytes) = memory {
         db.set_sort_memory(bytes);
         db.set_join_memory(bytes);
@@ -1107,25 +1112,44 @@ fn sequoia_agrees_with_sqlite() {
             eprintln!("skipped: no sqlite3 command");
             return;
         };
-        let found = run_sequoia(&script, None);
         statements += script.len();
         queries += script.iter().filter(|s| s.kind != Kind::Other).count();
-        failed += found.iter().zip(&expected).filter(|(a, b)| matches!((a, b), (Outcome::Error(_), Outcome::Error(_)))).count();
         // Again with budgets so small that every sort, join and aggregation spills.
-        for (found, memory) in [(found, None), (run_sequoia(&script, Some(SPILL_MEMORY)), Some(SPILL_MEMORY))] {
-            if let Some(i) = (0..script.len()).find(|&i| !agree(script[i].kind, &found[i], &expected[i])) {
+        'runs: for memory in [None, Some(SPILL_MEMORY)] {
+            let iterator = run_sequoia(&script, Some(Model::Iterator), memory);
+            if memory.is_none() {
+                failed += iterator
+                    .iter()
+                    .zip(&expected)
+                    .filter(|(a, b)| matches!((a, b), (Outcome::Error(_), Outcome::Error(_))))
+                    .count();
+            }
+            let models = Model::ALL.into_iter().map(Some).chain([None]);
+            for model in models {
+                let found = match model {
+                    Some(Model::Iterator) => &iterator,
+                    _ => &run_sequoia(&script, model, memory),
+                };
+                let wrong = |i: usize| match agree(script[i].kind, &found[i], &expected[i]) {
+                    false => Some("sqlite"),
+                    true if found[i] != iterator[i] => Some("the iterator model"),
+                    true => None,
+                };
+                let Some((i, against)) = (0..script.len()).find_map(|i| Some((i, wrong(i)?))) else { continue };
                 let setup: Vec<String> = script[..i].iter().map(|s| format!("{};", s.sequoia)).collect();
-                let budgets = memory.map_or(String::new(), |bytes| format!(" (memory budgets of {bytes} bytes)"));
+                let budgets = memory.map_or(String::new(), |bytes| format!(", memory budgets of {bytes} bytes"));
+                let model = model.map_or("models chosen per query".to_string(), |m| format!("{m} model"));
+                let other = if against == "sqlite" { &expected[i] } else { &iterator[i] };
                 mismatches.push(format!(
-                    "seed {seed}, statement {i}{budgets}:\n  {}\n  sequoia: {:?}\n  sqlite:  {:?}\n  sqlite statement: {}\n  script:\n{}\n{};",
+                    "seed {seed}, statement {i} ({model}{budgets}), against {against}:\n  {}\n  sequoia: {:?}\n  {against}: {:?}\n  sqlite statement: {}\n  script:\n{}\n{};",
                     script[i].sequoia,
                     found[i],
-                    expected[i],
+                    other,
                     script[i].sqlite,
                     setup.join("\n"),
                     script[i].sequoia
                 ));
-                break;
+                break 'runs;
             }
         }
     }

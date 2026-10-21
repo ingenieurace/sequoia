@@ -164,8 +164,6 @@ pub fn eval_with(expr: &Expr, fields: &[Field], row: &[Value], subqueries: &mut 
 
 /// Calls a scalar function on its arguments, which `eval` evaluates.
 fn call(function: Function, args: &[Expr], eval: &mut dyn FnMut(&Expr) -> Result<Value>) -> Result<Value> {
-    use Value::{Int, Null, Real, Text};
-
     if function == Function::Coalesce {
         for arg in args {
             let value = eval(arg)?;
@@ -173,13 +171,24 @@ fn call(function: Function, args: &[Expr], eval: &mut dyn FnMut(&Expr) -> Result
                 return Ok(value);
             }
         }
-        return Ok(Null);
+        return Ok(Value::Null);
     }
     let values: Vec<Value> = args.iter().map(&mut *eval).collect::<Result<_>>()?;
+    apply(function, &values)
+}
+
+/// Applies a scalar function to the values of its arguments. `COALESCE`,
+/// given them all, takes the first that is not NULL.
+pub(crate) fn apply(function: Function, values: &[Value]) -> Result<Value> {
+    use Value::{Int, Null, Real, Text};
+
+    if function == Function::Coalesce {
+        return Ok(values.iter().find(|v| !v.is_null()).cloned().unwrap_or(Null));
+    }
     let wrong = |value: &Value, expected: &str| {
         err(format!("{} expects {expected}, got {}", function.name().to_uppercase(), value.to_sql()))
     };
-    match (function, values.as_slice()) {
+    match (function, values) {
         (Function::Nullif, [a, b]) => {
             Ok(if binary(a.clone(), BinaryOp::Eq, b.clone())? == Value::Bool(true) { Null } else { a.clone() })
         }
@@ -274,7 +283,7 @@ fn round(x: f64, digits: i64) -> f64 {
 
 /// Whether `text` matches a LIKE `pattern`: `%` matches any characters, `_`
 /// any one, and ASCII letters match in either case, as in SQLite.
-fn like(text: &str, pattern: &str) -> bool {
+pub(crate) fn like(text: &str, pattern: &str) -> bool {
     let (text, pattern): (Vec<char>, Vec<char>) = (text.chars().collect(), pattern.chars().collect());
     let (mut t, mut p) = (0, 0);
     // After the last `%` passed: where the pattern goes on, and the text
@@ -303,7 +312,7 @@ fn like(text: &str, pattern: &str) -> bool {
     pattern[p..].iter().all(|&c| c == '%')
 }
 
-fn unary(op: UnaryOp, value: Value) -> Result<Value> {
+pub(crate) fn unary(op: UnaryOp, value: Value) -> Result<Value> {
     match (op, value) {
         (_, Value::Null) => Ok(Value::Null),
         (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
@@ -313,7 +322,7 @@ fn unary(op: UnaryOp, value: Value) -> Result<Value> {
     }
 }
 
-fn binary(left: Value, op: BinaryOp, right: Value) -> Result<Value> {
+pub(crate) fn binary(left: Value, op: BinaryOp, right: Value) -> Result<Value> {
     use BinaryOp::*;
     use Value::{Bool, Int, Null, Text};
 
@@ -385,13 +394,13 @@ fn binary(left: Value, op: BinaryOp, right: Value) -> Result<Value> {
 }
 
 /// A REAL result, or an error if it is too big to be one.
-fn real(r: f64) -> Result<Value> {
+pub(crate) fn real(r: f64) -> Result<Value> {
     match r.is_finite() {
         true => Ok(Value::Real(r)),
         false => err("REAL overflow"),
     }
 }
 
-fn overflow() -> Error {
+pub(crate) fn overflow() -> Error {
     Error("integer overflow".into())
 }

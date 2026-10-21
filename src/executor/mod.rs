@@ -1,14 +1,20 @@
 //! Executes parsed statements against the catalog. A SELECT is planned (see
-//! `plan/query.rs`) and run by `operator`s: `sort` orders rows, `aggregate`
-//! groups them, and `subquery` runs the subqueries of their expressions.
+//! `plan/query.rs`) and run in one of three execution models (see
+//! `model.rs`): `operator`s pass rows on one at a time, `materialize` runs
+//! each step to completion, `vectorized` passes batches of columns. `sort`
+//! orders rows, `aggregate` groups them, and `subquery` runs the subqueries
+//! of their expressions.
 
 pub mod aggregate;
 pub mod hash_join;
 pub mod join;
+mod materialize;
+pub mod model;
 pub mod operator;
 pub mod sort;
 pub mod spill;
 pub mod subquery;
+pub mod vectorized;
 
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -23,6 +29,7 @@ use crate::sql::ast::{Expr, Select, Statement};
 use crate::sql::eval::{Field, eval_with, matches_with};
 use crate::types::Value;
 use join::{HASH_MEMORY, JOIN_MEMORY};
+use model::Model;
 use operator::{Profile, Rows, StepCount};
 use sort::SORT_MEMORY;
 use subquery::Runner;
@@ -39,11 +46,14 @@ pub struct Settings {
     /// Bytes of right rows a hash join, or of groups a hash aggregation, may
     /// hold before it writes partitions of them to temporary files.
     pub hash_memory: usize,
+    /// The execution model every query runs in; by default, none: each
+    /// query runs in the one that suits it (see [`model::choose`]).
+    pub model: Option<Model>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { sort_memory: SORT_MEMORY, join_memory: JOIN_MEMORY, hash_memory: HASH_MEMORY }
+        Settings { sort_memory: SORT_MEMORY, join_memory: JOIN_MEMORY, hash_memory: HASH_MEMORY, model: None }
     }
 }
 
@@ -108,7 +118,7 @@ impl Iterator for Query<'_> {
 /// Plans a SELECT and starts running it; no row is read until asked for.
 pub fn select<'a>(catalog: &'a Catalog, query: Select, settings: &Settings) -> Result<Query<'a>> {
     let plan = query::select(catalog, query)?;
-    Ok(Query { columns: plan.columns, rows: operator::open(plan.root, catalog, settings) })
+    Ok(Query { columns: plan.columns, rows: model::open(plan.root, catalog, settings) })
 }
 
 /// Describes how a statement would run: its plan, one step per line, the
@@ -129,20 +139,23 @@ fn explain(catalog: &Catalog, statement: Statement) -> Result<QueryResult> {
 /// Runs a SELECT, reading all of its rows, and describes its plan as
 /// EXPLAIN does, each step followed by what it did: the rows it returned and
 /// the time it took, the time of the steps below it included (and, if it
-/// ran more than once, how often). A last line gives the query's rows and time.
+/// ran more than once, how often). A first line gives the execution model it
+/// ran in and why, a last line the query's rows and time.
 fn explain_analyze(catalog: &Catalog, query: Select, settings: &Settings) -> Result<QueryResult> {
     let root = query::select(catalog, query)?.root;
     let lines = root.explain_lines();
+    let (model, why) = model::choose(&root, settings);
     let profile = Rc::new(Profile::new(lines.len()));
     let start = Instant::now();
     let mut returned = 0;
-    for row in operator::open_profiled(root, catalog, settings, &profile) {
+    for row in model::open_in(model, root, catalog, settings, Some((profile.clone(), 0))) {
         row?;
         returned += 1;
     }
     let time = start.elapsed();
 
-    let mut out: Vec<String> = lines
+    let mut out = vec![format!("MODEL {model}  ({why})")];
+    out.extend(lines
         .into_iter()
         .zip(profile.counts())
         .map(|(line, count)| {
@@ -153,8 +166,7 @@ fn explain_analyze(catalog: &Catalog, query: Select, settings: &Settings) -> Res
                 StepCount { runs, rows, time, .. } => format!("{} in {runs} runs, {}", rows_of(rows), ms(time)),
             };
             format!("{line}  ({did})")
-        })
-        .collect();
+        }));
     out.push(format!("{} in {}", rows_of(returned), ms(time)));
     Ok(message(out.join("\n")))
 }

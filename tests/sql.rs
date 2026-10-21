@@ -1,7 +1,32 @@
+//! SQL statements end to end. Every query runs in the execution model each
+//! chooses for itself, or with `SEQUOIA_MODEL` set (to `iterator`,
+//! `materialization` or `vectorized`), all in that one.
+
+use sequoia::executor::model::Model;
 use sequoia::{Database, QueryResult, Value};
 
-fn setup() -> Database {
+/// The model `SEQUOIA_MODEL` names, if it is set.
+fn model() -> Option<Model> {
+    let name = std::env::var("SEQUOIA_MODEL").ok()?;
+    Some(Model::from_name(&name).unwrap_or_else(|| panic!("SEQUOIA_MODEL={name} names no model")))
+}
+
+/// A database in memory, running queries in [`model`].
+fn in_memory() -> Database {
     let mut db = Database::in_memory();
+    db.set_execution_model(model());
+    db
+}
+
+/// A database stored in a file, running queries in [`model`].
+fn open(path: impl AsRef<std::path::Path>) -> sequoia::Result<Database> {
+    let mut db = Database::open(path)?;
+    db.set_execution_model(model());
+    Ok(db)
+}
+
+fn setup() -> Database {
+    let mut db = in_memory();
     db.execute(
         "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT, active BOOL);
          INSERT INTO users VALUES (1, 'alice', 30, TRUE), (2, 'bob', 25, FALSE);
@@ -104,11 +129,11 @@ fn persists_to_disk() {
     let path = std::env::temp_dir().join(format!("sequoia-test-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::open(&path).unwrap();
+        let mut db = open(&path).unwrap();
         db.execute("CREATE TABLE notes (id INT PRIMARY KEY, body TEXT)").unwrap();
         db.execute("INSERT INTO notes VALUES (1, 'it''s here'), (2, NULL)").unwrap();
     }
-    let mut db = Database::open(&path).unwrap();
+    let mut db = open(&path).unwrap();
     assert_eq!(
         query(&mut db, "SELECT * FROM notes ORDER BY id"),
         vec![vec![int(1), text("it's here")], vec![int(2), Value::Null]]
@@ -144,7 +169,7 @@ fn file_size(db: &mut Database, path: &std::path::Path) -> u64 {
 fn large_tables_span_pages_and_survive_reopen() {
     let path = TempDb::new("large");
     {
-        let mut db = Database::open(&path.0).unwrap();
+        let mut db = open(&path.0).unwrap();
         db.execute("CREATE TABLE logs (id INT PRIMARY KEY, msg TEXT)").unwrap();
         for i in 0..500 {
             db.execute(&format!("INSERT INTO logs VALUES ({i}, '{}')", "x".repeat(100))).unwrap();
@@ -152,7 +177,7 @@ fn large_tables_span_pages_and_survive_reopen() {
         db.execute("DELETE FROM logs WHERE id >= 400").unwrap();
         db.execute("UPDATE logs SET msg = 'short' WHERE id < 10").unwrap();
     }
-    let mut db = Database::open(&path.0).unwrap();
+    let mut db = open(&path.0).unwrap();
     assert_eq!(query(&mut db, "SELECT id FROM logs").len(), 400);
     assert_eq!(query(&mut db, "SELECT msg FROM logs WHERE id = 5"), vec![vec![text("short")]]);
     // Inserts and key checks still work after reopening.
@@ -163,7 +188,7 @@ fn large_tables_span_pages_and_survive_reopen() {
 #[test]
 fn dropped_tables_free_their_pages() {
     let path = TempDb::new("drop");
-    let mut db = Database::open(&path.0).unwrap();
+    let mut db = open(&path.0).unwrap();
     let fill = |db: &mut Database| {
         db.execute("CREATE TABLE t (body TEXT)").unwrap();
         for _ in 0..100 {
@@ -177,7 +202,7 @@ fn dropped_tables_free_their_pages() {
     assert_eq!(file_size(&mut db, &path.0), size, "freed pages are reused");
 
     drop(db);
-    let mut db = Database::open(&path.0).unwrap();
+    let mut db = open(&path.0).unwrap();
     assert_eq!(db.table_names(), vec!["t"]);
     assert_eq!(query(&mut db, "SELECT * FROM t").len(), 100);
 }
@@ -194,7 +219,7 @@ fn rows_larger_than_a_page_are_rejected() {
 fn deleted_space_is_reused_after_reopening() {
     let path = TempDb::new("reuse");
     let size = {
-        let mut db = Database::open(&path.0).unwrap();
+        let mut db = open(&path.0).unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, body TEXT)").unwrap();
         for i in 0..200 {
             db.execute(&format!("INSERT INTO t VALUES ({i}, '{}')", "x".repeat(100))).unwrap();
@@ -203,7 +228,7 @@ fn deleted_space_is_reused_after_reopening() {
         file_size(&mut db, &path.0)
     };
 
-    let mut db = Database::open(&path.0).unwrap();
+    let mut db = open(&path.0).unwrap();
     for i in 0..100 {
         db.execute(&format!("INSERT INTO t VALUES ({i}, '{}')", "y".repeat(100))).unwrap();
     }
@@ -214,7 +239,7 @@ fn deleted_space_is_reused_after_reopening() {
 #[test]
 fn updates_that_grow_rows_keep_every_row() {
     let path = TempDb::new("grow");
-    let mut db = Database::open(&path.0).unwrap();
+    let mut db = open(&path.0).unwrap();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, body TEXT)").unwrap();
     for i in 0..100 {
         db.execute(&format!("INSERT INTO t VALUES ({i}, 'x')")).unwrap();
@@ -227,14 +252,14 @@ fn updates_that_grow_rows_keep_every_row() {
     // Rows too big for their page move elsewhere.
     db.execute(&format!("UPDATE t SET body = '{}' WHERE id < 50", "z".repeat(500))).unwrap();
     drop(db);
-    let mut db = Database::open(&path.0).unwrap();
+    let mut db = open(&path.0).unwrap();
     assert_eq!(query(&mut db, "SELECT id FROM t").len(), 100);
     assert_eq!(query(&mut db, "SELECT id FROM t WHERE body = 'y'").len(), 50);
     assert_eq!(query(&mut db, &format!("SELECT id FROM t WHERE body = '{}'", "z".repeat(500))).len(), 50);
 }
 
 fn setup_lsm() -> Database {
-    let mut db = Database::in_memory();
+    let mut db = in_memory();
     db.execute(
         "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT, active BOOL) USING LSM;
          INSERT INTO users VALUES (1, 'alice', 30, TRUE), (2, 'bob', 25, FALSE);
@@ -283,7 +308,7 @@ fn lsm_tables_enforce_constraints() {
 
 #[test]
 fn storage_clause_is_parsed_and_checked() {
-    let mut db = Database::in_memory();
+    let mut db = in_memory();
     db.execute("CREATE TABLE a (x INT) using lsm").unwrap();
     db.execute("CREATE TABLE b (x INT) USING heap").unwrap();
     db.execute("CREATE TABLE d (x INT) USING Column").unwrap();
@@ -297,7 +322,7 @@ fn lsm_tables_survive_flushes_compactions_and_reopening() {
     let path = TempDb::new("lsm");
     let row = |i: i64, tag: &str| vec![int(i), text(&format!("{tag}{}", "x".repeat(100)))];
     {
-        let mut db = Database::open(&path.0).unwrap();
+        let mut db = open(&path.0).unwrap();
         db.execute("CREATE TABLE logs (id INT PRIMARY KEY, msg TEXT) USING LSM").unwrap();
         // About 1 MB of writes: many MemTable flushes and several compactions.
         for batch in 0..30 {
@@ -309,7 +334,7 @@ fn lsm_tables_survive_flushes_compactions_and_reopening() {
         db.execute("DELETE FROM logs WHERE id >= 7000").unwrap();
     }
 
-    let mut db = Database::open(&path.0).unwrap();
+    let mut db = open(&path.0).unwrap();
     assert_eq!(query(&mut db, "SELECT id FROM logs").len(), 7000);
     assert_eq!(query(&mut db, "SELECT * FROM logs WHERE id = 5"), vec![row(5, "new")]);
     assert_eq!(query(&mut db, "SELECT * FROM logs WHERE id = 6999"), vec![row(6999, "v27")]);
@@ -322,12 +347,12 @@ fn lsm_tables_survive_flushes_compactions_and_reopening() {
 fn lsm_tables_without_a_primary_key_use_rowids() {
     let path = TempDb::new("rowid");
     {
-        let mut db = Database::open(&path.0).unwrap();
+        let mut db = open(&path.0).unwrap();
         db.execute("CREATE TABLE events (name TEXT) USING LSM").unwrap();
         db.execute("INSERT INTO events VALUES ('a'), ('a'), ('b')").unwrap();
         db.execute("UPDATE events SET name = 'c' WHERE name = 'b'").unwrap();
     }
-    let mut db = Database::open(&path.0).unwrap();
+    let mut db = open(&path.0).unwrap();
     // New rows after reopening must not overwrite old ones.
     db.execute("INSERT INTO events VALUES ('d')").unwrap();
     assert_eq!(
@@ -339,7 +364,7 @@ fn lsm_tables_without_a_primary_key_use_rowids() {
 #[test]
 fn dropped_lsm_tables_free_their_pages() {
     let path = TempDb::new("lsm-drop");
-    let mut db = Database::open(&path.0).unwrap();
+    let mut db = open(&path.0).unwrap();
     let fill = |db: &mut Database| {
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, body TEXT) USING LSM").unwrap();
         for i in 0..1000 {
@@ -354,7 +379,7 @@ fn dropped_lsm_tables_free_their_pages() {
 }
 
 fn setup_column() -> Database {
-    let mut db = Database::in_memory();
+    let mut db = in_memory();
     db.execute(
         "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT, active BOOL) USING COLUMN;
          INSERT INTO users VALUES (1, 'alice', 30, TRUE), (2, 'bob', 25, FALSE);
@@ -401,7 +426,7 @@ fn column_tables_survive_migrations_and_reopening() {
     let path = TempDb::new("column");
     let cities = ["lima", "oslo", "paris", "tokyo"];
     {
-        let mut db = Database::open(&path.0).unwrap();
+        let mut db = open(&path.0).unwrap();
         db.execute("CREATE TABLE visits (id INT PRIMARY KEY, city TEXT, nights INT, paid BOOL) USING COLUMN").unwrap();
         // Several row groups of 1024 rows, plus rows left in the delta store.
         for batch in 0..5 {
@@ -419,7 +444,7 @@ fn column_tables_survive_migrations_and_reopening() {
         db.execute("DELETE FROM visits WHERE city = 'oslo'").unwrap();
     }
 
-    let mut db = Database::open(&path.0).unwrap();
+    let mut db = open(&path.0).unwrap();
     assert_eq!(query(&mut db, "SELECT id FROM visits").len(), 3750);
     assert_eq!(query(&mut db, "SELECT city FROM visits WHERE city = 'rome'").len(), 50);
     assert!(query(&mut db, "SELECT id FROM visits WHERE city = 'oslo'").is_empty());
@@ -444,7 +469,7 @@ fn column_tables_survive_migrations_and_reopening() {
 #[test]
 fn dropped_column_tables_free_their_pages() {
     let path = TempDb::new("column-drop");
-    let mut db = Database::open(&path.0).unwrap();
+    let mut db = open(&path.0).unwrap();
     let fill = |db: &mut Database| {
         db.execute("CREATE TABLE t (id INT, body TEXT) USING COLUMN").unwrap();
         for batch in 0..3 {
@@ -462,7 +487,7 @@ fn dropped_column_tables_free_their_pages() {
 
 #[test]
 fn column_tables_filter_compressed_chunks_like_heap_tables() {
-    let mut db = Database::in_memory();
+    let mut db = in_memory();
     let cities = ["lima", "oslo", "paris", "tokyo"];
     for storage in ["HEAP", "COLUMN"] {
         let schema = "(id INT PRIMARY KEY, city TEXT, nights INT, paid BOOL)";
@@ -577,7 +602,7 @@ fn heap_primary_keys_and_created_indexes_are_used_by_where() {
 
 #[test]
 fn indexed_tables_answer_like_unindexed_ones() {
-    let mut db = Database::in_memory();
+    let mut db = in_memory();
     for storage in ["HEAP", "LSM"] {
         for indexed in [false, true] {
             let t = format!("{storage}_{indexed}");
@@ -658,7 +683,7 @@ fn indexed_tables_answer_like_unindexed_ones() {
 
 #[test]
 fn lsm_primary_key_ranges_read_only_their_keys() {
-    let mut db = Database::in_memory();
+    let mut db = in_memory();
     for (t, key) in [("ints", "INT"), ("texts", "TEXT")] {
         db.execute(&format!("CREATE TABLE {t} (k {key} PRIMARY KEY, v INT) USING LSM")).unwrap();
         // Enough rows to fill SSTables, then deletes and new rows still in the MemTable.
@@ -761,12 +786,12 @@ fn indexes_survive_reopening_and_are_dropped_with_their_table() {
         }
     };
     {
-        let mut db = Database::open(&path.0).unwrap();
+        let mut db = open(&path.0).unwrap();
         fill(&mut db);
         db.execute("CREATE INDEX t_n ON t (n)").unwrap();
         db.execute("DELETE FROM t WHERE n >= 1000").unwrap();
     }
-    let mut db = Database::open(&path.0).unwrap();
+    let mut db = open(&path.0).unwrap();
     assert_eq!(plan(&mut db, "SELECT * FROM t WHERE tag = 'tag7'"), "SEARCH t USING INDEX t_tag (tag = 'tag7')");
     assert_eq!(query(&mut db, "SELECT id FROM t WHERE tag = 'tag7'").len(), 20);
     assert_eq!(query(&mut db, "SELECT id FROM t WHERE n >= 990").len(), 10);
@@ -782,13 +807,13 @@ fn indexes_survive_reopening_and_are_dropped_with_their_table() {
     assert_eq!(file_size(&mut db, &path.0), size, "the indexes' pages were freed and reused");
     drop(db);
 
-    let mut db = Database::open(&path.0).unwrap();
+    let mut db = open(&path.0).unwrap();
     assert_eq!(query(&mut db, "SELECT id FROM t WHERE tag = 'tag1'").len(), 40);
 }
 
 #[test]
 fn several_keys_expressions_partial_and_covering_indexes_are_used() {
-    let mut db = Database::in_memory();
+    let mut db = in_memory();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, city TEXT, nights INT, status TEXT)").unwrap();
     let values: Vec<String> = (0..200)
         .map(|id| {
@@ -868,7 +893,7 @@ fn several_keys_expressions_partial_and_covering_indexes_are_used() {
 
 #[test]
 fn indexes_of_every_kind_answer_like_no_index() {
-    let mut db = Database::in_memory();
+    let mut db = in_memory();
     let indexes = [
         "CREATE INDEX {t}_a ON {t} (city, nights)",
         "CREATE INDEX {t}_b ON {t} (LOWER(city), nights * 2 + 1)",
@@ -967,7 +992,7 @@ fn indexes_of_every_kind_answer_like_no_index() {
 #[test]
 fn hash_indexes_find_rows_whose_every_key_is_fixed() {
     let file = TempDb::new("hash-index");
-    let mut db = Database::open(&file.0).unwrap();
+    let mut db = open(&file.0).unwrap();
     db.execute(
         "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, n INT, x REAL);
          CREATE INDEX t_name ON t USING HASH (name);
@@ -1010,7 +1035,7 @@ fn hash_indexes_find_rows_whose_every_key_is_fixed() {
     assert!(db.execute("INSERT INTO t VALUES (5000, 'new', 1, 1.0), (1, 'dup', 1, 1.0)").is_err());
     db.execute("BEGIN; DELETE FROM t WHERE n = 103; ROLLBACK").unwrap();
     drop(db);
-    let mut db = Database::open(&file.0).unwrap();
+    let mut db = open(&file.0).unwrap();
     for (sql, count) in [
         ("SELECT COUNT(*) FROM t WHERE name = 'renamed'", 1000),
         ("SELECT COUNT(*) FROM t WHERE name = 'name 207'", 4),
@@ -1044,7 +1069,7 @@ fn hash_indexes_find_rows_whose_every_key_is_fixed() {
 
 #[test]
 fn unique_indexes_of_several_keys_or_partial_ones_reject_duplicates() {
-    let mut db = Database::in_memory();
+    let mut db = in_memory();
     db.execute("CREATE TABLE r (id INT PRIMARY KEY, room INT, day INT, active BOOL)").unwrap();
     db.execute("CREATE UNIQUE INDEX r_booking ON r (room, day) WHERE active").unwrap();
     db.execute("INSERT INTO r VALUES (1, 1, 1, TRUE), (2, 1, 2, TRUE), (3, 2, 1, TRUE), (4, 1, 1, FALSE)").unwrap();
@@ -1097,14 +1122,14 @@ fn index_definitions_are_checked() {
 fn indexes_of_every_kind_survive_reopening() {
     let path = TempDb::new("index-kinds");
     {
-        let mut db = Database::open(&path.0).unwrap();
+        let mut db = open(&path.0).unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, n INT, x REAL)").unwrap();
         db.execute("INSERT INTO t VALUES (1, 'a', -1, 1.0), (2, 'B', 2, 2.5), (3, 'c', NULL, -0.5), (4, NULL, 4, 3.0)")
             .unwrap();
         db.execute("CREATE INDEX t_k ON t (LOWER(name), - -n) INCLUDE (x, name) WHERE x > 0 AND name IS NOT NULL").unwrap();
         db.execute("CREATE UNIQUE INDEX t_u ON t (x, n)").unwrap();
     }
-    let mut db = Database::open(&path.0).unwrap();
+    let mut db = open(&path.0).unwrap();
     assert_eq!(
         plan(&mut db, "SELECT x FROM t WHERE lower(name) = 'b' AND x > 0 AND name IS NOT NULL"),
         "SEARCH t USING COVERING INDEX t_k (LOWER(name) = 'b')"
@@ -1122,7 +1147,7 @@ fn indexes_of_every_kind_survive_reopening() {
 
 #[test]
 fn order_by_gives_the_same_rows_when_sorts_spill_to_disk() {
-    let mut db = Database::in_memory();
+    let mut db = in_memory();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, k INT, name TEXT)").unwrap();
     let values: Vec<String> = (0..3000i64)
         .map(|id| {
@@ -1171,7 +1196,7 @@ fn limit_without_order_by_stops_reading_rows() {
 }
 
 fn setup_people(storage: &str) -> Database {
-    let mut db = Database::in_memory();
+    let mut db = in_memory();
     db.execute(&format!("CREATE TABLE p (id INT PRIMARY KEY, city TEXT, age INT, vip BOOL) USING {storage}")).unwrap();
     db.execute(
         "INSERT INTO p VALUES (1, 'oslo', 30, TRUE), (2, 'lima', NULL, FALSE), (3, 'oslo', 21, FALSE),
@@ -1444,7 +1469,7 @@ fn query_streams_rows_as_they_are_produced() {
 }
 
 fn setup_shop() -> Database {
-    let mut db = Database::in_memory();
+    let mut db = in_memory();
     db.execute(
         "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, city TEXT);
          CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, total INT);
@@ -1574,7 +1599,7 @@ fn every_join_method_and_storage_agrees_with_a_nested_loop() {
     ];
     for storage in ["HEAP", "LSM", "COLUMN"] {
         for indexed in [false, true] {
-            let mut db = Database::in_memory();
+            let mut db = in_memory();
             db.execute(&format!("CREATE TABLE a (id INT PRIMARY KEY, k INT, tag TEXT) USING {storage}")).unwrap();
             db.execute(&format!("CREATE TABLE b (id INT PRIMARY KEY, a_k INT, v INT) USING {storage}")).unwrap();
             if indexed && storage != "COLUMN" {
@@ -1621,7 +1646,7 @@ fn every_join_method_and_storage_agrees_with_a_nested_loop() {
 
 #[test]
 fn index_join_is_picked_for_few_left_rows_by_row_counts() {
-    let mut db = Database::in_memory();
+    let mut db = in_memory();
     db.execute(
         "CREATE TABLE l (id INT PRIMARY KEY, k INT);
          CREATE TABLE r (id INT PRIMARY KEY, k INT, v INT);
@@ -1698,7 +1723,7 @@ fn merge_join_stands_in_for_an_order_by_on_its_keys() {
 
 #[test]
 fn merge_join_agrees_with_a_hash_join_and_a_sort() {
-    let mut db = Database::in_memory();
+    let mut db = in_memory();
     db.execute(
         "CREATE TABLE a (id INT PRIMARY KEY, k INT, g INT);
          CREATE TABLE b (id INT PRIMARY KEY, k INT, t TEXT, h INT);
@@ -1774,7 +1799,7 @@ fn merge_join_agrees_with_a_hash_join_and_a_sort() {
 
 #[test]
 fn block_nested_loop_join_agrees_for_every_block_size() {
-    let mut db = Database::in_memory();
+    let mut db = in_memory();
     db.execute(
         "CREATE TABLE a (id INT PRIMARY KEY, k INT);
          CREATE TABLE b (id INT PRIMARY KEY, v INT);
@@ -1815,7 +1840,7 @@ fn block_nested_loop_join_agrees_for_every_block_size() {
 
 #[test]
 fn hash_joins_and_aggregates_spill_partitions_past_their_budget() {
-    let mut db = Database::in_memory();
+    let mut db = in_memory();
     db.execute(
         "CREATE TABLE a (id INT PRIMARY KEY, k INT, s TEXT);
          CREATE TABLE b (id INT PRIMARY KEY, k REAL, one INT, t TEXT);",
@@ -2096,7 +2121,7 @@ fn every_storage_answers_subqueries_alike() {
     ];
     let mut results = Vec::new();
     for storage in ["HEAP", "LSM", "COLUMN"] {
-        let mut db = Database::in_memory();
+        let mut db = in_memory();
         db.execute(&format!(
             "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, city TEXT) USING {storage};
              CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, total INT) USING {storage};
@@ -2231,12 +2256,12 @@ fn transaction_statements_are_checked() {
 fn closing_the_database_rolls_back_an_open_transaction() {
     let path = TempDb::new("tx");
     {
-        let mut db = Database::open(&path.0).unwrap();
+        let mut db = open(&path.0).unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY); INSERT INTO t VALUES (1)").unwrap();
         db.execute("BEGIN; INSERT INTO t VALUES (2); COMMIT").unwrap();
         db.execute("BEGIN; INSERT INTO t VALUES (3); DELETE FROM t WHERE id = 1").unwrap();
     }
-    let mut db = Database::open(&path.0).unwrap();
+    let mut db = open(&path.0).unwrap();
     assert_eq!(ints(query(&mut db, "SELECT id FROM t ORDER BY id")), [int(1), int(2)]);
     assert!(!db.in_transaction());
 }
@@ -2333,10 +2358,11 @@ fn select_list_names_and_order_by_them() {
 }
 
 /// What EXPLAIN ANALYZE says each step did, without its times: each line's
-/// step, and what follows it in parentheses, then the query's rows.
+/// step, and what follows it in parentheses, then the query's rows. The
+/// first line, the execution model, is left out.
 fn analyzed(db: &mut Database, sql: &str) -> Vec<(String, String)> {
     let plan = explain(db, &format!("ANALYZE {sql}"));
-    let mut lines: Vec<&str> = plan.lines().collect();
+    let mut lines: Vec<&str> = plan.lines().skip(1).collect();
     let total = lines.pop().unwrap();
     let without_time = |did: &str| match did.rsplit_once(", ") {
         Some((did, time)) if time.ends_with(" ms") => did.to_string(),
@@ -2357,6 +2383,7 @@ fn analyzed(db: &mut Database, sql: &str) -> Vec<(String, String)> {
 
 #[test]
 fn explain_analyze_tells_what_each_step_did() {
+    // What the models chosen per query do.
     let mut db = Database::in_memory();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, g INT)").unwrap();
     db.execute("CREATE TABLE u (id INT PRIMARY KEY, g INT)").unwrap();
@@ -2529,7 +2556,7 @@ fn offset_and_union() {
 
 #[test]
 fn real_numbers() {
-    let mut db = Database::in_memory();
+    let mut db = in_memory();
     for storage in ["HEAP", "LSM", "COLUMN"] {
         let t = format!("prices_{storage}");
         db.execute(&format!("CREATE TABLE {t} (id INT PRIMARY KEY, price REAL, qty INT) USING {storage}")).unwrap();
@@ -2584,11 +2611,184 @@ fn real_numbers() {
 
     let file = TempDb::new("reals");
     {
-        let mut db = Database::open(&file.0).unwrap();
+        let mut db = open(&file.0).unwrap();
         db.execute("CREATE TABLE r (x REAL PRIMARY KEY) USING LSM; INSERT INTO r VALUES (0.5), (-1e-7), (3)").unwrap();
     }
-    let mut db = Database::open(&file.0).unwrap();
+    let mut db = open(&file.0).unwrap();
     assert_eq!(query(&mut db, "SELECT x FROM r WHERE x > -1 ORDER BY x DESC"), [vec![real(3.0)], vec![real(0.5)], vec![
         real(-1e-7)
     ]]);
+}
+
+
+/// A heap table and a column table of the same `n` rows, with NULLs, many
+/// batches and row groups of them, and a small table to join them with.
+fn models_setup(n: i64) -> Database {
+    let mut db = Database::in_memory();
+    for (table, storage) in [("h", "HEAP"), ("c", "COLUMN")] {
+        db.execute(&format!("CREATE TABLE {table} (id INT PRIMARY KEY, g INT, x REAL, name TEXT, flag BOOL) USING {storage}"))
+            .unwrap();
+        for start in (0..n).step_by(1000) {
+            let rows: Vec<String> = (start..n.min(start + 1000))
+                .map(|i| {
+                    let g = if i % 11 == 0 { "NULL".to_string() } else { (i % 7).to_string() };
+                    let x = if i % 13 == 0 { "NULL".to_string() } else { format!("{}.5", i % 100) };
+                    format!("({i}, {g}, {x}, 'n{}', {})", i % 50, i % 3 == 0)
+                })
+                .collect();
+            db.execute(&format!("INSERT INTO {table} VALUES {}", rows.join(", "))).unwrap();
+        }
+    }
+    db.execute("CREATE TABLE k (g INT PRIMARY KEY, label TEXT)").unwrap();
+    db.execute("INSERT INTO k VALUES (0, 'zero'), (1, 'one'), (2, 'two'), (3, 'three'), (5, 'five')").unwrap();
+    db
+}
+
+/// What a statement returns in `model`: its rows, or its error.
+fn outcome(db: &mut Database, model: Option<Model>, sql: &str) -> Result<Vec<Vec<Value>>, String> {
+    db.set_execution_model(model);
+    match db.execute(sql) {
+        Ok(mut results) => match results.pop() {
+            Some(QueryResult::Rows { rows, .. }) => Ok(rows),
+            other => panic!("expected rows, got {other:?}"),
+        },
+        Err(e) => Err(e.0),
+    }
+}
+
+/// The model EXPLAIN ANALYZE says a query ran in, and why.
+fn model_of(db: &mut Database, sql: &str) -> String {
+    explain(db, &format!("ANALYZE {sql}")).lines().next().unwrap().to_string()
+}
+
+#[test]
+fn every_execution_model_returns_the_same_rows() {
+    let mut db = models_setup(5000);
+    for table in ["h", "c"] {
+        let queries = [
+            "SELECT * FROM {t}",
+            "SELECT id, g * 2 + 1, x / 2, name || '!', NOT flag FROM {t} WHERE g > 2 AND x < 40.0",
+            "SELECT id FROM {t} WHERE g IS NULL OR name LIKE 'n1%'",
+            "SELECT id, g IN (1, 3, NULL), g NOT IN (2, 4) FROM {t} WHERE id < 100",
+            "SELECT id, CASE WHEN g > 3 THEN 'high' WHEN g IS NULL THEN 'none' ELSE 'low' END, COALESCE(g, -1) FROM {t}",
+            "SELECT ABS(g - 3), UPPER(name), LENGTH(name), ROUND(x, 1), NULLIF(g, 0) FROM {t} WHERE id < 60",
+            "SELECT COUNT(*), COUNT(g), SUM(g), SUM(x), AVG(g), AVG(x), MIN(x), MAX(name), MIN(id), MAX(id) FROM {t}",
+            "SELECT COUNT(*), SUM(id) FROM {t} WHERE flag",
+            "SELECT g, COUNT(*), SUM(x), MIN(name), COUNT(DISTINCT name) FROM {t} GROUP BY g",
+            "SELECT g, flag, AVG(x) FROM {t} GROUP BY g, flag HAVING COUNT(*) > 200 ORDER BY g, flag",
+            "SELECT COUNT(DISTINCT g), SUM(DISTINCT g) FROM {t}",
+            "SELECT DISTINCT g, flag FROM {t}",
+            "SELECT id, name FROM {t} ORDER BY x DESC, id LIMIT 25 OFFSET 10",
+            "SELECT id FROM {t} LIMIT 1500 OFFSET 1000",
+            "SELECT id FROM {t} WHERE g = 3 LIMIT 3",
+            "SELECT t.id, k.label FROM {t} t JOIN k ON k.g = t.g WHERE t.id < 300",
+            "SELECT t.id, k.label FROM {t} t LEFT JOIN k ON k.g = t.g AND k.label <> 'one' WHERE t.id < 300",
+            "SELECT k.label, COUNT(*) FROM {t} t JOIN k ON k.g = t.g GROUP BY k.label ORDER BY k.label",
+            "SELECT a.id, b.id FROM {t} a JOIN {t} b ON b.id = a.id + 1 WHERE a.id < 50",
+            "SELECT id FROM {t} WHERE id < 10 UNION SELECT g FROM {t} WHERE g IS NOT NULL",
+            "SELECT id FROM {t} WHERE id < 5 UNION ALL SELECT id FROM {t} WHERE id > 4995",
+            "SELECT d.g, d.n FROM (SELECT g, COUNT(*) AS n FROM {t} GROUP BY g) d WHERE d.n > 600",
+            "SELECT id, (SELECT label FROM k WHERE k.g = t.g) FROM {t} t WHERE id < 40",
+            "SELECT id FROM {t} t WHERE EXISTS (SELECT 1 FROM k WHERE k.g = t.g) AND id < 100",
+            "SELECT COUNT(*) FROM {t} WHERE g IN (SELECT g FROM k)",
+            "SELECT id FROM {t} WHERE id > 100000",
+            "SELECT SUM(g) FROM {t} WHERE id > 100000",
+        ];
+        for sql in queries {
+            let sql = sql.replace("{t}", table);
+            let expected = outcome(&mut db, Some(Model::Iterator), &sql);
+            assert!(expected.is_ok(), "{sql}: {expected:?}");
+            for model in [Some(Model::Materialization), Some(Model::Vectorized), None] {
+                assert_eq!(outcome(&mut db, model, &sql), expected, "{sql} in {model:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn every_execution_model_fails_on_the_row_the_iterator_model_does() {
+    let mut db = models_setup(3000);
+    // Row 500 divides by zero, row 2000 overflows: the first a row at a time is the error.
+    db.execute("UPDATE h SET g = 1 WHERE g = 0").unwrap();
+    db.execute("UPDATE h SET g = 0 WHERE id = 500").unwrap();
+    db.execute("UPDATE h SET g = 9223372036854775807 WHERE id = 2000").unwrap();
+    for (sql, fails) in [
+        // A LIMIT that has its rows before the error ends the query without it,
+        // though a batch of 1024 rows holds it.
+        ("SELECT id / g FROM h WHERE g IS NOT NULL LIMIT 10", false),
+        ("SELECT id / g FROM h WHERE g IS NOT NULL LIMIT 600", true),
+        ("SELECT id FROM h WHERE id / g > 0 LIMIT 100", false),
+        ("SELECT id FROM h WHERE id / g >= 0", true),
+        ("SELECT id, g + g FROM h WHERE id > 1000 LIMIT 500", false),
+        ("SELECT id, g + g FROM h WHERE id > 1000", true),
+        ("SELECT SUM(g) FROM h WHERE id < 1500", false),
+        ("SELECT SUM(g) FROM h", true),
+        ("SELECT COUNT(*), MAX(g), SUM(x) FROM h", false),
+        ("SELECT SUM(g + g) FROM h", true),
+        ("SELECT SUM(g * 1000000000000) FROM h", true),
+        ("SELECT g, SUM(id / g) FROM h GROUP BY g", true),
+        // The select list is evaluated on the 3 rows the sort keeps, its keys on all.
+        ("SELECT id, id / g FROM h ORDER BY id LIMIT 3", false),
+        ("SELECT id FROM h ORDER BY id / g LIMIT 3", true),
+        ("SELECT id FROM h WHERE g = 'text' LIMIT 1", true),
+    ] {
+        let expected = outcome(&mut db, Some(Model::Iterator), sql);
+        assert_eq!(expected.is_err(), fails, "{sql}: {expected:?}");
+        for model in [Some(Model::Materialization), Some(Model::Vectorized), None] {
+            assert_eq!(outcome(&mut db, model, sql), expected, "{sql} in {model:?}");
+        }
+    }
+}
+
+#[test]
+fn each_query_runs_in_the_model_that_suits_it() {
+    let mut db = models_setup(20_000);
+    // A lookup of a few rows: each step hands on all of its rows at once.
+    assert!(model_of(&mut db, "SELECT * FROM h WHERE id = 7").starts_with("MODEL materialization  (at most about 1 row "));
+    assert!(model_of(&mut db, "SELECT label FROM k").starts_with("MODEL materialization"));
+    // Scanning and aggregating many rows: batches of columns.
+    assert!(model_of(&mut db, "SELECT g, COUNT(*) FROM h GROUP BY g").starts_with("MODEL vectorized  (about 20000 rows at a step"));
+    // A whole column table is read, however few rows its filter keeps.
+    assert!(model_of(&mut db, "SELECT id, x FROM c WHERE g = 1").starts_with("MODEL vectorized"));
+    assert!(model_of(&mut db, "SELECT * FROM h WHERE g = 1 LIMIT 5").starts_with("MODEL vectorized"));
+    // Joins work on rows: streamed a row at a time.
+    let joined = model_of(&mut db, "SELECT t.id, k.label FROM h t JOIN k ON k.g = t.g");
+    assert!(joined.starts_with("MODEL iterator  (up to about 20000 rows at a step, through a join"), "{joined}");
+    // Subqueries run a row at a time anyway.
+    assert!(model_of(&mut db, "SELECT COUNT(*) FROM h t WHERE EXISTS (SELECT 1 FROM k WHERE k.g = t.g)").starts_with("MODEL iterator"));
+    // Too many rows to hold, too few for batches.
+    db.execute("DELETE FROM h WHERE id >= 1000").unwrap();
+    let some = model_of(&mut db, "SELECT * FROM h WHERE g = 1");
+    assert!(some.starts_with("MODEL iterator  (up to about 1000 rows at a step, too many"), "{some}");
+    // A model the session sets runs every query.
+    db.set_execution_model(Some(Model::Vectorized));
+    assert_eq!(model_of(&mut db, "SELECT * FROM h WHERE id = 7"), "MODEL vectorized  (set for the session)");
+}
+
+#[test]
+fn explain_analyze_shows_how_each_model_reads() {
+    let mut db = models_setup(5000);
+    let steps = |db: &mut Database, model, sql| {
+        db.set_execution_model(Some(model));
+        analyzed(db, sql)
+    };
+    let limited = "SELECT id FROM h WHERE g = 1 LIMIT 3";
+    // The iterator model stops the scan at the row the LIMIT needs, the
+    // vectorized one at the end of that row's batch.
+    let scanned = |steps: Vec<(String, String)>| steps[3].1.clone();
+    assert_eq!(scanned(steps(&mut db, Model::Iterator, limited)), "16 rows");
+    assert_eq!(scanned(steps(&mut db, Model::Vectorized, limited)), "1024 rows");
+    // In the materialization model, a filter makes all of its rows: who
+    // knows how many it drops. With none, a LIMIT stops the scan.
+    assert_eq!(scanned(steps(&mut db, Model::Materialization, limited)), "5000 rows");
+    let first = steps(&mut db, Model::Materialization, "SELECT id FROM h LIMIT 3");
+    assert_eq!(first[2], ("SCAN h".to_string(), "3 rows".to_string()));
+    // A block nested loop join reads its right side once per block of left
+    // rows, but in the materialization model, it runs once and is kept.
+    db.set_join_memory(10_000);
+    let join = "SELECT COUNT(*) FROM h a JOIN h b ON b.id < a.id WHERE a.id < 300 AND b.id < 300";
+    let right = |steps: Vec<(String, String)>| steps.iter().find(|(step, _)| step.contains("h b")).unwrap().1.clone();
+    assert_eq!(right(steps(&mut db, Model::Materialization, join)), "300 rows");
+    let iterator = right(steps(&mut db, Model::Iterator, join));
+    assert!(iterator.ends_with(" runs") && iterator.starts_with("1500 rows in 5"), "{iterator}");
 }
