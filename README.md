@@ -146,7 +146,9 @@ cargo bench --bench aggregate -- distinct
 
 `benches/scan.rs` times reading 200,000 rows, the cost under every other
 step: `engines` the same rows in a heap, an LSM tree and a column store,
-`filter` WHERE clauses keeping 1% to all of the rows, `project` more and
+`zones` WHERE clauses on a column table whose row groups its zone maps
+(each column's least and greatest values per row group) let a scan skip,
+or not, `filter` WHERE clauses keeping 1% to all of the rows, `project` more and
 more columns and expressions (in Sequoia alone, as SQLite computes no column
 its count leaves unread), and `limit` a `LIMIT` without `ORDER BY`.
 `benches/subquery.rs` times subqueries over 200,000 orders: uncorrelated,
@@ -319,7 +321,7 @@ src/
       sstable.rs  SSTable: sorted entries in pages, in-memory summary
       bloom.rs    Bloom filter for SSTable lookups
     column/       column store
-      store.rs    PAX row groups, delete bitmaps, delta store
+      store.rs    PAX row groups, zone maps, delete bitmaps, delta store
       encoding.rs column compression: RLE, bit-packing, patching, delta, dictionary, bitmap
   trie/           tries: sorted maps that branch on a byte of the key per level
     mod.rs        one tree for the trie, radix tree (paths compressed) and ART

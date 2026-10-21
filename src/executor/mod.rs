@@ -140,12 +140,19 @@ fn explain(catalog: &Catalog, statement: Statement) -> Result<QueryResult> {
 /// EXPLAIN does, each step followed by what it did: the rows it returned and
 /// the time it took, the time of the steps below it included (and, if it
 /// ran more than once, how often). A first line gives the execution model it
-/// ran in and why, a last line the query's rows and time.
+/// ran in and why; after the steps, a line for each column table read says
+/// how many of the row groups it looked at its zone maps let it skip; a last
+/// line gives the query's rows and time.
 fn explain_analyze(catalog: &Catalog, query: Select, settings: &Settings) -> Result<QueryResult> {
     let root = query::select(catalog, query)?.root;
     let lines = root.explain_lines();
     let (model, why) = model::choose(&root, settings);
     let profile = Rc::new(Profile::new(lines.len()));
+    let zones = |catalog: &Catalog| -> Vec<(String, (u64, u64))> {
+        let tables = catalog.table_names().into_iter().filter_map(|name| catalog.get(name).ok());
+        tables.filter_map(|table| Some((table.name.clone(), table.zone_stats()?))).collect()
+    };
+    let before = zones(catalog);
     let start = Instant::now();
     let mut returned = 0;
     for row in model::open_in(model, root, catalog, settings, Some((profile.clone(), 0))) {
@@ -153,6 +160,7 @@ fn explain_analyze(catalog: &Catalog, query: Select, settings: &Settings) -> Res
         returned += 1;
     }
     let time = start.elapsed();
+    let after = zones(catalog);
 
     let mut out = vec![format!("MODEL {model}  ({why})")];
     out.extend(lines
@@ -167,6 +175,12 @@ fn explain_analyze(catalog: &Catalog, query: Select, settings: &Settings) -> Res
             };
             format!("{line}  ({did})")
         }));
+    for ((table, (read, skipped)), (_, (read_before, skipped_before))) in after.into_iter().zip(before) {
+        let (read, skipped) = (read - read_before, skipped - skipped_before);
+        if read + skipped > 0 {
+            out.push(format!("ZONE MAPS {table}  ({skipped} of {} row groups skipped)", read + skipped));
+        }
+    }
     out.push(format!("{} in {}", rows_of(returned), ms(time)));
     Ok(message(out.join("\n")))
 }

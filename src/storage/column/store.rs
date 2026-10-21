@@ -30,7 +30,9 @@
 //!
 //! ```text
 //! 0..4    row count r
-//! 4..8    column count c, then c chunk first page ids, in schema order
+//! 4..8    column count c, with bit 31 set if the group has a zone map
+//!         c chunk first page ids, in schema order
+//!         the zone map's first page id, if it has one
 //!         delete bitmap, ceil(r / 8) bytes; bit i set = row i is deleted
 //! ```
 //!
@@ -51,11 +53,33 @@
 //! decodes the other columns only for the rows left (late materialization). A
 //! group with no row left is skipped without decoding anything.
 //!
+//! **Zone maps.** Before reading any of a group's chunks, a scan checks its
+//! predicates against the group's zone map: each column's least and
+//! greatest values and how many are NULL, counted when the group was
+//! written, and kept in memory. A group with a predicate no row can satisfy
+//! (`k < 100` where the least `k` is 5000, or any predicate on a column of
+//! NULLs) is skipped without reading a page, and a predicate every row
+//! satisfies is not evaluated. Deletes leave a zone map as it was: true of
+//! the rows left too, if less tight. It pays on columns whose values come
+//! in order of insertion, as ids and times do, where each group holds a
+//! narrow range. [`ColumnStore::zone_stats`] counts the groups skipped. Groups
+//! written before zone maps existed have none, and are read as before.
+//!
+//! A zone map is stored like a chunk (see below), in its own pages:
+//!
+//! ```text
+//! c x u32         each column's NULL count
+//! u32 + bytes     the least value of each column, as a row (see `tuple.rs`):
+//!                 NULL for a column of NULLs alone
+//! u32 + bytes     the greatest
+//! ```
+//!
 //! [`ColumnStore::scan`] then puts each row together from its columns' values;
 //! [`ColumnStore::scan_by_column`] leaves them in their columns, for the
 //! vectorized executor, which works on columns itself.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use crate::storage::buffer::pool::BufferPool;
 use crate::storage::io::disk::{PAGE_USABLE, PageId, decode_id, encode_id, read_u32, write_u32};
@@ -63,10 +87,12 @@ use super::encoding;
 use crate::storage::heap::{RecordId, TableHeap};
 use crate::storage::tuple;
 use crate::error::{Result, err};
-use crate::predicate::Predicate;
+use crate::predicate::{Compare, Predicate};
 use crate::types::{Column, Value};
 
 const CHUNK_HEADER: usize = 6;
+/// The bit of a row group header's column count that says it has a zone map.
+const ZONED: u32 = 1 << 31;
 const CHUNK_CAPACITY: usize = PAGE_USABLE - CHUNK_HEADER;
 
 #[derive(Debug, Clone, Copy)]
@@ -106,6 +132,10 @@ pub struct ColumnStore {
     delta_rows: usize,
     /// Oldest first.
     groups: Vec<RowGroup>,
+    /// Row groups scans read, and skipped by their zone maps, since the
+    /// store was opened.
+    groups_read: AtomicU64,
+    groups_skipped: AtomicU64,
 }
 
 struct RowGroup {
@@ -113,22 +143,137 @@ struct RowGroup {
     rows: usize,
     /// Each column's chunk, in schema order.
     chunks: Vec<PageId>,
+    /// Each column's zone, in schema order, and the first page they are
+    /// stored in; none for a group written before zone maps.
+    zones: Option<(Vec<Zone>, PageId)>,
+    /// Where the delete bitmap starts in the header page.
+    bitmap_at: usize,
     deleted: Vec<u8>,
     live: usize,
+}
+
+/// What a column of a row group holds, as a zone map keeps it: its least and
+/// greatest values (none if every one is NULL) and how many are NULL.
+#[derive(Debug, Clone, PartialEq)]
+struct Zone {
+    range: Option<(Value, Value)>,
+    nulls: u32,
+}
+
+/// Which rows of a row group a predicate may hold for, by its zone.
+#[derive(Debug, PartialEq)]
+enum Holds {
+    /// None of them: the group can be skipped.
+    None,
+    /// Some, maybe: the chunk must be read to tell which.
+    Some,
+    /// All of them, NULLs aside, and there are none.
+    All,
+}
+
+impl Zone {
+    /// The zone of a column's values.
+    fn of(values: &[Value]) -> Zone {
+        let nulls = values.iter().filter(|v| v.is_null()).count() as u32;
+        let mut present = values.iter().filter(|v| !v.is_null());
+        let range = present.next().map(|first| {
+            present.fold((first, first), |(min, max), v| {
+                (if v.sort_cmp(min).is_lt() { v } else { min }, if v.sort_cmp(max).is_gt() { v } else { max })
+            })
+        });
+        Zone { range: range.map(|(min, max)| (min.clone(), max.clone())), nulls }
+    }
+
+    /// Which rows `column op literal` may hold for. A value never compared
+    /// with the literal is NULL, and a NULL satisfies no predicate.
+    fn holds(&self, op: Compare, literal: &Value) -> Holds {
+        let Some((min, max)) = &self.range else { return Holds::None };
+        // A literal of another type: the chunk's filter reports the error.
+        let (Some(low), Some(high)) = (min.compare(literal), max.compare(literal)) else { return Holds::Some };
+        let (none, all) = match op {
+            Compare::Eq => (low.is_gt() || high.is_lt(), low.is_eq() && high.is_eq()),
+            Compare::NotEq => (low.is_eq() && high.is_eq(), low.is_gt() || high.is_lt()),
+            Compare::Lt => (low.is_ge(), high.is_lt()),
+            Compare::LtEq => (low.is_gt(), high.is_le()),
+            Compare::Gt => (high.is_le(), low.is_gt()),
+            Compare::GtEq => (high.is_lt(), low.is_ge()),
+        };
+        match (none, all && self.nulls == 0) {
+            (true, _) => Holds::None,
+            (false, true) => Holds::All,
+            (false, false) => Holds::Some,
+        }
+    }
+}
+
+/// Encodes the zones of a row group's columns, as its zone map stores them.
+fn encode_zones(columns: &[Column], zones: &[Zone]) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    zones.iter().for_each(|zone| bytes.extend_from_slice(&zone.nulls.to_le_bytes()));
+    for end in [0, 1] {
+        let row: Vec<Value> = zones
+            .iter()
+            .map(|zone| zone.range.as_ref().map_or(Value::Null, |(min, max)| [min, max][end].clone()))
+            .collect();
+        let row = tuple::encode(columns, &row)?;
+        bytes.extend_from_slice(&(row.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&row);
+    }
+    Ok(bytes)
+}
+
+fn decode_zones(columns: &[Column], bytes: &[u8]) -> Result<Vec<Zone>> {
+    fn corrupted<T>() -> Result<T> {
+        err("corrupted zone map")
+    }
+    let mut pos = 0;
+    let u32_at = |pos: &mut usize| -> Result<u32> {
+        let Some(word) = bytes.get(*pos..*pos + 4) else { return corrupted() };
+        *pos += 4;
+        Ok(u32::from_le_bytes(word.try_into().expect("4 bytes")))
+    };
+    let nulls = (0..columns.len()).map(|_| u32_at(&mut pos)).collect::<Result<Vec<_>>>()?;
+    let mut ends = Vec::new();
+    for _ in 0..2 {
+        let len = u32_at(&mut pos)? as usize;
+        let Some(row) = bytes.get(pos..pos + len) else { return corrupted() };
+        ends.push(tuple::decode(columns, row)?);
+        pos += len;
+    }
+    if pos != bytes.len() {
+        return corrupted();
+    }
+    let (min, max) = (ends.swap_remove(0), ends.swap_remove(0));
+    Ok(min
+        .into_iter()
+        .zip(max)
+        .zip(nulls)
+        .map(|((min, max), nulls)| Zone { range: (!min.is_null()).then_some((min, max)), nulls })
+        .collect())
 }
 
 impl ColumnStore {
     /// Creates an empty store. Fails if a row group header for this many
     /// columns would not fit in a page.
     pub fn create(pool: Arc<BufferPool>, columns: Vec<Column>, config: ColumnConfig) -> Result<Self> {
-        let max_columns = (PAGE_USABLE - 8 - config.group_rows.div_ceil(8)) / 4;
+        let max_columns = (PAGE_USABLE - 12 - config.group_rows.div_ceil(8)) / 4;
         if columns.len() > max_columns {
             return err(format!("a column table can have at most {max_columns} columns"));
         }
         let delta = TableHeap::create(pool.clone())?;
         pool.flush_page(delta.first_page())?;
         let manifest = pool.new_page()?.id();
-        let store = ColumnStore { pool, columns, config, manifest, delta, delta_rows: 0, groups: Vec::new() };
+        let store = ColumnStore {
+            pool,
+            columns,
+            config,
+            manifest,
+            delta,
+            delta_rows: 0,
+            groups: Vec::new(),
+            groups_read: AtomicU64::new(0),
+            groups_skipped: AtomicU64::new(0),
+        };
         store.write_manifest()?;
         Ok(store)
     }
@@ -143,10 +288,25 @@ impl ColumnStore {
             }
             (PageId(read_u32(&page, 0)), (0..count).map(|i| PageId(read_u32(&page, 8 + 4 * i))).collect::<Vec<_>>())
         };
-        let groups = headers.into_iter().map(|id| RowGroup::open(&pool, id, columns.len())).collect::<Result<_>>()?;
+        let groups = headers.into_iter().map(|id| RowGroup::open(&pool, id, &columns)).collect::<Result<_>>()?;
         let delta = TableHeap::open(pool.clone(), delta_page, delta_page)?;
         let delta_rows = delta.scan().try_fold(0, |n, item| item.map(|_| n + 1))?;
-        Ok(ColumnStore { pool, columns, config, manifest, delta, delta_rows, groups })
+        let (groups_read, groups_skipped) = (AtomicU64::new(0), AtomicU64::new(0));
+        Ok(ColumnStore { pool, columns, config, manifest, delta, delta_rows, groups, groups_read, groups_skipped })
+    }
+
+    /// How many row groups scans have read, and how many their zone maps let
+    /// them skip, since the store was opened.
+    pub fn zone_stats(&self) -> (u64, u64) {
+        (self.groups_read.load(Relaxed), self.groups_skipped.load(Relaxed))
+    }
+
+    /// Whether a scan with these predicates must read the group, counted.
+    fn must_read(&self, group: &RowGroup, predicates: &[Predicate]) -> bool {
+        let read = group.may_match(predicates);
+        let counter = if read { &self.groups_read } else { &self.groups_skipped };
+        counter.fetch_add(1, Relaxed);
+        read
     }
 
     pub fn manifest_page(&self) -> PageId {
@@ -203,7 +363,9 @@ impl ColumnStore {
         predicates: Vec<Predicate>,
     ) -> impl Iterator<Item = Result<(Position, Vec<Value>)>> + '_ {
         let delta = self.delta_rows(predicates.clone());
-        let groups = self.groups.iter().flat_map(move |group| {
+        let zone_predicates = predicates.clone();
+        let read = self.groups.iter().filter(move |group| self.must_read(group, &zone_predicates));
+        let groups = read.flat_map(move |group| {
             let rows = group.read(&self.pool, &self.columns, &needed, &predicates);
             let (rows, error) = match rows {
                 Ok(rows) => (rows, None),
@@ -255,6 +417,9 @@ impl ColumnStore {
             }
         });
         let groups = self.groups.iter().filter_map(move |group| {
+            if !self.must_read(group, &predicates) {
+                return None;
+            }
             group.read_columns(&self.pool, &self.columns, &needed, &predicates).transpose()
         });
         groups.chain(delta)
@@ -324,35 +489,54 @@ impl RowGroup {
             let values: Vec<Value> = rows.iter().map(|row| row[i].clone()).collect();
             chunks.push(write_chunk(pool, &encoding::encode(column.data_type, &values)?)?);
         }
+        let zones: Vec<Zone> = (0..columns.len())
+            .map(|i| Zone::of(&rows.iter().map(|row| row[i].clone()).collect::<Vec<_>>()))
+            .collect();
+        let zone_page = write_chunk(pool, &encode_zones(columns, &zones)?)?;
         let deleted = vec![0; rows.len().div_ceil(8)];
 
         let mut page = pool.new_page()?;
         write_u32(&mut page, 0, rows.len() as u32);
-        write_u32(&mut page, 4, chunks.len() as u32);
+        write_u32(&mut page, 4, chunks.len() as u32 | ZONED);
         for (i, chunk) in chunks.iter().enumerate() {
             write_u32(&mut page, 8 + 4 * i, chunk.0);
         }
+        write_u32(&mut page, 8 + 4 * chunks.len(), zone_page.0);
         let header = page.id();
         drop(page);
         pool.flush_page(header)?;
-        Ok(RowGroup { header, rows: rows.len(), chunks, deleted, live: rows.len() })
+        let bitmap_at = 12 + 4 * chunks.len();
+        Ok(RowGroup { header, rows: rows.len(), chunks, zones: Some((zones, zone_page)), bitmap_at, deleted, live: rows.len() })
     }
 
-    fn open(pool: &BufferPool, header: PageId, column_count: usize) -> Result<Self> {
+    fn open(pool: &BufferPool, header: PageId, columns: &[Column]) -> Result<Self> {
         let page = pool.fetch_read(header)?;
         let rows = read_u32(&page, 0) as usize;
-        if read_u32(&page, 4) as usize != column_count {
+        let count = read_u32(&page, 4);
+        if (count & !ZONED) as usize != columns.len() {
             return err(format!("corrupted row group at page {}: wrong column count", header.0));
         }
-        let chunks = (0..column_count).map(|i| PageId(read_u32(&page, 8 + 4 * i))).collect();
-        let start = 8 + 4 * column_count;
-        let end = start + rows.div_ceil(8);
+        let chunks: Vec<PageId> = (0..columns.len()).map(|i| PageId(read_u32(&page, 8 + 4 * i))).collect();
+        let zone_page = (count & ZONED != 0).then(|| PageId(read_u32(&page, 8 + 4 * chunks.len())));
+        let bitmap_at = 8 + 4 * chunks.len() + if zone_page.is_some() { 4 } else { 0 };
+        let end = bitmap_at + rows.div_ceil(8);
         if end > PAGE_USABLE {
             return err(format!("corrupted row group at page {}: too many rows", header.0));
         }
-        let deleted = page[start..end].to_vec();
+        let deleted = page[bitmap_at..end].to_vec();
+        drop(page);
         let live = rows - deleted.iter().map(|b| b.count_ones() as usize).sum::<usize>();
-        Ok(RowGroup { header, rows, chunks, deleted, live })
+        let zones = match zone_page {
+            Some(first) => Some((decode_zones(columns, &read_chunk(pool, first)?)?, first)),
+            None => None,
+        };
+        Ok(RowGroup { header, rows, chunks, zones, bitmap_at, deleted, live })
+    }
+
+    /// Whether some row of the group may satisfy every predicate, by its zone map.
+    fn may_match(&self, predicates: &[Predicate]) -> bool {
+        let Some((zones, _)) = &self.zones else { return true };
+        predicates.iter().all(|p| zones[p.column].holds(p.op, &p.literal) != Holds::None)
     }
 
     fn is_deleted(&self, row: usize) -> bool {
@@ -366,7 +550,7 @@ impl RowGroup {
         }
         self.deleted[row / 8] |= 1 << (row % 8);
         self.live -= 1;
-        let at = 8 + 4 * self.chunks.len() + row / 8;
+        let at = self.bitmap_at + row / 8;
         pool.fetch_write(self.header)?[at] = self.deleted[row / 8];
         Ok(())
     }
@@ -423,8 +607,11 @@ impl RowGroup {
         if !self.rows.is_multiple_of(8) {
             *selected.last_mut().unwrap() &= (1 << (self.rows % 8)) - 1;
         }
-        // Find the matching rows on the compressed chunks, stopping once none is left.
-        for p in predicates {
+        // Find the matching rows on the compressed chunks, stopping once none
+        // is left, but for predicates the zone map says every row satisfies.
+        let zones = self.zones.as_ref().map(|(zones, _)| zones);
+        let unsure = |p: &&Predicate| zones.is_none_or(|zones| zones[p.column].holds(p.op, &p.literal) != Holds::All);
+        for p in predicates.iter().filter(unsure) {
             if selected.iter().all(|&b| b == 0) {
                 break;
             }
@@ -457,7 +644,7 @@ impl RowGroup {
     }
 
     fn destroy(self, pool: &BufferPool) -> Result<()> {
-        for chunk in self.chunks {
+        for chunk in self.chunks.into_iter().chain(self.zones.map(|(_, first)| first)) {
             free_chunk(pool, chunk)?;
         }
         pool.delete_page(self.header)
@@ -687,6 +874,120 @@ mod tests {
         let pages = pool.disk().page_count();
         fill();
         assert_eq!(pool.disk().page_count(), pages, "freed pages are reused");
+    }
+
+    #[test]
+    fn zones_bound_what_predicates_may_hold_for() {
+        use Value::{Int, Null, Real, Text};
+        let zone = Zone::of(&[Int(5), Null, Int(9), Int(7)]);
+        assert_eq!(zone, Zone { range: Some((Int(5), Int(9))), nulls: 1 });
+        let holds = |zone: &Zone, op, literal: Value| zone.holds(op, &literal);
+        for (op, literal, expected) in [
+            (Compare::Lt, 5, Holds::None),
+            (Compare::Lt, 6, Holds::Some),
+            (Compare::LtEq, 4, Holds::None),
+            (Compare::Gt, 9, Holds::None),
+            (Compare::GtEq, 9, Holds::Some),
+            (Compare::Eq, 10, Holds::None),
+            (Compare::Eq, 7, Holds::Some),
+            (Compare::NotEq, 7, Holds::Some),
+        ] {
+            assert_eq!(holds(&zone, op, Int(literal)), expected, "{op:?} {literal}");
+        }
+        // Every value satisfies it, but a NULL would not.
+        assert_eq!(holds(&zone, Compare::GtEq, Int(5)), Holds::Some);
+        let full = Zone::of(&[Int(5), Int(9)]);
+        assert_eq!(holds(&full, Compare::GtEq, Int(5)), Holds::All);
+        assert_eq!(holds(&full, Compare::NotEq, Int(4)), Holds::All);
+        assert_eq!(holds(&Zone::of(&[Int(3), Int(3)]), Compare::NotEq, Int(3)), Holds::None);
+        assert_eq!(holds(&Zone::of(&[Int(3), Int(3)]), Compare::Eq, Int(3)), Holds::All);
+        // A column of NULLs satisfies nothing.
+        assert_eq!(Zone::of(&[Null, Null]), Zone { range: None, nulls: 2 });
+        assert_eq!(holds(&Zone::of(&[Null]), Compare::NotEq, Int(0)), Holds::None);
+        // -0.0 and 0.0 are one value, as a REAL compares.
+        assert_eq!(holds(&Zone::of(&[Real(-0.0), Real(2.5)]), Compare::Lt, Real(0.0)), Holds::None);
+        assert_eq!(holds(&Zone::of(&[Real(-1.5), Real(0.0)]), Compare::Gt, Real(-0.0)), Holds::None);
+        let texts = Zone::of(&[Text("oslo".into()), Text("lima".into()), Text("paris".into())]);
+        assert_eq!(texts.range, Some((Text("lima".into()), Text("paris".into()))));
+        assert_eq!(holds(&texts, Compare::Gt, Text("p".into())), Holds::Some);
+        assert_eq!(holds(&texts, Compare::Gt, Text("pz".into())), Holds::None);
+        // A literal of another type cannot be judged: the chunk's filter reports it.
+        assert_eq!(holds(&full, Compare::Eq, Text("x".into())), Holds::Some);
+    }
+
+    #[test]
+    fn zone_maps_skip_row_groups_and_survive_reopening() {
+        let pool = pool();
+        let mut store = ColumnStore::create(pool.clone(), columns(), small()).unwrap();
+        insert(&mut store, 0..550);
+        let predicate = |column, op, literal| Predicate { column, op, literal };
+        let all = scan(&store, &[true, true, true]);
+        let check = |store: &ColumnStore, predicates: Vec<Predicate>, skipped: u64| {
+            let before = store.zone_stats();
+            let expected: Vec<_> = all.iter().filter(|(_, r)| predicates.iter().all(|p| p.matches(r))).cloned().collect();
+            let found: Vec<_> = store.scan(vec![true; 3], predicates.clone()).collect::<Result<_>>().unwrap();
+            assert_eq!(found, expected, "{predicates:?}");
+            let chunks: Vec<ColumnChunk> = store.scan_by_column(vec![true; 3], predicates.clone(), 64).collect::<Result<_>>().unwrap();
+            assert_eq!(chunks.iter().map(|c| c.rows).sum::<usize>(), expected.len(), "{predicates:?}");
+            let after = store.zone_stats();
+            let (read, skip) = (after.0 - before.0, after.1 - before.1);
+            assert_eq!((read + skip, skip), (10, 2 * skipped), "{predicates:?}: twice over the 5 groups");
+        };
+        // Ids grow with each group: 0..100, 100..200, ...
+        check(&store, vec![predicate(0, Compare::Lt, Value::Int(150))], 3);
+        check(&store, vec![predicate(0, Compare::Eq, Value::Int(321))], 4);
+        check(&store, vec![predicate(0, Compare::GtEq, Value::Int(250)), predicate(0, Compare::Lt, Value::Int(300))], 4);
+        check(&store, vec![predicate(0, Compare::Gt, Value::Int(10_000))], 5);
+        // Every group holds every city, and NULLs: none is skipped.
+        check(&store, vec![predicate(1, Compare::Eq, Value::Text("oslo".into()))], 0);
+        check(&store, vec![predicate(2, Compare::NotEq, Value::Bool(true))], 0);
+        // A predicate every row satisfies leaves out none.
+        check(&store, vec![predicate(0, Compare::GtEq, Value::Int(0))], 0);
+
+        // Deleting rows leaves the zone maps true of the rows left.
+        let doomed: Vec<Position> =
+            all.iter().filter(|(_, r)| matches!(r[0], Value::Int(i) if i < 120 || i % 7 == 0)).map(|(p, _)| *p).collect();
+        doomed.iter().for_each(|&p| store.delete(p).unwrap());
+        pool.flush_all().unwrap();
+        let reopened = ColumnStore::open(pool, store.manifest_page(), columns(), small()).unwrap();
+        let zones = |store: &ColumnStore| store.groups.iter().map(|g| g.zones.clone()).collect::<Vec<_>>();
+        assert_eq!(zones(&reopened), zones(&store));
+        // The first group lost every row, and was freed; the next keeps its zones, if less tight now.
+        assert_eq!(reopened.group_count(), 4);
+        assert_eq!(reopened.groups[0].zones.as_ref().unwrap().0[0], Zone { range: Some((Value::Int(100), Value::Int(199))), nulls: 0 });
+        let left: Vec<i64> = (0..550).filter(|i| *i >= 120 && i % 7 != 0).collect();
+        assert_eq!(ids(&reopened), left);
+        let low: Vec<_> = reopened.scan(vec![true; 3], vec![predicate(0, Compare::Lt, Value::Int(130))]).collect::<Result<_>>().unwrap();
+        assert_eq!(low.len(), left.iter().filter(|&&i| i < 130).count());
+    }
+
+    #[test]
+    fn row_groups_without_zone_maps_are_read() {
+        let pool = pool();
+        let mut store = ColumnStore::create(pool.clone(), columns(), small()).unwrap();
+        insert(&mut store, 0..250);
+        let first = store.scan(vec![true, false, false], Vec::new()).next().unwrap().unwrap().0;
+        store.delete(first).unwrap();
+        // Rewrite each header as groups were written before zone maps: no
+        // flag, no zone map page, the delete bitmap right after the chunks.
+        for group in &store.groups {
+            let mut page = pool.fetch_write(group.header).unwrap();
+            let bitmap = page[group.bitmap_at..group.bitmap_at + group.deleted.len()].to_vec();
+            write_u32(&mut page, 4, group.chunks.len() as u32);
+            let at = 8 + 4 * group.chunks.len();
+            page[at..at + bitmap.len()].copy_from_slice(&bitmap);
+        }
+        pool.flush_all().unwrap();
+        let mut reopened = ColumnStore::open(pool, store.manifest_page(), columns(), small()).unwrap();
+        assert!(reopened.groups.iter().all(|g| g.zones.is_none()));
+        assert_eq!(ids(&reopened), (1..250).collect::<Vec<_>>());
+        let low = Predicate { column: 0, op: Compare::Lt, literal: Value::Int(5) };
+        assert_eq!(reopened.scan(vec![true; 3], vec![low]).count(), 4);
+        assert_eq!(reopened.zone_stats().1, 0, "nothing to skip by");
+        // Deletes find the bitmap where it is.
+        let second = reopened.scan(vec![true, false, false], Vec::new()).next().unwrap().unwrap().0;
+        reopened.delete(second).unwrap();
+        assert_eq!(ids(&reopened), (2..250).collect::<Vec<_>>());
     }
 
     #[test]

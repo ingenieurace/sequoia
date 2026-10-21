@@ -5,7 +5,8 @@
 //!
 //! The same rows are stored three times: in a heap (`th`), an LSM tree
 //! (`tl`) and a column store (`tc`). `engines` reads each in the same ways,
-//! `filter` times WHERE clauses that keep more and more rows, `project`
+//! `zones` the column store's WHERE clauses that its zone maps let it skip
+//! row groups for, or not, `filter` WHERE clauses that keep more and more rows, `project`
 //! more and more columns and expressions, and `limit` a LIMIT without ORDER
 //! BY, which stops the scan once it has its rows. Every other step costs
 //! something on top of these.
@@ -38,6 +39,20 @@ fn main() {
                 case("column, two columns", "SELECT id, k FROM tc WHERE k >= 0", &["COMPRESSED CHUNKS ON k >= 0"]),
                 // Only the rows that match are decoded from the other chunks.
                 case("column, 1% of rows", "SELECT * FROM tc WHERE k < 10000", &["COMPRESSED CHUNKS ON k < 10000"]),
+            ],
+        ),
+        (
+            // The column table's zone maps: rows come in `id` order, so each
+            // row group holds a narrow range of ids, and a scan skips the
+            // groups whose range a predicate rules out without reading them.
+            // `k` is scattered: every group holds nearly all of its range.
+            "zones",
+            vec![
+                case("column, 1% by id, in order", "SELECT * FROM tc WHERE id < 2000", &["CHUNKS ON id < 2000"]),
+                case("column, 1% by k, scattered", "SELECT * FROM tc WHERE k < 10000", &["CHUNKS ON k < 10000"]),
+                case("column, one id", "SELECT * FROM tc WHERE id = 123456", &["CHUNKS ON id = 123456"]),
+                case("column, 10% by id", "SELECT COUNT(*) FROM tc WHERE id >= 50000 AND id < 70000", &["CHUNKS ON id >="]),
+                case("column, no id", "SELECT * FROM tc WHERE id > 500000", &["CHUNKS ON id > 500000"]),
             ],
         ),
         (

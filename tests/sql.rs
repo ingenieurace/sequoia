@@ -2621,6 +2621,76 @@ fn real_numbers() {
 }
 
 
+#[test]
+fn zone_maps_skip_row_groups_and_change_no_result() {
+    let mut db = Database::in_memory();
+    // `id` grows with each row, `k` is scattered, `x` has NULLs and -0.0.
+    for (table, storage) in [("h", "HEAP"), ("c", "COLUMN")] {
+        db.execute(&format!("CREATE TABLE {table} (id INT, k INT, x REAL, name TEXT, flag BOOL) USING {storage}")).unwrap();
+        for start in (0..10_000).step_by(1000) {
+            let rows: Vec<String> = (start..start + 1000)
+                .map(|i: i64| {
+                    let x = match i % 9 {
+                        0 => "NULL".to_string(),
+                        1 => "-0.0".to_string(),
+                        _ => format!("{}.5", i / 10),
+                    };
+                    let flag = if i < 3000 { "NULL" } else if i % 2 == 0 { "TRUE" } else { "FALSE" };
+                    format!("({i}, {}, {x}, 'n{:05}', {flag})", (i * 7919) % 10_000, i / 3)
+                })
+                .collect();
+            db.execute(&format!("INSERT INTO {table} VALUES {}", rows.join(", "))).unwrap();
+        }
+    }
+    let changes = ["DELETE FROM {t} WHERE id % 13 = 0", "UPDATE {t} SET k = -1 WHERE id >= 4000 AND id < 4100"];
+    for (round, change) in ["", changes[0], changes[1]].into_iter().enumerate() {
+        for table in ["h", "c"] {
+            if !change.is_empty() {
+                db.execute(&change.replace("{t}", table).replace("id % 13 = 0", "id - id / 13 * 13 = 0")).unwrap();
+            }
+        }
+        for filter in [
+            "id < 500",
+            "id >= 2500 AND id < 2600",
+            "id = 7777",
+            "id > 20000",
+            "id <> 5",
+            "k < 100",
+            "k = -1",
+            "x < 0.0",
+            "x <= -0.0",
+            "x >= 999.5",
+            "x IS NULL AND id < 2000",
+            "name >= 'n03000' AND name < 'n03010'",
+            "flag = TRUE AND id < 3500",
+            "flag <> FALSE",
+            "id >= 0",
+        ] {
+            let sql = |t: &str| format!("SELECT id, k, x, name, flag FROM {t} WHERE {filter} ORDER BY id");
+            let heap = query(&mut db, &sql("h"));
+            for model in Model::ALL {
+                db.set_execution_model(Some(model));
+                assert_eq!(query(&mut db, &sql("c")), heap, "round {round}, {filter}, {model}");
+            }
+            db.set_execution_model(None);
+        }
+    }
+    // What EXPLAIN ANALYZE says of the zone maps, after the changes above.
+    let skipped = |db: &mut Database, filter: &str| -> (u64, u64) {
+        let plan = explain(db, &format!("ANALYZE SELECT COUNT(*) FROM c WHERE {filter}"));
+        let line = plan.lines().find(|line| line.starts_with("ZONE MAPS c  (")).unwrap_or_else(|| panic!("{plan}"));
+        let (skipped, total) = line["ZONE MAPS c  (".len()..].split_once(" of ").unwrap();
+        (skipped.parse().unwrap(), total.split(' ').next().unwrap().parse().unwrap())
+    };
+    let (skipped_low, groups) = skipped(&mut db, "id < 500");
+    assert!(groups >= 8 && skipped_low == groups - 1, "{skipped_low} of {groups}");
+    assert_eq!(skipped(&mut db, "id > 20000"), (groups, groups));
+    assert_eq!(skipped(&mut db, "k < 100").0, 0, "k is scattered over every group");
+    assert_eq!(skipped(&mut db, "flag = TRUE AND id < 2000").0, groups, "flag is all NULL where id < 3000");
+    // Heap tables have no zone maps.
+    assert!(!explain(&mut db, "ANALYZE SELECT COUNT(*) FROM h WHERE id < 500").contains("ZONE MAPS"));
+}
+
 /// A heap table and a column table of the same `n` rows, with NULLs, many
 /// batches and row groups of them, and a small table to join them with.
 fn models_setup(n: i64) -> Database {

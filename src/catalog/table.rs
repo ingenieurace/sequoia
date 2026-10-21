@@ -304,6 +304,15 @@ impl Table {
         }
     }
 
+    /// For a column table, how many row groups scans have read, and how many
+    /// their zone maps let them skip, since the table was opened.
+    pub fn zone_stats(&self) -> Option<(u64, u64)> {
+        match &self.storage {
+            Storage::Column(store) => Some(store.zone_stats()),
+            _ => None,
+        }
+    }
+
     /// How many rows the table has, for the planner to weigh plans by. The
     /// first call after the table is opened counts them with a scan (as an
     /// ANALYZE would), and writes keep the count from then on. Opening the
