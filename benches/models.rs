@@ -7,7 +7,8 @@
 //! The same 200,000 rows are in a heap table (`th`) and a column table
 //! (`tc`). `oltp` looks a few rows up, many times over, where what costs is
 //! starting a query and handing its few rows on; `olap` scans and
-//! aggregates every row, where the cost per row is all; `stream` returns
+//! aggregates every row, where the cost per row is all; `vector` runs the
+//! loops of the vectorized model over a column at a time; `stream` returns
 //! many rows or stops early at a LIMIT, where holding rows costs.
 
 mod common;
@@ -80,6 +81,35 @@ fn main() {
                 (
                     "filter, project (column)",
                     "SELECT id, k + g, x * 2.0 FROM tc WHERE k < 50000",
+                    1,
+                ),
+            ],
+        ),
+        // The vectorized model's loops over a column at a time: comparisons
+        // of columns (a column store takes those with a literal itself),
+        // arithmetic, and aggregates without GROUP BY, which take a whole
+        // column at once.
+        (
+            "vector",
+            vec![
+                (
+                    "compare INT columns",
+                    "SELECT COUNT(*) FROM tc WHERE k > id AND k < id + 100000 AND g <> k",
+                    1,
+                ),
+                (
+                    "INT arithmetic",
+                    "SELECT SUM(k * 3 + g * 2 - id) FROM tc",
+                    1,
+                ),
+                (
+                    "REAL arithmetic",
+                    "SELECT MIN(x * 2.0 + x / 4.0), MAX(x - 1.5) FROM tc",
+                    1,
+                ),
+                (
+                    "COUNT, SUM, AVG, MIN, MAX",
+                    "SELECT COUNT(k), SUM(k), AVG(k), MIN(k), MAX(k) FROM tc",
                     1,
                 ),
             ],

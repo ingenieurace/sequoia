@@ -37,6 +37,13 @@
 //! Rows come to a [`Folder`] one at a time, or, from the vectorized
 //! executor, a batch at a time: without `GROUP BY`, each aggregate then adds
 //! a whole column of INTs or REALs in one loop ([`Folder::add_columns`]).
+//! Over INTs, those loops are written for the compiler to turn into SIMD
+//! instructions: a count adds up flags, a minimum or maximum folds the
+//! column with a NULL's place taken by a value that cannot win, an average
+//! sums each value's high and low 32 bits apart, exactly, and a sum adds
+//! the column at once when no running total can overflow, which its lowest
+//! and highest values tell; else it adds a value at a time, checking each.
+//! REALs are summed in order, as their rounding depends on it.
 //!
 //! [`HASH_MEMORY`]: super::joins::HASH_MEMORY
 
@@ -599,6 +606,42 @@ impl Accumulator {
     /// Adds the INTs that are not NULL, in order, as [`Accumulator::add`]
     /// would one by one.
     fn add_ints(&mut self, values: &[i64], nulls: Option<&[bool]>) -> Result<()> {
+        let count = present_count(values.len(), nulls);
+        match self {
+            Accumulator::Count(n) => {
+                *n += count as i64;
+                return Ok(());
+            }
+            Accumulator::Avg { ints, count: c, .. } => {
+                *ints += exact_sum(values, nulls);
+                *c += count as i64;
+                return Ok(());
+            }
+            Accumulator::Min(best) if count > 0 => {
+                let min = fold_masked(values, nulls, i64::MAX, i64::MAX, i64::min);
+                return keep(best, Value::Int(min), Ordering::Less);
+            }
+            Accumulator::Max(best) if count > 0 => {
+                let max = fold_masked(values, nulls, i64::MIN, i64::MIN, i64::max);
+                return keep(best, Value::Int(max), Ordering::Greater);
+            }
+            Accumulator::Min(_) | Accumulator::Max(_) => return Ok(()),
+            Accumulator::Sum(sum @ (None | Some(Value::Int(_)))) => {
+                if count == 0 {
+                    return Ok(());
+                }
+                let start = match sum {
+                    Some(Value::Int(total)) => *total,
+                    _ => 0,
+                };
+                if no_running_total_overflows(start, values, nulls) {
+                    let total = fold_masked(values, nulls, 0, start, i64::wrapping_add);
+                    *sum = Some(Value::Int(total));
+                    return Ok(());
+                }
+            }
+            Accumulator::Sum(_) => {}
+        }
         let mut present = values
             .iter()
             .enumerate()
@@ -659,6 +702,10 @@ impl Accumulator {
             .map(|(_, &r)| r);
         // The first of the values that compares to all the others as `wanted`
         // or equal, as `keep` keeps.
+        if let Accumulator::Count(n) = self {
+            *n += present_count(values.len(), nulls) as i64;
+            return Ok(());
+        }
         let best = |values: &mut dyn Iterator<Item = f64>, wanted: Ordering| {
             values.fold(None, |best: Option<f64>, r| match best {
                 Some(b) if r.partial_cmp(&b) != Some(wanted) => Some(b),
@@ -798,6 +845,61 @@ impl Accumulator {
     }
 }
 
+/// How many of `n` values are not NULL, counting the flags with no branch.
+fn present_count(n: usize, nulls: Option<&[bool]>) -> usize {
+    match nulls {
+        Some(nulls) => n - nulls.iter().fold(0, |count, &null| count + null as usize),
+        None => n,
+    }
+}
+
+/// Whether adding the values to `start` one by one keeps every running
+/// total an INT: true if each value is smaller in size than the room left
+/// above `start`, shared among them, rounded down to a power of two, 2^k.
+/// That every value lies in -2^k..2^k is one check of all at once, as the
+/// bits from k + 1 up of `v + 2^k`, ORed together, are all zero then.
+fn no_running_total_overflows(start: i64, values: &[i64], nulls: Option<&[bool]>) -> bool {
+    let room = i64::MAX as i128 - (start as i128).abs();
+    let share = room / values.len().max(1) as i128;
+    if share < 1 {
+        return false;
+    }
+    let k = (127 - share.leading_zeros()).min(62);
+    let offset = 1i64 << k;
+    let outside = fold_masked(values, nulls, 0, 0, |acc, v| {
+        acc | ((v.wrapping_add(offset) as u64) >> (k + 1)) as i64
+    });
+    outside == 0
+}
+
+/// `f` folded over the values from `init`, each NULL's place taken by
+/// `null`: one loop with no branch, without NULLs and with them.
+fn fold_masked(
+    values: &[i64],
+    nulls: Option<&[bool]>,
+    null: i64,
+    init: i64,
+    f: impl Fn(i64, i64) -> i64,
+) -> i64 {
+    match nulls {
+        None => values.iter().fold(init, |acc, &v| f(acc, v)),
+        Some(nulls) => values.iter().zip(nulls).fold(init, |acc, (&v, &is_null)| {
+            f(acc, if is_null { null } else { v })
+        }),
+    }
+}
+
+/// The sum of the values that are not NULL, exactly: their high 32 bits
+/// and their low 32 bits summed apart, neither of which can overflow for
+/// fewer than 2^31 values.
+fn exact_sum(values: &[i64], nulls: Option<&[bool]>) -> i128 {
+    let high = fold_masked(values, nulls, 0, 0, |acc, v| acc.wrapping_add(v >> 32));
+    let low = fold_masked(values, nulls, 0, 0, |acc, v| {
+        (acc as u64).wrapping_add(v as u32 as u64) as i64
+    }) as u64;
+    ((high as i128) << 32) + low as i128
+}
+
 /// A sum of REALs, if it is not too big to be one.
 fn finite(total: f64) -> Result<f64> {
     if total.is_finite() {
@@ -833,5 +935,71 @@ fn number<'v>(value: &'v Value, function: &str) -> Result<&'v Value> {
             "{function} expects a number, got {}",
             other.to_sql()
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Running totals one value at a time, as a plain loop checks them.
+    fn running_totals_fit(start: i64, values: &[i64], nulls: Option<&[bool]>) -> bool {
+        let mut total = start;
+        for (i, &v) in values.iter().enumerate() {
+            if nulls.is_some_and(|nulls| nulls[i]) {
+                continue;
+            }
+            match total.checked_add(v) {
+                Some(t) => total = t,
+                None => return false,
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn column_loops_sum_exactly_and_never_miss_an_overflow() {
+        let edges = [
+            i64::MAX,
+            i64::MIN,
+            i64::MAX - 1,
+            i64::MIN + 1,
+            -1,
+            0,
+            1,
+            1 << 40,
+            -(1 << 40),
+        ];
+        let columns: Vec<Vec<i64>> = vec![
+            edges.to_vec(),
+            vec![i64::MAX, 1, -1],
+            vec![1 << 52; 1024],
+            vec![-(1 << 52); 1024],
+            (0..1000).map(|i| i * 1_000_003 - 500_000_000).collect(),
+            vec![],
+        ];
+        for values in &columns {
+            let every_third: Vec<bool> = (0..values.len()).map(|i| i % 3 == 0).collect();
+            for nulls in [None, Some(&every_third[..])] {
+                let present = values
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| nulls.is_none_or(|nulls: &[bool]| !nulls[*i]));
+                let expected: i128 = present.map(|(_, &v)| v as i128).sum();
+                assert_eq!(exact_sum(values, nulls), expected, "{values:?}");
+                for start in [0, 1, -1, i64::MAX, i64::MIN, 1 << 62, -(1 << 62)] {
+                    // It may say no where the totals would fit, never yes where one would not.
+                    if no_running_total_overflows(start, values, nulls) {
+                        assert!(
+                            running_totals_fit(start, values, nulls),
+                            "{start} {values:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // Small values from a small start: the fast way.
+        assert!(no_running_total_overflows(0, &[5; 1024], None));
+        assert!(no_running_total_overflows(-7, &[-(1 << 50); 1024], None));
     }
 }

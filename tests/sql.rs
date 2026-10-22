@@ -4410,6 +4410,93 @@ fn analyzed(db: &mut Database, sql: &str) -> Vec<(String, String)> {
 }
 
 #[test]
+fn column_loops_return_and_fail_as_rows_do_in_every_model() {
+    let mut db = Database::in_memory();
+    // Batches of the vectorized model: a column table's row groups, and a
+    // heap's rows put in batches.
+    for (table, storage) in [("tc", "COLUMN"), ("th", "HEAP")] {
+        db.execute(&format!(
+            "CREATE TABLE {table} (id INT PRIMARY KEY, k INT, big INT, x REAL, gone INT) USING {storage}"
+        ))
+        .unwrap();
+        let rows: Vec<String> = (0..5000i64)
+            .map(|i| {
+                let k = if i % 11 == 0 {
+                    "NULL".into()
+                } else {
+                    ((i * 37) % 2000 - 1000).to_string()
+                };
+                let big = match i % 4 {
+                    0 => (i64::MAX - i).to_string(),
+                    1 => (i64::MIN + i).to_string(),
+                    2 => "NULL".into(),
+                    _ => i.to_string(),
+                };
+                format!("({i}, {k}, {big}, {}.25, NULL)", (i * 13) % 300)
+            })
+            .collect();
+        db.execute(&format!("INSERT INTO {table} VALUES {}", rows.join(", ")))
+            .unwrap();
+    }
+    // A running sum that overflows on the way, though the last would fit.
+    db.execute("CREATE TABLE s (id INT PRIMARY KEY, v INT) USING COLUMN")
+        .unwrap();
+    db.execute(&format!(
+        "INSERT INTO s VALUES (1, {}), (2, 1), (3, -1)",
+        i64::MAX
+    ))
+    .unwrap();
+
+    let mut queries = vec![
+        "SELECT SUM(v) FROM s".to_string(),
+        "SELECT AVG(v), MIN(v), MAX(v), COUNT(v) FROM s".to_string(),
+    ];
+    for t in ["tc", "th"] {
+        queries.extend([
+            format!("SELECT COUNT(*), COUNT(k), SUM(k), AVG(k), MIN(k), MAX(k) FROM {t}"),
+            format!("SELECT AVG(big), MIN(big), MAX(big), COUNT(big) FROM {t}"),
+            format!("SELECT SUM(big) FROM {t}"),
+            format!("SELECT SUM(big) FROM {t} WHERE big > 0"),
+            format!("SELECT COUNT(gone), SUM(gone), AVG(gone), MIN(gone), MAX(gone) FROM {t}"),
+            format!("SELECT SUM(x), AVG(x), MIN(x), MAX(x), COUNT(x) FROM {t}"),
+            format!("SELECT COUNT(*), SUM(k) FROM {t} WHERE k > id - 3000 AND x < k + 100.0"),
+            format!("SELECT SUM(k * 2 + id), MIN(x * 2.0 - k), MAX(k - x / 4.0) FROM {t}"),
+            format!("SELECT SUM(k * 3), SUM(big * 2) FROM {t} WHERE id < 10"),
+            format!("SELECT COUNT(*) FROM {t} WHERE x / (k - k) > 1.0"),
+            format!("SELECT id, k * id, x - k FROM {t} WHERE k <> id AND (k < 0 OR x > 100.0)"),
+        ]);
+    }
+    for sql in &queries {
+        let mut outcomes = Vec::new();
+        for model in Model::ALL {
+            db.set_execution_model(Some(model));
+            let outcome = match db.execute(sql) {
+                Ok(mut results) => match results.pop() {
+                    Some(QueryResult::Rows { rows, .. }) => Ok(rows),
+                    other => panic!("expected rows, got {other:?}"),
+                },
+                Err(e) => Err(e.to_string()),
+            };
+            outcomes.push((model, outcome));
+        }
+        let (first, expected) = &outcomes[0];
+        for (model, outcome) in &outcomes[1..] {
+            assert!(
+                outcome == expected,
+                "{sql}: {model} gives {outcome:?}, {first} {expected:?}"
+            );
+        }
+    }
+    // What the column loops must keep: an overflow on the way is one, as
+    // value by value, and the sums an average takes are exact.
+    db.set_execution_model(Some(Model::Vectorized));
+    let e = db.execute("SELECT SUM(v) FROM s").unwrap_err().to_string();
+    assert!(e.contains("overflow"), "{e}");
+    let rows = query(&mut db, "SELECT AVG(v) FROM s");
+    assert_eq!(rows, vec![vec![Value::Real(i64::MAX as f64 / 3.0)]]);
+}
+
+#[test]
 fn explain_analyze_tells_what_each_step_did() {
     // What the models chosen per query do.
     let mut db = Database::in_memory();

@@ -10,6 +10,15 @@
 //! which run once per row. `AND` and `OR` evaluate their right side only on
 //! the rows their left one does not decide, as `sql::eval` does row by row.
 //!
+//! The loops of the usual cases are written for the compiler to turn into
+//! SIMD instructions, a few values at a time: a comparison, an `AND` or an
+//! `OR` of two columns with no error to check per row, and arithmetic that
+//! first works the whole column out, then checks once whether any value
+//! overflowed (or, for REALs, is not finite). If one did, the column is
+//! worked out again a value at a time, which fails at the row that does,
+//! with the error it always has, or at none, if that row is NULL. Built for
+//! a CPU with wider registers (`-C target-cpu`), they do more at a time.
+//!
 //! The results are those of `sql::eval` row by row, but errors may differ:
 //! a column of an expression is evaluated for every row before the next
 //! column, so the first error found is not always the first a row-by-row
@@ -173,8 +182,8 @@ pub fn select(
     let matches = eval(predicate, fields, batch, subqueries)?;
     Ok(match &*matches {
         Vector::Bool(matches, nulls) => match nulls {
-            None => (0..n).filter(|&i| matches[i]).collect(),
-            Some(nulls) => (0..n).filter(|&i| matches[i] && !nulls[i]).collect(),
+            None => positions(matches.iter().copied()),
+            Some(nulls) => positions(matches.iter().zip(nulls).map(|(&m, &null)| m & !null)),
         },
         Vector::Const(Value::Bool(true), _) => (0..n).collect(),
         Vector::Const(Value::Bool(false) | Value::Null, _) => Vec::new(),
@@ -250,9 +259,16 @@ fn typed(left: &Vector, op: BinaryOp, right: &Vector) -> Option<Result<Vector>> 
                 Gt => ord.is_gt(),
                 _ => ord.is_ge(),
             };
-            let compared = if let (Some(a), Some(b)) = (ints(left), ints(right)) {
-                map2(n, &a, &b, |a, b| Ok(test(a.cmp(b))))
-            } else if let (Some(a), Some(b)) = (reals(left), reals(right)) {
+            if let (Some(a), Some(b)) = (ints(left), ints(right)) {
+                return Some(Ok(compare(n, &a, &b, op)));
+            }
+            if let (Some(a), Some(b)) = (reals(left), reals(right))
+                && !has_nan(&a)
+                && !has_nan(&b)
+            {
+                return Some(Ok(compare(n, &a, &b, op)));
+            }
+            let compared = if let (Some(a), Some(b)) = (reals(left), reals(right)) {
                 map2(n, &a, &b, |a, b| {
                     a.partial_cmp(b)
                         .map(test)
@@ -269,6 +285,9 @@ fn typed(left: &Vector, op: BinaryOp, right: &Vector) -> Option<Result<Vector>> 
         }
         Add | Sub | Mul | Div => {
             if let (Some(a), Some(b)) = (ints(left), ints(right)) {
+                if let Some(result) = int_arithmetic(n, &a, op, &b) {
+                    return Some(Ok(result));
+                }
                 let result = map2(n, &a, &b, |&a, &b| {
                     if op == Div && b == 0 {
                         return err("division by zero");
@@ -284,6 +303,31 @@ fn typed(left: &Vector, op: BinaryOp, right: &Vector) -> Option<Result<Vector>> 
                 return Some(result.map(|(values, nulls)| Vector::Int(values, nulls)));
             }
             // With a REAL, both as REALs.
+            // An INT column's values as REALs, for that.
+            let (a_ints, b_ints): (Vec<f64>, Vec<f64>);
+            let a = match (reals(left), ints(left)) {
+                (Some(a), _) => Some(a),
+                (None, Some(Typed::Many(values, nulls))) => {
+                    a_ints = values.iter().map(|&v| v as f64).collect();
+                    Some(Typed::Many(&a_ints[..], nulls))
+                }
+                (None, Some(Typed::One(value))) => Some(Typed::One(value.map(|v| v as f64))),
+                _ => None,
+            };
+            let b = match (reals(right), ints(right)) {
+                (Some(b), _) => Some(b),
+                (None, Some(Typed::Many(values, nulls))) => {
+                    b_ints = values.iter().map(|&v| v as f64).collect();
+                    Some(Typed::Many(&b_ints[..], nulls))
+                }
+                (None, Some(Typed::One(value))) => Some(Typed::One(value.map(|v| v as f64))),
+                _ => None,
+            };
+            if let (Some(a), Some(b)) = (&a, &b)
+                && let Some(result) = real_arithmetic(n, a, op, b)
+            {
+                return Some(Ok(result));
+            }
             let arithmetic = move |a: f64, b: f64| {
                 if op == Div && b == 0.0 {
                     return err("division by zero");
@@ -322,6 +366,14 @@ fn typed(left: &Vector, op: BinaryOp, right: &Vector) -> Option<Result<Vector>> 
 
 /// `AND` or `OR` with SQL's three-valued logic: NULL means unknown.
 fn logic(op: BinaryOp, n: usize, a: &Typed<bool>, b: &Typed<bool>) -> Vector {
+    // Without a NULL, the plain operation on two arrays.
+    if null_flags(a).is_none() && null_flags(b).is_none() && !null_literal(a) && !null_literal(b) {
+        let (values, nulls) = match op {
+            BinaryOp::And => zip_with(n, a, b, |x, y| x & y),
+            _ => zip_with(n, a, b, |x, y| x | y),
+        };
+        return Vector::Bool(values, nulls);
+    }
     let (mut values, mut nulls) = (Vec::with_capacity(n), None);
     for i in 0..n {
         let value = match (op, a.get(i), b.get(i)) {
@@ -421,6 +473,140 @@ fn map2<A, B, R: Default>(
         }
     }
     Ok((values, nulls))
+}
+
+/// The positions of the `true`s, in order, found without a branch per
+/// value: each position is written, and kept by counting it only if true.
+fn positions(flags: impl ExactSizeIterator<Item = bool>) -> Vec<usize> {
+    let mut kept = vec![0; flags.len()];
+    let mut count = 0;
+    for (i, flag) in flags.enumerate() {
+        kept[count] = i;
+        count += flag as usize;
+    }
+    kept.truncate(count);
+    kept
+}
+
+/// The null flags of a column, if it has any.
+fn null_flags<'a, T>(values: &Typed<'a, T>) -> Option<&'a [bool]> {
+    match values {
+        Typed::Many(_, nulls) => *nulls,
+        Typed::One(_) => None,
+    }
+}
+
+/// Whether it is a NULL literal, which makes every row NULL.
+fn null_literal<T>(values: &Typed<T>) -> bool {
+    matches!(values, Typed::One(None))
+}
+
+/// `f` of each pair of values, NULL where either is (with `R::default()`
+/// there), as one loop over plain arrays with no error to check and no
+/// early exit, which a compiler turns into SIMD instructions where `f`
+/// allows. `f` is worked out on the NULL rows' placeholders too: it must
+/// not fail or panic on any values.
+fn zip_with<T: Copy, R: Copy + Default>(
+    n: usize,
+    a: &Typed<T>,
+    b: &Typed<T>,
+    f: impl Fn(T, T) -> R,
+) -> (Vec<R>, Nulls) {
+    if null_literal(a) || null_literal(b) {
+        return (vec![R::default(); n], Some(vec![true; n]));
+    }
+    let mut values: Vec<R> = match (a, b) {
+        (Typed::Many(a, _), Typed::Many(b, _)) => {
+            a.iter().zip(b.iter()).map(|(&x, &y)| f(x, y)).collect()
+        }
+        (Typed::Many(a, _), Typed::One(Some(y))) => a.iter().map(|&x| f(x, *y)).collect(),
+        (Typed::One(Some(x)), Typed::Many(b, _)) => b.iter().map(|&y| f(*x, y)).collect(),
+        (Typed::One(Some(x)), Typed::One(Some(y))) => vec![f(*x, *y); n],
+        _ => unreachable!("NULL literals returned above"),
+    };
+    let nulls: Nulls = match (null_flags(a), null_flags(b)) {
+        (None, None) => None,
+        (Some(nulls), None) | (None, Some(nulls)) => Some(nulls.to_vec()),
+        (Some(a), Some(b)) => Some(a.iter().zip(b).map(|(&x, &y)| x | y).collect()),
+    };
+    if let Some(nulls) = &nulls {
+        for (value, &null) in values.iter_mut().zip(nulls) {
+            *value = if null { R::default() } else { *value };
+        }
+    }
+    (values, nulls)
+}
+
+/// Whether `f` is true of any pair of values, NULL rows' placeholders
+/// included, as one loop that folds with no early exit.
+fn any_pair<T: Copy>(a: &Typed<T>, b: &Typed<T>, f: impl Fn(T, T) -> bool) -> bool {
+    match (a, b) {
+        (Typed::Many(a, _), Typed::Many(b, _)) => a
+            .iter()
+            .zip(b.iter())
+            .fold(false, |any, (&x, &y)| any | f(x, y)),
+        (Typed::Many(a, _), Typed::One(Some(y))) => a.iter().fold(false, |any, &x| any | f(x, *y)),
+        (Typed::One(Some(x)), Typed::Many(b, _)) => b.iter().fold(false, |any, &y| any | f(*x, y)),
+        (Typed::One(Some(x)), Typed::One(Some(y))) => f(*x, *y),
+        _ => false, // a NULL literal: every row NULL
+    }
+}
+
+/// A comparison of two columns of INTs, or of REALs with no NaN, which
+/// cannot fail.
+fn compare<T: Copy + PartialOrd>(n: usize, a: &Typed<T>, b: &Typed<T>, op: BinaryOp) -> Vector {
+    let (values, nulls) = match op {
+        BinaryOp::Eq => zip_with(n, a, b, |x, y| x == y),
+        BinaryOp::NotEq => zip_with(n, a, b, |x, y| x != y),
+        BinaryOp::Lt => zip_with(n, a, b, |x, y| x < y),
+        BinaryOp::LtEq => zip_with(n, a, b, |x, y| x <= y),
+        BinaryOp::Gt => zip_with(n, a, b, |x, y| x > y),
+        _ => zip_with(n, a, b, |x, y| x >= y),
+    };
+    Vector::Bool(values, nulls)
+}
+
+/// Whether a column of REALs has a NaN, which compares with nothing.
+fn has_nan(values: &Typed<f64>) -> bool {
+    match values {
+        Typed::Many(values, _) => values.iter().fold(false, |any, v| any | v.is_nan()),
+        Typed::One(value) => value.is_some_and(f64::is_nan),
+    }
+}
+
+/// `+`, `-` or `*` of two columns of INTs, if no value overflows, NULL
+/// rows' placeholders included; None to work it out a row at a time.
+fn int_arithmetic(n: usize, a: &Typed<i64>, op: BinaryOp, b: &Typed<i64>) -> Option<Vector> {
+    let (overflows, (values, nulls)) = match op {
+        BinaryOp::Add => (
+            any_pair(a, b, |x, y| x.overflowing_add(y).1),
+            zip_with(n, a, b, i64::wrapping_add),
+        ),
+        BinaryOp::Sub => (
+            any_pair(a, b, |x, y| x.overflowing_sub(y).1),
+            zip_with(n, a, b, i64::wrapping_sub),
+        ),
+        BinaryOp::Mul => (
+            any_pair(a, b, |x, y| x.overflowing_mul(y).1),
+            zip_with(n, a, b, i64::wrapping_mul),
+        ),
+        _ => return None,
+    };
+    (!overflows).then_some(Vector::Int(values, nulls))
+}
+
+/// `+`, `-`, `*` or `/` of two columns of REALs, if every value is finite
+/// (one divided by zero is not); None to work it out a row at a time.
+fn real_arithmetic(n: usize, a: &Typed<f64>, op: BinaryOp, b: &Typed<f64>) -> Option<Vector> {
+    let (values, nulls) = match op {
+        BinaryOp::Add => zip_with(n, a, b, |x, y| x + y),
+        BinaryOp::Sub => zip_with(n, a, b, |x, y| x - y),
+        BinaryOp::Mul => zip_with(n, a, b, |x, y| x * y),
+        _ => zip_with(n, a, b, |x, y| x / y),
+    };
+    // A NULL row's value is 0 by now, whatever its placeholders made.
+    let finite = values.iter().fold(true, |all, v| all & v.is_finite());
+    finite.then_some(Vector::Real(values, nulls))
 }
 
 #[cfg(test)]
@@ -615,5 +801,95 @@ mod tests {
         }
         // On rows whose values make no error, none.
         assert!(both("a / b", &rows[1..]).is_ok());
+    }
+
+    /// The loops that work a column out first and check it after: a value
+    /// that overflows, or is not finite, fails as it does row by row, and
+    /// one on a NULL row (whose placeholder may overflow) fails not at all.
+    #[test]
+    fn whole_column_loops_fail_as_rows_do() {
+        let (int, real, null) = (Value::Int, Value::Real, Value::Null);
+        let ints = vec![
+            vec![int(3), int(-7)],
+            vec![int(i64::MAX), int(1)],
+            vec![int(i64::MIN), null.clone()],
+            vec![null.clone(), int(i64::MIN)],
+            vec![int(0), int(0)],
+        ];
+        // Whether each fails on these rows: `both` checks it fails as it
+        // does row by row, and returns what it returns.
+        for (sql, fails) in [
+            ("a + b", true), // MAX + 1
+            ("a - b", false),
+            ("b - a", false),
+            ("a * b", false),
+            ("a * 2", true),
+            ("2 * a", true),
+            ("a + NULL", false),
+            ("-1 - b", false), // -1 - MIN is MAX
+            ("0 - b", true),   // 0 - MIN
+            ("a - 1", true),   // MIN - 1
+        ] {
+            assert_eq!(both(sql, &ints).is_err(), fails, "{sql}");
+        }
+        // NULL - MIN on the fourth row: its placeholder overflows, it does not.
+        assert!(both("a - b", &ints[3..]).is_ok());
+        assert_eq!(
+            both("a - b", &ints[2..4]).unwrap(),
+            vec![null.clone(), null.clone()]
+        );
+
+        let reals = vec![
+            vec![real(1.5), real(2.0)],
+            vec![real(-0.5), real(0.0)],
+            vec![real(1e308), real(1e308)],
+            vec![null.clone(), real(0.0)],
+            vec![real(4.0), null.clone()],
+        ];
+        for (sql, rows) in [
+            ("a / b", &reals[..2]),  // by zero
+            ("a + b", &reals[2..3]), // overflow
+            ("a * b", &reals[2..3]), // overflow
+            ("a - b", &reals[..]),   // overflow on the third row only
+        ] {
+            let found = both(sql, rows);
+            assert!(found.is_err() || sql == "a - b", "{sql}: {found:?}");
+        }
+        // NULL / 0.0 and 4.0 / NULL: no error, NULL.
+        assert_eq!(
+            both("a / b", &reals[3..]).unwrap(),
+            vec![null.clone(), null.clone()]
+        );
+        assert_eq!(both("a / b + 1.0", &reals[..1]).unwrap(), vec![real(1.75)]);
+        // INT with REAL, either way round, and a literal.
+        let mixed = vec![vec![int(3), real(0.5)], vec![int(-2), null.clone()]];
+        for sql in ["a + b", "b * a", "a / 2.0", "1.5 - a", "a - b * 2.0"] {
+            both(sql, &mixed).unwrap();
+        }
+
+        // Comparisons and logic, with and without NULLs and literals.
+        for sql in [
+            "a < b",
+            "a = b",
+            "a <> b",
+            "a >= 3",
+            "2 > a",
+            "a <= NULL",
+            "a < b AND b < 3",
+            "a < b OR a = 3",
+            "NOT (a < b)",
+        ] {
+            both(sql, &ints).unwrap();
+            both(sql, &ints[..2]).unwrap();
+            both(sql, &reals).unwrap();
+        }
+        let bools = vec![
+            vec![Value::Bool(true), Value::Bool(false)],
+            vec![Value::Bool(true), Value::Bool(true)],
+            vec![Value::Bool(false), Value::Bool(false)],
+        ];
+        for sql in ["a AND b", "a OR b", "a AND TRUE", "FALSE OR b"] {
+            both(sql, &bools).unwrap();
+        }
     }
 }
