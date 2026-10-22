@@ -9,7 +9,7 @@ use crate::predicate::Predicate;
 use crate::sql::ast::CreateIndex;
 use crate::storage::{
     BufferPool, ColumnChunk, ColumnConfig, ColumnStore, LsmConfig, LsmTree, MAX_TUPLE_SIZE, PageId,
-    Position, RecordId, TableHeap, tuple,
+    Position, RecordId, SharedScan, TableHeap, tuple,
 };
 use crate::types::{Column, StorageKind, Value, column_index};
 
@@ -49,6 +49,21 @@ pub struct Table {
 
 /// A row count not counted yet.
 const UNCOUNTED: u64 = u64::MAX;
+
+/// The rows of a heap table, read by threads together: see [`Table::shared_scan`].
+pub struct SharedTableScan {
+    pages: SharedScan,
+    columns: Vec<Column>,
+    needed: Vec<bool>,
+}
+
+impl SharedTableScan {
+    /// The rows of the next page no thread has taken, or None once all are.
+    pub fn next_rows(&self) -> Result<Option<Vec<Row>>> {
+        self.pages
+            .next_page(|bytes| tuple::decode_columns(&self.columns, bytes, &self.needed))
+    }
+}
 
 enum Storage {
     Heap(TableHeap),
@@ -158,6 +173,21 @@ impl Table {
             Storage::Heap(_) => StorageKind::Heap,
             Storage::Lsm { .. } => StorageKind::Lsm,
             Storage::Column(_) => StorageKind::Column,
+        }
+    }
+
+    /// A scan of every row that threads share, a page at a time, if the
+    /// table is a heap; the columns not marked in `needed` are left NULL.
+    /// It holds no borrow of the table, which must not change while it runs.
+    pub fn shared_scan(&self, needed: &[bool]) -> Option<SharedTableScan> {
+        assert_eq!(needed.len(), self.columns.len());
+        match &self.storage {
+            Storage::Heap(heap) => Some(SharedTableScan {
+                pages: heap.shared_scan(),
+                columns: self.columns.clone(),
+                needed: needed.to_vec(),
+            }),
+            _ => None,
         }
     }
 

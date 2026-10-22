@@ -19,7 +19,7 @@
 //! pages at a time.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use super::page::{MAX_TUPLE_SIZE, SlottedPage};
 use crate::error::{Result, err};
@@ -173,6 +173,14 @@ impl TableHeap {
         }
     }
 
+    /// A scan that threads share, each taking the next page in turn.
+    pub fn shared_scan(&self) -> SharedScan {
+        SharedScan {
+            pool: self.pool.clone(),
+            next_page: Mutex::new(Some(self.first_page)),
+        }
+    }
+
     /// Returns all of the heap's pages to the free list.
     pub fn destroy(self) -> Result<()> {
         let mut next = Some(self.first_page);
@@ -241,6 +249,41 @@ impl<T, F: FnMut(&[u8]) -> Result<T>> Iterator for Scan<'_, T, F> {
                 .collect();
             self.pending = tuples.into_iter();
         }
+    }
+}
+
+/// The pages of a heap, handed out one at a time to threads that scan it
+/// together, in storage order. Only finding the next page is done one
+/// thread at a time; reading the tuples of each is done by the thread that
+/// took it. It owns what it reads through, so threads may outlive the heap's
+/// borrow; the heap must not change while they scan.
+pub struct SharedScan {
+    pool: Arc<BufferPool>,
+    next_page: Mutex<Option<PageId>>,
+}
+
+impl SharedScan {
+    /// The tuples of the next page no thread has taken, each as `f` made
+    /// it, or None once every page is taken. After an error, none is left.
+    pub fn next_page<T>(&self, mut f: impl FnMut(&[u8]) -> Result<T>) -> Result<Option<Vec<T>>> {
+        let guard = {
+            let mut next = self
+                .next_page
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let Some(id) = *next else {
+                return Ok(None);
+            };
+            *next = None;
+            let guard = self.pool.fetch_read(id)?;
+            *next = SlottedPage::new(&*guard).next_page();
+            guard
+        };
+        let page = SlottedPage::new(&*guard);
+        page.iter()
+            .map(|(_, tuple)| f(tuple))
+            .collect::<Result<_>>()
+            .map(Some)
     }
 }
 

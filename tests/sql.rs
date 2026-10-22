@@ -2832,6 +2832,391 @@ fn parallel_hash_join_returns_what_the_serial_one_does() {
 }
 
 #[test]
+fn gathered_hash_joins_return_what_one_thread_does() {
+    use sequoia::plan::query::ForceJoin;
+    let mut db = in_memory();
+    db.execute(
+        "CREATE TABLE a (id INT PRIMARY KEY, k INT, tag TEXT);
+         CREATE TABLE b (id INT PRIMARY KEY, k INT, tag TEXT, v INT);
+         CREATE TABLE c (id INT PRIMARY KEY, w INT);",
+    )
+    .unwrap();
+    // Keys repeated, NULL, and on one side only; text keys too.
+    let a: Vec<String> = (0..4000i64)
+        .map(|i| match i % 11 {
+            0 => format!("({i}, NULL, 't{}')", i % 40),
+            _ => format!("({i}, {}, 't{}')", i % 700, i % 40),
+        })
+        .collect();
+    let b: Vec<String> = (0..2500i64)
+        .map(|i| match i % 13 {
+            0 => format!("({i}, NULL, NULL, {})", i % 7),
+            _ => format!("({i}, {}, 't{}', {})", i % 900, i % 50, i % 7),
+        })
+        .collect();
+    let c: Vec<String> = (0..500i64).map(|i| format!("({i}, {})", i % 3)).collect();
+    db.execute(&format!(
+        "INSERT INTO a VALUES {}; INSERT INTO b VALUES {}; INSERT INTO c VALUES {};",
+        a.join(", "),
+        b.join(", "),
+        c.join(", ")
+    ))
+    .unwrap();
+    let queries = [
+        "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k",
+        "SELECT a.id, b.v * 2 FROM a JOIN b ON b.k = a.k AND b.v > a.id / 1000 WHERE a.tag < 't20'",
+        "SELECT a.id, b.id FROM a LEFT JOIN b ON b.k = a.k AND b.v > 2",
+        "SELECT a.id, b.v FROM a LEFT JOIN b ON b.k = a.k WHERE b.v IS NULL OR b.v < 3",
+        "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k AND b.tag = a.tag",
+        "SELECT a.id, b.id FROM a JOIN b ON b.tag = a.tag WHERE a.id < 300",
+        "SELECT a.tag, COUNT(*), SUM(b.v) FROM a JOIN b ON b.k = a.k GROUP BY a.tag",
+        "SELECT a.id, b.id, c.w FROM a JOIN b ON b.k = a.k JOIN c ON c.id = b.v + a.k",
+        "SELECT a.id FROM a JOIN b ON b.k = a.k WHERE b.id > 5000",
+    ];
+    let sorted = |mut rows: Vec<Vec<Value>>| {
+        rows.sort_by(|x, y| {
+            x.iter()
+                .zip(y)
+                .map(|(x, y)| x.sort_cmp(y))
+                .find(|o| o.is_ne())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rows
+    };
+    db.set_force_join(Some(ForceJoin::Hash));
+    let default = sequoia::executor::joins::HASH_MEMORY;
+    for sql in queries {
+        db.set_scan_workers(1);
+        db.set_hash_memory(default);
+        let expected = sorted(query(&mut db, sql));
+        // Plenty of memory; and so little that the build writes partitions
+        // out, and the left rows of theirs wait to be joined after.
+        for memory in [default, 4096] {
+            for workers in [2, 4, 16] {
+                db.set_scan_workers(workers);
+                db.set_hash_memory(memory);
+                let plan = explain(&mut db, sql);
+                assert!(
+                    plan.contains(&format!("GATHER ({workers} WORKERS)"))
+                        && plan.contains("HASH JOIN")
+                        && !plan.contains("PARALLEL"),
+                    "{sql}\n{plan}"
+                );
+                let found = sorted(query(&mut db, sql));
+                assert!(
+                    found == expected,
+                    "{sql}, {workers} workers in {memory} bytes\n{plan}"
+                );
+            }
+        }
+    }
+    db.set_hash_memory(default);
+    db.set_scan_workers(4);
+    // The whole join in the workers, as the slides draw it.
+    assert_eq!(
+        explain(
+            &mut db,
+            "SELECT a.id, b.v FROM a JOIN b ON b.k = a.k WHERE b.v > 1"
+        ),
+        "GATHER (4 WORKERS)
+  PROJECT a.id, b.v
+    HASH JOIN ON a.k = b.k
+      SCAN a
+      FILTER b.v > 1
+        SCAN b"
+    );
+    // A LIMIT stops the workers early.
+    assert_eq!(
+        query(&mut db, "SELECT a.id FROM a JOIN b ON b.k = a.k LIMIT 7").len(),
+        7
+    );
+    // An error in any phase is the query's: building, probing, and joining
+    // the partitions that waited.
+    for (sql, memory) in [
+        (
+            "SELECT a.id FROM a JOIN b ON b.k / (b.id - b.id) = a.k",
+            default,
+        ),
+        (
+            "SELECT a.id FROM a JOIN b ON b.k = a.k / (a.id - a.id)",
+            default,
+        ),
+        (
+            "SELECT a.id FROM a JOIN b ON b.k = a.k AND b.v / (a.id - a.id) > 0",
+            default,
+        ),
+        (
+            "SELECT a.id FROM a JOIN b ON b.k = a.k AND b.v / (a.id - a.id) > 0",
+            4096,
+        ),
+    ] {
+        db.set_hash_memory(memory);
+        let e = db.execute(sql).unwrap_err().to_string();
+        assert!(e.contains("division by zero"), "{sql}: {e}");
+    }
+}
+
+#[test]
+fn partial_aggregates_return_what_one_thread_does() {
+    let mut db = in_memory();
+    db.execute(
+        "CREATE TABLE h (id INT PRIMARY KEY, g INT, k INT, r REAL, big INT, tag TEXT);
+         CREATE TABLE b (id INT PRIMARY KEY, k INT, v INT);",
+    )
+    .unwrap();
+    // NULLs in every column; REALs that add up exactly, in any order; INTs
+    // near the largest, whose sums only an average's wider sum holds.
+    let h: Vec<String> = (0..6000i64)
+        .map(|i| {
+            let null = |v: String| if i % 13 == 0 { "NULL".into() } else { v };
+            let big = if i % 2 == 0 {
+                i64::MAX - i
+            } else {
+                i64::MIN + i
+            };
+            format!(
+                "({i}, {}, {}, {}, {}, {})",
+                null((i % 7).to_string()),
+                null((i % 500).to_string()),
+                null(format!("{}.5", i % 40)),
+                null(big.to_string()),
+                null(format!("'t{}'", i % 30)),
+            )
+        })
+        .collect();
+    let b: Vec<String> = (0..1500i64)
+        .map(|i| format!("({i}, {}, {})", i % 700, i % 9))
+        .collect();
+    db.execute(&format!(
+        "INSERT INTO h VALUES {}; INSERT INTO b VALUES {};",
+        h.join(", "),
+        b.join(", ")
+    ))
+    .unwrap();
+    let queries = [
+        "SELECT COUNT(*), COUNT(k), SUM(k), AVG(k), MIN(tag), MAX(tag) FROM h",
+        "SELECT SUM(r), AVG(r), SUM(k + r), MIN(r), MAX(r) FROM h WHERE g < 5",
+        "SELECT AVG(big), COUNT(big), MIN(big), MAX(big) FROM h",
+        "SELECT g, COUNT(*), SUM(k), AVG(r), MAX(tag) FROM h GROUP BY g",
+        "SELECT g, tag, COUNT(*), MIN(k) FROM h GROUP BY g, tag",
+        "SELECT k / 100, COUNT(*) FROM h GROUP BY k / 100 HAVING COUNT(*) > 1000",
+        "SELECT id, SUM(k), AVG(big) FROM h GROUP BY id",
+        "SELECT COUNT(*), SUM(k) FROM h WHERE k > 100000",
+        "SELECT g, COUNT(*) FROM h WHERE k > 100000 GROUP BY g",
+        "SELECT h.g, COUNT(*), SUM(b.v), AVG(b.v) FROM h JOIN b ON b.k = h.k GROUP BY h.g",
+        "SELECT h.g, COUNT(*), COUNT(b.v), MAX(b.id) FROM h LEFT JOIN b ON b.k = h.k AND b.v > 4 GROUP BY h.g",
+        "SELECT COUNT(*) FROM h JOIN b ON b.k = h.k",
+    ];
+    let sorted = |mut rows: Vec<Vec<Value>>| {
+        rows.sort_by(|x, y| {
+            x.iter()
+                .zip(y)
+                .map(|(x, y)| x.sort_cmp(y))
+                .find(|o| o.is_ne())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rows
+    };
+    let default = sequoia::executor::joins::HASH_MEMORY;
+    for sql in queries {
+        db.set_scan_workers(1);
+        db.set_hash_memory(default);
+        let expected = sorted(query(&mut db, sql));
+        // Plenty of memory; and so little that the workers' groups, and the
+        // merged ones, are written out and folded again.
+        for memory in [default, 4096] {
+            for workers in [2, 4, 16] {
+                db.set_scan_workers(workers);
+                db.set_hash_memory(memory);
+                let plan = explain(&mut db, sql);
+                assert!(
+                    plan.contains("FINALIZE AGGREGATE") && plan.contains("PARTIAL AGGREGATE"),
+                    "{sql}\n{plan}"
+                );
+                let found = sorted(query(&mut db, sql));
+                assert!(
+                    found == expected,
+                    "{sql}, {workers} workers in {memory} bytes\n{plan}"
+                );
+            }
+        }
+    }
+    db.set_hash_memory(default);
+    db.set_scan_workers(4);
+    assert_eq!(
+        explain(&mut db, "SELECT g, COUNT(*) FROM h WHERE k > 3 GROUP BY g"),
+        "PROJECT g, COUNT(*)
+  FINALIZE AGGREGATE COUNT(*) BY g
+    GATHER (4 WORKERS)
+      PARTIAL AGGREGATE COUNT(*) BY g
+        FILTER k > 3
+          SCAN h"
+    );
+    // A DISTINCT aggregate is folded in the query's thread, from a gather.
+    let plan = explain(&mut db, "SELECT g, COUNT(DISTINCT k) FROM h GROUP BY g");
+    assert!(
+        !plan.contains("PARTIAL") && plan.contains("GATHER"),
+        "{plan}"
+    );
+    let distinct = "SELECT g, COUNT(DISTINCT k), SUM(k) FROM h GROUP BY g";
+    let found = sorted(query(&mut db, distinct));
+    db.set_scan_workers(1);
+    assert!(found == sorted(query(&mut db, distinct)));
+    db.set_scan_workers(4);
+    // Errors in the workers are the query's: an argument's, and a sum's.
+    let e = db
+        .execute("SELECT g, SUM(k / (k - k)) FROM h GROUP BY g")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("division by zero"), "{e}");
+    let e = db
+        .execute("SELECT SUM(big) FROM h WHERE big > 0")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("overflow"), "{e}");
+}
+
+#[test]
+fn gathered_scans_return_what_one_thread_does() {
+    let mut db = in_memory();
+    db.execute(
+        "CREATE TABLE h (id INT PRIMARY KEY, k INT, tag TEXT, body TEXT);
+         CREATE TABLE l (id INT PRIMARY KEY, k INT) USING LSM;
+         CREATE TABLE c (id INT PRIMARY KEY, k INT) USING COLUMN;
+         CREATE INDEX h_k ON h (k);",
+    )
+    .unwrap();
+    // Enough rows for many pages, some with NULLs.
+    let h: Vec<String> = (0..6000i64)
+        .map(|i| match i % 17 {
+            0 => format!("({i}, NULL, NULL, '{}')", "x".repeat(i as usize % 50)),
+            _ => format!(
+                "({i}, {}, 't{}', '{}')",
+                i % 300,
+                i % 9,
+                "x".repeat(i as usize % 50)
+            ),
+        })
+        .collect();
+    let small: Vec<String> = (0..400i64).map(|i| format!("({i}, {})", i % 30)).collect();
+    db.execute(&format!(
+        "INSERT INTO h VALUES {}; INSERT INTO l VALUES {}; INSERT INTO c VALUES {};",
+        h.join(", "),
+        small.join(", "),
+        small.join(", ")
+    ))
+    .unwrap();
+    // Each, but the ordered ones, compared as sorted rows.
+    let queries = [
+        ("SELECT * FROM h", false),
+        (
+            "SELECT id, k * 2, tag FROM h WHERE k > 100 AND tag <> 't3'",
+            false,
+        ),
+        (
+            "SELECT id FROM h WHERE k IS NULL OR body LIKE 'xxxx%'",
+            false,
+        ),
+        ("SELECT id, k FROM h WHERE k < 50 ORDER BY k DESC, id", true),
+        (
+            "SELECT tag, COUNT(*), SUM(k), MAX(body) FROM h GROUP BY tag",
+            false,
+        ),
+        ("SELECT DISTINCT k FROM h WHERE id > 100", false),
+        (
+            "SELECT a.id, b.id FROM h a JOIN h b ON b.id = a.k WHERE a.id < 2000",
+            false,
+        ),
+        (
+            "SELECT a.id, l.id FROM h a LEFT JOIN l ON l.k = a.k WHERE a.id < 500",
+            false,
+        ),
+        (
+            "SELECT a.id, c.id FROM h a JOIN c ON c.k < a.k WHERE a.id < 40",
+            false,
+        ),
+        (
+            "SELECT t.k, COUNT(*) FROM (SELECT k FROM h WHERE id >= 0) t GROUP BY t.k",
+            false,
+        ),
+        (
+            "SELECT id FROM h WHERE id < 10 UNION SELECT k FROM h WHERE k < 20",
+            false,
+        ),
+        ("SELECT id FROM h WHERE k > (SELECT AVG(k) FROM h)", false),
+        (
+            "SELECT id, (SELECT COUNT(*) FROM l WHERE l.k = h.k) FROM h WHERE id < 300",
+            false,
+        ),
+        ("SELECT id FROM h WHERE k = 7", false),
+    ];
+    let sorted = |mut rows: Vec<Vec<Value>>| {
+        rows.sort_by(|x, y| {
+            x.iter()
+                .zip(y)
+                .map(|(x, y)| x.sort_cmp(y))
+                .find(|o| o.is_ne())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rows
+    };
+    for (sql, ordered) in queries {
+        db.set_scan_workers(1);
+        let expected = query(&mut db, sql);
+        for workers in [2, 4, 16] {
+            db.set_scan_workers(workers);
+            // A tiny block, so that the block join reads its gathered right side again and again.
+            db.set_join_memory(64);
+            let found = query(&mut db, sql);
+            db.set_join_memory(sequoia::executor::joins::JOIN_MEMORY);
+            let label = format!("{sql}, {workers} workers\n{}", explain(&mut db, sql));
+            match ordered {
+                true => assert!(found == expected, "{label}"),
+                false => assert!(sorted(found) == sorted(expected.clone()), "{label}"),
+            }
+        }
+    }
+
+    db.set_scan_workers(4);
+    let plan = |db: &mut Database, sql| explain(db, sql);
+    // The scan, its filters and its projection, all in the workers.
+    assert_eq!(
+        plan(&mut db, "SELECT id, k + 1 FROM h WHERE tag <> 't3'"),
+        "GATHER (4 WORKERS)\n  PROJECT id, k + 1\n    FILTER tag != 't3'\n      SCAN h"
+    );
+    // A filter with a subquery stays in the query's thread; so does an
+    // index's scan, and the scans of LSM and column tables.
+    let p = plan(&mut db, "SELECT id FROM h WHERE k > (SELECT AVG(k) FROM h)");
+    assert!(
+        p.contains("FILTER k > (SELECT") && p.contains("GATHER"),
+        "{p}"
+    );
+    for sql in [
+        "SELECT id FROM h WHERE k = 7",
+        "SELECT * FROM l",
+        "SELECT * FROM c",
+    ] {
+        let p = plan(&mut db, sql);
+        assert!(!p.contains("GATHER"), "{p}");
+    }
+    // A LIMIT stops the workers early.
+    assert_eq!(query(&mut db, "SELECT id FROM h LIMIT 3").len(), 3);
+    // An error in a worker is the query's.
+    let e = db
+        .execute("SELECT id FROM h WHERE id / (k - k) > 1")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("division by zero"), "{e}");
+    // Writes see what gathered reads saw.
+    db.execute("UPDATE h SET k = k + 1 WHERE id IN (SELECT id FROM h WHERE k = 5)")
+        .unwrap();
+    db.set_scan_workers(1);
+    let one = sorted(query(&mut db, "SELECT id, k FROM h WHERE k = 6"));
+    db.set_scan_workers(8);
+    assert!(sorted(query(&mut db, "SELECT id, k FROM h WHERE k = 6")) == one);
+}
+
+#[test]
 fn index_join_is_picked_for_few_left_rows_by_row_counts() {
     let mut db = in_memory();
     db.execute(
@@ -4081,7 +4466,7 @@ fn explain_analyze_tells_what_each_step_did() {
             ("SEARCH t USING INDEX t_pkey (id = 3)", "1 row"),
             (
                 "LOOKUP u USING INDEX u_g (u.g = t.g)",
-                "counted with the join above"
+                "counted with the step above"
             ),
             ("total", "10 rows"),
         ])

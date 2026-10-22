@@ -55,6 +55,7 @@ mod merge;
 mod naive;
 mod parallel;
 mod probe;
+mod scan_join;
 
 pub use block::BlockJoin;
 pub use index::Lookup;
@@ -62,6 +63,7 @@ pub use merge::{MergeJoin, MergeSort};
 pub use naive::NaiveJoin;
 pub use parallel::ParallelHashJoin;
 pub use probe::{Join, Key, Right};
+pub(crate) use scan_join::scan_join;
 
 /// Default memory a block nested loop join may hold left rows in: 4 MB.
 pub const JOIN_MEMORY: usize = 4 << 20;

@@ -30,7 +30,7 @@ pub use buffer::pool::{BufferPool, PageReadGuard, PageWriteGuard, REPLACEMENT_PO
 pub use buffer::replacer::{ArcReplacer, ClockReplacer, LruKReplacer, Policy, Replacer};
 pub use column::store::{ColumnChunk, ColumnConfig, ColumnStore, Position};
 pub use hash::{HASH_SCHEME, HashFile, HashScheme};
-pub use heap::{RecordId, TableHeap};
+pub use heap::{RecordId, SharedScan, TableHeap};
 pub use io::disk::{CHECKPOINT_BYTES, DiskManager, PAGE_SIZE, PAGE_USABLE, Page, PageId};
 pub use lsm::tree::{LsmConfig, LsmTree};
 pub use page::{MAX_TUPLE_SIZE, SlottedPage};

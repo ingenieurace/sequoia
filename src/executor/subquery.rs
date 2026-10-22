@@ -13,6 +13,7 @@ use std::rc::Rc;
 use super::{Settings, model};
 use crate::catalog::Catalog;
 use crate::error::{Result, err};
+use crate::plan::query::Choices;
 use crate::plan::{filter, query};
 use crate::sql::ast::{ColumnRef, Expr, Select};
 use crate::sql::eval::{Answer, Field, Subqueries, resolve};
@@ -66,7 +67,12 @@ impl Subqueries for Runner<'_> {
                 .expect("collected above");
             Ok(values[i].clone())
         })?;
-        let plan = query::select(self.catalog, bound, self.settings.choices())?;
+        // Run once per outer row, it reads too little to be worth threads to scan.
+        let choices = Choices {
+            scan_workers: 1,
+            ..self.settings.choices()
+        };
+        let plan = query::select(self.catalog, bound, choices)?;
         let mut rows = model::open(plan.root, self.catalog, &self.settings);
         let answer = match subquery {
             Expr::Exists(_) => Answer::Exists(rows.next().transpose()?.is_some()),

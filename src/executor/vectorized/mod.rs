@@ -41,7 +41,7 @@ use super::subquery::Runner;
 use crate::catalog::Catalog;
 use crate::catalog::table::{Access, Row, Table};
 use crate::error::{Error, Result};
-use crate::plan::query::{AggregateCall, Node};
+use crate::plan::query::{AggregateCall, Node, Phase};
 use crate::predicate::Predicate;
 use crate::sql::ast::Expr;
 use crate::sql::eval::{Field, NoSubqueries, eval_with, locate, locate_all, matches_with};
@@ -197,6 +197,9 @@ fn open_node<'a>(
             Box::new(parts.into_iter().flatten())
         }
         Node::Derived { input, .. } => open(*input, below(step, 0)),
+        Node::Gather { input, workers } => {
+            batches_of(operator::gather(*input, workers, settings, step), width)
+        }
         Node::Sort { input, keys, limit } => {
             let fields = input.columns();
             let input = rows_of(open(*input, below(step, 0)));
@@ -218,18 +221,27 @@ fn open_node<'a>(
             input,
             group_by,
             aggregates,
+            phase,
         } => {
             let fields = input.columns();
             let input = open(*input, below(step, 0));
             let budget = settings.hash_memory;
             let groups = deferred(move || {
-                Ok(Box::new(aggregate(
-                    input,
-                    &fields,
-                    &group_by,
-                    &aggregates,
-                    budget,
-                )?))
+                Ok(match phase {
+                    Phase::Whole => {
+                        Box::new(aggregate(input, &fields, &group_by, &aggregates, budget)?)
+                    }
+                    // The gather's rows, a group's states each, merged.
+                    Phase::Final => Box::new(super::aggregate::merge(
+                        rows_of(input),
+                        group_by.len(),
+                        &aggregates,
+                        budget,
+                    )?),
+                    Phase::Partial => {
+                        unreachable!("a partial aggregate runs in a gather's workers")
+                    }
+                })
             });
             batches_of(groups, width)
         }

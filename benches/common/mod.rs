@@ -33,6 +33,8 @@ pub struct Case {
     join_memory: usize,
     sort_memory: usize,
     hash_memory: usize,
+    /// Threads a scan of a heap runs on.
+    scan_workers: usize,
     /// Whether to time it in SQLite too.
     sqlite: bool,
 }
@@ -45,11 +47,19 @@ pub fn case(name: &'static str, sql: impl Into<String>, plan: &'static [&'static
         join_memory: JOIN_MEMORY,
         sort_memory: SORT_MEMORY,
         hash_memory: HASH_MEMORY,
+        scan_workers: 1,
         sqlite: true,
     }
 }
 
 impl Case {
+    pub fn scan_workers(self, workers: usize) -> Case {
+        Case {
+            scan_workers: workers,
+            ..self
+        }
+    }
+
     pub fn without_sqlite(self) -> Case {
         Case {
             sqlite: false,
@@ -113,6 +123,7 @@ pub fn run(groups: Vec<(&'static str, Vec<Case>)>, setup: &[String], rows: &str)
             db.set_join_memory(case.join_memory);
             db.set_sort_memory(case.sort_memory);
             db.set_hash_memory(case.hash_memory);
+            db.set_scan_workers(case.scan_workers);
             check_case_plan(&mut db, case);
             let (time, rows) = best_of(&mut db, &case.sql);
             let mut line = format!("  {:<28} {}", case.name, shown(time));

@@ -231,6 +231,15 @@ impl Session {
         self.state.settings.join_workers
     }
 
+    /// See [`crate::Database::set_scan_workers`].
+    pub fn set_scan_workers(&mut self, workers: usize) {
+        self.state.settings.scan_workers = workers.max(1);
+    }
+
+    pub fn scan_workers(&self) -> usize {
+        self.state.settings.scan_workers
+    }
+
     /// Lets the other sessions in again.
     fn leave(&mut self) {
         if self.writing {

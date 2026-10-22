@@ -309,10 +309,17 @@ fn command(db: &mut Database, line: &str) -> bool {
             Some(model) => println!("{model}"),
             None => println!("auto (each query in the model that suits it)"),
         },
-        (".workers", None) => println!("{}", db.join_workers()),
+        (".workers", None) => println!(
+            "scans on {}, hash joins on {}",
+            db.scan_workers(),
+            db.join_workers()
+        ),
         (".workers", Some(n)) => match n.parse() {
-            Ok(n) if n > 0 => db.set_join_workers(n),
-            _ => println!("a hash join needs a number of workers above 0: {n}"),
+            Ok(n) if n > 0 => {
+                db.set_scan_workers(n);
+                db.set_join_workers(n);
+            }
+            _ => println!("a query needs a number of workers above 0: {n}"),
         },
         (".model", Some("auto")) => db.set_execution_model(None),
         (".model", Some(name)) => match Model::from_name(name) {

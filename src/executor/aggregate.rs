@@ -23,6 +23,17 @@
 //! remembers grow the groups in memory past the budget: they cannot be
 //! written out.
 //!
+//! **In parallel.** Under a gather, each worker folds its own rows into
+//! groups of its own (see `gather.rs`), and hands on their aggregates'
+//! running states rather than their results, a row per group: its key,
+//! then each state as values ([`Folder::finish_states`]). The query's
+//! thread then merges the states of each group ([`merge`]): two counts add
+//! up, two sums too, the lower of two minimums wins, two averages' sums and
+//! counts add up. Within its budget as above, a row of a new group past it
+//! written out, its key and states, to be merged with its partition's. A
+//! `DISTINCT` aggregate's values are not merged so: the planner folds those
+//! in one thread.
+//!
 //! Rows come to a [`Folder`] one at a time, or, from the vectorized
 //! executor, a batch at a time: without `GROUP BY`, each aggregate then adds
 //! a whole column of INTs or REALs in one loop ([`Folder::add_columns`]).
@@ -61,6 +72,23 @@ pub fn fold(
     let mut folder = Folder::new(group_by.len(), &aggregates, budget);
     for row in input {
         folder.add_row(&row?, columns, &group_by)?;
+    }
+    Ok(folder.finish())
+}
+
+/// Reads every row of `input`, each a group's key of `keys` values and then
+/// its aggregates' states as [`Folder::finish_states`] gives them, from
+/// workers that folded rows of their own, and returns one row per group,
+/// as [`fold`] does, its states merged.
+pub fn merge(
+    input: Rows,
+    keys: usize,
+    aggregates: &[AggregateCall],
+    budget: usize,
+) -> Result<Groups> {
+    let mut folder = Folder::new(keys, aggregates, budget);
+    for row in input {
+        folder.merge_row(row?)?;
     }
     Ok(folder.finish())
 }
@@ -174,9 +202,40 @@ impl Folder {
         true
     }
 
+    /// Merges a row of a group's key and its aggregates' states, as
+    /// [`Folder::finish_states`] gives them, into its group.
+    pub fn merge_row(&mut self, row: Row) -> Result<()> {
+        let mut values = row.into_iter();
+        let key: Row = values.by_ref().take(self.keys).collect();
+        let states = decode_states(&self.aggregates, &mut values)?;
+        let Folder {
+            table,
+            scratch,
+            aggregates,
+            budget,
+            ..
+        } = self;
+        table.merge(key, states, aggregates, *budget, scratch)
+    }
+
     /// The groups, with their aggregates' results. Without `GROUP BY`, all
     /// rows form one group, which exists even when there are none.
-    pub fn finish(mut self) -> Groups {
+    pub fn finish(self) -> Groups {
+        self.finish_as(Output::Results)
+    }
+
+    /// The groups, with their aggregates' running states instead of their
+    /// results, for [`merge`] to merge with other folders': each state as
+    /// values, an `AVG` as four. Never with `DISTINCT`.
+    pub fn finish_states(self) -> Groups {
+        assert!(
+            !self.aggregates.iter().any(|(_, _, distinct)| *distinct),
+            "a DISTINCT aggregate's state is not merged"
+        );
+        self.finish_as(Output::States)
+    }
+
+    fn finish_as(mut self, output: Output) -> Groups {
         if self.keys == 0 && self.table.groups.is_empty() {
             self.table
                 .groups
@@ -189,16 +248,26 @@ impl Folder {
             budget,
             ..
         } = self;
+        let merging = table.merging;
         let mut groups = Groups {
             aggregates,
             keys,
             budget,
+            output,
+            merging,
             rows: Vec::new().into_iter(),
             pending: Vec::new(),
         };
         groups.start(table);
         groups
     }
+}
+
+/// What a group's row holds after its key: each aggregate's result, or its state.
+#[derive(Clone, Copy, PartialEq)]
+enum Output {
+    Results,
+    States,
 }
 
 /// The rows of the groups: those in memory, then those of each partition
@@ -208,6 +277,10 @@ pub struct Groups {
     /// How many group keys each row written out starts with.
     keys: usize,
     budget: usize,
+    output: Output,
+    /// Whether the rows written out hold states to merge, rather than
+    /// arguments to add.
+    merging: bool,
     rows: std::vec::IntoIter<Row>,
     /// Partitions written out, and the level to split each at if it must be.
     pending: Vec<(RowFile, u32)>,
@@ -228,7 +301,14 @@ impl Groups {
             .groups
             .into_iter()
             .map(|(mut row, states)| {
-                row.extend(states.iter().map(|state| state.accumulator.result()));
+                match self.output {
+                    Output::Results => {
+                        row.extend(states.iter().map(|state| state.accumulator.result()))
+                    }
+                    Output::States => states
+                        .iter()
+                        .for_each(|state| state.accumulator.encode(&mut row)),
+                }
                 row
             })
             .collect();
@@ -236,13 +316,19 @@ impl Groups {
     }
 
     /// Folds the rows of a partition written out, each its key and then
-    /// the arguments of the aggregates that have one.
+    /// the arguments of the aggregates that have one, or when merging, the
+    /// states of all of them.
     fn fold_partition(&mut self, file: RowFile, level: u32) -> Result<()> {
         let mut table = Table::new(level);
         let mut scratch = Vec::new();
         for record in file.read() {
             let mut values = record?.into_iter();
             let key: Row = values.by_ref().take(self.keys).collect();
+            if self.merging {
+                let states = decode_states(&self.aggregates, &mut values)?;
+                table.merge(key, states, &self.aggregates, self.budget, &mut scratch)?;
+                continue;
+            }
             let args: Vec<Option<Value>> = self
                 .aggregates
                 .iter()
@@ -288,6 +374,8 @@ struct Table {
     bytes: usize,
     /// [`FANOUT`] partitions once rows were written out; none before.
     spilled: Vec<RowFile>,
+    /// Whether it merges states, which then are what it writes out.
+    merging: bool,
 }
 
 impl Table {
@@ -298,7 +386,39 @@ impl Table {
             index: HashMap::new(),
             bytes: 0,
             spilled: Vec::new(),
+            merging: false,
         }
+    }
+
+    /// Merges a group's aggregates' `states` into its group; writes them
+    /// out with its key instead if it is a new group and the groups take
+    /// `budget`, as [`Table::add`] does.
+    fn merge(
+        &mut self,
+        key: Row,
+        states: Vec<Accumulator>,
+        aggregates: &[AggregateCall],
+        budget: usize,
+        scratch: &mut Vec<u8>,
+    ) -> Result<()> {
+        self.merging = true;
+        let i = match self.index.get(&key) {
+            Some(&i) => i,
+            None if self.bytes > budget && self.level <= MAX_LEVEL => {
+                if self.spilled.is_empty() {
+                    self.spilled = (0..FANOUT).map(|_| RowFile::new()).collect();
+                }
+                let p = partition(&key, self.level, scratch);
+                let mut record = key;
+                states.iter().for_each(|state| state.encode(&mut record));
+                return self.spilled[p].push(&record);
+            }
+            None => self.group(key, aggregates),
+        };
+        for (state, other) in self.groups[i].1.iter_mut().zip(states) {
+            state.accumulator.merge(other)?;
+        }
+        Ok(())
     }
 
     /// Adds a row with this key and these aggregate arguments (`None` for
@@ -354,6 +474,17 @@ impl Table {
         self.groups.push((key, fresh(aggregates)));
         self.groups.len() - 1
     }
+}
+
+/// The states of `aggregates` that [`Accumulator::encode`] wrote, read from `values`.
+fn decode_states(
+    aggregates: &[AggregateCall],
+    values: &mut impl Iterator<Item = Value>,
+) -> Result<Vec<Accumulator>> {
+    aggregates
+        .iter()
+        .map(|(function, _, _)| Accumulator::decode(*function, values))
+        .collect()
 }
 
 /// The states of a new group's aggregates.
@@ -565,6 +696,91 @@ impl Accumulator {
                     keep(max, Value::Real(r), Ordering::Greater)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Adds the values this state stands for to `out`, for [`Accumulator::decode`].
+    fn encode(&self, out: &mut Row) {
+        match self {
+            Accumulator::Count(n) => out.push(Value::Int(*n)),
+            Accumulator::Sum(value) | Accumulator::Min(value) | Accumulator::Max(value) => {
+                out.push(value.clone().unwrap_or(Value::Null))
+            }
+            // The sum of INTs, an i128, as its high and low 64 bits.
+            Accumulator::Avg { ints, reals, count } => out.extend([
+                Value::Int((*ints >> 64) as i64),
+                Value::Int(*ints as i64),
+                Value::Real(*reals),
+                Value::Int(*count),
+            ]),
+        }
+    }
+
+    /// The state of `function` that [`Accumulator::encode`] wrote, read
+    /// from `values`.
+    fn decode(function: Aggregate, values: &mut impl Iterator<Item = Value>) -> Result<Self> {
+        let mut next = || {
+            values
+                .next()
+                .ok_or_else(|| Error("an aggregate's state is cut short".into()))
+        };
+        let present = |value: Value| (!value.is_null()).then_some(value);
+        Ok(match function {
+            Aggregate::Count => match next()? {
+                Value::Int(n) => Accumulator::Count(n),
+                other => return err(format!("not a count: {other:?}")),
+            },
+            Aggregate::Sum => Accumulator::Sum(present(next()?)),
+            Aggregate::Min => Accumulator::Min(present(next()?)),
+            Aggregate::Max => Accumulator::Max(present(next()?)),
+            Aggregate::Avg => match (next()?, next()?, next()?, next()?) {
+                (Value::Int(high), Value::Int(low), Value::Real(reals), Value::Int(count)) => {
+                    Accumulator::Avg {
+                        ints: ((high as i128) << 64) | (low as u64 as i128),
+                        reals,
+                        count,
+                    }
+                }
+                other => return err(format!("not an average's state: {other:?}")),
+            },
+        })
+    }
+
+    /// Adds another state of the same aggregate to this one, as if its
+    /// values had been added to it.
+    fn merge(&mut self, other: Accumulator) -> Result<()> {
+        match (self, other) {
+            (Accumulator::Count(a), Accumulator::Count(b)) => {
+                *a = a
+                    .checked_add(b)
+                    .ok_or_else(|| Error("integer overflow".into()))?
+            }
+            // Another sum is added as a value of the sum's would be.
+            (sum @ Accumulator::Sum(_), Accumulator::Sum(Some(value))) => sum.add(Some(value))?,
+            (Accumulator::Min(best), Accumulator::Min(Some(value))) => {
+                keep(best, value, Ordering::Less)?
+            }
+            (Accumulator::Max(best), Accumulator::Max(Some(value))) => {
+                keep(best, value, Ordering::Greater)?
+            }
+            (
+                Accumulator::Avg { ints, reals, count },
+                Accumulator::Avg {
+                    ints: i,
+                    reals: r,
+                    count: c,
+                },
+            ) => {
+                *ints += i;
+                *reals += r;
+                *count += c;
+            }
+            // A sum, minimum or maximum of no values adds nothing.
+            (Accumulator::Sum(_), Accumulator::Sum(None))
+            | (Accumulator::Min(_), Accumulator::Min(None))
+            | (Accumulator::Max(_), Accumulator::Max(None)) => {}
+            _ => unreachable!("states of the same aggregate"),
         }
         Ok(())
     }

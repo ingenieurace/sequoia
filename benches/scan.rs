@@ -9,7 +9,9 @@
 //! row groups for, or not, `filter` WHERE clauses that keep more and more rows, `project`
 //! more and more columns and expressions, and `limit` a LIMIT without ORDER
 //! BY, which stops the scan once it has its rows. Every other step costs
-//! something on top of these.
+//! something on top of these. `parallel` reads the heap on more and more
+//! threads, gathering its rows (`Database::set_scan_workers`), each thread
+//! taking the next page and filtering and projecting its rows.
 //!
 //! With a `sqlite3` command, the same statements fill the same tables in
 //! SQLite (with no storage engines to choose: all three are B-trees) and
@@ -24,7 +26,7 @@ use common::{case, insert};
 const ROWS: i64 = 200_000;
 
 fn main() {
-    let groups = vec![
+    let mut groups = vec![
         (
             "engines",
             vec![
@@ -262,6 +264,42 @@ fn main() {
             ],
         ),
     ];
+
+    // The same queries on 1, 2, 4 and 8 threads; SQLite times only the first.
+    let mut parallel = Vec::new();
+    for (name, sql) in [
+        ("1% of rows", "SELECT id FROM th WHERE k < 10000"),
+        (
+            "COUNT(*), every row",
+            "SELECT COUNT(*) FROM th WHERE k >= 0",
+        ),
+        (
+            "every row, two columns",
+            "SELECT id, k FROM th WHERE k >= 0",
+        ),
+        (
+            "text, 10%, expression",
+            "SELECT id, k * 2 + g FROM th WHERE name < 'customer 0100000'",
+        ),
+        (
+            "100 groups, 4 aggregates",
+            "SELECT g, COUNT(*), SUM(k), MIN(name), AVG(k) FROM th WHERE k >= 0 GROUP BY g",
+        ),
+    ] {
+        parallel.push(case(name, sql, &["SCAN th"]));
+        for (workers, label, plan) in [
+            (2, "  2 threads", &["GATHER (2 WORKERS)"]),
+            (4, "  4 threads", &["GATHER (4 WORKERS)"]),
+            (8, "  8 threads", &["GATHER (8 WORKERS)"]),
+        ] {
+            parallel.push(
+                case(label, sql, plan)
+                    .scan_workers(workers)
+                    .without_sqlite(),
+            );
+        }
+    }
+    groups.push(("parallel", parallel));
 
     common::run(
         groups,

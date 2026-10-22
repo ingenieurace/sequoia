@@ -338,6 +338,19 @@ impl Database {
         self.session.settings.join_workers
     }
 
+    /// Sets how many threads a scan of a heap table runs on (one by
+    /// default). With more, every full scan of a heap whose filters and
+    /// projection have no subquery is gathered from that many threads, each
+    /// taking the next page in turn, and its rows come out in no order (see
+    /// `executor/gather.rs`).
+    pub fn set_scan_workers(&mut self, workers: usize) {
+        self.session.settings.scan_workers = workers.max(1);
+    }
+
+    pub fn scan_workers(&self) -> usize {
+        self.session.settings.scan_workers
+    }
+
     /// Switches the buffer pool to another page replacement policy, keeping
     /// the pages it holds (see [`BufferPool::set_policy`]). The default is
     /// [`crate::storage::REPLACEMENT_POLICY`].

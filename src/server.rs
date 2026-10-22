@@ -172,13 +172,18 @@ fn command(session: &mut Session, line: &str) -> Option<String> {
             Some(model) => model.to_string(),
             None => "auto (each query in the model that suits it)".into(),
         },
-        (".workers", None) => session.join_workers().to_string(),
+        (".workers", None) => format!(
+            "scans on {}, hash joins on {}",
+            session.scan_workers(),
+            session.join_workers()
+        ),
         (".workers", Some(n)) => match n.parse() {
             Ok(n) if n > 0 => {
+                session.set_scan_workers(n);
                 session.set_join_workers(n);
                 String::new()
             }
-            _ => format!("a hash join needs a number of workers above 0: {n}"),
+            _ => format!("a query needs a number of workers above 0: {n}"),
         },
         (".model", Some("auto")) => {
             session.set_execution_model(None);

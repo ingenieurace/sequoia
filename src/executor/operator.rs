@@ -27,7 +27,7 @@ use super::subquery::Runner;
 use crate::catalog::Catalog;
 use crate::catalog::table::Row;
 use crate::error::Result;
-use crate::plan::query::{JoinMethod, Node};
+use crate::plan::query::{JoinMethod, Node, Phase};
 use crate::sql::ast::{Expr, JoinKind, OrderBy};
 use crate::sql::eval::{Field, eval_with, locate, locate_all, matches_with};
 
@@ -51,8 +51,9 @@ pub struct StepCount {
     /// The time spent opening it and asking it for rows, the time of the
     /// steps below it included.
     pub time: Duration,
-    /// Whether it runs inside the join above it, which looks rows up through
-    /// it, rather than as a step of its own: it is counted with the join.
+    /// Whether it runs inside the step above it, rather than as a step of its
+    /// own: the index join that looks rows up through it, or the gather whose
+    /// workers run it. It is counted with that step.
     pub inside: bool,
 }
 
@@ -83,6 +84,29 @@ pub(super) type Step = Option<(Rc<Profile>, usize)>;
 pub(super) fn below(step: &Step, offset: usize) -> Step {
     step.as_ref()
         .map(|(profile, id)| (profile.clone(), id + 1 + offset))
+}
+
+/// Marks `node`, whose step is `step`, and the steps below it as run inside
+/// the step above, which counts them with its own.
+pub(super) fn inside(step: &Step, node: &Node) {
+    if let Some((profile, first)) = step {
+        let mut steps = profile.steps.borrow_mut();
+        steps[*first..*first + node.steps()]
+            .iter_mut()
+            .for_each(|count| count.inside = true);
+    }
+}
+
+/// Opens a gather (see `gather.rs`), whose input runs on worker threads,
+/// counted with it.
+pub(super) fn gather<'a>(
+    input: Node<'a>,
+    workers: usize,
+    settings: &Settings,
+    step: &Step,
+) -> Rows<'a> {
+    inside(&below(step, 0), &input);
+    super::gather::open(input, workers, settings)
 }
 
 /// Opens a plan step and everything below it, on tables of `catalog` (which
@@ -224,6 +248,7 @@ fn open_node<'a>(
             Box::new(parts.into_iter().flatten())
         }
         Node::Derived { input, .. } => open(*input, below(step, 0)),
+        Node::Gather { input, workers } => gather(*input, workers, settings, step),
         Node::Project { input, exprs } => {
             let columns = input.columns();
             let exprs = locate_all(&exprs, &columns);
@@ -256,18 +281,21 @@ fn open_node<'a>(
             input,
             group_by,
             aggregates,
+            phase,
         } => {
             let columns = input.columns();
             let input = open(*input, below(step, 0));
             let budget = settings.hash_memory;
             deferred(move || {
-                Ok(Box::new(aggregate::fold(
-                    input,
-                    &columns,
-                    &group_by,
-                    &aggregates,
-                    budget,
-                )?))
+                Ok(Box::new(match phase {
+                    Phase::Whole => {
+                        aggregate::fold(input, &columns, &group_by, &aggregates, budget)?
+                    }
+                    Phase::Final => aggregate::merge(input, group_by.len(), &aggregates, budget)?,
+                    Phase::Partial => {
+                        unreachable!("a partial aggregate runs in a gather's workers")
+                    }
+                }))
             })
         }
     }
@@ -378,12 +406,7 @@ pub(super) fn join<'a>(
             });
         }
         JoinMethod::Index => {
-            if let Some((profile, first)) = right_step {
-                let mut steps = profile.steps.borrow_mut();
-                steps[*first..*first + right.steps()]
-                    .iter_mut()
-                    .for_each(|count| count.inside = true);
-            }
+            inside(right_step, &right);
             let (filter, lookup) = match right {
                 Node::Filter { input, predicate } => (Some(predicate), *input),
                 node => (None, node),

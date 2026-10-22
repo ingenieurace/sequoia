@@ -83,6 +83,19 @@
 //! that many threads (`PARALLEL HASH JOIN`), unless it must keep its left
 //! side's order: its rows come out in no order.
 //!
+//! With more than one scan worker set, each full scan of a heap is gathered
+//! from that many threads (`GATHER`), with the filters and the projection
+//! right above it, unless one of them has a subquery: each worker takes the
+//! next page in turn and filters and projects its rows, and the rows come
+//! out in no order (see `executor/gather.rs`). So is a hash join of two
+//! such scans that need not keep its order, with the filters and the
+//! projection above it: the workers that scan its right side build its hash
+//! table, and those that scan its left side probe it. An aggregate (with
+//! no `DISTINCT`) over such a scan or join is split in two: in each worker,
+//! a `PARTIAL AGGREGATE` folds its rows into groups of its own, and above
+//! the gather, a `FINALIZE AGGREGATE` merges their states. A subquery run
+//! for each row scans in one thread.
+//!
 //! **Steps.** On top of the scans and joins, a SELECT has an aggregate (and a
 //! filter for HAVING) if it groups, a sort if it has ORDER BY that no merge
 //! join sorted for (which applies the LIMIT itself, as a top-N sort) or else
@@ -180,6 +193,9 @@ pub enum Node<'a> {
         input: Box<Node<'a>>,
         group_by: Vec<Expr>,
         aggregates: Vec<AggregateCall>,
+        /// Whether it folds rows into results, or does half of that, in
+        /// the workers of a gather or above one.
+        phase: Phase,
     },
     /// Orders the rows, keeping the first `limit` if given.
     Sort {
@@ -209,6 +225,37 @@ pub enum Node<'a> {
         qualifier: String,
         names: Vec<String>,
     },
+    /// Its input run by `workers` threads at once, their rows gathered:
+    /// a heap's scan, with the filters and the projection above it, if any
+    /// (see `executor/gather.rs`). Its rows come out in no order.
+    Gather {
+        input: Box<Node<'a>>,
+        workers: usize,
+    },
+}
+
+/// What an aggregate step does: all of the folding, or, split between a
+/// gather's workers and the query's thread, half of it (see
+/// `executor/aggregate.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Folds rows into a row per group: its keys, then its aggregates.
+    Whole,
+    /// In each worker, folds its rows into its own groups, and returns a
+    /// row per group of its keys and its aggregates' running states.
+    Partial,
+    /// Above the gather of partial ones, merges the states of each group
+    /// into its row: its keys, then its aggregates, as `Whole` returns it.
+    Final,
+}
+
+/// How many values a running state of `function` takes in a row of a
+/// partial aggregate: an average's four, any other's one.
+pub fn state_width(function: Aggregate) -> usize {
+    match function {
+        Aggregate::Avg => 4,
+        _ => 1,
+    }
 }
 
 /// How a join finds the right rows that may match a left row.
@@ -252,6 +299,9 @@ pub struct Choices {
     /// More than one makes every hash join that need not keep its left
     /// side's order a parallel one, on that many threads.
     pub join_workers: usize,
+    /// More than one gathers every scan of a heap that can be, with the
+    /// filters and projection above it, from that many threads.
+    pub scan_workers: usize,
 }
 
 /// A join method every join of a query is made to use, rather than the one
@@ -562,6 +612,7 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Resu
             input: Box::new(node),
             group_by,
             aggregates,
+            phase: Phase::Whole,
         };
         (Some(exprs), having, order_by)
     } else {
@@ -615,9 +666,188 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Resu
         }
     }
     Ok(Plan {
-        root: node,
+        root: gathered(node, choices.scan_workers),
         columns,
     })
+}
+
+/// The plan with each step that can be gathered from `workers` threads
+/// gathered, with the filters and the projection above it: a full scan of a
+/// heap, or a hash join of two that need not keep its order, under filters
+/// and a projection with no subquery, as subqueries run in the query's
+/// thread only.
+fn gathered(node: Node<'_>, workers: usize) -> Node<'_> {
+    fn scan_chain(node: &Node) -> bool {
+        match node {
+            Node::Filter { input, predicate } => !predicate.has_subquery() && scan_chain(input),
+            Node::Scan { table, access, .. } => {
+                *access == Access::Scan && table.storage_kind() == StorageKind::Heap
+            }
+            _ => false,
+        }
+    }
+    fn join_chain(node: &Node) -> bool {
+        match node {
+            Node::Filter { input, predicate } => !predicate.has_subquery() && join_chain(input),
+            Node::Join {
+                left,
+                right,
+                method:
+                    JoinMethod::Hash {
+                        keep_order: false, ..
+                    },
+                condition,
+                ..
+            } => {
+                !condition.as_ref().is_some_and(Expr::has_subquery)
+                    && scan_chain(left)
+                    && scan_chain(right)
+            }
+            _ => false,
+        }
+    }
+    // A hash join the gather's workers run is no parallel one of its own.
+    fn one_thread(node: Node<'_>) -> Node<'_> {
+        match node {
+            Node::Project { input, exprs } => Node::Project {
+                input: Box::new(one_thread(*input)),
+                exprs,
+            },
+            Node::Filter { input, predicate } => Node::Filter {
+                input: Box::new(one_thread(*input)),
+                predicate,
+            },
+            Node::Join {
+                left,
+                right,
+                kind,
+                method:
+                    JoinMethod::Hash {
+                        left_keys,
+                        right_keys,
+                        keep_order,
+                        ..
+                    },
+                condition,
+            } => Node::Join {
+                left,
+                right,
+                kind,
+                method: JoinMethod::Hash {
+                    left_keys,
+                    right_keys,
+                    keep_order,
+                    workers: 1,
+                },
+                condition,
+            },
+            node => node,
+        }
+    }
+    if workers <= 1 {
+        return node;
+    }
+    let chain = |node: &Node| scan_chain(node) || join_chain(node);
+    let gatherable = match &node {
+        Node::Project { input, exprs } => !exprs.iter().any(Expr::has_subquery) && chain(input),
+        node => chain(node),
+    };
+    if gatherable {
+        return Node::Gather {
+            input: Box::new(one_thread(node)),
+            workers,
+        };
+    }
+    fn inner(input: Node<'_>, workers: usize) -> Box<Node<'_>> {
+        Box::new(gathered(input, workers))
+    }
+    match node {
+        Node::Scan { .. } | Node::Lookup { .. } | Node::Gather { .. } => node,
+        Node::Filter { input, predicate } => Node::Filter {
+            input: inner(*input, workers),
+            predicate,
+        },
+        Node::Join {
+            left,
+            right,
+            kind,
+            method,
+            condition,
+        } => Node::Join {
+            left: inner(*left, workers),
+            right: inner(*right, workers),
+            kind,
+            method,
+            condition,
+        },
+        Node::Aggregate {
+            input,
+            group_by,
+            aggregates,
+            phase: Phase::Whole,
+        } if !aggregates.iter().any(|(_, _, distinct)| *distinct) && chain(&input) => {
+            // Folded in the workers, then merged.
+            let partial = Node::Aggregate {
+                input: Box::new(one_thread(*input)),
+                group_by: group_by.clone(),
+                aggregates: aggregates.clone(),
+                phase: Phase::Partial,
+            };
+            Node::Aggregate {
+                input: Box::new(Node::Gather {
+                    input: Box::new(partial),
+                    workers,
+                }),
+                group_by,
+                aggregates,
+                phase: Phase::Final,
+            }
+        }
+        Node::Aggregate {
+            input,
+            group_by,
+            aggregates,
+            phase,
+        } => Node::Aggregate {
+            input: inner(*input, workers),
+            group_by,
+            aggregates,
+            phase,
+        },
+        Node::Sort { input, keys, limit } => Node::Sort {
+            input: inner(*input, workers),
+            keys,
+            limit,
+        },
+        Node::Union { inputs } => Node::Union {
+            inputs: inputs.into_iter().map(|n| gathered(n, workers)).collect(),
+        },
+        Node::Distinct { input } => Node::Distinct {
+            input: inner(*input, workers),
+        },
+        Node::Limit {
+            input,
+            count,
+            offset,
+        } => Node::Limit {
+            input: inner(*input, workers),
+            count,
+            offset,
+        },
+        Node::Project { input, exprs } => Node::Project {
+            input: inner(*input, workers),
+            exprs,
+        },
+        Node::Derived {
+            input,
+            qualifier,
+            names,
+        } => Node::Derived {
+            input: inner(*input, workers),
+            qualifier,
+            names,
+        },
+    }
 }
 
 /// Plans queries joined by `UNION [ALL]`: the rows of each in turn, left to
@@ -1105,9 +1335,10 @@ pub fn estimate(node: &Node) -> f64 {
             count.map_or(rows, |n| rows.min(n as f64))
         }
         Node::Union { inputs } => inputs.iter().map(estimate).sum(),
-        Node::Distinct { input } | Node::Project { input, .. } | Node::Derived { input, .. } => {
-            estimate(input)
-        }
+        Node::Distinct { input }
+        | Node::Project { input, .. }
+        | Node::Derived { input, .. }
+        | Node::Gather { input, .. } => estimate(input),
     }
 }
 
@@ -1386,13 +1617,33 @@ impl Node<'_> {
             Node::Filter { input, .. }
             | Node::Sort { input, .. }
             | Node::Distinct { input }
-            | Node::Limit { input, .. } => input.columns(),
+            | Node::Limit { input, .. }
+            | Node::Gather { input, .. } => input.columns(),
             Node::Join { left, right, .. } => [left.columns(), right.columns()].concat(),
             // Named by the first query's columns, which ORDER BY above refers to.
             Node::Union { inputs } => inputs[0]
                 .columns()
                 .into_iter()
                 .map(|f| Field::named(f.name))
+                .collect(),
+            // A partial one's states are named for their aggregate, and
+            // numbered when there are several.
+            Node::Aggregate {
+                group_by,
+                aggregates,
+                phase: Phase::Partial,
+                ..
+            } => group_by
+                .iter()
+                .map(Expr::to_string)
+                .chain(aggregates.iter().flat_map(|aggregate| {
+                    let (name, width) = (aggregate_name(aggregate), state_width(aggregate.0));
+                    (0..width).map(move |i| match width {
+                        1 => format!("{name} state"),
+                        _ => format!("{name} state {}", i + 1),
+                    })
+                }))
+                .map(Field::named)
                 .collect(),
             Node::Aggregate {
                 group_by,
@@ -1454,7 +1705,8 @@ impl Node<'_> {
             | Node::Distinct { input }
             | Node::Limit { input, .. }
             | Node::Project { input, .. }
-            | Node::Derived { input, .. } => vec![input],
+            | Node::Derived { input, .. }
+            | Node::Gather { input, .. } => vec![input],
         }
     }
 
@@ -1563,10 +1815,16 @@ impl Node<'_> {
             Node::Aggregate {
                 group_by,
                 aggregates,
+                phase,
                 ..
             } => {
+                let phase = match phase {
+                    Phase::Whole => "",
+                    Phase::Partial => "PARTIAL ",
+                    Phase::Final => "FINALIZE ",
+                };
                 let mut line = format!(
-                    "AGGREGATE {}",
+                    "{phase}AGGREGATE {}",
                     list(&mut aggregates.iter().map(aggregate_name))
                 );
                 if !group_by.is_empty() {
@@ -1590,6 +1848,7 @@ impl Node<'_> {
                 format!("PROJECT {}", list(&mut exprs.iter().map(Expr::to_string)))
             }
             Node::Derived { qualifier, .. } => format!("SUBQUERY {qualifier}"),
+            Node::Gather { workers, .. } => format!("GATHER ({workers} WORKERS)"),
         };
         lines.push(format!("{}{line}", "  ".repeat(depth)));
         for input in self.inputs() {

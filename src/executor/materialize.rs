@@ -40,7 +40,7 @@ use super::subquery::Runner;
 use crate::catalog::Catalog;
 use crate::catalog::table::Row;
 use crate::error::{Error, Result};
-use crate::plan::query::Node;
+use crate::plan::query::{Node, Phase};
 use crate::sql::eval::{eval_with, locate, locate_all, matches_with};
 
 /// A step's rows, and the error that stopped it after them, if one did.
@@ -249,6 +249,9 @@ fn run_node<'a>(
             Output { rows, error: None }
         }
         Node::Derived { input, .. } => run(*input, below(step, 0), wanted),
+        Node::Gather { input, workers } => {
+            Output::read(operator::gather(*input, workers, settings, step), wanted)
+        }
         Node::Sort { input, keys, limit } => {
             let fields = input.columns();
             let input = run(*input, below(step, 0), None);
@@ -269,16 +272,17 @@ fn run_node<'a>(
             input,
             group_by,
             aggregates,
+            phase,
         } => {
             let fields = input.columns();
-            let input = run(*input, below(step, 0), None);
-            match aggregate::fold(
-                input.into_rows(),
-                &fields,
-                &group_by,
-                &aggregates,
-                settings.hash_memory,
-            ) {
+            let input = run(*input, below(step, 0), None).into_rows();
+            let budget = settings.hash_memory;
+            let groups = match phase {
+                Phase::Whole => aggregate::fold(input, &fields, &group_by, &aggregates, budget),
+                Phase::Final => aggregate::merge(input, group_by.len(), &aggregates, budget),
+                Phase::Partial => unreachable!("a partial aggregate runs in a gather's workers"),
+            };
+            match groups {
                 Ok(groups) => Output::read(groups, wanted),
                 Err(e) => Output::failed(e),
             }

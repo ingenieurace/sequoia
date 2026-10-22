@@ -11,7 +11,8 @@
 //! where it would take too long: a nested loop join tries every pair of
 //! rows, ten billion of them for 200,000 left rows by 50,000 right ones.
 //! "parallel hash" is the hash join on [`WORKERS`] threads, a parallel grace
-//! hash join ([`Database::set_join_workers`]). Below the table, the SQL of
+//! hash join ([`Database::set_join_workers`]), whose tables are scanned on
+//! as many ([`Database::set_scan_workers`]). Below the table, the SQL of
 //! each query.
 
 mod common;
@@ -33,14 +34,16 @@ const LONG: Duration = Duration::from_secs(1);
 const WORKERS: usize = 8;
 
 /// The join methods, each a column: the method forced, on how many
-/// threads, its heading, and what its plan says.
+/// threads, its heading, and what its plan says (one of the `|` ones).
 const METHODS: [(ForceJoin, usize, &str, &str); 6] = [
     (ForceJoin::Hash, 1, "hash", "HASH JOIN"),
     (
         ForceJoin::Hash,
         WORKERS,
         "parallel hash",
-        "PARALLEL HASH JOIN",
+        // The whole join gathered; or, with a side read otherwise than by
+        // a heap's full scan, a parallel hash join.
+        "GATHER (8 WORKERS)|PARALLEL HASH JOIN",
     ),
     (ForceJoin::Index, 1, "index", "INDEX JOIN"),
     (ForceJoin::Merge, 1, "merge", "MERGE JOIN"),
@@ -180,7 +183,7 @@ fn main() {
         "Each row is one query; each column, the join method it is made to use. Times are the\n\
          fastest of up to {RUNS} runs, then how many times slower than the row's fastest method.\n\
          n/a: the method cannot run the query. skipped: it would take too long.\n\
-         parallel hash: the hash join's partitions joined by {WORKERS} worker threads at once.\n"
+         parallel hash: both tables scanned, and the partitions joined, by {WORKERS} threads at once.\n"
     );
 
     let start = Instant::now();
@@ -250,11 +253,12 @@ fn row(db: &mut Database, query: &Query) -> Vec<Cell> {
         .map(|&(method, workers, heading, plan_word)| {
             db.set_force_join(Some(method));
             db.set_join_workers(workers);
+            db.set_scan_workers(workers);
             let Some(plan) = explain(db, query.sql) else {
                 return Cell::NotApplicable;
             };
             assert!(
-                plan.contains(plan_word),
+                plan_word.split('|').any(|word| plan.contains(word)),
                 "{}, by {heading}: no {plan_word} in\n{plan}",
                 query.sql
             );
@@ -275,6 +279,7 @@ fn row(db: &mut Database, query: &Query) -> Vec<Cell> {
         .collect();
     db.set_force_join(None);
     db.set_join_workers(1);
+    db.set_scan_workers(1);
     cells
 }
 

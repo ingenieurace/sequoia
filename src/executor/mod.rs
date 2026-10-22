@@ -6,6 +6,7 @@
 //! of their expressions.
 
 pub mod aggregate;
+mod gather;
 pub mod joins;
 mod materialize;
 pub mod model;
@@ -55,6 +56,10 @@ pub struct Settings {
     /// join that need not keep its order a parallel grace hash join (see
     /// `joins/parallel.rs`), whose workers share `hash_memory`.
     pub join_workers: usize,
+    /// Threads a scan of a heap runs on, with the filters and projection
+    /// above it; by default one. More gathers it from that many (see
+    /// `gather.rs`): its rows come out in no order.
+    pub scan_workers: usize,
 }
 
 impl Default for Settings {
@@ -66,6 +71,7 @@ impl Default for Settings {
             model: None,
             force_join: None,
             join_workers: 1,
+            scan_workers: 1,
         }
     }
 }
@@ -76,6 +82,7 @@ impl Settings {
         Choices {
             force_join: self.force_join,
             join_workers: self.join_workers,
+            scan_workers: self.scan_workers,
         }
     }
 }
@@ -254,7 +261,7 @@ fn explain_analyze(catalog: &Catalog, query: Select, settings: &Settings) -> Res
             .zip(profile.counts())
             .map(|(line, count)| {
                 let did = match count {
-                    StepCount { inside: true, .. } => "counted with the join above".to_string(),
+                    StepCount { inside: true, .. } => "counted with the step above".to_string(),
                     StepCount { runs: 0, .. } => "never run".to_string(),
                     StepCount {
                         runs: 1,

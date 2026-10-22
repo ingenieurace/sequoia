@@ -362,20 +362,20 @@ impl Iterator for ParallelHashJoin<'_> {
 
 /// The rows of one side, in [`FANOUT`] partitions by the hash of their keys,
 /// held in memory within `budget`, and past it the largest written out.
-struct Partitions {
-    parts: Vec<Partition>,
+pub(super) struct Partitions {
+    pub(super) parts: Vec<Partition>,
     /// Bytes of the partitions in memory.
     bytes: usize,
     budget: usize,
 }
 
-enum Partition {
+pub(super) enum Partition {
     Memory { rows: Vec<Row>, bytes: usize },
     File(RowFile),
 }
 
 impl Partitions {
-    fn new(budget: usize) -> Self {
+    pub(super) fn new(budget: usize) -> Self {
         Partitions {
             parts: (0..FANOUT)
                 .map(|_| Partition::Memory {
@@ -388,7 +388,7 @@ impl Partitions {
         }
     }
 
-    fn push(&mut self, p: usize, row: Row) -> Result<()> {
+    pub(super) fn push(&mut self, p: usize, row: Row) -> Result<()> {
         match &mut self.parts[p] {
             Partition::File(file) => file.push(&row)?,
             Partition::Memory { rows, bytes } => {
@@ -430,7 +430,7 @@ impl Partitions {
 }
 
 impl Partition {
-    fn rows(&self) -> u64 {
+    pub(super) fn rows(&self) -> u64 {
         match self {
             Partition::Memory { rows, .. } => rows.len() as u64,
             Partition::File(file) => file.rows(),
@@ -438,7 +438,7 @@ impl Partition {
     }
 
     /// The rows of the parts of a partition, one part after another.
-    fn all(parts: Vec<Partition>) -> Rows<'static> {
+    pub(super) fn all(parts: Vec<Partition>) -> Rows<'static> {
         Box::new(parts.into_iter().flat_map(Partition::into_rows))
     }
 
