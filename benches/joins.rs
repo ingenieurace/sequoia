@@ -12,8 +12,9 @@
 //! rows, ten billion of them for 200,000 left rows by 50,000 right ones.
 //! "parallel hash" is the hash join on [`WORKERS`] threads, a parallel grace
 //! hash join ([`Database::set_join_workers`]), whose tables are scanned on
-//! as many ([`Database::set_scan_workers`]). Below the table, the SQL of
-//! each query.
+//! as many ([`Database::set_scan_workers`]); "parallel index" the index join
+//! on as many, whose workers each scan pages of the left side and look its
+//! rows up. Below the table, the SQL of each query.
 
 mod common;
 
@@ -30,12 +31,12 @@ const RIGHT: i64 = 50_000;
 const RUNS: usize = 5;
 const LONG: Duration = Duration::from_secs(1);
 
-/// Threads the parallel hash join runs on.
+/// Threads the parallel hash and index joins run on.
 const WORKERS: usize = 8;
 
 /// The join methods, each a column: the method forced, on how many
 /// threads, its heading, and what its plan says (one of the `|` ones).
-const METHODS: [(ForceJoin, usize, &str, &str); 6] = [
+const METHODS: [(ForceJoin, usize, &str, &str); 7] = [
     (ForceJoin::Hash, 1, "hash", "HASH JOIN"),
     (
         ForceJoin::Hash,
@@ -46,6 +47,8 @@ const METHODS: [(ForceJoin, usize, &str, &str); 6] = [
         "GATHER (8 WORKERS)|PARALLEL HASH JOIN",
     ),
     (ForceJoin::Index, 1, "index", "INDEX JOIN"),
+    // Gathered whole, or its left side only, or not at all, as its sides allow.
+    (ForceJoin::Index, WORKERS, "parallel index", "INDEX JOIN"),
     (ForceJoin::Merge, 1, "merge", "MERGE JOIN"),
     (
         ForceJoin::Block,
@@ -183,7 +186,7 @@ fn main() {
         "Each row is one query; each column, the join method it is made to use. Times are the\n\
          fastest of up to {RUNS} runs, then how many times slower than the row's fastest method.\n\
          n/a: the method cannot run the query. skipped: it would take too long.\n\
-         parallel hash: both tables scanned, and the partitions joined, by {WORKERS} threads at once.\n"
+         parallel hash, parallel index: each run by {WORKERS} threads at once.\n"
     );
 
     let start = Instant::now();

@@ -54,6 +54,7 @@ pub const SPLIT_LOAD: f64 = 0.75;
 /// The part below which the last split is undone.
 pub const MERGE_LOAD: f64 = 0.35;
 
+#[derive(Clone)]
 pub struct Linear {
     pool: Arc<BufferPool>,
     root: PageId,

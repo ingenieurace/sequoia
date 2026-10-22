@@ -82,6 +82,9 @@ const HEADER_SIZE: usize = 7;
 const LEAF: u8 = 0;
 const INTERNAL: u8 = 1;
 
+/// A clone is another handle to the same tree, on the same pages: the
+/// pages hold all of its state, so threads may each read through one.
+#[derive(Clone)]
 pub struct BPlusTree {
     pool: Arc<BufferPool>,
     root: PageId,

@@ -76,6 +76,9 @@ impl HashScheme {
 const EXTENDIBLE: u8 = b'E';
 const LINEAR: u8 = b'L';
 
+/// A clone is another handle to the same file, on the same pages: the
+/// pages hold all of its state, so threads may each read through one.
+#[derive(Clone)]
 pub enum HashFile {
     Extendible(Extendible),
     Linear(Linear),

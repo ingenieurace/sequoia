@@ -47,6 +47,7 @@ use crate::storage::io::disk::{Page, PageId};
 
 const SLOTS: Slots = Slots { header: 2, size: 5 };
 
+#[derive(Clone)]
 pub struct Extendible {
     pool: Arc<BufferPool>,
     root: PageId,

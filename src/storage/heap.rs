@@ -126,7 +126,13 @@ impl TableHeap {
     /// Returns the tuple at `rid`, or `None` if it was deleted.
     /// `rid` must belong to this heap; that is not checked.
     pub fn get(&self, rid: RecordId) -> Result<Option<Vec<u8>>> {
-        let page = self.pool.fetch_read(rid.page_id)?;
+        Self::get_in(&self.pool, rid)
+    }
+
+    /// The tuple at `rid` in a heap whose pages are in `pool`: a read that
+    /// needs no handle to the heap, only where the tuple is.
+    pub fn get_in(pool: &BufferPool, rid: RecordId) -> Result<Option<Vec<u8>>> {
+        let page = pool.fetch_read(rid.page_id)?;
         Ok(SlottedPage::new(&*page).get(rid.slot).map(<[u8]>::to_vec))
     }
 

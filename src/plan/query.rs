@@ -90,7 +90,9 @@
 //! out in no order (see `executor/gather.rs`). So is a hash join of two
 //! such scans that need not keep its order, with the filters and the
 //! projection above it: the workers that scan its right side build its hash
-//! table, and those that scan its left side probe it. An aggregate (with
+//! table, and those that scan its left side probe it. So is an index join
+//! of such a scan with a heap it looks rows up in through an index: the
+//! workers that scan its left side look each row's key up themselves. An aggregate (with
 //! no `DISTINCT`) over such a scan or join is split in two: in each worker,
 //! a `PARTIAL AGGREGATE` folds its rows into groups of its own, and above
 //! the gather, a `FINALIZE AGGREGATE` merges their states. A subquery run
@@ -673,7 +675,8 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Resu
 
 /// The plan with each step that can be gathered from `workers` threads
 /// gathered, with the filters and the projection above it: a full scan of a
-/// heap, or a hash join of two that need not keep its order, under filters
+/// heap, a hash join of two that need not keep its order, or an index join
+/// of one with a heap's index, under filters
 /// and a projection with no subquery, as subqueries run in the query's
 /// thread only.
 fn gathered(node: Node<'_>, workers: usize) -> Node<'_> {
@@ -703,6 +706,29 @@ fn gathered(node: Node<'_>, workers: usize) -> Node<'_> {
                     && scan_chain(left)
                     && scan_chain(right)
             }
+            Node::Join {
+                left,
+                right,
+                method: JoinMethod::Index,
+                condition,
+                ..
+            } => {
+                !condition.as_ref().is_some_and(Expr::has_subquery)
+                    && scan_chain(left)
+                    && lookup_chain(right)
+            }
+            _ => false,
+        }
+    }
+    // An index join's lookups in a heap, under filters with no subquery.
+    fn lookup_chain(node: &Node) -> bool {
+        match node {
+            Node::Filter { input, predicate } => !predicate.has_subquery() && lookup_chain(input),
+            Node::Lookup {
+                table,
+                key: LookupKey::Index(_),
+                ..
+            } => table.storage_kind() == StorageKind::Heap,
             _ => false,
         }
     }

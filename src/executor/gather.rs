@@ -42,11 +42,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 
-use crate::catalog::table::{Row, SharedTableScan};
+use crate::catalog::table::{Row, SharedLookup, SharedTableScan};
 use crate::error::{Result, err};
-use crate::plan::query::{AggregateCall, JoinMethod, Node, Phase};
+use crate::plan::query::{AggregateCall, JoinMethod, LookupKey, Node, Phase};
 use crate::sql::ast::Expr;
 use crate::sql::eval::{Field, eval, locate, matches};
+use crate::types::Value;
 
 use super::Settings;
 use super::aggregate::{self, Folder};
@@ -130,6 +131,19 @@ pub(super) fn open<'a>(input: Node<'a>, workers: usize, settings: &Settings) -> 
                 workers,
             )
         }
+        Node::Join {
+            left,
+            right,
+            kind,
+            method: JoinMethod::Index,
+            condition,
+        } => {
+            let fields = [left.columns(), right.columns()].concat();
+            let steps = Steps::new(&filters, project.as_deref(), &fields);
+            let left = Source::of(*left);
+            let right = Lookups::of(*right, left.fields());
+            joins::scan_index_join(left, right, kind, condition, steps, partial, workers)
+        }
         node => {
             let steps = Steps::new(&[], project.as_deref(), &node.columns());
             scan(Source::of(node), steps, partial, workers)
@@ -138,6 +152,76 @@ pub(super) fn open<'a>(input: Node<'a>, workers: usize, settings: &Settings) -> 
     match started {
         Ok(rows) => Box::new(rows),
         Err(e) => Box::new(std::iter::once(Err(e))),
+    }
+}
+
+/// The right side of an index join, which workers look rows up in
+/// together: a heap's rows by a column, through an index on it, each left
+/// row's key worked out from it, and the filters above the lookup.
+pub(crate) struct Lookups {
+    lookup: SharedLookup,
+    /// The left key, located in the left side's fields.
+    left_key: Expr,
+    /// The filters, located in the right table's fields.
+    filters: Vec<Option<Expr>>,
+    fields: Vec<Field>,
+}
+
+impl Lookups {
+    /// The lookups of an index join's right side, a heap's under filters,
+    /// maybe, for left rows whose fields are `left_fields`.
+    fn of(mut node: Node, left_fields: &[Field]) -> Lookups {
+        let mut filters = Vec::new();
+        loop {
+            match node {
+                Node::Filter { input, predicate } => {
+                    filters.push(predicate);
+                    node = *input;
+                }
+                Node::Lookup {
+                    table,
+                    qualifier,
+                    needed,
+                    column,
+                    key: LookupKey::Index(index),
+                    left_key,
+                } => {
+                    let fields = Field::of_table(&qualifier, &table.columns);
+                    return Lookups {
+                        lookup: table
+                            .shared_lookup(index, column, &needed)
+                            .expect("only a heap's lookups are gathered"),
+                        left_key: locate(&left_key, left_fields),
+                        filters: filters.iter().map(|f| Some(locate(f, &fields))).collect(),
+                        fields,
+                    };
+                }
+                _ => unreachable!("only an index's lookups and their filters are gathered"),
+            }
+        }
+    }
+
+    pub(crate) fn fields(&self) -> &[Field] {
+        &self.fields
+    }
+
+    /// The right rows a left row's key finds that the filters keep.
+    pub(crate) fn find(&self, left: &[Value], left_fields: &[Field]) -> Result<Vec<Row>> {
+        let key = eval(&self.left_key, left_fields, left)?;
+        let mut rows = self.lookup.find(&key)?;
+        if !self.filters.is_empty() {
+            let mut kept = Vec::with_capacity(rows.len());
+            'rows: for row in rows {
+                for filter in &self.filters {
+                    if !matches(filter, &self.fields, &row)? {
+                        continue 'rows;
+                    }
+                }
+                kept.push(row);
+            }
+            rows = kept;
+        }
+        Ok(rows)
     }
 }
 

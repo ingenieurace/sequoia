@@ -65,6 +65,56 @@ impl SharedTableScan {
     }
 }
 
+/// Lookups of a heap table's rows by one column, through an index on it,
+/// that threads make together: see [`Table::shared_lookup`].
+pub struct SharedLookup {
+    index: Index,
+    pool: Arc<BufferPool>,
+    columns: Vec<Column>,
+    column: usize,
+    needed: Vec<bool>,
+    covering: bool,
+}
+
+impl SharedLookup {
+    /// The rows whose column equals `value`, as an index join's lookup
+    /// finds them: none for NULL, or for a value that equals no value of
+    /// the column's type; from the index's entries if it covers the
+    /// columns needed, else from the heap, whole.
+    pub fn find(&self, value: &Value) -> Result<Vec<Row>> {
+        if value.is_null() {
+            return Ok(Vec::new());
+        }
+        let Some(value) = value.coerce(self.columns[self.column].data_type) else {
+            return Ok(Vec::new());
+        };
+        let entries = self.index.scan(std::slice::from_ref(&value), None, None)?;
+        let mut rows = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            if self.covering {
+                rows.push(self.index.row(entry, &self.needed)?);
+                continue;
+            }
+            let rid = record_id(self.index.row_id(entry)?)?;
+            let bytes = TableHeap::get_in(&self.pool, rid)?
+                .ok_or_else(|| Error(format!("index points to a missing row: {rid:?}")))?;
+            rows.push(tuple::decode(&self.columns, &bytes)?);
+        }
+        Ok(rows)
+    }
+}
+
+/// A heap row's id, as an index entry ends with it.
+fn record_id(bytes: &[u8]) -> Result<RecordId> {
+    match <[u8; RECORD_ID_LEN]>::try_from(bytes) {
+        Ok([a, b, c, d, e, f]) => Ok(RecordId {
+            page_id: PageId(u32::from_be_bytes([a, b, c, d])),
+            slot: u16::from_be_bytes([e, f]),
+        }),
+        Err(_) => err("corrupted index entry: bad record id"),
+    }
+}
+
 enum Storage {
     Heap(TableHeap),
     /// Rows are keyed by their primary key or, in a table without one, by a
@@ -189,6 +239,31 @@ impl Table {
             }),
             _ => None,
         }
+    }
+
+    /// Lookups by `column` through the index at `index` (whose first key it
+    /// is) that threads make together, if the table is a heap; `needed`
+    /// marks the columns read above, as for [`Table::shared_scan`]. Like
+    /// that scan, it holds no borrow of the table, which must not change
+    /// while it runs.
+    pub fn shared_lookup(
+        &self,
+        index: usize,
+        column: usize,
+        needed: &[bool],
+    ) -> Option<SharedLookup> {
+        let Storage::Heap(_) = &self.storage else {
+            return None;
+        };
+        let index = self.indexes[index].clone();
+        Some(SharedLookup {
+            covering: index.covers(needed),
+            index,
+            pool: self.pool.clone(),
+            columns: self.columns.clone(),
+            column,
+            needed: needed.to_vec(),
+        })
     }
 
     /// The pages the catalog records to open the table again: a heap's first
@@ -717,13 +792,7 @@ impl Table {
     /// Turns the bytes an index stores back into a row id.
     fn row_id(&self, bytes: Vec<u8>) -> Result<RowId> {
         match &self.storage {
-            Storage::Heap(_) => match <[u8; RECORD_ID_LEN]>::try_from(bytes.as_slice()) {
-                Ok([a, b, c, d, e, f]) => Ok(RowId::Record(RecordId {
-                    page_id: PageId(u32::from_be_bytes([a, b, c, d])),
-                    slot: u16::from_be_bytes([e, f]),
-                })),
-                Err(_) => err("corrupted index entry: bad record id"),
-            },
+            Storage::Heap(_) => record_id(&bytes).map(RowId::Record),
             Storage::Lsm { .. } => Ok(RowId::Key(bytes)),
             Storage::Column(_) => err("COLUMN tables cannot have indexes"),
         }

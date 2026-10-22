@@ -2868,7 +2868,7 @@ fn gathered_hash_joins_return_what_one_thread_does() {
         "SELECT a.id, b.id FROM a LEFT JOIN b ON b.k = a.k AND b.v > 2",
         "SELECT a.id, b.v FROM a LEFT JOIN b ON b.k = a.k WHERE b.v IS NULL OR b.v < 3",
         "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k AND b.tag = a.tag",
-        "SELECT a.id, b.id FROM a JOIN b ON b.tag = a.tag WHERE a.id < 300",
+        "SELECT a.id, b.id FROM a JOIN b ON b.tag = a.tag WHERE a.k < 300",
         "SELECT a.tag, COUNT(*), SUM(b.v) FROM a JOIN b ON b.k = a.k GROUP BY a.tag",
         "SELECT a.id, b.id, c.w FROM a JOIN b ON b.k = a.k JOIN c ON c.id = b.v + a.k",
         "SELECT a.id FROM a JOIN b ON b.k = a.k WHERE b.id > 5000",
@@ -2951,6 +2951,117 @@ fn gathered_hash_joins_return_what_one_thread_does() {
         ),
     ] {
         db.set_hash_memory(memory);
+        let e = db.execute(sql).unwrap_err().to_string();
+        assert!(e.contains("division by zero"), "{sql}: {e}");
+    }
+}
+
+#[test]
+fn gathered_index_joins_return_what_one_thread_does() {
+    use sequoia::plan::query::ForceJoin;
+    let mut db = in_memory();
+    db.execute(
+        "CREATE TABLE a (id INT PRIMARY KEY, k INT, r REAL, tag TEXT);
+         CREATE TABLE b (id INT PRIMARY KEY, k INT, v INT, w INT, tag TEXT);
+         CREATE TABLE l (id INT PRIMARY KEY, v INT) USING LSM;
+         CREATE INDEX b_k ON b (k);
+         CREATE INDEX b_vw ON b (v) INCLUDE (w);
+         CREATE INDEX b_tag ON b USING HASH (tag);",
+    )
+    .unwrap();
+    // Keys repeated, NULL, missing on one side; REALs equal to INTs.
+    let a: Vec<String> = (0..4000i64)
+        .map(|i| match i % 11 {
+            0 => format!("({i}, NULL, NULL, NULL)"),
+            _ => format!("({i}, {}, {}.0, 't{}')", i % 700, i % 9, i % 40),
+        })
+        .collect();
+    let b: Vec<String> = (0..2500i64)
+        .map(|i| match i % 13 {
+            0 => format!("({i}, NULL, NULL, NULL, NULL)"),
+            _ => format!("({i}, {}, {}, {}, 't{}')", i % 900, i % 7, i % 5, i % 50),
+        })
+        .collect();
+    let l: Vec<String> = (0..800i64).map(|i| format!("({i}, {})", i % 3)).collect();
+    db.execute(&format!(
+        "INSERT INTO a VALUES {}; INSERT INTO b VALUES {}; INSERT INTO l VALUES {};",
+        a.join(", "),
+        b.join(", "),
+        l.join(", ")
+    ))
+    .unwrap();
+    let queries = [
+        "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k",
+        "SELECT a.id, b.v * 2 FROM a JOIN b ON b.k = a.k AND b.v > a.id / 1000 WHERE b.w < 4",
+        "SELECT a.id, b.id FROM a LEFT JOIN b ON b.k = a.k AND b.v > 2",
+        "SELECT a.id, b.v FROM a LEFT JOIN b ON b.k = a.k WHERE b.v IS NULL OR b.v < 3",
+        // Covered by its index: `w` is in its entries.
+        "SELECT a.id, b.w FROM a JOIN b ON b.v = a.k",
+        // Through a hash index, by text.
+        "SELECT a.id, b.id FROM a JOIN b ON b.tag = a.tag WHERE a.k < 300",
+        // A REAL key finds the INTs it equals.
+        "SELECT a.id, b.id FROM a JOIN b ON b.k = a.r",
+        "SELECT a.tag, COUNT(*), SUM(b.v), AVG(b.w) FROM a JOIN b ON b.k = a.k GROUP BY a.tag",
+        "SELECT COUNT(*) FROM a JOIN b ON b.k = a.k + 100000",
+    ];
+    let sorted = |mut rows: Vec<Vec<Value>>| {
+        rows.sort_by(|x, y| {
+            x.iter()
+                .zip(y)
+                .map(|(x, y)| x.sort_cmp(y))
+                .find(|o| o.is_ne())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rows
+    };
+    db.set_force_join(Some(ForceJoin::Index));
+    for sql in queries {
+        db.set_scan_workers(1);
+        let expected = sorted(query(&mut db, sql));
+        for workers in [2, 4, 16] {
+            db.set_scan_workers(workers);
+            let plan = explain(&mut db, sql);
+            assert!(
+                plan.contains(&format!("GATHER ({workers} WORKERS)"))
+                    && plan.contains("INDEX JOIN")
+                    && plan.find("GATHER") < plan.find("INDEX JOIN"),
+                "{sql}\n{plan}"
+            );
+            let found = sorted(query(&mut db, sql));
+            assert!(found == expected, "{sql}, {workers} workers\n{plan}");
+        }
+    }
+    db.set_scan_workers(4);
+    // The whole join in the workers.
+    assert_eq!(
+        explain(
+            &mut db,
+            "SELECT a.id, b.v FROM a JOIN b ON b.k = a.k WHERE b.w > 1"
+        ),
+        "GATHER (4 WORKERS)
+  PROJECT a.id, b.v
+    INDEX JOIN
+      SCAN a
+      FILTER b.w > 1
+        LOOKUP b USING INDEX b_k (b.k = a.k)"
+    );
+    // An LSM table's key is looked up in the query's thread: only the scan is gathered.
+    let plan = explain(&mut db, "SELECT a.id, l.v FROM a JOIN l ON l.id = a.k");
+    assert!(
+        plan.contains("INDEX JOIN") && plan.find("INDEX JOIN") < plan.find("GATHER"),
+        "{plan}"
+    );
+    // A LIMIT stops the workers early.
+    assert_eq!(
+        query(&mut db, "SELECT a.id FROM a JOIN b ON b.k = a.k LIMIT 7").len(),
+        7
+    );
+    // An error in a worker is the query's: in the key, the condition, a filter.
+    for sql in [
+        "SELECT a.id FROM a JOIN b ON b.k = a.k / (a.id - a.id)",
+        "SELECT a.id FROM a JOIN b ON b.k = a.k AND b.v / (a.id - a.id) > 0",
+        "SELECT a.id FROM a JOIN b ON b.k = a.k AND b.v / (b.w - b.w) > 0",
+    ] {
         let e = db.execute(sql).unwrap_err().to_string();
         assert!(e.contains("division by zero"), "{sql}: {e}");
     }

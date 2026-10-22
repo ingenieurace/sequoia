@@ -56,6 +56,9 @@ pub enum Key {
     Expr(Expr),
 }
 
+/// A clone reads the same entries, through a handle of its own to the same
+/// tree or file (see `Table::shared_lookup`); only the table writes them.
+#[derive(Clone)]
 pub struct Index {
     pub name: String,
     /// Whether two indexed rows may not have equal keys, unless one is NULL.
@@ -81,6 +84,7 @@ pub struct Index {
 }
 
 /// Where an index's entries are kept.
+#[derive(Clone)]
 enum Store {
     BTree(BPlusTree),
     Hash(HashFile),
