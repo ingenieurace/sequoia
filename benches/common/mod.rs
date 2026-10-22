@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use sequoia::executor::join::{HASH_MEMORY, JOIN_MEMORY};
+use sequoia::executor::joins::{HASH_MEMORY, JOIN_MEMORY};
 use sequoia::executor::sort::SORT_MEMORY;
 use sequoia::{Database, QueryResult};
 

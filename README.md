@@ -287,8 +287,13 @@ src/
       mod.rs      each plan step passing on batches of rows; joins and sorts on rows between them
       batch.rs    batches: typed column vectors and a selection of the rows still in them
       expr.rs     expressions a column at a time: loops over arrays, row by row for the rest
-    join.rs       block nested loop, hash, index and sort-merge joins; LEFT JOIN padding
-    hash_join.rs  a hash join's right side: hybrid hash join, partitions spilled past the budget
+    joins/        the join methods
+      mod.rs      their memory budgets
+      probe.rs    hash and index joins: a left row's candidates by its keys; LEFT JOIN padding
+      hash.rs     a hash join's right side: hybrid hash join, partitions spilled past the budget
+      index.rs    an index join's right side: lookups through an index or the primary key
+      block.rs    block nested loop join
+      merge.rs    sort-merge join
     sort.rs       ORDER BY: external merge sort, top-N heap for LIMIT
     spill.rs      temporary files of rows, and the partitions hash joins and aggregates spill
     aggregate.rs  hash aggregation: one row per group, partitions of new groups past the budget, the functions

@@ -6,8 +6,7 @@
 //! of their expressions.
 
 pub mod aggregate;
-pub mod hash_join;
-pub mod join;
+pub mod joins;
 mod materialize;
 pub mod model;
 pub mod operator;
@@ -28,7 +27,7 @@ use crate::result::QueryResult;
 use crate::sql::ast::{ColumnRef, Expr, Projection, Select, SelectItem, Statement};
 use crate::sql::eval::{Field, eval_with, locate, matches_with};
 use crate::types::Value;
-use join::{HASH_MEMORY, JOIN_MEMORY};
+use joins::{HASH_MEMORY, JOIN_MEMORY};
 use model::Model;
 use operator::{Profile, Rows, StepCount};
 use sort::SORT_MEMORY;

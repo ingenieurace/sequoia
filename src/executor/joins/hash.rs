@@ -28,12 +28,12 @@
 
 use std::collections::HashMap;
 
-use super::join::Key;
-use super::operator::Rows;
-use super::sort::value_size;
-use super::spill::{FANOUT, MAX_LEVEL, RowFile, RowReader, partition};
+use super::Key;
 use crate::catalog::table::Row;
 use crate::error::Result;
+use crate::executor::operator::Rows;
+use crate::executor::sort::value_size;
+use crate::executor::spill::{FANOUT, MAX_LEVEL, RowFile, RowReader, partition};
 use crate::sql::eval::Field;
 use crate::types::Value;
 

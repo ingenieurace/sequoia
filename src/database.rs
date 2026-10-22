@@ -214,14 +214,14 @@ impl Database {
     }
 
     /// Sets how many bytes of left rows a block nested loop join may hold at
-    /// once ([`executor::join::JOIN_MEMORY`] by default); it reads its right
+    /// once ([`executor::joins::JOIN_MEMORY`] by default); it reads its right
     /// side once for each block of them.
     pub fn set_join_memory(&mut self, bytes: usize) {
         self.settings.join_memory = bytes;
     }
 
     /// Sets how many bytes of right rows a hash join, or of groups a hash
-    /// aggregation, may hold ([`executor::join::HASH_MEMORY`] by default)
+    /// aggregation, may hold ([`executor::joins::HASH_MEMORY`] by default)
     /// before it writes partitions of them to temporary files.
     pub fn set_hash_memory(&mut self, bytes: usize) {
         self.settings.hash_memory = bytes;

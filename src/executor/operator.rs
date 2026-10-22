@@ -6,7 +6,7 @@
 //! `LIMIT` stops the scan once it has enough, and a query's rows can be read
 //! without holding them all. A sort and an aggregate are blocking: they read
 //! all of their input when their first row is asked for. So is the right side
-//! of a hash join (see `join.rs`); the left side streams, but for the rows of
+//! of a hash join (see `joins/`); the left side streams, but for the rows of
 //! partitions it writes out past its budget, which come at the end. A block
 //! nested loop join reads its left side a block at a time, and its right side
 //! again for each block. A merge join sorts both sides when its first row is
@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use super::Settings;
 use super::aggregate;
-use super::join::{BlockJoin, Join, Lookup, MergeJoin, MergeSort, Right};
+use super::joins::{BlockJoin, Join, Lookup, MergeJoin, MergeSort, Right};
 use super::sort::{Sorted, Sorter};
 use super::subquery::Runner;
 use crate::catalog::Catalog;

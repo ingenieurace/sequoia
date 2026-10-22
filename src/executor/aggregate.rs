@@ -27,7 +27,7 @@
 //! executor, a batch at a time: without `GROUP BY`, each aggregate then adds
 //! a whole column of INTs or REALs in one loop ([`Folder::add_columns`]).
 //!
-//! [`HASH_MEMORY`]: super::join::HASH_MEMORY
+//! [`HASH_MEMORY`]: super::joins::HASH_MEMORY
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
