@@ -5,6 +5,9 @@
 //!
 //! Most groups pit a method against another on the same rows, so what one
 //! wins or loses by shows too: `+ 0` on a key hides it from the planner.
+//! The `naive` group times the naive nested loop join, which no plan runs,
+//! as a baseline: it builds the joins itself, on rows in memory, rather than
+//! running SQL.
 //!
 //! With a `sqlite3` command, the same statements fill the same tables in
 //! SQLite and every query is timed there too, for a column beside Sequoia's
@@ -13,6 +16,12 @@
 mod common;
 
 use common::{case, insert};
+use sequoia::Value;
+use sequoia::catalog::table::Row;
+use sequoia::executor::joins::{BlockJoin, JOIN_MEMORY, NaiveJoin};
+use sequoia::executor::operator::Rows;
+use sequoia::sql::ast::{BinaryOp, ColumnRef, Expr, JoinKind};
+use sequoia::sql::eval::Field;
 
 const LEFT: i64 = 200_000;
 const RIGHT: i64 = 50_000;
@@ -182,11 +191,133 @@ fn main() {
         ),
     ];
 
-    common::run(
-        groups.into(),
-        &setup(),
-        &format!("{LEFT} rows joined with {RIGHT}"),
+    // Fill the tables only for a group that queries them.
+    if groups.iter().any(|(group, _)| common::wanted(group)) {
+        common::run(
+            groups.into(),
+            &setup(),
+            &format!("{LEFT} rows joined with {RIGHT}"),
+        );
+    }
+    if common::wanted("naive") {
+        naive();
+    }
+}
+
+/// The naive nested loop join against the block nested loop join, on the
+/// rows the `block` group joins: the first 1,000 of `a` and 2,000 of `b`,
+/// their `id` and `k`, in memory. The naive join reads `b` again for each
+/// left row, so 1,000 times; the block join with its default budget reads it
+/// once and keeps it, and held to 1 KB reads it again for each block of a
+/// dozen rows or so. Held to 1 byte, each block is one row and nothing is
+/// kept: it reads `b` as often as the naive join, so the two differ only in
+/// how they are built. Reading `b` again here copies its rows out of memory;
+/// from a table it would scan the table's pages again too.
+fn naive() {
+    let left: Vec<Row> = (0..1000)
+        .map(|i| vec![Value::Int(i), Value::Int(i % RIGHT)])
+        .collect();
+    let right: Vec<Row> = (0..2000)
+        .map(|i| vec![Value::Int(i), Value::Int(i)])
+        .collect();
+    let fields = |table: &str| {
+        ["id", "k"].map(|name| Field {
+            table: Some(table.into()),
+            name: name.into(),
+        })
+    };
+    let column = |table: &str, name: &str| {
+        Box::new(Expr::Column(ColumnRef {
+            table: Some(table.into()),
+            name: name.into(),
+        }))
+    };
+    // b.k < a.k, and for the LEFT JOIN b.k > a.k + 1500, true of no right
+    // row for a.k >= 499: half the left rows are padded.
+    let inner = Expr::Binary(column("b", "k"), BinaryOp::Lt, column("a", "k"));
+    let plus = Expr::Binary(
+        column("a", "k"),
+        BinaryOp::Add,
+        Box::new(Expr::Literal(Value::Int(1500))),
     );
+    let left_join = Expr::Binary(column("b", "k"), BinaryOp::Gt, Box::new(plus));
+
+    let count = |join: &mut dyn Iterator<Item = sequoia::Result<Row>>| {
+        let mut rows = 0;
+        for row in join {
+            row.unwrap();
+            rows += 1;
+        }
+        rows
+    };
+    let naive = |kind, condition: &Expr| {
+        let right = Box::new(|| rows(&right));
+        let mut join = NaiveJoin::new(
+            rows(&left),
+            fields("a").into(),
+            right,
+            fields("b").into(),
+            kind,
+            Some(condition.clone()),
+        );
+        count(&mut join)
+    };
+    let block = |kind, condition: &Expr, budget| {
+        let right = Box::new(|| rows(&right));
+        let mut join = BlockJoin::new(
+            rows(&left),
+            fields("a").into(),
+            right,
+            fields("b").into(),
+            kind,
+            Some(condition.clone()),
+            budget,
+        );
+        count(&mut join)
+    };
+
+    println!("\n{:<30} {:>11}", "naive", "sequoia");
+    let cases: [(&str, Run); 6] = [
+        ("naive", Box::new(|| naive(JoinKind::Inner, &inner))),
+        (
+            "  as block, b kept",
+            Box::new(|| block(JoinKind::Inner, &inner, JOIN_MEMORY)),
+        ),
+        (
+            "  as block, 1 KB",
+            Box::new(|| block(JoinKind::Inner, &inner, 1000)),
+        ),
+        (
+            "  as block, 1 byte",
+            Box::new(|| block(JoinKind::Inner, &inner, 1)),
+        ),
+        (
+            "naive, left join",
+            Box::new(|| naive(JoinKind::Left, &left_join)),
+        ),
+        (
+            "  as block, b kept",
+            Box::new(|| block(JoinKind::Left, &left_join, JOIN_MEMORY)),
+        ),
+    ];
+    let mut expected = None;
+    for (i, (name, run)) in cases.iter().enumerate() {
+        let (time, rows) = common::fastest(run);
+        // Each method returns the rows the naive join before it did.
+        if name.starts_with("naive") {
+            expected = Some(rows);
+        }
+        assert_eq!(Some(rows), expected, "case {i}, {name}");
+        println!("  {name:<28} {}  ({rows} rows)", common::shown(time));
+    }
+}
+
+/// A case of the `naive` group: runs a join, and returns how many rows it gave.
+type Run<'a> = Box<dyn Fn() -> usize + 'a>;
+
+/// Rows from memory, as a join reads them.
+fn rows(rows: &[Row]) -> Rows<'_> {
+    Box::new(rows.iter().cloned().map(Ok))
 }
 
 /// The statements that fill the tables: `a` (LEFT rows) and three with the

@@ -294,6 +294,7 @@ src/
       index.rs    an index join's right side: lookups through an index or the primary key
       block.rs    block nested loop join
       merge.rs    sort-merge join
+      naive.rs    naive nested loop join: no plan runs it; a baseline for the joins benchmark
     sort.rs       ORDER BY: external merge sort, top-N heap for LIMIT
     spill.rs      temporary files of rows, and the partitions hash joins and aggregates spill
     aggregate.rs  hash aggregation: one row per group, partitions of new groups past the budget, the functions

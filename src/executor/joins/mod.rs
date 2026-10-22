@@ -33,20 +33,25 @@
 //! uses, which writes runs to a temporary file past its budget, so besides
 //! those budgets it holds only the right rows of one key at a time. Its rows come out in
 //! the left side's sorted order, which is why the planner picks it: for an
+//! ORDER BY that starts with its keys, the sort is already done.
 //!
 //! Each method has a file of its own: `probe.rs` runs the joins that find a
 //! left row's right rows by its keys, through `hash.rs` or `index.rs`;
 //! `block.rs` is the block nested loop join, `merge.rs` the sort-merge join.
+//! `naive.rs`, the naive nested loop join, is not one of them: no plan runs
+//! it, and the joins benchmark measures the others against it.
 
 mod block;
 mod hash;
 mod index;
 mod merge;
+mod naive;
 mod probe;
 
 pub use block::BlockJoin;
 pub use index::Lookup;
 pub use merge::{MergeJoin, MergeSort};
+pub use naive::NaiveJoin;
 pub use probe::{Join, Key, Right};
 
 /// Default memory a block nested loop join may hold left rows in: 4 MB.
