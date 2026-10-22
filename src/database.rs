@@ -17,6 +17,12 @@
 //! the transaction goes on. `SAVEPOINT name` takes such a savepoint by name,
 //! for `ROLLBACK TO name` to go back to (keeping it, and dropping the ones
 //! taken after it) and `RELEASE name` to forget (with those after it).
+//!
+//! **Sessions.** What a database holds, its pages and its catalog, is its
+//! [`Core`]; what each user of it holds, its settings and its transaction,
+//! is a [`SessionState`]. A [`Database`] is one of each, for one thread. A
+//! [`SharedDatabase`](crate::shared::SharedDatabase) shares a core between
+//! the sessions of many threads (see `shared.rs`).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -36,13 +42,24 @@ use crate::storage::{BufferPool, DiskManager, Policy, Stats};
 const BUFFER_POOL_FRAMES: usize = 256;
 
 pub struct Database {
+    core: Core,
+    session: SessionState,
+}
+
+/// What every session of a database shares: its pages and its catalog.
+pub(crate) struct Core {
     pool: Arc<BufferPool>,
     catalog: Catalog,
-    settings: Settings,
-    /// The savepoints of the transaction in progress, oldest first, if there is one.
-    transaction: Option<Vec<(String, Savepoint)>>,
     /// Set when a rollback failed, leaving the state in memory unknown.
     broken: bool,
+}
+
+/// What a session holds of its own: its settings and its transaction.
+#[derive(Default)]
+pub(crate) struct SessionState {
+    pub(crate) settings: Settings,
+    /// The savepoints of the transaction in progress, oldest first, if there is one.
+    transaction: Option<Vec<(String, Savepoint)>>,
 }
 
 /// The position of the newest savepoint with this name.
@@ -57,14 +74,12 @@ fn message(text: impl Into<String>) -> QueryResult {
     QueryResult::Message(text.into())
 }
 
-impl Database {
-    /// Creates a database that lives only in memory.
-    pub fn in_memory() -> Self {
+impl Core {
+    pub(crate) fn in_memory() -> Self {
         Self::with_disk(DiskManager::in_memory()).expect("in-memory storage cannot fail")
     }
 
-    /// Opens (or creates) a database stored in the given file.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::with_disk(DiskManager::open(path)?)
     }
 
@@ -73,25 +88,62 @@ impl Database {
         let mut catalog = Catalog::open(pool.clone())?;
         catalog.save()?; // a new database's empty catalog
         pool.disk().commit()?;
-        Ok(Database {
+        Ok(Core {
             pool,
             catalog,
-            settings: Settings::default(),
-            transaction: None,
             broken: false,
         })
     }
 
-    /// Parses and runs every statement in `sql`, stopping at the first error.
-    pub fn execute(&mut self, sql: &str) -> Result<Vec<QueryResult>> {
-        parse(sql)?.into_iter().map(|stmt| self.run(stmt)).collect()
+    pub(crate) fn pool(&self) -> &Arc<BufferPool> {
+        &self.pool
     }
 
-    /// Runs a single parsed statement.
-    pub fn run(&mut self, statement: Statement) -> Result<QueryResult> {
-        if self.broken {
-            return err("a failed rollback left the database unusable: open it again");
+    pub(crate) fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
+    /// An error if a failed rollback left the core unusable.
+    fn usable(&self) -> Result<()> {
+        match self.broken {
+            true => err("a failed rollback left the database unusable: open it again"),
+            false => Ok(()),
         }
+    }
+
+    /// Undoes what failed with `e`: everything since `to`, or since the last commit.
+    fn undo(&mut self, e: Error, to: Option<&Savepoint>) -> Result<QueryResult> {
+        match self.restore(to) {
+            Ok(()) => Err(e),
+            Err(rollback) => err(format!("{e}; then the rollback failed: {rollback}")),
+        }
+    }
+
+    /// Undoes everything since `to`, or since the last commit, in memory and
+    /// on disk. If that fails, the database is unusable.
+    pub(crate) fn restore(&mut self, to: Option<&Savepoint>) -> Result<()> {
+        let result = (|| {
+            self.pool.discard_all()?;
+            match to {
+                Some(savepoint) => self.pool.disk().rollback_to(savepoint)?,
+                None => self.pool.disk().rollback()?,
+            }
+            self.catalog = Catalog::open(self.pool.clone())?;
+            Ok(())
+        })();
+        self.broken |= result.is_err();
+        result
+    }
+}
+
+impl SessionState {
+    pub(crate) fn in_transaction(&self) -> bool {
+        self.transaction.is_some()
+    }
+
+    /// Runs a single parsed statement on `core`.
+    pub(crate) fn run(&mut self, core: &mut Core, statement: Statement) -> Result<QueryResult> {
+        core.usable()?;
         match statement {
             Statement::Begin => {
                 if self.transaction.is_some() {
@@ -104,16 +156,16 @@ impl Database {
                 if self.transaction.take().is_none() {
                     return err("no transaction is in progress");
                 }
-                match self.pool.disk().commit() {
+                match core.pool.disk().commit() {
                     Ok(()) => Ok(message("transaction committed")),
-                    Err(e) => self.undo(e, None),
+                    Err(e) => core.undo(e, None),
                 }
             }
             Statement::Rollback { savepoint: None } => {
                 if self.transaction.take().is_none() {
                     return err("no transaction is in progress");
                 }
-                self.restore(None)?;
+                core.restore(None)?;
                 Ok(message("transaction rolled back"))
             }
             Statement::Rollback {
@@ -123,11 +175,11 @@ impl Database {
                 let i = find(savepoints, &name)?;
                 savepoints.truncate(i + 1);
                 let savepoint = savepoints[i].1.clone();
-                self.restore(Some(&savepoint))?;
+                core.restore(Some(&savepoint))?;
                 Ok(message(format!("rolled back to savepoint {name}")))
             }
             Statement::Savepoint { name } => {
-                let savepoint = self.pool.disk().savepoint();
+                let savepoint = core.pool.disk().savepoint();
                 self.savepoints("SAVEPOINT")?
                     .push((name.clone(), savepoint));
                 Ok(message(format!("savepoint {name} created")))
@@ -141,36 +193,37 @@ impl Database {
             Statement::Checkpoint if self.transaction.is_some() => {
                 err("CHECKPOINT cannot run inside a transaction")
             }
-            statement => self.statement(statement),
+            statement if executor::reads_only(&statement) => self.read(core, statement),
+            statement => self.write(core, statement),
         }
     }
 
-    /// Runs a statement other than the transaction ones, atomically: commits
-    /// it, or inside a transaction saves it, or else undoes it.
-    fn statement(&mut self, statement: Statement) -> Result<QueryResult> {
-        let modifies = !matches!(statement, Statement::Select(_) | Statement::Explain { .. });
-        let savepoint =
-            (modifies && self.transaction.is_some()).then(|| self.pool.disk().savepoint());
-        let result = executor::execute(&mut self.catalog, statement, &self.settings);
-        if !modifies {
-            return result;
-        }
+    /// Runs a statement that only reads (see [`executor::reads_only`]) on a
+    /// core that other sessions may be reading too.
+    pub(crate) fn read(&self, core: &Core, statement: Statement) -> Result<QueryResult> {
+        core.usable()?;
+        executor::execute_read(&core.catalog, statement, &self.settings)
+    }
+
+    /// Runs a statement that changes data, atomically: commits it, or inside
+    /// a transaction saves it, or else undoes it.
+    fn write(&mut self, core: &mut Core, statement: Statement) -> Result<QueryResult> {
+        let savepoint = self
+            .transaction
+            .is_some()
+            .then(|| core.pool.disk().savepoint());
+        let result = executor::execute(&mut core.catalog, statement, &self.settings);
         let saved = result.and_then(|result| {
-            self.catalog.save()?;
+            core.catalog.save()?;
             if self.transaction.is_none() {
-                self.pool.disk().commit()?;
+                core.pool.disk().commit()?;
             }
             Ok(result)
         });
         match saved {
             Ok(result) => Ok(result),
-            Err(e) => self.undo(e, savepoint.as_ref()),
+            Err(e) => core.undo(e, savepoint.as_ref()),
         }
-    }
-
-    /// Whether a transaction is in progress.
-    pub fn in_transaction(&self) -> bool {
-        self.transaction.is_some()
     }
 
     /// The savepoints of the transaction in progress, for `statement` to use.
@@ -180,13 +233,44 @@ impl Database {
             None => err(format!("{statement} can only be used in a transaction")),
         }
     }
+}
 
-    /// Undoes what failed with `e`: everything since `to`, or since the last commit.
-    fn undo(&mut self, e: Error, to: Option<&Savepoint>) -> Result<QueryResult> {
-        match self.restore(to) {
-            Ok(()) => Err(e),
-            Err(rollback) => err(format!("{e}; then the rollback failed: {rollback}")),
+impl Database {
+    /// Creates a database that lives only in memory.
+    pub fn in_memory() -> Self {
+        Self::of(Core::in_memory())
+    }
+
+    /// Opens (or creates) a database stored in the given file.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self::of(Core::open(path)?))
+    }
+
+    #[cfg(test)]
+    fn with_disk(disk: DiskManager) -> Result<Self> {
+        Ok(Self::of(Core::with_disk(disk)?))
+    }
+
+    fn of(core: Core) -> Self {
+        Database {
+            core,
+            session: SessionState::default(),
         }
+    }
+
+    /// Parses and runs every statement in `sql`, stopping at the first error.
+    pub fn execute(&mut self, sql: &str) -> Result<Vec<QueryResult>> {
+        parse(sql)?.into_iter().map(|stmt| self.run(stmt)).collect()
+    }
+
+    /// Runs a single parsed statement.
+    pub fn run(&mut self, statement: Statement) -> Result<QueryResult> {
+        self.session.run(&mut self.core, statement)
+    }
+
+    /// Whether a transaction is in progress.
+    pub fn in_transaction(&self) -> bool {
+        self.session.in_transaction()
     }
 
     /// Runs one SELECT and returns its rows as they are produced, without
@@ -194,81 +278,64 @@ impl Database {
     /// it must, and a sort or aggregate holds only what it needs. The
     /// database cannot change while the rows are being read.
     pub fn query(&self, sql: &str) -> Result<Query<'_>> {
-        if self.broken {
-            return err("a failed rollback left the database unusable: open it again");
-        }
+        self.core.usable()?;
         let mut statements = parse(sql)?;
         match (statements.pop(), statements.is_empty()) {
             (Some(Statement::Select(query)), true) => {
-                executor::select(&self.catalog, query, &self.settings)
+                executor::select(&self.core.catalog, query, &self.session.settings)
             }
             _ => err("query runs a single SELECT; use execute for other statements"),
         }
     }
 
-    /// Undoes everything since `to`, or since the last commit, in memory and
-    /// on disk. If that fails, the database is unusable.
-    fn restore(&mut self, to: Option<&Savepoint>) -> Result<()> {
-        let result = (|| {
-            self.pool.discard_all()?;
-            match to {
-                Some(savepoint) => self.pool.disk().rollback_to(savepoint)?,
-                None => self.pool.disk().rollback()?,
-            }
-            self.catalog = Catalog::open(self.pool.clone())?;
-            Ok(())
-        })();
-        self.broken |= result.is_err();
-        result
-    }
-
     /// Sets how many bytes a sort may buffer before it writes sorted runs to
     /// a temporary file ([`executor::sort::SORT_MEMORY`] by default).
     pub fn set_sort_memory(&mut self, bytes: usize) {
-        self.settings.sort_memory = bytes;
+        self.session.settings.sort_memory = bytes;
     }
 
     /// Sets how many bytes of left rows a block nested loop join may hold at
     /// once ([`executor::joins::JOIN_MEMORY`] by default); it reads its right
     /// side once for each block of them.
     pub fn set_join_memory(&mut self, bytes: usize) {
-        self.settings.join_memory = bytes;
+        self.session.settings.join_memory = bytes;
     }
 
     /// Sets how many bytes of right rows a hash join, or of groups a hash
     /// aggregation, may hold ([`executor::joins::HASH_MEMORY`] by default)
     /// before it writes partitions of them to temporary files.
     pub fn set_hash_memory(&mut self, bytes: usize) {
-        self.settings.hash_memory = bytes;
+        self.session.settings.hash_memory = bytes;
     }
 
     /// Sets the execution model every query runs in, or with `None`, lets
     /// each query run in the one that suits it, as by default (see
     /// [`executor::model`]).
     pub fn set_execution_model(&mut self, model: Option<Model>) {
-        self.settings.model = model;
+        self.session.settings.model = model;
     }
 
     pub fn execution_model(&self) -> Option<Model> {
-        self.settings.model
+        self.session.settings.model
     }
 
     /// Makes every join use `method`, or with `None`, lets the planner pick
     /// each, as by default: for comparing the methods on the same query.
     /// A query with a join that cannot use it fails to plan (see [`ForceJoin`]).
     pub fn set_force_join(&mut self, method: Option<ForceJoin>) {
-        self.settings.force_join = method;
+        self.session.settings.force_join = method;
     }
 
     /// Switches the buffer pool to another page replacement policy, keeping
     /// the pages it holds (see [`BufferPool::set_policy`]). The default is
     /// [`crate::storage::REPLACEMENT_POLICY`].
     pub fn set_replacement_policy(&mut self, policy: Policy) {
-        self.pool.set_policy(policy);
+        self.core.pool.set_policy(policy);
     }
 
     pub fn replacement_policy(&self) -> Policy {
-        self.pool
+        self.core
+            .pool
             .policy()
             .expect("the database's pool is made with a policy")
     }
@@ -276,11 +343,11 @@ impl Database {
     /// The buffer pool's hits and misses since its policy was last set, and
     /// how many frames it has.
     pub fn buffer_stats(&self) -> (Stats, usize) {
-        (self.pool.stats(), self.pool.capacity())
+        (self.core.pool.stats(), self.core.pool.capacity())
     }
 
     pub fn table_names(&self) -> Vec<&str> {
-        self.catalog.table_names()
+        self.core.catalog.table_names()
     }
 }
 

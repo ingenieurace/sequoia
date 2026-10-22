@@ -65,11 +65,50 @@ impl Default for Settings {
     }
 }
 
+/// Whether a statement only reads: SELECT and EXPLAIN, which
+/// [`execute_read`] runs on a catalog it cannot change.
+pub fn reads_only(statement: &Statement) -> bool {
+    matches!(statement, Statement::Select(_) | Statement::Explain { .. })
+}
+
+/// Runs a statement that only reads (see [`reads_only`]).
+pub fn execute_read(
+    catalog: &Catalog,
+    statement: Statement,
+    settings: &Settings,
+) -> Result<QueryResult> {
+    match statement {
+        Statement::Explain {
+            statement,
+            analyze: false,
+        } => explain(catalog, *statement, settings),
+        Statement::Explain {
+            statement,
+            analyze: true,
+        } => match *statement {
+            Statement::Select(query) => explain_analyze(catalog, query, settings),
+            _ => err("EXPLAIN ANALYZE supports only SELECT"),
+        },
+        Statement::Select(query) => {
+            let query = select(catalog, query, settings)?;
+            let columns = query.columns.clone();
+            Ok(QueryResult::Rows {
+                columns,
+                rows: query.collect::<Result<_>>()?,
+            })
+        }
+        _ => unreachable!("a statement that changes nothing"),
+    }
+}
+
 pub fn execute(
     catalog: &mut Catalog,
     statement: Statement,
     settings: &Settings,
 ) -> Result<QueryResult> {
+    if reads_only(&statement) {
+        return execute_read(catalog, statement, settings);
+    }
     match statement {
         Statement::CreateTable {
             name,
@@ -92,25 +131,7 @@ pub fn execute(
             catalog.drop_index(&name)?;
             Ok(message(format!("index {name} dropped")))
         }
-        Statement::Explain {
-            statement,
-            analyze: false,
-        } => explain(catalog, *statement, settings),
-        Statement::Explain {
-            statement,
-            analyze: true,
-        } => match *statement {
-            Statement::Select(query) => explain_analyze(catalog, query, settings),
-            _ => err("EXPLAIN ANALYZE supports only SELECT"),
-        },
-        Statement::Select(query) => {
-            let query = select(catalog, query, settings)?;
-            let columns = query.columns.clone();
-            Ok(QueryResult::Rows {
-                columns,
-                rows: query.collect::<Result<_>>()?,
-            })
-        }
+        Statement::Select(_) | Statement::Explain { .. } => unreachable!("run above"),
         Statement::Checkpoint => {
             catalog.checkpoint()?;
             Ok(message("checkpoint done".into()))
