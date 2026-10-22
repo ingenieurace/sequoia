@@ -1,17 +1,28 @@
-//! Times every join method: `cargo bench --bench joins`, or with group names
-//! (`cargo bench --bench joins -- hash merge`) for only those groups. Prints
-//! the fastest of a few runs of each query, to compare changes to a join by,
-//! and checks that each query's plan uses the join it is meant to time.
+//! Compares the join methods: `cargo bench --bench joins`, or with group
+//! names (`cargo bench --bench joins -- equi few`) for only those groups.
 //!
-//! Most groups pit a method against another on the same rows, so what one
-//! wins or loses by shows too: `+ 0` on a key hides it from the planner.
+//! Each group is one query, and each of its cases a join method running it,
+//! on the same rows: the fastest of a few runs, and how many times slower
+//! that is than the group's fastest method. Every method of a group must
+//! return the same rows, and each case's plan must use the method it names.
+//!
+//! The planner picks one method for a query, so each case makes it pick
+//! another, spelled so that what is left to do is the same:
+//!
+//! - hash: `+ 0` on the right side's key, which an index cannot look up;
+//! - index: a WHERE true of every row of `a` ([`ALL_ROWS`]), but which the
+//!   planner guesses keeps 1 in 81, so few that looking each up wins. Every
+//!   case of a group that has an index join has it, to do the same work;
+//! - merge: ORDER BY the key, which a merge join sorts its sides by. For a
+//!   join whose order no one asks for, that is in a subquery whose rows are
+//!   counted, as every case of the group counts them;
+//! - block nested loop: `bi.k - a.k = 0` rather than `bi.k = a.k`, which is
+//!   no equality between the two sides. As it pairs every left row with
+//!   every right one, it runs only on a few thousand rows (in `small`).
+//!
 //! The `naive` group times the naive nested loop join, which no plan runs,
-//! as a baseline: it builds the joins itself, on rows in memory, rather than
-//! running SQL.
-//!
-//! With a `sqlite3` command, the same statements fill the same tables in
-//! SQLite and every query is timed there too, for a column beside Sequoia's
-//! and the ratio of the two; `--no-sqlite` leaves it out.
+//! against the block nested loop join: it builds the joins itself, on rows
+//! in memory, rather than running SQL.
 
 mod common;
 
@@ -28,175 +39,254 @@ const RIGHT: i64 = 50_000;
 
 /// A condition true of every row of `a`, of four comparisons that the
 /// planner guesses keep a third of the rows each: 1 in 81 in all.
-macro_rules! all_rows {
-    () => {
-        "a.k >= 0 AND a.k <= 1000000 AND a.k > -1 AND a.k < 1000001"
-    };
+const ALL_ROWS: &str = "a.k >= 0 AND a.k <= 1000000 AND a.k > -1 AND a.k < 1000001";
+
+const HASH: &[&str] = &["HASH JOIN"];
+const INDEX: &[&str] = &["INDEX JOIN"];
+const MERGE: &[&str] = &["MERGE JOIN"];
+const BLOCK: &[&str] = &["BLOCK NESTED LOOP JOIN"];
+
+/// The rows of a join counted, in a subquery, so that a merge join may sort
+/// them inside it.
+fn counted(select: String) -> String {
+    format!("SELECT COUNT(*) FROM ({select}) t")
 }
 
 fn main() {
-    let groups = [
+    // Each of these counts a join of `a` with the right side `join` names,
+    // with ORDER BY `order` (or none) inside, for a merge join.
+    let every = |join: &str, order: &str| {
+        counted(format!(
+            "SELECT a.id FROM a JOIN {join} WHERE {ALL_ROWS}{order}"
+        ))
+    };
+    let few = |join: &str, order: &str| {
+        counted(format!(
+            "SELECT a.id FROM a JOIN {join} WHERE a.id < 1000 AND {ALL_ROWS}{order}"
+        ))
+    };
+    let small = |join: &str, order: &str| {
+        counted(format!(
+            "SELECT a.id FROM a JOIN {join} WHERE a.id < 1000 AND bi.id < 2000 AND {ALL_ROWS}{order}"
+        ))
+    };
+    let left = |join: &str, order: &str| {
+        counted(format!(
+            "SELECT a.id FROM a LEFT JOIN {join} WHERE {ALL_ROWS}{order}"
+        ))
+    };
+    // These return the joined rows in a.k's order, or ten of them.
+    let ordered = |on: &str, order: &str, limit: &str| {
+        format!(
+            "SELECT a.id, bi.id FROM a JOIN bi ON {on} WHERE {ALL_ROWS} ORDER BY {order}{limit}"
+        )
+    };
+    let range = "SELECT COUNT(*) FROM a JOIN b ON b.k < a.k WHERE a.id < 1000 AND b.id < 2000";
+    let range_left = "SELECT COUNT(*) FROM a LEFT JOIN b ON b.k > a.k + 1500 AND b.id < 2000 \
+                      WHERE a.id < 1000";
+    let aggregate = "SELECT COUNT(*) FROM a JOIN (SELECT k / 250 AS g, COUNT(*) AS n FROM b GROUP BY k / 250) t \
+                     ON t.g * 250 < a.k WHERE a.id < 20000";
+
+    let groups = vec![
         (
-            "hash",
-            vec![
-                // What the joins below cost beyond these is the join's own.
-                // COUNT(k), as SQLite counts the rows of COUNT(*) without reading them.
-                case("scan a alone", "SELECT COUNT(a.k) FROM a", &[]),
-                case("scan b alone", "SELECT COUNT(b.k) FROM b", &[]),
-                case("int key", "SELECT COUNT(*) FROM a JOIN b ON b.k = a.k", &["HASH JOIN"]),
-                case("int key, every row", "SELECT a.id, b.id, b.name FROM a JOIN b ON b.k = a.k", &["HASH JOIN"]),
-                case("text key", "SELECT COUNT(*) FROM a JOIN b ON b.name = a.name", &["HASH JOIN"]),
-                case("two keys", "SELECT COUNT(*) FROM a JOIN b ON b.k = a.k AND b.name = a.name", &["HASH JOIN"]),
-                case("rest of condition", "SELECT COUNT(*) FROM a JOIN b ON b.k = a.k AND b.name > a.name", &["HASH JOIN"]),
-                case("left join, 10% match", "SELECT COUNT(*) FROM a LEFT JOIN b ON b.k = a.k + 45000", &["HASH JOIN"]),
-                // Past its budget the right side is partitioned: most of b and of a go to disk and back.
-                case("int key, 1 MB of b held", "SELECT COUNT(*) FROM a JOIN b ON b.k = a.k", &["HASH JOIN"])
-                    .hash_memory(1 << 20),
-                case("int key, 64 KB of b held", "SELECT COUNT(*) FROM a JOIN b ON b.k = a.k", &["HASH JOIN"])
-                    .hash_memory(64 << 10),
-            ],
+            "equi",
+            (
+                "all 200,000 rows of a, each finding one of 50,000 by an int key",
+                vec![
+                    case("hash", every("bi ON bi.k + 0 = a.k", ""), HASH),
+                    case("index, B+ tree on k", every("bi ON bi.k = a.k", ""), INDEX),
+                    case(
+                        "index, LSM primary key",
+                        every("bl ON bl.id = a.k", ""),
+                        INDEX,
+                    ),
+                    case("merge", every("bi ON bi.k = a.k", " ORDER BY a.k"), MERGE),
+                ],
+            ),
         ),
         (
-            "index",
-            // all_rows!() keeps every row of `a`, but the planner guesses that
-            // each of its four comparisons keeps a third of them: so few that
-            // it plans an index join. With `+ 0` hiding the key, the same
-            // query makes a hash join.
-            vec![
-                case(
-                    "index on k",
-                    concat!("SELECT COUNT(*) FROM a JOIN bi ON bi.k = a.k WHERE ", all_rows!()),
-                    &["INDEX JOIN"],
-                ),
-                case(
-                    "  as a hash join",
-                    concat!("SELECT COUNT(*) FROM a JOIN bi ON bi.k + 0 = a.k WHERE ", all_rows!()),
-                    &["HASH JOIN"],
-                ),
-                case(
-                    "LSM primary key",
-                    concat!("SELECT COUNT(*) FROM a JOIN bl ON bl.id = a.k WHERE ", all_rows!()),
-                    &["INDEX JOIN"],
-                ),
-                case(
-                    "  as a hash join",
-                    concat!("SELECT COUNT(*) FROM a JOIN bl ON bl.id + 0 = a.k WHERE ", all_rows!()),
-                    &["HASH JOIN"],
-                ),
-                // A hash join reads all of the right side, however few left rows probe it.
-                case(
-                    "1,000 left rows",
-                    concat!("SELECT COUNT(*) FROM a JOIN bi ON bi.k = a.k WHERE a.id < 1000 AND ", all_rows!()),
-                    &["INDEX JOIN"],
-                ),
-                case(
-                    "  as a hash join",
-                    concat!("SELECT COUNT(*) FROM a JOIN bi ON bi.k + 0 = a.k WHERE a.id < 1000 AND ", all_rows!()),
-                    &["HASH JOIN"],
-                ),
-                // What the planner picks on its own. For `a.id < 1000` it
-                // guesses a third of `a`, and so a hash join, though lookups
-                // would be faster.
-                case("200,000 left rows, planned", "SELECT COUNT(*) FROM a JOIN bi ON bi.k = a.k", &["HASH JOIN"]),
-                case(
-                    "1,000 left rows, planned",
-                    "SELECT COUNT(*) FROM a JOIN bi ON bi.k = a.k WHERE a.id < 1000",
-                    &["HASH JOIN"],
-                ),
-            ],
+            "few",
+            (
+                "1,000 rows of a, each finding one of 50,000: a hash join reads all of them",
+                vec![
+                    case("hash", few("bi ON bi.k + 0 = a.k", ""), HASH),
+                    case("index", few("bi ON bi.k = a.k", ""), INDEX),
+                    case("merge", few("bi ON bi.k = a.k", " ORDER BY a.k"), MERGE),
+                ],
+            ),
         ),
         (
-            "block",
-            vec![
-                // 1,000 left rows and 2,000 right ones: two million pairs.
-                case(
-                    "1 block",
-                    "SELECT COUNT(*) FROM a JOIN b ON b.k < a.k WHERE a.id < 1000 AND b.id < 2000",
-                    &["BLOCK NESTED LOOP JOIN"],
-                ),
-                case(
-                    "100 blocks",
-                    "SELECT COUNT(*) FROM a JOIN b ON b.k < a.k WHERE a.id < 1000 AND b.id < 2000",
-                    &["BLOCK NESTED LOOP JOIN"],
-                )
-                .join_memory(1000),
-                // 20,000 left rows in about 100 blocks of 20 KB, and on the
-                // right the 200 groups of an aggregate over all of `b`, which
-                // fit in 20 KB too: kept, rather than grouped again per block.
-                // SQLite takes over a minute: it groups again per left row.
-                case(
-                    "100 blocks, aggregate kept",
-                    "SELECT COUNT(*) FROM a JOIN (SELECT k / 250 AS g, COUNT(*) AS n FROM b GROUP BY k / 250) t
-                     ON t.g * 250 < a.k WHERE a.id < 20000",
-                    &["BLOCK NESTED LOOP JOIN"],
-                )
-                .join_memory(20_000)
-                .without_sqlite(),
-                case(
-                    "left join, 1 block",
-                    // In the ON: WHERE would filter the right side only after the join.
-                    "SELECT COUNT(*) FROM a LEFT JOIN b ON b.k > a.k + 1500 AND b.id < 2000 WHERE a.id < 1000",
-                    &["LEFT BLOCK NESTED LOOP JOIN"],
-                ),
-            ],
+            "small",
+            (
+                "1,000 rows of a, each finding one of 2,000: two million pairs",
+                vec![
+                    case("hash", small("bi ON bi.k + 0 = a.k", ""), HASH),
+                    case("index", small("bi ON bi.k = a.k", ""), INDEX),
+                    case("merge", small("bi ON bi.k = a.k", " ORDER BY a.k"), MERGE),
+                    case(
+                        "block nested loop",
+                        small("bi ON bi.k - a.k = 0", ""),
+                        BLOCK,
+                    ),
+                ],
+            ),
         ),
         (
-            "merge",
-            vec![
-                case(
-                    "ORDER BY int key",
-                    "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k ORDER BY a.k",
-                    &["MERGE JOIN"],
-                ),
-                case(
-                    "  as hash join + sort",
-                    "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k ORDER BY a.k + 0",
-                    &["HASH JOIN", "SORT BY"],
-                ),
-                case(
-                    "ORDER BY text key",
-                    "SELECT a.id, b.id FROM a JOIN b ON b.name = a.name ORDER BY a.name DESC",
-                    &["MERGE JOIN"],
-                ),
-                case(
-                    "  as hash join + sort",
-                    "SELECT a.id, b.id FROM a JOIN b ON b.name = a.name ORDER BY a.label DESC",
-                    &["HASH JOIN", "SORT BY"],
-                ),
-                // Both sides spill: runs written out and merged back.
-                case(
-                    "ORDER BY int key, 256 KB",
-                    "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k ORDER BY a.k",
-                    &["MERGE JOIN"],
-                )
-                .sort_memory(256 << 10),
-                case(
-                    "  as hash join + sort",
-                    "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k ORDER BY a.k + 0",
-                    &["HASH JOIN", "SORT BY"],
-                )
-                .sort_memory(256 << 10),
-                // A merge join sorts every row; a top-N sort keeps only ten.
-                case(
-                    "ORDER BY key LIMIT 10",
-                    "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k ORDER BY a.k LIMIT 10",
-                    &["MERGE JOIN"],
-                ),
-                case(
-                    "  as hash join + top 10",
-                    "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k ORDER BY a.k + 0 LIMIT 10",
-                    &["HASH JOIN", "TOP 10"],
-                ),
-            ],
+            "text",
+            (
+                "all 200,000 rows of a, each finding one of 50,000 by a text key",
+                vec![
+                    case(
+                        "hash",
+                        counted("SELECT a.id FROM a JOIN b ON b.name = a.name".into()),
+                        HASH,
+                    ),
+                    case(
+                        "merge",
+                        counted(
+                            "SELECT a.id FROM a JOIN b ON b.name = a.name ORDER BY a.name".into(),
+                        ),
+                        MERGE,
+                    ),
+                ],
+            ),
+        ),
+        (
+            "left",
+            (
+                "LEFT JOIN: 1 in 10 of a's 200,000 rows finds one of 50,000",
+                vec![
+                    case("hash", left("bi ON bi.k + 0 = a.k + 45000", ""), HASH),
+                    case("index", left("bi ON bi.k = a.k + 45000", ""), INDEX),
+                    case(
+                        "merge",
+                        left("bi ON bi.k = a.k + 45000", " ORDER BY a.k + 45000"),
+                        MERGE,
+                    ),
+                ],
+            ),
+        ),
+        (
+            "ordered",
+            (
+                "the 200,000 joined rows of `equi`, in a.k's order",
+                vec![
+                    case("merge", ordered("bi.k = a.k", "a.k", ""), MERGE),
+                    case(
+                        "hash, then sort",
+                        ordered("bi.k + 0 = a.k", "a.k + 0", ""),
+                        &["HASH JOIN", "SORT BY"],
+                    ),
+                    case(
+                        "index, then sort",
+                        ordered("bi.k = a.k", "a.k + 0", ""),
+                        &["INDEX JOIN", "SORT BY"],
+                    ),
+                ],
+            ),
+        ),
+        (
+            "top",
+            (
+                "the first 10 joined rows of `equi` in a.k's order: a merge join sorts every row",
+                vec![
+                    case("merge", ordered("bi.k = a.k", "a.k", " LIMIT 10"), MERGE),
+                    case(
+                        "hash, then top 10",
+                        ordered("bi.k + 0 = a.k", "a.k + 0", " LIMIT 10"),
+                        &["HASH JOIN", "TOP 10"],
+                    ),
+                    case(
+                        "index, then top 10",
+                        ordered("bi.k = a.k", "a.k + 0", " LIMIT 10"),
+                        &["INDEX JOIN", "TOP 10"],
+                    ),
+                ],
+            ),
+        ),
+        (
+            "memory",
+            (
+                "`equi` in little memory: a hash join partitions and writes out, a merge join's sorts write runs",
+                vec![
+                    case("hash, 1 MB", every("bi ON bi.k + 0 = a.k", ""), HASH)
+                        .hash_memory(1 << 20),
+                    case("hash, 64 KB", every("bi ON bi.k + 0 = a.k", ""), HASH)
+                        .hash_memory(64 << 10),
+                    case(
+                        "merge, 1 MB",
+                        every("bi ON bi.k = a.k", " ORDER BY a.k"),
+                        MERGE,
+                    )
+                    .sort_memory(1 << 20),
+                    case(
+                        "merge, 64 KB",
+                        every("bi ON bi.k = a.k", " ORDER BY a.k"),
+                        MERGE,
+                    )
+                    .sort_memory(64 << 10),
+                    case(
+                        "index, holding no rows",
+                        every("bi ON bi.k = a.k", ""),
+                        INDEX,
+                    ),
+                ],
+            ),
+        ),
+        // Without an equality, only a block nested loop join runs: these
+        // compare its budgets, the fewer blocks the fewer reads of the right side.
+        (
+            "range",
+            (
+                "b.k < a.k, 1,000 rows of a by 2,000 of b",
+                vec![
+                    case("block, 1 block", range, BLOCK),
+                    case("block, 100 blocks", range, BLOCK).join_memory(1000),
+                ],
+            ),
+        ),
+        (
+            "range-left",
+            (
+                "LEFT JOIN on b.k > a.k + 1500, 1,000 rows of a by 2,000 of b",
+                vec![
+                    case(
+                        "block, 1 block",
+                        range_left,
+                        &["LEFT BLOCK NESTED LOOP JOIN"],
+                    ),
+                    case(
+                        "block, 100 blocks",
+                        range_left,
+                        &["LEFT BLOCK NESTED LOOP JOIN"],
+                    )
+                    .join_memory(1000),
+                ],
+            ),
+        ),
+        (
+            "aggregate",
+            (
+                "20,000 rows of a by the 200 groups of an aggregate over b, kept rather than grouped again per block",
+                vec![
+                    case("block, 1 block", aggregate, BLOCK),
+                    case("block, 100 blocks", aggregate, BLOCK).join_memory(20_000),
+                ],
+            ),
         ),
     ];
 
     // Fill the tables only for a group that queries them.
     if groups.iter().any(|(group, _)| common::wanted(group)) {
-        common::run(
-            groups.into(),
+        common::compare(
+            groups,
             &setup(),
             &format!("{LEFT} rows joined with {RIGHT}"),
+            // What the joins cost beyond these is the join's own.
+            &[
+                ("scanning a alone", "SELECT COUNT(a.k) FROM a"),
+                ("scanning bi alone", "SELECT COUNT(bi.k) FROM bi"),
+            ],
         );
     }
     if common::wanted("naive") {
@@ -205,7 +295,7 @@ fn main() {
 }
 
 /// The naive nested loop join against the block nested loop join, on the
-/// rows the `block` group joins: the first 1,000 of `a` and 2,000 of `b`,
+/// rows the `range` group joins: the first 1,000 of `a` and 2,000 of `b`,
 /// their `id` and `k`, in memory. The naive join reads `b` again for each
 /// left row, so 1,000 times; the block join with its default budget reads it
 /// once and keeps it, and held to 1 KB reads it again for each block of a
@@ -276,7 +366,9 @@ fn naive() {
         count(&mut join)
     };
 
-    println!("\n{:<30} {:>11}", "naive", "sequoia");
+    println!(
+        "\nnaive: the naive nested loop join, which no plan runs, against the block one, in memory"
+    );
     let cases: [(&str, Run); 6] = [
         ("naive", Box::new(|| naive(JoinKind::Inner, &inner))),
         (
@@ -300,15 +392,18 @@ fn naive() {
             Box::new(|| block(JoinKind::Left, &left_join, JOIN_MEMORY)),
         ),
     ];
+    // Each method's time against the naive join before it, which returns
+    // the same rows.
     let mut expected = None;
     for (i, (name, run)) in cases.iter().enumerate() {
         let (time, rows) = common::fastest(run);
-        // Each method returns the rows the naive join before it did.
         if name.starts_with("naive") {
-            expected = Some(rows);
+            expected = Some((time, rows));
         }
-        assert_eq!(Some(rows), expected, "case {i}, {name}");
-        println!("  {name:<28} {}  ({rows} rows)", common::shown(time));
+        let (naive_time, naive_rows) = expected.expect("a naive join first");
+        assert_eq!(rows, naive_rows, "case {i}, {name}");
+        let r = common::ratio(common::ms(time) / common::ms(naive_time));
+        println!("  {name:<28} {}  {r}  ({rows} rows)", common::shown(time));
     }
 }
 
@@ -323,18 +418,16 @@ fn rows(rows: &[Row]) -> Rows<'_> {
 /// The statements that fill the tables: `a` (LEFT rows) and three with the
 /// same RIGHT rows: `b`, `bi` with an index on `k`, and `bl`, an LSM table,
 /// whose primary key is a lookup key. Each `a.k` matches one right row, and
-/// each `a.name` one in the first 20,000. `a.label` is `a.name` again, to
-/// order by without ordering by a join key.
+/// each `a.name` one in the first 20,000.
 fn setup() -> Vec<String> {
     let mut sql = vec![
-        "CREATE TABLE a (id INT PRIMARY KEY, k INT, name TEXT, label TEXT)".to_string(),
+        "CREATE TABLE a (id INT PRIMARY KEY, k INT, name TEXT)".to_string(),
         "CREATE TABLE b (id INT PRIMARY KEY, k INT, name TEXT)".into(),
         "CREATE TABLE bi (id INT PRIMARY KEY, k INT, name TEXT)".into(),
         "CREATE TABLE bl (id INT PRIMARY KEY, k INT, name TEXT) USING LSM".into(),
     ];
     insert(&mut sql, "a", LEFT, |i| {
-        let name = format!("'customer {}'", i % 20_000);
-        format!("({i}, {}, {name}, {name})", i % RIGHT)
+        format!("({i}, {}, 'customer {}')", i % RIGHT, i % 20_000)
     });
     for table in ["b", "bi", "bl"] {
         insert(&mut sql, table, RIGHT, |i| {

@@ -8,7 +8,9 @@
 //!
 //! A case is one query ([`run`]), or a [`Batch`] of statements timed
 //! together: many queries on tables filled once ([`run_queries`]), or writes
-//! to a database on disk made afresh for each run ([`run_writes`]).
+//! to a database on disk made afresh for each run ([`run_writes`]). With
+//! [`compare`], the cases of a group are ways to run one query, timed
+//! against each other rather than against SQLite.
 //! Benchmarks of the storage layer, below SQL, time their own work with
 //! [`fastest`] and pick groups with [`wanted`].
 
@@ -20,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use sequoia::executor::joins::{HASH_MEMORY, JOIN_MEMORY};
 use sequoia::executor::sort::SORT_MEMORY;
-use sequoia::{Database, QueryResult};
+use sequoia::{Database, QueryResult, Value};
 
 const RUNS: usize = 5;
 
@@ -28,7 +30,7 @@ const RUNS: usize = 5;
 /// run it with.
 pub struct Case {
     name: &'static str,
-    sql: &'static str,
+    sql: String,
     plan: &'static [&'static str],
     join_memory: usize,
     sort_memory: usize,
@@ -37,10 +39,10 @@ pub struct Case {
     sqlite: bool,
 }
 
-pub fn case(name: &'static str, sql: &'static str, plan: &'static [&'static str]) -> Case {
+pub fn case(name: &'static str, sql: impl Into<String>, plan: &'static [&'static str]) -> Case {
     Case {
         name,
-        sql,
+        sql: sql.into(),
         plan,
         join_memory: JOIN_MEMORY,
         sort_memory: SORT_MEMORY,
@@ -113,11 +115,8 @@ pub fn run(groups: Vec<(&'static str, Vec<Case>)>, setup: &[String], rows: &str)
             db.set_join_memory(case.join_memory);
             db.set_sort_memory(case.sort_memory);
             db.set_hash_memory(case.hash_memory);
-            let plan = explain(&mut db, case.sql);
-            for word in case.plan {
-                assert!(plan.contains(word), "{}: no {word} in\n{plan}", case.sql);
-            }
-            let (time, rows) = best_of(&mut db, case.sql);
+            check_case_plan(&mut db, case);
+            let (time, rows) = best_of(&mut db, &case.sql);
             let mut line = format!("  {:<28} {}", case.name, shown(time));
             if let Some((lite_time, lite_rows)) = lite.as_mut().and_then(Iterator::next) {
                 match lite_time {
@@ -134,12 +133,99 @@ pub fn run(groups: Vec<(&'static str, Vec<Case>)>, setup: &[String], rows: &str)
     }
 }
 
+/// Fills the tables with `setup` and times the cases of the groups the
+/// arguments name, or of every group: each group a query, with what it is
+/// about, and its cases ways to run that query, which must return the same
+/// rows. Each case prints the fastest of a few runs and how many times
+/// slower that is than the group's fastest case. `rows` says what the tables
+/// hold; `scans`, named queries timed first, what reading them costs alone.
+#[allow(clippy::type_complexity)]
+pub fn compare(
+    groups: Vec<(&'static str, (&'static str, Vec<Case>))>,
+    setup: &[String],
+    rows: &str,
+    scans: &[(&str, &str)],
+) {
+    let (groups, _) = pick(groups);
+
+    let start = Instant::now();
+    let mut db = Database::in_memory();
+    for sql in setup {
+        db.execute(sql).unwrap();
+    }
+    println!(
+        "{rows}; tables filled in {:.1} s",
+        start.elapsed().as_secs_f64()
+    );
+    for (name, sql) in scans {
+        let (time, _) = best_of(&mut db, sql);
+        println!("{name}: {}", shown(time).trim_start());
+    }
+    for (group, (about, cases)) in &groups {
+        println!("\n{group}: {about}");
+        let mut results = Vec::new();
+        for case in cases {
+            db.set_join_memory(case.join_memory);
+            db.set_sort_memory(case.sort_memory);
+            db.set_hash_memory(case.hash_memory);
+            check_case_plan(&mut db, case);
+            results.push(fastest(|| outcome(&mut db, &case.sql)));
+        }
+        let best = results.iter().map(|(time, _)| *time).min();
+        for (case, (time, outcome)) in cases.iter().zip(&results) {
+            assert_eq!(
+                outcome, &results[0].1,
+                "{group}: {} returns other rows than {}",
+                case.name, cases[0].name
+            );
+            let r = ratio(ms(*time) / ms(best.expect("a case at least")));
+            println!("  {:<28} {}  {r}  ({outcome})", case.name, shown(*time));
+        }
+    }
+}
+
+/// What the ways to run one query must agree on: how many rows it returns,
+/// and the row if it returns one only, such as a count.
+#[derive(Debug, PartialEq)]
+struct Outcome {
+    rows: usize,
+    lone: Option<Vec<Value>>,
+}
+
+impl std::fmt::Display for Outcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self.lone.as_deref() {
+            Some([value]) => write!(f, "= {value}"),
+            _ => write!(f, "{} rows", self.rows),
+        }
+    }
+}
+
+fn outcome(db: &mut Database, sql: &str) -> Outcome {
+    match db.execute(sql).unwrap().pop() {
+        Some(QueryResult::Rows { rows, .. }) => Outcome {
+            rows: rows.len(),
+            lone: (rows.len() == 1).then(|| rows[0].clone()),
+        },
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// Checks that a case's plan has the words it names.
+fn check_case_plan(db: &mut Database, case: &Case) {
+    let plan = explain(db, &case.sql);
+    for word in case.plan {
+        assert!(plan.contains(word), "{}: no {word} in\n{plan}", case.sql);
+    }
+}
+
 pub fn ms(time: Duration) -> f64 {
     time.as_secs_f64() * 1000.0
 }
 
-/// How many times slower Sequoia was, in 6 columns, with more decimals under one.
-fn ratio(r: f64) -> String {
+/// How many times slower one time was than another, in 6 columns, with more
+/// decimals under one.
+pub fn ratio(r: f64) -> String {
     match r {
         r if r < 1.0 => format!("{r:>5.2}x"),
         r => format!("{r:>5.1}x"),
