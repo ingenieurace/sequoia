@@ -326,6 +326,18 @@ impl Database {
         self.session.settings.force_join = method;
     }
 
+    /// Sets how many threads a hash join runs on (one by default). With
+    /// more, every hash join that need not keep its left side's order is a
+    /// parallel grace hash join, whose rows come out in no order, and its
+    /// workers share the hash join's memory (see `executor/joins/parallel.rs`).
+    pub fn set_join_workers(&mut self, workers: usize) {
+        self.session.settings.join_workers = workers.max(1);
+    }
+
+    pub fn join_workers(&self) -> usize {
+        self.session.settings.join_workers
+    }
+
     /// Switches the buffer pool to another page replacement policy, keeping
     /// the pages it holds (see [`BufferPool::set_policy`]). The default is
     /// [`crate::storage::REPLACEMENT_POLICY`].

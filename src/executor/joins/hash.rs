@@ -45,6 +45,9 @@ pub struct HashSide<'a> {
     left_fields: Vec<Field>,
     right_fields: Vec<Field>,
     budget: usize,
+    /// The hash bits the table first splits by: past 0 for rows that were
+    /// partitioned already, by the bits before (see `parallel.rs`).
+    level: u32,
     table: Table,
     /// Partitions written out whose turn has not come.
     pending: Vec<Pending>,
@@ -102,6 +105,7 @@ impl<'a> HashSide<'a> {
         left_fields: Vec<Field>,
         right_fields: Vec<Field>,
         budget: usize,
+        level: u32,
     ) -> Self {
         HashSide {
             source: Some(source),
@@ -110,6 +114,7 @@ impl<'a> HashSide<'a> {
             left_fields,
             right_fields,
             budget,
+            level,
             table: Table::default(),
             pending: Vec::new(),
             deferred: None,
@@ -131,7 +136,7 @@ impl<'a> HashSide<'a> {
     /// come back from [`HashSide::deferred`].
     pub fn find(&mut self, left: &Row) -> Result<Option<usize>> {
         if let Some(source) = self.source.take() {
-            self.build(source, 0)?;
+            self.build(source, self.level)?;
         }
         Key::eval_all(&self.left_keys, &self.left_fields, left, &mut self.probe)?;
         self.bucket = None;

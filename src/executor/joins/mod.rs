@@ -21,6 +21,11 @@
 //! written out come after the others, out of order. A hash join that must
 //! keep its left side's order then sorts its rows back into it.
 //!
+//! With more than one join worker set, a hash join that need not keep its
+//! left side's order runs in parallel instead (see `parallel.rs`): both
+//! sides are partitioned by a hash of their keys, then worker threads join
+//! the pairs of partitions side by side, each as a hash join of its own.
+//!
 //! A block nested loop join holds left rows instead: a block of as many as
 //! fit in its memory budget ([`JOIN_MEMORY`] by default). For each block it
 //! reads the right side again from the start and pairs each right row with
@@ -36,7 +41,8 @@
 //! ORDER BY that starts with its keys, the sort is already done.
 //!
 //! Each method has a file of its own: `probe.rs` runs the joins that find a
-//! left row's right rows by its keys, through `hash.rs` or `index.rs`;
+//! left row's right rows by its keys, through `hash.rs` or `index.rs`, and
+//! `parallel.rs` the parallel grace hash join, through them in each worker;
 //! `block.rs` is the block nested loop join, `merge.rs` the sort-merge join.
 //! `naive.rs`, the naive nested loop join, is not one of them: the planner
 //! never picks it on its own, but runs it when it is forced to, for the joins
@@ -47,12 +53,14 @@ mod hash;
 mod index;
 mod merge;
 mod naive;
+mod parallel;
 mod probe;
 
 pub use block::BlockJoin;
 pub use index::Lookup;
 pub use merge::{MergeJoin, MergeSort};
 pub use naive::NaiveJoin;
+pub use parallel::ParallelHashJoin;
 pub use probe::{Join, Key, Right};
 
 /// Default memory a block nested loop join may hold left rows in: 4 MB.

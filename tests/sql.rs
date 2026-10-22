@@ -2721,6 +2721,117 @@ fn every_forced_join_method_returns_what_the_planner_does() {
 }
 
 #[test]
+fn parallel_hash_join_returns_what_the_serial_one_does() {
+    use sequoia::plan::query::ForceJoin;
+    let mut db = in_memory();
+    db.execute(
+        "CREATE TABLE a (id INT PRIMARY KEY, k INT, tag TEXT);
+         CREATE TABLE b (id INT PRIMARY KEY, k INT, tag TEXT, v INT);
+         CREATE TABLE c (id INT PRIMARY KEY, w INT);",
+    )
+    .unwrap();
+    // Keys repeated, NULL, and on one side only; text keys too.
+    let a: Vec<String> = (0..3000i64)
+        .map(|i| match i % 11 {
+            0 => format!("({i}, NULL, 't{}')", i % 40),
+            _ => format!("({i}, {}, 't{}')", i % 700, i % 40),
+        })
+        .collect();
+    let b: Vec<String> = (0..2000i64)
+        .map(|i| match i % 13 {
+            0 => format!("({i}, NULL, NULL, {})", i % 7),
+            _ => format!("({i}, {}, 't{}', {})", i % 900, i % 50, i % 7),
+        })
+        .collect();
+    let c: Vec<String> = (0..500i64).map(|i| format!("({i}, {})", i % 3)).collect();
+    db.execute(&format!(
+        "INSERT INTO a VALUES {}; INSERT INTO b VALUES {}; INSERT INTO c VALUES {};",
+        a.join(", "),
+        b.join(", "),
+        c.join(", ")
+    ))
+    .unwrap();
+    let queries = [
+        "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k",
+        "SELECT a.id, b.id FROM a LEFT JOIN b ON b.k = a.k AND b.v > 2",
+        "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k AND b.tag = a.tag",
+        "SELECT a.id, b.id FROM a LEFT JOIN b ON b.tag = a.tag WHERE a.id < 400",
+        "SELECT a.id, b.id, c.w FROM a JOIN b ON b.k = a.k JOIN c ON c.id = b.v + a.k",
+        "SELECT a.tag, COUNT(*), SUM(b.v) FROM a JOIN b ON b.k = a.k GROUP BY a.tag",
+        "SELECT a.id FROM a JOIN b ON b.k = a.k WHERE b.id > 5000",
+    ];
+    let sorted = |mut rows: Vec<Vec<Value>>| {
+        rows.sort_by(|x, y| {
+            x.iter()
+                .zip(y)
+                .map(|(x, y)| x.sort_cmp(y))
+                .find(|o| o.is_ne())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rows
+    };
+    db.set_force_join(Some(ForceJoin::Hash));
+    for sql in queries {
+        db.set_join_workers(1);
+        db.set_hash_memory(sequoia::executor::joins::HASH_MEMORY);
+        let expected = sorted(query(&mut db, sql));
+        // Plenty of memory; and so little that partitions go to files, and
+        // the workers' tables split again.
+        for memory in [sequoia::executor::joins::HASH_MEMORY, 4096] {
+            for workers in [2, 4, 16] {
+                db.set_join_workers(workers);
+                db.set_hash_memory(memory);
+                let plan = explain(&mut db, sql);
+                assert!(
+                    plan.contains("PARALLEL HASH JOIN")
+                        && plan.contains(&format!("({workers} WORKERS)")),
+                    "{sql}\n{plan}"
+                );
+                let found = sorted(query(&mut db, sql));
+                assert!(
+                    found == expected,
+                    "{sql}, {workers} workers in {memory} bytes"
+                );
+            }
+        }
+    }
+    db.set_hash_memory(sequoia::executor::joins::HASH_MEMORY);
+    db.set_force_join(None);
+    db.set_join_workers(4);
+
+    // A LIMIT stops reading early, and the workers stop with it.
+    let rows = query(&mut db, "SELECT a.id FROM a JOIN b ON b.k = a.k LIMIT 7");
+    assert_eq!(rows.len(), 7);
+    // An error in a worker comes back as the query's.
+    let e = db
+        .execute("SELECT a.id FROM a JOIN b ON b.k = a.k AND b.v / (a.id - a.id) > 0")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("division by zero"), "{e}");
+    // And so does one in a partitioner, working out a key.
+    let e = db
+        .execute("SELECT a.id FROM a JOIN b ON b.k = a.k / (a.id - a.id)")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("division by zero"), "{e}");
+    // A hash join after a merge join keeps its order, so it runs alone.
+    let sql =
+        "SELECT a.id, b.id, c.w FROM a JOIN b ON b.k = a.k JOIN c ON c.id = b.id ORDER BY a.k";
+    let plan = explain(&mut db, sql);
+    assert!(
+        plan.contains("MERGE JOIN") && !plan.contains("PARALLEL"),
+        "{plan}"
+    );
+    // With one worker, it is the hash join it always was.
+    db.set_join_workers(1);
+    let plan = explain(&mut db, "SELECT a.id FROM a JOIN b ON b.k = a.k");
+    assert!(
+        plan.contains("HASH JOIN") && !plan.contains("PARALLEL"),
+        "{plan}"
+    );
+}
+
+#[test]
 fn index_join_is_picked_for_few_left_rows_by_row_counts() {
     let mut db = in_memory();
     db.execute(

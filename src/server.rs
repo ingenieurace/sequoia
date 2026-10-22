@@ -21,7 +21,7 @@
 //!
 //! The client sends statements, a line ending with `;` running all of them
 //! up to it, or a command, a line starting with `.` (`.tables`, `.model`,
-//! `.exit`). Each answer ends with a line `.end`, or `.end*` when the
+//! `.workers`, `.exit`). Each answer ends with a line `.end`, or `.end*` when the
 //! session is in a transaction; any line of it that starts with `.` has
 //! another `.` put before it, which the client takes off.
 
@@ -40,7 +40,8 @@ pub const PORT: u16 = 1024;
 /// Connections a server takes at once by default.
 pub const MAX_CONNECTIONS: usize = 64;
 
-const GREETING: &str = "Sequoia server. End statements with ';'. Commands: .tables, .model, .exit";
+const GREETING: &str =
+    "Sequoia server. End statements with ';'. Commands: .tables, .model, .workers, .exit";
 
 pub struct Server {
     db: SharedDatabase,
@@ -170,6 +171,14 @@ fn command(session: &mut Session, line: &str) -> Option<String> {
         (".model", None) => match session.execution_model() {
             Some(model) => model.to_string(),
             None => "auto (each query in the model that suits it)".into(),
+        },
+        (".workers", None) => session.join_workers().to_string(),
+        (".workers", Some(n)) => match n.parse() {
+            Ok(n) if n > 0 => {
+                session.set_join_workers(n);
+                String::new()
+            }
+            _ => format!("a hash join needs a number of workers above 0: {n}"),
         },
         (".model", Some("auto")) => {
             session.set_execution_model(None);

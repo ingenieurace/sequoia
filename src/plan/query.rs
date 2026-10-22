@@ -79,6 +79,10 @@
 //! merge join saves ORDER BY its sort only if it is the last join, as the
 //! merge joins after another would sort its rows again.
 //!
+//! With more than one join worker set, a hash join is a parallel one on
+//! that many threads (`PARALLEL HASH JOIN`), unless it must keep its left
+//! side's order: its rows come out in no order.
+//!
 //! **Steps.** On top of the scans and joins, a SELECT has an aggregate (and a
 //! filter for HAVING) if it groups, a sort if it has ORDER BY that no merge
 //! join sorted for (which applies the LIMIT itself, as a top-N sort) or else
@@ -222,6 +226,9 @@ pub enum JoinMethod {
         left_keys: Vec<Expr>,
         right_keys: Vec<Expr>,
         keep_order: bool,
+        /// Threads that join its partitions side by side, if more than one
+        /// (see `executor/joins/parallel.rs`).
+        workers: usize,
     },
     /// Those the right side, a `Lookup` (maybe under filters), finds for the left row.
     Index,
@@ -235,6 +242,16 @@ pub enum JoinMethod {
         desc: Vec<bool>,
         then: Vec<OrderBy>,
     },
+}
+
+/// What a session asks of the planner, besides the query: a join method to
+/// force, and how many threads a hash join may run on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Choices {
+    pub force_join: Option<ForceJoin>,
+    /// More than one makes every hash join that need not keep its left
+    /// side's order a parallel one, on that many threads.
+    pub join_workers: usize,
 }
 
 /// A join method every join of a query is made to use, rather than the one
@@ -351,14 +368,10 @@ pub fn output_names(catalog: &Catalog, query: &Select) -> Result<Vec<String>> {
 }
 
 /// Plans a SELECT on the tables of the catalog, each of its joins (and
-/// those of its subqueries in FROM) by the method `force` names, if any.
-pub fn select<'a>(
-    catalog: &'a Catalog,
-    query: Select,
-    force: Option<ForceJoin>,
-) -> Result<Plan<'a>> {
+/// those of its subqueries in FROM) as `choices` says.
+pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Result<Plan<'a>> {
     if !query.compound.is_empty() {
-        return union(catalog, query, force);
+        return union(catalog, query, choices);
     }
     let Select {
         distinct,
@@ -378,7 +391,7 @@ pub fn select<'a>(
         .map(|r| match &r.source {
             TableSource::Table(name) => Ok(Source::table(catalog.get(name)?, r.qualifier())),
             TableSource::Subquery(query) => {
-                let plan = select(catalog, (**query).clone(), force)?;
+                let plan = select(catalog, (**query).clone(), choices)?;
                 let kind = SourceKind::Derived(Some(plan.root));
                 Ok(Source {
                     kind,
@@ -525,7 +538,7 @@ pub fn select<'a>(
         needed,
         &binder,
         order,
-        force,
+        choices,
     )?;
 
     let (exprs, having, order_by) = if grouped {
@@ -612,11 +625,7 @@ pub fn select<'a>(
 /// stands. With an ORDER BY, LIMIT or OFFSET, the union is planned as a
 /// subquery in FROM of a query that has them, so that ORDER BY names its
 /// columns as it would a table's.
-fn union<'a>(
-    catalog: &'a Catalog,
-    mut query: Select,
-    force: Option<ForceJoin>,
-) -> Result<Plan<'a>> {
+fn union<'a>(catalog: &'a Catalog, mut query: Select, choices: Choices) -> Result<Plan<'a>> {
     if !query.order_by.is_empty() || query.limit.is_some() || query.offset.is_some() {
         let (order_by, limit, offset) = (
             std::mem::take(&mut query.order_by),
@@ -645,14 +654,14 @@ fn union<'a>(
             offset,
             compound,
         };
-        return select(catalog, outer, force);
+        return select(catalog, outer, choices);
     }
     let parts = std::mem::take(&mut query.compound);
-    let first = select(catalog, query, force)?;
+    let first = select(catalog, query, choices)?;
     let columns = first.columns;
     let mut node = first.root;
     for (all, part) in parts {
-        let part = select(catalog, part, force)?;
+        let part = select(catalog, part, choices)?;
         if part.columns.len() != columns.len() {
             return err(format!(
                 "each query of a UNION must return as many columns: {} and {}",
@@ -683,7 +692,7 @@ fn union<'a>(
 
 /// Plans the scans and joins of FROM, with WHERE and the ONs placed as the
 /// module docs describe, and whether a merge join puts its rows in the order
-/// `order_by` asks for. Every join uses the method `force` names, if any.
+/// `order_by` asks for. Every join uses the method `choices` forces, if any.
 #[allow(clippy::too_many_arguments)]
 fn joins<'a>(
     sources: &mut [Source<'a>],
@@ -693,8 +702,9 @@ fn joins<'a>(
     mut needed: Vec<Vec<bool>>,
     binder: &Binder,
     order_by: &[OrderBy],
-    force: Option<ForceJoin>,
+    choices: Choices,
 ) -> Result<(Node<'a>, bool)> {
+    let force = choices.force_join;
     let n = sources.len();
     let kinds: Vec<JoinKind> = std::iter::once(JoinKind::Inner)
         .chain(from.joins.iter().map(|j| j.kind))
@@ -883,10 +893,16 @@ fn joins<'a>(
                                 then: Vec::new(),
                             }
                         } else {
+                            // Only a hash join that need not keep its order runs in parallel.
+                            let keep_order = merge_at.is_some_and(|at| i > at);
                             JoinMethod::Hash {
                                 left_keys,
                                 right_keys,
-                                keep_order: merge_at.is_some_and(|at| i > at),
+                                keep_order,
+                                workers: match keep_order {
+                                    true => 1,
+                                    false => choices.join_workers.max(1),
+                                },
                             }
                         };
                         (method, right)
@@ -1233,7 +1249,12 @@ impl<'c> Binder<'c> {
     fn subquery(&self, query: &Select, one_column: bool) -> Result<Select> {
         let query = self.correlate(query, &mut Vec::new())?;
         let check = substitute(&query, &mut |_| Ok(Value::Null))?;
-        if select(self.catalog, check, None)?.columns.len() != 1 && one_column {
+        if select(self.catalog, check, Choices::default())?
+            .columns
+            .len()
+            != 1
+            && one_column
+        {
             return err("subquery must return only one column");
         }
         Ok(query)
@@ -1497,10 +1518,10 @@ impl Node<'_> {
                         right_keys,
                         ..
                     } => {
-                        let name = if matches!(method, JoinMethod::Hash { .. }) {
-                            "HASH"
-                        } else {
-                            "MERGE"
+                        let name = match method {
+                            JoinMethod::Hash { workers, .. } if *workers > 1 => "PARALLEL HASH",
+                            JoinMethod::Hash { .. } => "HASH",
+                            _ => "MERGE",
                         };
                         (
                             name,
@@ -1531,6 +1552,9 @@ impl Node<'_> {
                             .map(|(e, &desc)| sort_key(e, desc));
                         let then = then.iter().map(|o| sort_key(&o.expr, o.desc));
                         format!(" (SORTED BY {})", list(&mut keys.chain(then)))
+                    }
+                    JoinMethod::Hash { workers, .. } if *workers > 1 => {
+                        format!(" ({workers} WORKERS)")
                     }
                     _ => String::new(),
                 };

@@ -10,7 +10,9 @@
 //! index or merge join needs an equality between the two sides), "skipped"
 //! where it would take too long: a nested loop join tries every pair of
 //! rows, ten billion of them for 200,000 left rows by 50,000 right ones.
-//! Below the table, the SQL of each query.
+//! "parallel hash" is the hash join on [`WORKERS`] threads, a parallel grace
+//! hash join ([`Database::set_join_workers`]). Below the table, the SQL of
+//! each query.
 
 mod common;
 
@@ -27,13 +29,33 @@ const RIGHT: i64 = 50_000;
 const RUNS: usize = 5;
 const LONG: Duration = Duration::from_secs(1);
 
-/// The join methods, each a column: its heading, and what its plan says.
-const METHODS: [(ForceJoin, &str, &str); 5] = [
-    (ForceJoin::Hash, "hash", "HASH JOIN"),
-    (ForceJoin::Index, "index", "INDEX JOIN"),
-    (ForceJoin::Merge, "merge", "MERGE JOIN"),
-    (ForceJoin::Block, "block nested", "BLOCK NESTED LOOP JOIN"),
-    (ForceJoin::Naive, "naive nested", "NAIVE NESTED LOOP JOIN"),
+/// Threads the parallel hash join runs on.
+const WORKERS: usize = 8;
+
+/// The join methods, each a column: the method forced, on how many
+/// threads, its heading, and what its plan says.
+const METHODS: [(ForceJoin, usize, &str, &str); 6] = [
+    (ForceJoin::Hash, 1, "hash", "HASH JOIN"),
+    (
+        ForceJoin::Hash,
+        WORKERS,
+        "parallel hash",
+        "PARALLEL HASH JOIN",
+    ),
+    (ForceJoin::Index, 1, "index", "INDEX JOIN"),
+    (ForceJoin::Merge, 1, "merge", "MERGE JOIN"),
+    (
+        ForceJoin::Block,
+        1,
+        "block nested",
+        "BLOCK NESTED LOOP JOIN",
+    ),
+    (
+        ForceJoin::Naive,
+        1,
+        "naive nested",
+        "NAIVE NESTED LOOP JOIN",
+    ),
 ];
 const NESTED: &[ForceJoin] = &[ForceJoin::Block, ForceJoin::Naive];
 
@@ -157,7 +179,8 @@ fn main() {
     println!(
         "Each row is one query; each column, the join method it is made to use. Times are the\n\
          fastest of up to {RUNS} runs, then how many times slower than the row's fastest method.\n\
-         n/a: the method cannot run the query. skipped: it would take too long.\n"
+         n/a: the method cannot run the query. skipped: it would take too long.\n\
+         parallel hash: the hash join's partitions joined by {WORKERS} worker threads at once.\n"
     );
 
     let start = Instant::now();
@@ -175,7 +198,7 @@ fn main() {
     );
 
     print!("   {:<30}", "query");
-    for (_, heading, _) in METHODS {
+    for (_, _, heading, _) in METHODS {
         print!("{heading:>15}");
     }
     println!();
@@ -224,8 +247,9 @@ fn row(db: &mut Database, query: &Query) -> Vec<Cell> {
     let mut first: Option<(&str, Outcome)> = None;
     let cells = METHODS
         .iter()
-        .map(|&(method, heading, plan_word)| {
+        .map(|&(method, workers, heading, plan_word)| {
             db.set_force_join(Some(method));
+            db.set_join_workers(workers);
             let Some(plan) = explain(db, query.sql) else {
                 return Cell::NotApplicable;
             };
@@ -250,6 +274,7 @@ fn row(db: &mut Database, query: &Query) -> Vec<Cell> {
         })
         .collect();
     db.set_force_join(None);
+    db.set_join_workers(1);
     cells
 }
 

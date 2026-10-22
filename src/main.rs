@@ -147,7 +147,9 @@ fn main() {
     if let Some(policy) = args.policy {
         db.set_replacement_policy(policy);
     }
-    println!("Sequoia. End statements with ';'. Commands: .tables, .model, .replacer, .exit");
+    println!(
+        "Sequoia. End statements with ';'. Commands: .tables, .model, .workers, .replacer, .exit"
+    );
     shell(&mut db);
 }
 
@@ -306,6 +308,11 @@ fn command(db: &mut Database, line: &str) -> bool {
         (".model", None) => match db.execution_model() {
             Some(model) => println!("{model}"),
             None => println!("auto (each query in the model that suits it)"),
+        },
+        (".workers", None) => println!("{}", db.join_workers()),
+        (".workers", Some(n)) => match n.parse() {
+            Ok(n) if n > 0 => db.set_join_workers(n),
+            _ => println!("a hash join needs a number of workers above 0: {n}"),
         },
         (".model", Some("auto")) => db.set_execution_model(None),
         (".model", Some(name)) => match Model::from_name(name) {

@@ -66,7 +66,7 @@ impl Subqueries for Runner<'_> {
                 .expect("collected above");
             Ok(values[i].clone())
         })?;
-        let plan = query::select(self.catalog, bound, self.settings.force_join)?;
+        let plan = query::select(self.catalog, bound, self.settings.choices())?;
         let mut rows = model::open(plan.root, self.catalog, &self.settings);
         let answer = match subquery {
             Expr::Exists(_) => Answer::Exists(rows.next().transpose()?.is_some()),

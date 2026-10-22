@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 
 use super::Settings;
 use super::aggregate;
-use super::joins::{BlockJoin, Join, Lookup, MergeJoin, MergeSort, NaiveJoin, Right};
+use super::joins::{
+    BlockJoin, Join, Lookup, MergeJoin, MergeSort, NaiveJoin, ParallelHashJoin, Right,
+};
 use super::sort::{Sorted, Sorter};
 use super::subquery::Runner;
 use crate::catalog::Catalog;
@@ -341,9 +343,24 @@ pub(super) fn join<'a>(
             left_keys,
             right_keys,
             keep_order,
+            workers,
         } => {
             let source = open_right(right);
             let budget = settings.hash_memory;
+            if workers > 1 {
+                return Box::new(ParallelHashJoin::new(
+                    left,
+                    left_fields,
+                    source,
+                    right_fields,
+                    left_keys,
+                    right_keys,
+                    kind,
+                    condition,
+                    budget,
+                    workers,
+                ));
+            }
             let right = Right::hash(
                 source,
                 left_keys,
@@ -351,6 +368,7 @@ pub(super) fn join<'a>(
                 &left_fields,
                 right_fields.clone(),
                 budget,
+                0,
             );
             let join = Join::new(left, left_fields, right, right_fields, kind, condition);
             return Box::new(if keep_order {

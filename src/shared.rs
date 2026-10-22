@@ -222,6 +222,15 @@ impl Session {
         self.state.settings.force_join = method;
     }
 
+    /// See [`crate::Database::set_join_workers`].
+    pub fn set_join_workers(&mut self, workers: usize) {
+        self.state.settings.join_workers = workers.max(1);
+    }
+
+    pub fn join_workers(&self) -> usize {
+        self.state.settings.join_workers
+    }
+
     /// Lets the other sessions in again.
     fn leave(&mut self) {
         if self.writing {

@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use crate::catalog::Catalog;
 use crate::catalog::table::{Row, RowId, Table};
 use crate::error::{Result, err};
-use crate::plan::query::{self, ForceJoin, forbid};
+use crate::plan::query::{self, Choices, ForceJoin, forbid};
 use crate::plan::{access, filter};
 use crate::result::QueryResult;
 use crate::sql::ast::{ColumnRef, Expr, Projection, Select, SelectItem, Statement};
@@ -51,6 +51,10 @@ pub struct Settings {
     /// The method every join is made to use; by default, none: the planner
     /// picks each (see [`ForceJoin`]).
     pub force_join: Option<ForceJoin>,
+    /// Threads a hash join runs on; by default one. More makes each hash
+    /// join that need not keep its order a parallel grace hash join (see
+    /// `joins/parallel.rs`), whose workers share `hash_memory`.
+    pub join_workers: usize,
 }
 
 impl Default for Settings {
@@ -61,6 +65,17 @@ impl Default for Settings {
             hash_memory: HASH_MEMORY,
             model: None,
             force_join: None,
+            join_workers: 1,
+        }
+    }
+}
+
+impl Settings {
+    /// What the planner is asked to choose by these settings.
+    pub fn choices(&self) -> Choices {
+        Choices {
+            force_join: self.force_join,
+            join_workers: self.join_workers,
         }
     }
 }
@@ -177,7 +192,7 @@ impl Iterator for Query<'_> {
 
 /// Plans a SELECT and starts running it; no row is read until asked for.
 pub fn select<'a>(catalog: &'a Catalog, query: Select, settings: &Settings) -> Result<Query<'a>> {
-    let plan = query::select(catalog, query, settings.force_join)?;
+    let plan = query::select(catalog, query, settings.choices())?;
     Ok(Query {
         columns: plan.columns,
         rows: model::open(plan.root, catalog, settings),
@@ -188,7 +203,7 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, settings: &Settings) -> R
 /// scan (and the index it uses, if any) last.
 fn explain(catalog: &Catalog, statement: Statement, settings: &Settings) -> Result<QueryResult> {
     let plan = match statement {
-        Statement::Select(query) => query::select(catalog, query, settings.force_join)?.root,
+        Statement::Select(query) => query::select(catalog, query, settings.choices())?.root,
         Statement::Update { table, filter, .. } | Statement::Delete { table, filter, .. } => {
             let table = catalog.get(&table)?;
             let filter = filter
@@ -209,7 +224,7 @@ fn explain(catalog: &Catalog, statement: Statement, settings: &Settings) -> Resu
 /// how many of the row groups it looked at its zone maps let it skip; a last
 /// line gives the query's rows and time.
 fn explain_analyze(catalog: &Catalog, query: Select, settings: &Settings) -> Result<QueryResult> {
-    let root = query::select(catalog, query, settings.force_join)?.root;
+    let root = query::select(catalog, query, settings.choices())?.root;
     let lines = root.explain_lines();
     let (model, why) = model::choose(&root, settings);
     let profile = Rc::new(Profile::new(lines.len()));

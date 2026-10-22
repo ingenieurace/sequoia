@@ -203,7 +203,8 @@ impl Iterator for Join<'_> {
 
 impl<'a> Right<'a> {
     /// A hash join's right side: the rows of `source`, by `right_keys`, for
-    /// left rows to find by `left_keys`, held within `budget`.
+    /// left rows to find by `left_keys`, held within `budget`, split past it
+    /// by the hash bits of `level` first.
     pub fn hash(
         source: Rows<'a>,
         left_keys: Vec<Expr>,
@@ -211,6 +212,7 @@ impl<'a> Right<'a> {
         left_fields: &[Field],
         right_fields: Vec<Field>,
         budget: usize,
+        level: u32,
     ) -> Self {
         let (left_keys, right_keys) = (
             Key::all(left_keys, left_fields),
@@ -223,6 +225,7 @@ impl<'a> Right<'a> {
             left_fields.to_vec(),
             right_fields,
             budget,
+            level,
         ))
     }
 
@@ -265,7 +268,7 @@ impl<'a> Right<'a> {
 
 impl Key {
     /// The keys `exprs`, on rows with these fields.
-    fn all(exprs: Vec<Expr>, fields: &[Field]) -> Vec<Key> {
+    pub(super) fn all(exprs: Vec<Expr>, fields: &[Field]) -> Vec<Key> {
         exprs
             .into_iter()
             .map(|expr| match &expr {
