@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use super::Settings;
 use super::aggregate;
-use super::joins::{BlockJoin, Join, Lookup, MergeJoin, MergeSort, Right};
+use super::joins::{BlockJoin, Join, Lookup, MergeJoin, MergeSort, NaiveJoin, Right};
 use super::sort::{Sorted, Sorter};
 use super::subquery::Runner;
 use crate::catalog::Catalog;
@@ -300,6 +300,17 @@ pub(super) fn join<'a>(
                 kind,
                 condition,
                 budget,
+            ));
+        }
+        JoinMethod::Naive => {
+            let reopen = Box::new(move || open_right(right.clone()));
+            return Box::new(NaiveJoin::new(
+                left,
+                left_fields,
+                reopen,
+                right_fields,
+                kind,
+                condition,
             ));
         }
         JoinMethod::Merge {

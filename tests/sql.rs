@@ -2616,6 +2616,111 @@ fn every_join_method_and_storage_agrees_with_a_nested_loop() {
 }
 
 #[test]
+fn every_forced_join_method_returns_what_the_planner_does() {
+    use sequoia::plan::query::ForceJoin;
+    let methods = [
+        (ForceJoin::Hash, "HASH JOIN", "a hash join"),
+        (ForceJoin::Index, "INDEX JOIN", "an index join"),
+        (ForceJoin::Merge, "MERGE JOIN", "a merge join"),
+        (
+            ForceJoin::Block,
+            "BLOCK NESTED LOOP JOIN",
+            "a block nested loop join",
+        ),
+        (
+            ForceJoin::Naive,
+            "NAIVE NESTED LOOP JOIN",
+            "a naive nested loop join",
+        ),
+    ];
+    let mut db = in_memory();
+    db.execute(
+        "CREATE TABLE a (id INT PRIMARY KEY, k INT);
+         CREATE TABLE b (id INT PRIMARY KEY, k INT, v INT);
+         CREATE TABLE c (id INT PRIMARY KEY, w INT) USING LSM;
+         CREATE INDEX b_k ON b (k);",
+    )
+    .unwrap();
+    let a: Vec<String> = (0..40i64)
+        .map(|i| match i % 9 {
+            0 => format!("({i}, NULL)"),
+            _ => format!("({i}, {})", i % 13),
+        })
+        .collect();
+    let b: Vec<String> = (0..60i64)
+        .map(|i| format!("({i}, {}, {})", i % 17, i % 5))
+        .collect();
+    let c: Vec<String> = (0..30i64).map(|i| format!("({i}, {})", i % 4)).collect();
+    db.execute(&format!(
+        "INSERT INTO a VALUES {}; INSERT INTO b VALUES {}; INSERT INTO c VALUES {};",
+        a.join(", "),
+        b.join(", "),
+        c.join(", ")
+    ))
+    .unwrap();
+
+    // Each sorted, but the last, whose ORDER BY orders every row.
+    let queries = [
+        "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k",
+        "SELECT a.id, b.id FROM a LEFT JOIN b ON b.k = a.k AND b.v > 2",
+        "SELECT a.id, b.id, c.w FROM a JOIN b ON b.k = a.k JOIN c ON c.id = b.id WHERE c.w < 3",
+        "SELECT t.id, COUNT(*) FROM (SELECT a.id FROM a JOIN b ON b.k = a.k) t GROUP BY t.id",
+        "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k ORDER BY a.k DESC, a.id, b.id",
+    ];
+    for (i, sql) in queries.iter().enumerate() {
+        let sorted = |mut rows: Vec<Vec<Value>>| {
+            if i < queries.len() - 1 {
+                rows.sort_by(|x, y| {
+                    x.iter()
+                        .zip(y)
+                        .map(|(x, y)| x.sort_cmp(y))
+                        .find(|o| o.is_ne())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+            rows
+        };
+        db.set_force_join(None);
+        let expected = sorted(query(&mut db, sql));
+        assert!(!expected.is_empty(), "{sql}");
+        for (method, word, _) in methods {
+            db.set_force_join(Some(method));
+            let plan = explain(&mut db, sql);
+            assert!(plan.contains(word), "{method:?}: {sql}\n{plan}");
+            assert_eq!(sorted(query(&mut db, sql)), expected, "{method:?}: {sql}");
+        }
+    }
+
+    // Without an equality, only the nested loop joins can.
+    let sql = "SELECT a.id, b.id FROM a JOIN b ON b.v < a.k";
+    db.set_force_join(None);
+    let expected = query(&mut db, sql).len();
+    for (method, word, name) in methods {
+        db.set_force_join(Some(method));
+        match method {
+            ForceJoin::Block | ForceJoin::Naive => {
+                assert!(explain(&mut db, sql).contains(word));
+                assert_eq!(query(&mut db, sql).len(), expected, "{method:?}");
+            }
+            _ => {
+                let e = db.execute(sql).unwrap_err().to_string();
+                assert!(
+                    e.contains(&format!("the join of b cannot be {name}")),
+                    "{e}"
+                );
+            }
+        }
+    }
+    // Nor an index join without an index on the right column.
+    db.set_force_join(Some(ForceJoin::Index));
+    let e = db
+        .execute("SELECT a.id FROM a JOIN b ON b.v = a.k")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("cannot be an index join"), "{e}");
+}
+
+#[test]
 fn index_join_is_picked_for_few_left_rows_by_row_counts() {
     let mut db = in_memory();
     db.execute(

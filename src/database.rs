@@ -25,6 +25,7 @@ use crate::catalog::Catalog;
 use crate::error::{Error, Result, err};
 use crate::executor::model::Model;
 use crate::executor::{self, Query, Settings};
+use crate::plan::query::ForceJoin;
 use crate::result::QueryResult;
 use crate::sql::ast::Statement;
 use crate::sql::parse;
@@ -250,6 +251,13 @@ impl Database {
 
     pub fn execution_model(&self) -> Option<Model> {
         self.settings.model
+    }
+
+    /// Makes every join use `method`, or with `None`, lets the planner pick
+    /// each, as by default: for comparing the methods on the same query.
+    /// A query with a join that cannot use it fails to plan (see [`ForceJoin`]).
+    pub fn set_force_join(&mut self, method: Option<ForceJoin>) {
+        self.settings.force_join = method;
     }
 
     /// Switches the buffer pool to another page replacement policy, keeping

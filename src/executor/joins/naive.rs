@@ -3,8 +3,10 @@
 //! but the left row, and reads the right side once per left row, where a
 //! block nested loop join reads it once per block.
 //!
-//! The planner never picks it, and no plan runs it: it is here for the
-//! joins benchmark to measure the other methods against.
+//! The planner never picks it on its own: a plan runs it only when a
+//! setting forces every join to be one (see `ForceJoin` in
+//! `plan/query.rs`), as the joins benchmark does to measure the other
+//! methods against it.
 
 use crate::catalog::table::Row;
 use crate::error::Result;

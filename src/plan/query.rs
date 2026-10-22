@@ -72,6 +72,13 @@
 //! hash or index joins. The left side is sorted by the rest of ORDER BY too,
 //! and the ORDER BY needs no sort of its own.
 //!
+//! A setting can make every join use one method instead ([`ForceJoin`]),
+//! to compare them on the same query, as `benches/joins.rs` does: also the
+//! naive nested loop join, which the planner never picks on its own. Where
+//! a join cannot use it, planning fails rather than pick another. A forced
+//! merge join saves ORDER BY its sort only if it is the last join, as the
+//! merge joins after another would sort its rows again.
+//!
 //! **Steps.** On top of the scans and joins, a SELECT has an aggregate (and a
 //! filter for HAVING) if it groups, a sort if it has ORDER BY that no merge
 //! join sorted for (which applies the LIMIT itself, as a top-N sort) or else
@@ -205,6 +212,9 @@ pub enum Node<'a> {
 pub enum JoinMethod {
     /// Tries every right row, reading them again for each block of left rows.
     Block,
+    /// Tries every right row, reading them again for each left row. Only
+    /// when forced: see [`ForceJoin`].
+    Naive,
     /// Those whose `right_keys` equal the left row's `left_keys`, from a hash
     /// table. `keep_order` if the rows must come out in the left side's
     /// order (after a merge join), even if the table spills.
@@ -225,6 +235,31 @@ pub enum JoinMethod {
         desc: Vec<bool>,
         then: Vec<OrderBy>,
     },
+}
+
+/// A join method every join of a query is made to use, rather than the one
+/// the planner would pick (see the module docs). A hash or merge join needs
+/// an equality between the two sides, an index join one with a column of
+/// the right table that an index or its primary key looks up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForceJoin {
+    Hash,
+    Index,
+    Merge,
+    Block,
+    Naive,
+}
+
+impl ForceJoin {
+    fn name(self) -> &'static str {
+        match self {
+            ForceJoin::Hash => "a hash join",
+            ForceJoin::Index => "an index join",
+            ForceJoin::Merge => "a merge join",
+            ForceJoin::Block => "a block nested loop join",
+            ForceJoin::Naive => "a naive nested loop join",
+        }
+    }
 }
 
 /// What a `Lookup` reads the table through.
@@ -315,10 +350,15 @@ pub fn output_names(catalog: &Catalog, query: &Select) -> Result<Vec<String>> {
     }
 }
 
-/// Plans a SELECT on the tables of the catalog.
-pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
+/// Plans a SELECT on the tables of the catalog, each of its joins (and
+/// those of its subqueries in FROM) by the method `force` names, if any.
+pub fn select<'a>(
+    catalog: &'a Catalog,
+    query: Select,
+    force: Option<ForceJoin>,
+) -> Result<Plan<'a>> {
     if !query.compound.is_empty() {
-        return union(catalog, query);
+        return union(catalog, query, force);
     }
     let Select {
         distinct,
@@ -338,7 +378,7 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
         .map(|r| match &r.source {
             TableSource::Table(name) => Ok(Source::table(catalog.get(name)?, r.qualifier())),
             TableSource::Subquery(query) => {
-                let plan = select(catalog, (**query).clone())?;
+                let plan = select(catalog, (**query).clone(), force)?;
                 let kind = SourceKind::Derived(Some(plan.root));
                 Ok(Source {
                     kind,
@@ -477,7 +517,16 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
         .collect();
 
     let order = if grouped { &[][..] } else { &order_by };
-    let (mut node, ordered) = joins(&mut sources, &from, filter, ons, needed, &binder, order);
+    let (mut node, ordered) = joins(
+        &mut sources,
+        &from,
+        filter,
+        ons,
+        needed,
+        &binder,
+        order,
+        force,
+    )?;
 
     let (exprs, having, order_by) = if grouped {
         forbid(&group_by, "GROUP BY")?;
@@ -563,7 +612,11 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
 /// stands. With an ORDER BY, LIMIT or OFFSET, the union is planned as a
 /// subquery in FROM of a query that has them, so that ORDER BY names its
 /// columns as it would a table's.
-fn union<'a>(catalog: &'a Catalog, mut query: Select) -> Result<Plan<'a>> {
+fn union<'a>(
+    catalog: &'a Catalog,
+    mut query: Select,
+    force: Option<ForceJoin>,
+) -> Result<Plan<'a>> {
     if !query.order_by.is_empty() || query.limit.is_some() || query.offset.is_some() {
         let (order_by, limit, offset) = (
             std::mem::take(&mut query.order_by),
@@ -592,14 +645,14 @@ fn union<'a>(catalog: &'a Catalog, mut query: Select) -> Result<Plan<'a>> {
             offset,
             compound,
         };
-        return select(catalog, outer);
+        return select(catalog, outer, force);
     }
     let parts = std::mem::take(&mut query.compound);
-    let first = select(catalog, query)?;
+    let first = select(catalog, query, force)?;
     let columns = first.columns;
     let mut node = first.root;
     for (all, part) in parts {
-        let part = select(catalog, part)?;
+        let part = select(catalog, part, force)?;
         if part.columns.len() != columns.len() {
             return err(format!(
                 "each query of a UNION must return as many columns: {} and {}",
@@ -630,7 +683,8 @@ fn union<'a>(catalog: &'a Catalog, mut query: Select) -> Result<Plan<'a>> {
 
 /// Plans the scans and joins of FROM, with WHERE and the ONs placed as the
 /// module docs describe, and whether a merge join puts its rows in the order
-/// `order_by` asks for.
+/// `order_by` asks for. Every join uses the method `force` names, if any.
+#[allow(clippy::too_many_arguments)]
 fn joins<'a>(
     sources: &mut [Source<'a>],
     from: &From,
@@ -639,7 +693,8 @@ fn joins<'a>(
     mut needed: Vec<Vec<bool>>,
     binder: &Binder,
     order_by: &[OrderBy],
-) -> (Node<'a>, bool) {
+    force: Option<ForceJoin>,
+) -> Result<(Node<'a>, bool)> {
     let n = sources.len();
     let kinds: Vec<JoinKind> = std::iter::once(JoinKind::Inner)
         .chain(from.joins.iter().map(|j| j.kind))
@@ -698,9 +753,15 @@ fn joins<'a>(
     // The join that can sort its sides into ORDER BY's order for a merge join.
     // The joins after it must keep their left side's order, as hash and index
     // joins do and a block nested loop join does not.
+    // Forced, only a merge join may, and only the last.
     let mut merge = None;
+    let tried = match force {
+        None => n,
+        Some(ForceJoin::Merge) => 1,
+        Some(_) => 0,
+    };
     if !order_by.is_empty() {
-        for i in (1..n).rev() {
+        for i in (1..n).rev().take(tried) {
             let keys = equalities(&conditions[i], i, binder);
             if keys.is_empty() {
                 break;
@@ -722,22 +783,31 @@ fn joins<'a>(
         let mut residual = std::mem::take(&mut conditions[i]);
         let keys = equalities(&residual, i, binder);
 
-        let index = keys
-            .iter()
-            .find_map(|(at, left, right)| {
-                let (Expr::Column(column), SourceKind::Table(table)) = (right, &source.kind) else {
-                    return None;
-                };
-                let column = table.column_index(&column.name).ok()?;
-                Some((
-                    *at,
-                    left.clone(),
-                    column,
-                    *table,
-                    lookup_key(table, column)?,
-                ))
-            })
-            .filter(|(.., table, key)| lookups_win(estimate(&node), table, *key));
+        let index = keys.iter().find_map(|(at, left, right)| {
+            let (Expr::Column(column), SourceKind::Table(table)) = (right, &source.kind) else {
+                return None;
+            };
+            let column = table.column_index(&column.name).ok()?;
+            Some((
+                *at,
+                left.clone(),
+                column,
+                *table,
+                lookup_key(table, column)?,
+            ))
+        });
+        let index = match force {
+            None => index.filter(|(.., table, key)| lookups_win(estimate(&node), table, *key)),
+            Some(ForceJoin::Index) if index.is_none() => {
+                return cannot(
+                    ForceJoin::Index,
+                    &source.qualifier,
+                    "no equality with a column of it that an index or its primary key looks up",
+                );
+            }
+            Some(ForceJoin::Index) => index,
+            Some(_) => None,
+        };
         let (method, right) =
             if let Some((_, (order, desc, then))) = merge.take_if(|(at, _)| *at == i) {
                 for (at, ..) in keys.iter().rev() {
@@ -776,23 +846,51 @@ fn joins<'a>(
                 };
                 (JoinMethod::Index, right)
             } else {
-                let right = source.read(right_filter, needed[i].clone());
-                if keys.is_empty() {
-                    (JoinMethod::Block, right)
-                } else {
-                    for (at, ..) in keys.iter().rev() {
-                        residual.remove(*at);
+                // A nested loop join checks the equalities with the rest.
+                match force {
+                    Some(ForceJoin::Block) => (
+                        JoinMethod::Block,
+                        source.read(right_filter, needed[i].clone()),
+                    ),
+                    Some(ForceJoin::Naive) => (
+                        JoinMethod::Naive,
+                        source.read(right_filter, needed[i].clone()),
+                    ),
+                    Some(method) if keys.is_empty() => {
+                        return cannot(
+                            method,
+                            &source.qualifier,
+                            "no equality between its two sides",
+                        );
                     }
-                    let (left_keys, right_keys) = keys.into_iter().map(|(_, l, r)| (l, r)).unzip();
-                    let keep_order = merge_at.is_some_and(|at| i > at);
-                    (
-                        JoinMethod::Hash {
-                            left_keys,
-                            right_keys,
-                            keep_order,
-                        },
-                        right,
-                    )
+                    None if keys.is_empty() => (
+                        JoinMethod::Block,
+                        source.read(right_filter, needed[i].clone()),
+                    ),
+                    _ => {
+                        let right = source.read(right_filter, needed[i].clone());
+                        for (at, ..) in keys.iter().rev() {
+                            residual.remove(*at);
+                        }
+                        let (left_keys, right_keys): (Vec<_>, Vec<_>) =
+                            keys.into_iter().map(|(_, l, r)| (l, r)).unzip();
+                        let method = if force == Some(ForceJoin::Merge) {
+                            // In no order anyone asked for: ascending, by each key in turn.
+                            JoinMethod::Merge {
+                                desc: vec![false; left_keys.len()],
+                                left_keys,
+                                right_keys,
+                                then: Vec::new(),
+                            }
+                        } else {
+                            JoinMethod::Hash {
+                                left_keys,
+                                right_keys,
+                                keep_order: merge_at.is_some_and(|at| i > at),
+                            }
+                        };
+                        (method, right)
+                    }
                 }
             };
         node = Node::Join {
@@ -809,7 +907,15 @@ fn joins<'a>(
             };
         }
     }
-    (node, ordered)
+    Ok((node, ordered))
+}
+
+/// The error of a join of `table` that cannot use the method forced on it.
+fn cannot<T>(force: ForceJoin, table: &str, why: &str) -> Result<T> {
+    err(format!(
+        "the join of {table} cannot be {}: {why}",
+        force.name()
+    ))
 }
 
 /// The equalities among `parts` between the tables before table `i` and
@@ -956,7 +1062,7 @@ pub fn estimate(node: &Node) -> f64 {
         } => {
             let (left, right) = (estimate(left), estimate(right));
             let rows = match method {
-                JoinMethod::Block => left * right * OTHER_KEEPS,
+                JoinMethod::Block | JoinMethod::Naive => left * right * OTHER_KEEPS,
                 _ => left.max(right),
             };
             if *kind == JoinKind::Left {
@@ -1127,7 +1233,7 @@ impl<'c> Binder<'c> {
     fn subquery(&self, query: &Select, one_column: bool) -> Result<Select> {
         let query = self.correlate(query, &mut Vec::new())?;
         let check = substitute(&query, &mut |_| Ok(Value::Null))?;
-        if select(self.catalog, check)?.columns.len() != 1 && one_column {
+        if select(self.catalog, check, None)?.columns.len() != 1 && one_column {
             return err("subquery must return only one column");
         }
         Ok(query)
@@ -1379,6 +1485,7 @@ impl Node<'_> {
                 let kind = if *kind == JoinKind::Left { "LEFT " } else { "" };
                 let (name, mut on) = match method {
                     JoinMethod::Block => ("BLOCK NESTED LOOP", Vec::new()),
+                    JoinMethod::Naive => ("NAIVE NESTED LOOP", Vec::new()),
                     JoinMethod::Index => ("INDEX", Vec::new()),
                     JoinMethod::Hash {
                         left_keys,

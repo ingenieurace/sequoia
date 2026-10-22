@@ -38,8 +38,9 @@
 //! Each method has a file of its own: `probe.rs` runs the joins that find a
 //! left row's right rows by its keys, through `hash.rs` or `index.rs`;
 //! `block.rs` is the block nested loop join, `merge.rs` the sort-merge join.
-//! `naive.rs`, the naive nested loop join, is not one of them: no plan runs
-//! it, and the joins benchmark measures the others against it.
+//! `naive.rs`, the naive nested loop join, is not one of them: the planner
+//! never picks it on its own, but runs it when it is forced to, for the joins
+//! benchmark to measure the others against it.
 
 mod block;
 mod hash;
