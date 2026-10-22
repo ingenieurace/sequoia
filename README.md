@@ -1,273 +1,214 @@
 # Sequoia
 
-A minimal disk-based relational database written in Rust with zero dependencies.
-It is meant to be small and easy to read, not fast.
+A relational database written from scratch in Rust, with no dependencies
+beyond the standard library.
 
-## Usage
+Sequoia is a study of how databases work. It implements the textbook
+techniques side by side, so they can be read and compared on the same data:
+three storage engines, two kinds of index, three execution models, five join
+methods, three page replacement policies, and intra-query parallelism. It is
+also a working database: SQL, transactions, crash recovery through a
+write-ahead log, a shell, and a TCP server.
+
+Every source file starts with a doc comment that explains its design, often
+with a diagram. Reading the code is the intended way to learn it; this README
+is the map.
+
+## Contents
+
+- [Quick start](#quick-start)
+- [What is inside](#what-is-inside)
+- [Shell, server and library](#shell-server-and-library)
+- [SQL](#sql)
+- [Source layout](#source-layout)
+- [How it works](#how-it-works)
+- [Settings and switches](#settings-and-switches)
+- [Limits](#limits)
+- [Testing](#testing)
+- [Benchmarks](#benchmarks)
+
+## Quick start
+
+Sequoia needs a recent stable Rust toolchain: it uses edition 2024 and
+`File::try_lock`, which is stable since Rust 1.89.
 
 ```bash
-cargo run                # in-memory database
-cargo run -- my.db       # persisted to my.db (and its log, my.db-wal, while open)
-cargo run -- my.db --replacer lru-2   # with another page replacement policy
+cargo run --release                 # a database in memory
+cargo run --release -- my.db        # a database in my.db (its log is my.db-wal while open)
 ```
-
-The buffer pool caches 256 pages, evicting by ARC unless `--replacer` (or
-`.replacer` in the shell) picks another: `arc`, `lru`, `lru-K` (LRU-K, e.g.
-`lru-2`) or `clock`. Switching keeps the pages cached; `.replacer` alone
-shows the policy and its hit rate since it was set, to compare them on the
-same queries.
 
 ```sql
-CREATE TABLE users (id INT PRIMARY KEY, name TEXT, active BOOL);
-INSERT INTO users VALUES (1, 'alice', TRUE), (2, 'bob', FALSE);
-SELECT name FROM users WHERE active AND id > 0 ORDER BY name DESC LIMIT 10;
-UPDATE users SET active = NOT active WHERE id = 2 RETURNING id, active;
-DELETE FROM users WHERE name = 'alice' RETURNING *;
-CREATE INDEX users_name ON users (name);
-EXPLAIN SELECT * FROM users WHERE name = 'bob';  -- the plan, ending in SEARCH users USING INDEX users_name
-CREATE INDEX users_active ON users USING HASH (active);
-DROP INDEX users_name;
-DROP TABLE users;
+CREATE TABLE users (id INT PRIMARY KEY, name TEXT, city TEXT, active BOOL);
+CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, total REAL);
+CREATE INDEX orders_user ON orders (user_id);
+INSERT INTO users VALUES (1, 'ann', 'oslo', TRUE), (2, 'bob', 'rome', TRUE), (3, 'cy', 'oslo', FALSE);
+INSERT INTO orders VALUES (1, 1, 9.5), (2, 1, 20.0), (3, 2, 5.25);
+
+SELECT u.city, COUNT(*), SUM(o.total)
+FROM users u JOIN orders o ON o.user_id = u.id
+WHERE u.active GROUP BY u.city ORDER BY u.city;
+
+EXPLAIN SELECT u.city, COUNT(*), SUM(o.total)
+FROM users u JOIN orders o ON o.user_id = u.id
+WHERE u.active GROUP BY u.city HAVING COUNT(*) > 1 ORDER BY u.city LIMIT 5;
 ```
 
-Shell commands: `.tables`, `.model [auto | iterator | materialization |
-vectorized]` (shows, or sets, the execution model queries run in),
-`.replacer [arc | lru | lru-K | clock]` (shows the page replacement policy
-and its hits and misses, or sets it), `.exit`.
+The `EXPLAIN` prints the plan, one step per line, each step indented under
+the step that reads its rows:
 
-## Execution models
+```
+PROJECT u.city, COUNT(*), SUM(o.total)
+  SORT BY u.city (TOP 5)
+    FILTER COUNT(*) > 1
+      AGGREGATE COUNT(*), SUM(o.total) BY u.city
+        INDEX JOIN
+          FILTER u.active
+            SCAN users u
+          LOOKUP orders o USING INDEX orders_user (o.user_id = u.id)
+```
 
-A query's plan runs in one of three execution models, which differ in how
-its steps hand rows to each other, and return the same rows and errors:
+`EXPLAIN ANALYZE` runs the query and adds the rows and time of each step, and
+the execution model the query ran in, with the reason it was chosen.
 
-| model | a step returns | suits |
-|---|---|---|
-| iterator (Volcano) | one row per `next()` | joins; anything, holding few rows |
-| materialization | all of its rows, in one call | few rows at every step (OLTP lookups) |
-| vectorized | a batch of 1024 rows, a column at a time | scans and aggregates of many rows (OLAP) |
+## What is inside
 
-By default each query runs in the one that suits it, from the planner's
-estimates of how many rows each step reads: materialization if no step has
-more than 100, vectorized from 4,096 when there is no join or subquery, the
-iterator model otherwise. `EXPLAIN ANALYZE` names the model a query ran in,
-and why; `Database::set_execution_model` (or `.model` in the shell) runs
-every query in one. `src/executor/model.rs` explains the choice, and
-`benches/models.rs` times the same queries in each:
+| Area | What Sequoia has |
+|---|---|
+| Storage engines | heap (slotted pages), LSM tree, column store (PAX row groups with compression) |
+| Indexes | B+ tree with latch crabbing; hash index with extendible or linear hashing; multi-column, expression, partial (`WHERE`), covering (`INCLUDE`) and unique indexes |
+| Column compression | run-length, bit-packing, patched bit-packing, delta, order-preserving dictionary, bitmap; filters run on compressed data; zone maps |
+| LSM tree | MemTable as a skip list, trie, radix tree or adaptive radix tree (ART); level or universal compaction; Bloom filters |
+| Buffer pool | 256 frames in 8 shards; ARC, LRU-K or CLOCK replacement, switchable at runtime |
+| Durability | write-ahead log of full pages with chained checksums; atomic statements; transactions and savepoints; checkpoints |
+| Execution models | iterator (Volcano), materialization, vectorized (batches of 1024 rows, a column at a time, SIMD-friendly loops) |
+| Joins | hash join (hybrid, spills to disk), index join, sort-merge join, block nested loop join, naive nested loop join (for comparison only) |
+| Parallelism | parallel heap scans, parallel grace hash join, gathered hash and index joins, two-phase (partial and final) aggregation |
+| Sort and aggregation | external merge sort with a tournament tree, top-N heap for `LIMIT`; hash aggregation that spills partitions |
+| Planner | access path choice, predicate pushdown, cost-based choice between index and hash joins, merge join to save a sort |
+| Concurrency | many readers or one writer at a time, as in SQLite; a thread per connection in the server |
+
+## Shell, server and library
+
+### Shell
 
 ```bash
-cargo bench --bench models
+sequoia [FILE] [--replacer arc|lru|lru-K|clock]
 ```
 
-In the vectorized model, a column table's rows go from its decoded chunks to
-the steps above in columns, never put together into rows before the top;
-expressions on columns of one type run as loops over arrays, `AND` and `OR`
-evaluate their right side only on the rows their left one leaves open (by
-narrowing the batch's selection, which copies nothing), and an
-aggregate without `GROUP BY` folds a whole column at once. On 200,000 rows
-of a column table it aggregates 5 to 10 times faster than the iterator model.
-The materialization model passes a `LIMIT` down to the steps below it, but a
-filter must make all of its rows first, which is why only small queries run
-in it.
+Statements end with `;` and may span lines. The prompt is `sequoia*>` while a
+transaction is open. Commands start with `.`:
 
-## Testing
+| Command | Effect |
+|---|---|
+| `.tables` | lists the tables |
+| `.model [auto \| iterator \| materialization \| vectorized]` | shows, or sets, the execution model of every query; `auto` lets each query pick |
+| `.workers [N]` | shows, or sets, how many threads scans and hash joins use (1 by default) |
+| `.replacer [arc \| lru \| lru-K \| clock]` | shows the replacement policy and its hit rate since it was set, or switches policy while keeping the cached pages |
+| `.exit`, `.quit` | leaves the shell |
+
+### Server
 
 ```bash
-cargo test
+sequoia [FILE] --serve [ADDR] [--max-connections N]   # serve a database over TCP
+sequoia --connect [ADDR]                               # open a shell on a server
 ```
 
-Besides unit and end-to-end tests, `tests/differential.rs` generates random
-schemas, rows, queries, changes (some with `RETURNING`) and transactions, runs them on Sequoia and on
-SQLite (through the `sqlite3` command; skipped if there is none), and fails if
-the two disagree, printing the case as a script for the shell. Each case runs
-in every execution model, which must also return exactly what the iterator
-model does, errors included. It runs 40 cases by default; run more, or other
-ones, with:
+`ADDR` is `host:port`, a port alone (on 127.0.0.1), or with `=` a host alone
+(`--serve=0.0.0.0`, on port 1024). By default it is `127.0.0.1:1024`, with at
+most 64 connections. Each connection is a thread with its own session (its
+own settings and transaction). The protocol is lines of text, so `nc` works
+as a client: the client sends what the shell would read, and each answer ends
+with a line `.end`, or `.end*` inside a transaction. The server accepts
+`.tables`, `.model`, `.workers` and `.exit`; the replacement policy is chosen
+with `--replacer` when the server starts.
 
-```bash
-SEQUOIA_DIFF_CASES=2000 SEQUOIA_DIFF_SEED=7 cargo test --release --test differential -- --nocapture
+### Library
+
+```rust
+use sequoia::{Database, SharedDatabase};
+
+let mut db = Database::open("my.db")?;          // or Database::in_memory()
+db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")?;
+db.execute("INSERT INTO t VALUES (1, 'ann'), (2, 'bob')")?;
+
+// Rows as they are made, without collecting them.
+for row in db.query("SELECT name FROM t ORDER BY id")? {
+    println!("{:?}", row?);
+}
+
+// Many threads: one session each.
+let shared = SharedDatabase::in_memory();
+let mut session = shared.session();        // one per thread; clone `shared` into each
+session.execute("CREATE TABLE t (id INT PRIMARY KEY)")?;
 ```
 
-`tests/sql.rs` runs each query in the model chosen for it; with
-`SEQUOIA_MODEL` set, all in that one:
+A `Database` is for one thread. A `SharedDatabase` is shared by many, each
+through a `Session` with its own settings, transaction and busy timeout.
+Both have setters for the memory budgets, the execution model, the number of
+workers, and a join method to force on every join (see
+[Settings and switches](#settings-and-switches)).
 
-```bash
-SEQUOIA_MODEL=vectorized cargo test --test sql
-```
+## SQL
 
-`benches/joins.rs` times every join method on 200,000 rows joined with
-50,000, mostly against another method on the same rows, checks that each
-query's plan uses the join it means to time, and prints the fastest of five
-runs of each (`hash` also with budgets too small for the right side, which
-spills). Name groups (`hash`, `index`, `block`, `merge`) to run only those:
+**Statements**
 
-```bash
-cargo bench --bench joins
-```
+- `CREATE TABLE name (column TYPE [PRIMARY KEY], ...) [USING HEAP | LSM | COLUMN]`, `DROP TABLE name`
+- `CREATE [UNIQUE] INDEX name ON table [USING BTREE | HASH] (key, ...) [INCLUDE (column, ...)] [WHERE condition]`, `DROP INDEX name`.
+  A key is a column or an expression of columns, such as `LOWER(name)`.
+- `INSERT INTO table [(column, ...)] VALUES (...), ...`
+- `SELECT`, `UPDATE table SET column = expr, ... [WHERE ...]`, `DELETE FROM table [WHERE ...]`
+- `RETURNING * | expr [AS name], ...` after `INSERT`, `UPDATE` or `DELETE` returns the rows written instead of a count
+- `EXPLAIN` before `SELECT`, `UPDATE` or `DELETE`; `EXPLAIN ANALYZE` before `SELECT`
+- `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT name`, `ROLLBACK TO [SAVEPOINT] name`, `RELEASE [SAVEPOINT] name` (each may add `TRANSACTION`)
+- `CHECKPOINT` copies the committed pages from the log into the database file
 
-```bash
-cargo bench --bench joins -- index merge
-```
+**Types**: `INT` (or `INTEGER`, 64-bit), `REAL` (or `FLOAT`, 64-bit float, never
+NaN or infinite), `TEXT` (UTF-8), `BOOL` (or `BOOLEAN`), and `NULL`. INTs and
+REALs compare, group and join by value (`1 = 1.0`). Values are type-checked,
+with no implicit conversion between other types: `LENGTH(5)` is an error.
 
-If there is a `sqlite3` command, the same tables are filled in SQLite and
-every query is timed there as well (by the shell's `.timer`; SQLite counts
-each query's rows instead of returning them), printed beside Sequoia's time
-with the ratio, and the row counts are checked to agree. Pass `--no-sqlite`
-to skip it:
+**Constraints**: `PRIMARY KEY` on one column (unique, not NULL), and unique
+indexes (rows with a NULL key may repeat; a partial unique index checks only
+the rows it holds).
 
-```bash
-cargo bench --bench joins -- --no-sqlite
-```
+**Queries**
 
-`benches/sort.rs` times `ORDER BY` on 200,000 rows the same way: `memory`
-with a budget every row fits in, `spill` with budgets from 4 MB down to
-64 KB, so that more and more runs are written out and merged back, and `top`
-with a `LIMIT`. Group names and `--no-sqlite` work as for the joins:
+- `SELECT [DISTINCT] * | expr [AS name], ... FROM ...`. `FROM` is required.
+- `FROM` takes tables with aliases, `[INNER] JOIN ... ON`, `LEFT [OUTER] JOIN ... ON`,
+  `CROSS JOIN`, commas, and subqueries with an alias: `(SELECT ...) d`
+- `WHERE`, `GROUP BY` (expressions), `HAVING`, `ORDER BY expr [ASC | DESC], ...`
+  (NULL first, stable; may name a select-list alias), `LIMIT n [OFFSET m]`
+- `UNION` and `UNION ALL`; an `ORDER BY`, `LIMIT` or `OFFSET` after the last query applies to all rows
+- Aggregates: `COUNT(*)`, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, each also with `DISTINCT`
+- Subqueries as a value, with `EXISTS` and with `[NOT] IN`, in the select
+  list, `WHERE`, `HAVING`, `ORDER BY`, `UPDATE`, `DELETE` and `VALUES`. They
+  may be correlated and nested.
 
-```bash
-cargo bench --bench sort
-```
+**Expressions**: `+ - * /` (INT division truncates toward zero), `||`,
+`= != <> < <= > >=`, `AND OR NOT` with three-valued logic, `IS [NOT] NULL`,
+`[NOT] IN (list)`, `[NOT] BETWEEN`, `[NOT] LIKE` (`%` and `_`; ASCII letters
+match in either case, as in SQLite), `CASE [x] WHEN ... THEN ... [ELSE ...] END`.
+`AND` and `OR` evaluate their right side only where the left side does not
+decide, so `x <> 0 AND 10 / x > 1` never divides by zero. Integer overflow and
+division by zero are errors.
 
-```bash
-cargo bench --bench sort -- spill
-```
+**Functions**: `COALESCE`, `NULLIF`, `LENGTH`, `UPPER`, `LOWER`, `SUBSTR(text, start[, length])`,
+`ABS`, `ROUND(number[, digits])`. They behave as in SQLite, without SQLite's type conversions.
 
-`benches/aggregate.rs` times aggregation on 200,000 rows the same way:
-`groups` with from one group to one per row, by int, text, two and
-expression keys, and one per row with more or less memory than they take,
-`functions` each aggregate over the same 100 groups,
-`distinct` `COUNT(DISTINCT ...)` and `SELECT DISTINCT`, and `around` an
-aggregate under `HAVING`, `ORDER BY` and `LIMIT`, or over a `WHERE`:
+**Transactions**: every statement is atomic, and outside a transaction it is
+durable once it returns. A transaction is durable once `COMMIT` returns; a
+crash, `ROLLBACK` or closing the database undoes it. A statement that fails
+inside a transaction is undone alone, and the transaction goes on.
 
-```bash
-cargo bench --bench aggregate
-```
+**Not supported**: `SELECT` without `FROM`, `INSERT ... SELECT`, `RIGHT` and
+`FULL` joins, `LATERAL`, subqueries in `ON` or `GROUP BY`, CTEs (`WITH`),
+window functions, `ALTER TABLE`, `NOT NULL`, `DEFAULT`, `CHECK`, foreign
+keys, composite primary keys, the `%` operator, quoted identifiers, `/* */`
+comments, and date, time and blob types.
 
-```bash
-cargo bench --bench aggregate -- distinct
-```
+## Source layout
 
-`benches/scan.rs` times reading 200,000 rows, the cost under every other
-step: `engines` the same rows in a heap, an LSM tree and a column store,
-`zones` WHERE clauses on a column table whose row groups its zone maps
-(each column's least and greatest values per row group) let a scan skip,
-or not, `filter` WHERE clauses keeping 1% to all of the rows, `project` more and
-more columns and expressions (in Sequoia alone, as SQLite computes no column
-its count leaves unread), and `limit` a `LIMIT` without `ORDER BY`.
-`benches/subquery.rs` times subqueries over 200,000 orders: uncorrelated,
-correlated with 10 to 10,000 distinct outer values, and in `FROM`.
-
-`benches/lookup.rs` times finding rows by key, in batches of many queries,
-each finding different rows, and prints how long each took: `point` one row
-by a heap's indexes, an LSM tree's key, or reading every row, and `range`
-0.1% to 10% of the rows by an index against reading them all. SQLite is
-made to read each row found, not only its index.
-
-`benches/writes.rs` times writes to a database file, made afresh and filled
-for each of three runs: `insert` 50,000 rows into each storage engine and
-with more indexes, `commit` single-row statements against one transaction,
-`update` and `delete` a tenth of 50,000 rows or all of them, and
-`checkpoint`. SQLite runs in WAL mode with `synchronous = FULL`, so it syncs
-its log at each commit as Sequoia does.
-
-Five benchmarks time the storage layer and its data structures alone, with
-no SQL or SQLite: `benches/buffer_pool.rs` reads pages in five patterns
-through 256 frames under each replacement policy and prints the hit rate and
-time of each, `benches/lsm.rs` loads and reads LSM trees under level and
-universal compaction and prints their write amplification,
-`benches/column_encoding.rs` prints the encoding the column store picks for
-each kind of data, the bytes a value takes, and the time to encode, decode
-and filter it, `benches/hash.rs` times the hash files of
-`src/storage/hash` (extendible and linear hashing) against a B+ tree on
-200,000 index entries, and `benches/trie.rs` times the tries of
-`src/trie` (trie, radix tree and ART) against a `BTreeMap` and the skip list
-on INT-like and text keys, with the memory each takes, and loads LSM trees
-with each kind of MemTable. Group names work for all of them:
-
-```bash
-cargo bench --bench writes -- commit
-```
-
-```bash
-cargo bench --bench buffer_pool -- scans
-```
-
-## Supported SQL
-
-- Statements: `CREATE TABLE ... [USING HEAP | LSM | COLUMN]`, `DROP TABLE`,
-  `CREATE [UNIQUE] INDEX name ON table [USING BTREE | HASH] (key, ...)
-  [INCLUDE (column, ...)] [WHERE condition]` (keys are columns or expressions
-  of them, like `LOWER(name)`; `WHERE` makes a partial index; `HASH` makes a
-  hash index, which finds only rows whose every key equals a value), `DROP INDEX`, `INSERT`, `SELECT`,
-  `UPDATE`, `DELETE` (each of the last three maybe ending in `RETURNING`, below),
-  `CHECKPOINT`, and `EXPLAIN` before a `SELECT`, `UPDATE` or
-  `DELETE` to see its plan, or `EXPLAIN ANALYZE` before a `SELECT` to run it
-  and see what each step of its plan did
-- Transactions: `BEGIN`, `COMMIT`, `ROLLBACK`, and `SAVEPOINT name`,
-  `ROLLBACK TO name`, `RELEASE name` (each may add `TRANSACTION` or `SAVEPOINT`
-  as in SQL)
-- Types: `INT`, `REAL` (or `FLOAT`: a 64-bit floating-point number, written
-  `2.5` or `1e20`), `TEXT`, `BOOL`, and `NULL`. INTs and REALs compare, sort,
-  group and join by value (`1 = 1.0`); arithmetic with a REAL gives a REAL, and
-  a REAL that would be infinite is an error
-- Constraints: `PRIMARY KEY` (unique, not null), unique indexes (keys with a
-  NULL may repeat; a partial one checks only the rows it holds);
-  values are type-checked, but an INT stored in a REAL column becomes a REAL,
-  and a REAL with no fraction stored in an INT column an INT
-- `FROM`: one table, or several joined: `[INNER] JOIN ... ON`, `LEFT [OUTER]
-  JOIN ... ON`, `CROSS JOIN` or commas, with aliases (`users u`, `users AS u`)
-  and qualified columns (`u.id`). A table may be a subquery with an alias,
-  `(SELECT ...) d`, whose columns are named by its select list
-- `SELECT [DISTINCT]`: `*` or expressions, each maybe named with `AS` (a name
-  `ORDER BY` may use), `WHERE`, `GROUP BY` (expressions), `HAVING`,
-  `ORDER BY ... ASC|DESC` (any expressions, NULL first, stable; with `DISTINCT`, only
-  ones in the select list), `LIMIT n [OFFSET m]`
-- `UNION` and `UNION ALL` between queries that return as many columns, named
-  by the first; `UNION` drops repeated rows. An `ORDER BY`, `LIMIT` or `OFFSET`
-  after the last query applies to all of the rows
-- Aggregates: `COUNT(*)`, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, each also as
-  `f(DISTINCT expr)`, which counts each distinct value once. They skip NULLs;
-  over no values `COUNT` is 0 and the rest NULL. `SUM` is an INT over INTs and a
-  REAL once a value is; `AVG` is a REAL. A selected column must be grouped or aggregated
-- Expressions: `+ - * /` (`/` of two INTs truncates toward zero), `||` (joins
-  TEXTs), `= != <> < <= > >=`, `AND OR NOT`, `IS [NOT] NULL`, `[NOT] IN (list)`,
-  `[NOT] BETWEEN a AND b`, `[NOT] LIKE pattern` (`%` any characters, `_` one;
-  ASCII letters match in either case, as in SQLite), `CASE [x] WHEN ... THEN ...
-  [ELSE ...] END`, parentheses, with SQL three-valued logic for `NULL`.
-  `AND` and `OR` evaluate their right side only where the left one does not
-  decide (`FALSE AND x` is FALSE, `TRUE OR x` TRUE, whatever `x`), so
-  `x <> 0 AND 10 / x > 1` fails on no row, and `FALSE AND 5` is FALSE
-- Functions: `COALESCE(a, b, ...)`, `NULLIF(a, b)`, `LENGTH(text)`,
-  `UPPER(text)` and `LOWER(text)` (ASCII letters), `SUBSTR(text, start[, length])`,
-  `ABS(number)`, and `ROUND(number[, digits])`, which gives a REAL, halves away
-  from zero. These, `LIKE` and `BETWEEN` work as in SQLite, but values are not
-  converted between types: `LENGTH(5)` is an error. `CASE` and `COALESCE`
-  evaluate only the parts they need
-- Subqueries: `(SELECT ...)` as a value (one column, at most one row; NULL for
-  none), `[NOT] EXISTS (SELECT ...)` and `expr [NOT] IN (SELECT ...)`, in the
-  select list, `WHERE`, `HAVING`, `ORDER BY`, `UPDATE`, `DELETE` and `VALUES`.
-  They may be correlated (refer to the columns of the query around them) and
-  nested; each runs once per distinct set of outer values it is given
-- `RETURNING * | expr [AS name], ...` after an `INSERT`, `UPDATE` or `DELETE`
-  makes it return a row for each row it wrote, instead of a count: of the
-  values stored (an INT put in a REAL column comes back a REAL), for `UPDATE`
-  the new ones, for `DELETE` those of the rows deleted. The expressions read
-  the table's columns, with no aggregates or subqueries; columns are named as
-  a select list's are. The rows come once the statement's changes are made
-  (an error evaluating them undoes the statement), in no promised order:
-  `INSERT`'s follow its `VALUES`, the others the order the rows were found
-  in. `RETURNING` is not a keyword, so it may still name a table or column
-
-Every statement is atomic and, outside a transaction, durable once it returns.
-A transaction is durable once `COMMIT` returns; until then a crash, `ROLLBACK`
-or closing the database undoes all of it. A statement that fails inside one is
-undone alone, and the transaction goes on. There is one connection, so no
-concurrency control between transactions; below that, the buffer pool and
-B+ trees may be used by many threads at once, with page latches. Not supported: `RIGHT` and `FULL` joins, subqueries in
-`JOIN ... ON`, `LATERAL`, `INSERT ... SELECT`.
-
-## Layout
-
-Each layer uses only the ones below it:
+Each layer uses only the layers below it:
 
 ```
 sql -> executor -> plan -> catalog -> storage        (types, predicate, error: shared by all)
@@ -275,385 +216,336 @@ sql -> executor -> plan -> catalog -> storage        (types, predicate, error: s
 
 ```
 src/
-  main.rs         interactive shell
-  lib.rs          module list and public exports
-  database.rs     entry point; runs SQL, commits or rolls back each statement or transaction
-  executor/       runs statements
-    mod.rs        statement execution; a SELECT's rows as a stream (`Database::query`)
-    model.rs      the three execution models, and which one runs each query
-    operator.rs   iterator model: each plan step as an iterator pulling rows from the one below
-    materialize.rs  materialization model: each step runs to completion, returns all its rows
-    vectorized/   vectorized model
-      mod.rs      each plan step passing on batches of rows; joins and sorts on rows between them
-      batch.rs    batches: typed column vectors and a selection of the rows still in them
-      expr.rs     expressions a column at a time: loops over arrays, row by row for the rest
-    joins/        the join methods
-      mod.rs      their memory budgets
-      probe.rs    hash and index joins: a left row's candidates by its keys; LEFT JOIN padding
-      hash.rs     a hash join's right side: hybrid hash join, partitions spilled past the budget
-      index.rs    an index join's right side: lookups through an index or the primary key
-      block.rs    block nested loop join
-      merge.rs    sort-merge join
-      naive.rs    naive nested loop join: no plan runs it; a baseline for the joins benchmark
-    sort.rs       ORDER BY: external merge sort, top-N heap for LIMIT
-    spill.rs      temporary files of rows, and the partitions hash joins and aggregates spill
-    aggregate.rs  hash aggregation: one row per group, partitions of new groups past the budget, the functions
-    subquery.rs   runs subqueries for each row, with outer references replaced by its values
-  types.rs        values, data types, columns
-  predicate.rs    `column op literal` conditions, shared by the planner and storage
-  result.rs       query results and table printing
-  error.rs        shared error type
-  sql/            the language
-    lexer.rs      SQL text -> tokens
-    parser.rs     tokens -> AST (recursive descent)
-    ast.rs        statement and expression types
-    eval.rs       evaluates expressions, with three-valued logic for NULL
-  plan/           how to read a table
-    filter.rs     WHERE -> pushed-down predicates; the columns a statement reads
-    access.rs     picks a full scan, an index or a key lookup
-    query.rs      a SELECT as a tree of steps: binds names, pushes filters down, picks joins
-  catalog/        tables and indexes
-    mod.rs        Catalog: table and index schemas and where their pages live
-    table.rs      a table: schema + storage + indexes, constraint checks
-    index.rs      secondary index: entries of (keys, included columns, row id) in a B+ tree or hash file
+  main.rs            shell, server and client command line
+  lib.rs             module list and public exports
+  database.rs        Database: one session on one core; atomic statements, transactions, savepoints
+  shared.rs          SharedDatabase and Session: many threads, many readers or one writer
+  server.rs          TCP server (a thread per connection) and client
+  types.rs           values, data types, columns
+  predicate.rs       `column op literal` conditions, shared by the planner and storage
+  result.rs          query results and table printing
+  error.rs           the error type
+
+  sql/
+    lexer.rs         text -> tokens
+    parser.rs        tokens -> AST (recursive descent)
+    ast.rs           statements and expressions; printing them back as SQL
+    eval.rs          evaluating an expression on a row, three-valued logic, scalar functions
+
+  plan/
+    filter.rs        what a statement needs from a table: columns read, conditions implied by WHERE
+    access.rs        full scan, index, or LSM key lookup / key range; EXPLAIN of a scan
+    query.rs         SELECT -> tree of plan steps: binding, pushdown, joins, costs, gathers, EXPLAIN
+
+  catalog/
+    mod.rs           tables and indexes, stored as their CREATE statements in a heap
+    table.rs         a table: schema, storage engine, indexes, constraint checks, row counts
+    index.rs         index entries (keys, included columns, row id) in a B+ tree or hash file
+
+  executor/
+    mod.rs           runs statements; INSERT, UPDATE, DELETE, RETURNING, EXPLAIN ANALYZE
+    model.rs         the three execution models and how a query picks one
+    operator.rs      iterator model; the join and sort steps every model shares
+    materialize.rs   materialization model
+    vectorized/      vectorized model: batches, column vectors, expressions over columns
+    gather.rs        steps run on worker threads, their rows gathered
+    aggregate.rs     hash aggregation, partial and final phases, column-at-a-time folds
+    sort.rs          external merge sort, top-N
+    spill.rs         temporary files of rows; hash partitioning
+    subquery.rs      runs subqueries, remembering answers per distinct outer values
+    joins/           hash, index, merge, block and naive joins; the parallel ones
+
   storage/
-    io/           durable pages
-      medium.rs   byte-addressed files: on disk, in memory, or crashing (for tests)
-      wal.rs      write-ahead log: page frames, commits, savepoints, recovery, checkpoints
-      disk.rs     DiskManager: fixed-size pages in one file, free list, via the WAL
-    buffer/       pages cached in memory
-      pool.rs     buffer pool: cached frames, pin counts, dirty pages
-      replacer.rs page replacement policies: ARC (default), LRU-K, CLOCK
-    page.rs       slotted page: many tuples in one page
-    tuple.rs      row <-> bytes (null bitmap + column values)
-    sort_key.rs   values <-> bytes that sort like them: sort keys and index keys
-    heap.rs       table heap: linked list of pages, free-space map, RecordId
-    btree.rs      B+ tree: sorted byte-string keys, splits, merges, range scans, latch crabbing
-    hash/         hash files, for indexes USING HASH
-      mod.rs      the hash of a key, as stored; picks the scheme (`HASH_SCHEME`)
-      extendible.rs  extendible hashing: a directory of slots that doubles and halves
-      linear.rs   linear hashing: buckets split in turn, by the load
-      directory.rs   slots in the root page, or in directory pages it lists
-      bucket.rs   a bucket: a chain of pages of entries, overflow pages
-    lsm/          log-structured merge tree
-      tree.rs     log + MemTable, SSTables, level/universal compaction
-      memtable.rs the MemTable: a skip list or a trie, as `MEMTABLE` says
-      skiplist.rs skip list: a MemTable, nodes in a Vec linked by index
-      sstable.rs  SSTable: sorted entries in pages, in-memory summary
-      bloom.rs    Bloom filter for SSTable lookups
-    column/       column store
-      store.rs    PAX row groups, zone maps, delete bitmaps, delta store
-      encoding.rs column compression: RLE, bit-packing, patching, delta, dictionary, bitmap
-  trie/           tries: sorted maps that branch on a byte of the key per level
-    mod.rs        one tree for the trie, radix tree (paths compressed) and ART
-    list.rs       children in a sorted list: the trie's and radix tree's
-    adaptive.rs   ART's children: Node4, Node16, Node48, Node256
-tests/sql.rs      end-to-end tests
-tests/differential.rs  random statements run on Sequoia and SQLite, which must agree
+    io/              medium.rs (files, memory, simulated crashes), wal.rs, disk.rs (pages, free list)
+    buffer/          pool.rs (sharded buffer pool), replacer.rs (ARC, LRU-K, CLOCK)
+    page.rs          slotted page
+    tuple.rs         row <-> bytes
+    sort_key.rs      values -> bytes that sort like the values
+    heap.rs          table heap: linked pages, free-space map
+    btree.rs         B+ tree with latch crabbing
+    hash/            hash files: extendible and linear hashing, buckets, directory
+    lsm/             LSM tree, SSTables, Bloom filter, skip list, MemTable
+    column/          column store (row groups, zone maps, delta store) and its encodings
+
+  trie/              trie, radix tree and ART, used as LSM MemTables
+
+tests/               end-to-end SQL, differential tests against SQLite, concurrency, server
+benches/             benchmarks (see below)
 ```
 
-## Storage
+## How it works
 
-A database is a single file of 4 KB pages:
+### Files and durability
 
-- **Page 0** is the file header: magic, format version, page size, page count,
-  free list head, and the root page.
-- **The catalog** is a table heap starting at the root page. Each row holds a
-  table's `CREATE TABLE` statement plus its first and last page, or an index's
-  `CREATE INDEX` statement plus its root page. (An index from a file written
-  before indexes had several keys is built again when the file is opened.)
-- **A heap table** (the default) is a linked list of slotted pages. A row is identified by its
-  `RecordId` (page, slot) and stored as a null bitmap followed by its columns.
-  An in-memory free-space map (rebuilt from the pages after opening) sends
-  each insert to the first page with room, so space freed by deletes is
-  reused. An update keeps a row in its page when the page has room for the
-  new value, and only otherwise deletes it and inserts it again.
-- **An LSM table** (`USING LSM`) is a log-structured merge tree keyed by the
-  primary key, or by a hidden rowid if there is none. Writes, deletes
-  included, go to an in-memory MemTable, and are appended to a log. The
-  MemTable is an adaptive radix tree (default), or a radix tree, a trie or a
-  skip list: to switch, edit `MEMTABLE` in `src/storage/lsm/memtable.rs`. When the
-  log reaches 64 KB the MemTable is written out sorted as an SSTable.
-  SSTables are merged by **level compaction** (default): four level-0
-  SSTables are merged into level 1, and each deeper level is a single SSTable
-  up to 10 times bigger than the one above, merged down when it outgrows
-  that. **Universal compaction** keeps every SSTable in one level instead;
-  once there are 8, it merges runs of similar size, or all of them when the
-  newer ones take twice the space of the oldest. It rewrites data less often
-  but leaves more SSTables to check. To switch, edit `COMPACTION` in
-  `src/storage/lsm/tree.rs`. Lookups check the MemTable, then SSTables newest first,
-  skipping those whose key range or Bloom filter rules the key out. Scans
-  merge the MemTable and the SSTables in key order, each read in place from
-  the key the scan starts at, so a range of keys reads only its own pages. A
-  manifest page lists the log and the SSTables. SSTable summaries are not
-  stored: opening a table reads its SSTables once to rebuild them.
-- **A column table** (`USING COLUMN`) is a column store in the PAX layout.
-  New rows go to a **delta store**, a heap of whole rows. Once it holds 1024
-  rows they are migrated into a **row group**, where each column's values are
-  stored together in their own chunk, so a query reads only the columns it
-  uses. Each chunk is compressed with whichever lossless encoding makes it
-  smallest: run-length, bit-packing (relative to the smallest value),
-  patching (bit-packing with a few outliers stored apart), delta (then
-  encoded again), an order-preserving dictionary, or one bitmap per value.
-  A WHERE clause's conditions of the form `column op literal` (joined by
-  AND) are **pushed down** into the scan and evaluated on the compressed
-  chunks: once per run for run-length encoding, by picking the literal's
-  bitmap, or, for a dictionary, by binary searching the sorted dictionary
-  for the literal and comparing codes instead of values. Only the rows that
-  match are then decoded from the other columns' chunks (late
-  materialization); the full WHERE clause is still checked on them.
-  Row groups are never rewritten: a delete sets the row's bit in the group's
-  delete bitmap, an update deletes the row and inserts the new value into the
-  delta store, and a group whose rows are all deleted is freed. A manifest
-  page lists the delta store and the row groups, which limits a column table
-  to about a thousand row groups.
-- **An index** is a B+ tree over the keys of a heap or LSM table's rows:
-  columns, or expressions of them. Each entry is a key of the tree: the keys,
-  each encoded as a sort key is (so bytes sort like values, NULL first, and
-  each value's encoding ends where it can be told to), then the `INCLUDE`
-  columns, then the row's id (a heap row's page and slot, or an LSM row's
-  key). The entries of rows with equal first keys are therefore adjacent, in
-  the order of the next key, and a lookup is a range scan of the leaves,
-  which are linked in key order. A partial index holds only the rows its
-  `WHERE` is true for; every other row has an entry, NULL keys included. A
-  node that overflows its
-  page splits; a delete that leaves a node under a quarter full merges it
-  with a neighbour, or moves keys over from it (and a parent that the longer
-  separator this may bring overflows splits in turn). The root page never
-  moves, so the catalog row stays valid. Threads may search and change a
-  tree at once, latching pages by **latch crabbing**: down from the root,
-  a node's latch is released only once its child's is held. A change that
-  fits in its leaf write-latches only the leaf; one that must split or merge
-  write-latches the way down, releasing everything above each node that the
-  change cannot spread past. A scan copies one leaf at a time and, instead
-  of following the leaf links (a merge may free the next leaf), goes down
-  again to the key that bounds the leaf above, which it noted on the way. Every insert, update and delete updates every
-  index of the table. A heap table with a primary key gets a unique index
-  `<table>_pkey` on it, which enforces the key and is dropped only with the
-  table. Column tables cannot have indexes: migrating rows into a row group
-  moves them, which would change their ids.
-- **A hash index** (`USING HASH`) holds the same entries in a hash file,
-  each hashed by its keys' encoding (with a hash function of its own, fixed
-  as it is stored: an INT and the REAL it equals hash alike). Its root page
-  leads straight to the one bucket that a hash picks, a chain of pages whose
-  entries are compared by their 32-bit hashes first, so it finds the rows
-  whose every key equals a value without searching a tree, and nothing
-  else: no ranges, no first keys alone, no order. A bucket's first page
-  takes new entries; when it is full and the bucket cannot be split apart,
-  its entries move to an overflow page after it. There are two schemes, and
-  `HASH_SCHEME` in `src/storage/hash/mod.rs` picks the one new indexes use
-  (a file's root page says which it was made with, so both open):
-  **extendible hashing** (default), where a directory of 2^d slots, indexed
-  by the low `d` bits of a hash, points to buckets: a full bucket splits by
-  the next bit, the directory doubling (copying page ids, not entries) only
-  when it has no slot to tell the halves apart by, and a bucket a delete
-  empties merges back into its buddy, the directory halving when it can;
-  and **linear hashing**, where buckets split one at a time in order,
-  whichever overflowed, whenever the entries outgrow 75% of the buckets'
-  first pages, and the last split is undone below 35%. The slots stay in
-  the root page while they fit (about 800), so a small index finds a bucket
-  from its root alone. Lookups latch the root and then the bucket, as the
-  B+ tree crabs; an extendible file's inserts and deletes write-latch only
-  the bucket unless they split or merge, a linear file's the root too, which
-  holds the bytes its load is measured by. A hash index suits keys with few
-  rows each: deleting one of many rows with one key searches a long chain.
-- **Finding rows**: a WHERE clause's conditions of the form `expression op
-  literal` (joined by AND) choose how a statement reads its table. A heap or
-  LSM table uses the index those conditions narrow down most: equalities on
-  its first keys, then a range on the next key (an equality counts more than
-  a range with two ends, which counts more than one with one end). A hash
-  index serves only equalities on every one of its keys, and wins a tie
-  with a B+ tree that does not hold more of the columns read. A partial
-  index serves only a WHERE that implies its condition: each of the
-  condition's conjuncts is one of the WHERE's, or follows from one of its
-  comparisons (`x > 5` gives `x > 0`), or is `e IS NOT NULL` for an `e` it
-  compares. The scan reads only the rows the index lists, in index order;
-  when the index's column keys and included columns hold every column the
-  statement reads, it reads them from the index alone (`USING COVERING
-  INDEX`). An LSM table whose primary key is fixed by an
-  equality looks that key up, and one whose primary key the conditions bound
-  reads only that range of keys, in key order (ranked as an index would be,
-  and winning ties). Otherwise every row is read, a column table's
-  with its conditions pushed down (above). The full WHERE clause is always
-  checked on the rows read. `EXPLAIN` shows the choice on its last line.
-- **Freed pages** (from `DROP TABLE`, `DROP INDEX`, B+ tree merges, an LSM
-  flush or compaction, or a column store migration) go on a free list and
-  are reused. A rolled-back statement's allocations are undone with it.
+A database is one file of 4 KB pages, plus a write-ahead log beside it
+(`<file>-wal`). Page 0 is a header (magic, version, page size, page count,
+free list, root page). The last 4 bytes of every page are reserved for a
+checksum that is not computed yet.
 
-Pages are read and written through a **buffer pool** of 256 frames (1 MB). A
-page in use is pinned and cannot be evicted; when the pool is full, ARC
-(Adaptive Replacement Cache) picks an unpinned victim, writing it back first if
-it is dirty. ARC balances recently used against frequently used pages, so a
-full table scan does not push frequently used pages out. LRU-K and CLOCK are
-also available: to switch, edit `REPLACEMENT_POLICY` in `src/storage/buffer/pool.rs`.
+The database file is never written directly. Every page write is appended to
+the log as a frame holding the whole page. A commit appends a commit frame
+and syncs the log. Each frame's checksum covers the frame and the previous
+frame's checksum, so recovery reads frames until one fails, keeps what was
+committed and cuts off the rest. A savepoint is a position in the log;
+rolling back to it truncates the log there. A checkpoint copies the newest
+committed version of each page into the database file. It runs when the log
+reaches 4 MB after a commit, on `CHECKPOINT`, when the database is closed,
+and when it is opened after a crash. The file is locked, so only one process
+can open it.
 
-**Plans**: a `SELECT` is planned as a tree of steps, each reading rows from
-the one below it, and run in the Volcano style: each step is an iterator
-that pulls rows from its input. For example:
+When a statement fails, the buffer pool drops its cached pages, the log
+drops the uncommitted frames, and the catalog is read again from the
+committed pages. The tests in `database.rs` crash a simulated disk at many
+points inside statements and transactions, and check that each one is
+applied whole or not at all.
 
+### Buffer pool
+
+Pages are read and written through a buffer pool of 256 frames (1 MB) in 8
+shards. A page goes to the shard picked by a hash of its id, and each shard
+has its own lock, page table and replacer, so threads reading different
+pages rarely wait for each other. Pinned pages are never evicted. Dirty pages
+are written to the log when they are evicted or when a statement ends. The
+replacement policy is ARC by default; LRU-K and CLOCK can be chosen with
+`--replacer` or `.replacer`, and the pool reports its hit rate.
+
+### Storage engines
+
+- **Heap** (default): a linked list of slotted pages. A row is found by its
+  page and slot. An in-memory free-space map sends each insert to the first
+  page with room. An update stays in place when its page has room.
+- **LSM tree** (`USING LSM`): keyed by the primary key, or by a hidden row id.
+  Writes go to a MemTable (ART by default) and to a log. The log is a heap
+  inside the database file, so it is covered by the write-ahead log too. At
+  64 KB the MemTable is written out as a sorted SSTable. Level compaction
+  (default) or universal compaction merges SSTables. Lookups check the
+  MemTable, then SSTables from newest to oldest, skipping those whose key
+  range or Bloom filter excludes the key. Scans merge all sources in key
+  order and start at the requested key.
+- **Column store** (`USING COLUMN`): new rows go to a delta store (a heap).
+  Every 1024 rows are moved into a row group, where each column is a chunk
+  compressed with whichever encoding makes it smallest. A row group keeps a
+  zone map (each column's least and greatest values and NULL count). Scans
+  skip row groups by their zone maps, evaluate `column op literal`
+  conditions on the compressed chunks (once per run, on the literal's
+  bitmap, or on dictionary codes), and then decode the other columns only
+  for the rows that match. Deletes set a bit in the group's delete bitmap;
+  updates delete and insert again.
+
+### Indexes
+
+A **B+ tree** index stores one byte string per row: the keys encoded so
+that bytes sort like values (NULL first), then the `INCLUDE` columns, then
+the row id. Lookups are range scans over the leaves. Nodes split when full
+and merge or borrow when under a quarter full. The root page never moves.
+Threads use the tree at the same time through latch crabbing; scans go down
+again from the root for each leaf instead of following leaf links, because a
+merge can free a leaf.
+
+A **hash index** (`USING HASH`) stores the same entries in a hash file. It
+only answers equality on all of its keys. Two schemes are implemented:
+extendible hashing (default; a directory of 2^d slots that doubles and halves)
+and linear hashing (buckets split one at a time as the load grows). A
+bucket that cannot be split continues in overflow pages.
+
+A heap table with a primary key gets a unique index `<table>_pkey`. Column
+tables cannot have indexes, because moving rows into a row group changes
+their ids. Every write updates every index of its table.
+
+### Planning
+
+A `SELECT` becomes a tree of steps. Column references are bound to their
+tables. `WHERE` and the `ON` of inner joins are split at `AND`; a condition
+on one table is pushed down to its scan, and a condition on several tables
+goes to the join that brings in the last of them. Conditions on the right
+side of a `LEFT JOIN` are kept in the join.
+
+**Access paths.** Conditions of the form `expr op literal` choose how a table
+is read: an LSM primary key lookup or key range, or the index that narrows
+the rows most (equalities on its first keys, then a range on the next key).
+A partial index is used only when the `WHERE` implies its condition. An index
+that holds every column the query reads is used without reading the table
+(`COVERING INDEX`). Otherwise the table is scanned.
+
+**Joins** are planned in the order of `FROM`; the planner does not reorder
+tables. For each join with an equality between the two sides:
+
+- an **index join** if the right table has an index (or LSM primary key) on
+  the column and looking up each left row costs less than building a hash
+  table of the right side;
+- otherwise a **hash join**;
+- a **merge join** only when its output order lets `ORDER BY` skip its sort.
+
+Without an equality, a **block nested loop join** is used. The costs are
+constants measured with `benches/joins.rs`. There are no statistics: table
+row counts are counted on first use, and selectivity is guessed (1/200 for an
+equality, 1/3 for anything else, one row for an equality on a unique key).
+
+### Execution
+
+All three models run the same plan and return the same rows and errors.
+
+| Model | A step returns | Chosen when |
+|---|---|---|
+| materialization | all its rows in one call | no step is expected to see more than 100 rows |
+| vectorized | batches of 1024 rows, stored by column | some step sees 4096 rows or more, and the query has no join or subquery |
+| iterator | one row per call | otherwise |
+
+In the vectorized model, filters narrow a selection vector without copying
+rows, `AND` and `OR` evaluate their right side only on undecided rows, and
+arithmetic and comparisons on typed columns are plain loops the compiler can
+vectorize. An aggregate without `GROUP BY` folds a whole column at once.
+Joins and sorts use the iterator model's code in all three models.
+
+Sorts, hash joins and hash aggregation have memory budgets. Past them, a
+sort writes sorted runs to a temporary file and merges them; a hash join or
+aggregation splits its rows into 16 partitions by hash and writes the
+largest to temporary files, splitting again by more hash bits if needed.
+Temporary files are deleted as soon as they are created.
+
+Subqueries are planned and run like any query, after their outer references
+are replaced by the current row's values. Answers are remembered per
+distinct set of outer values, so an uncorrelated subquery runs once.
+
+### Parallelism
+
+With `.workers N` (or `set_scan_workers` and `set_join_workers`):
+
+- A full scan of a heap, with the filters and projection above it, runs on
+  N threads that each take the next page (`GATHER`). Rows come out in no
+  order.
+- A hash join of two such scans runs entirely on the workers: they build the
+  hash table from the right side, then probe it with the left side.
+- An index join of such a scan with a heap's index runs on the workers, each
+  looking up the keys of its own rows.
+- An aggregate over these is split: each worker computes a
+  `PARTIAL AGGREGATE`, and a `FINALIZE AGGREGATE` merges the partial states.
+- Any other hash join that does not need to keep order becomes a
+  `PARALLEL HASH JOIN`, a grace hash join that partitions both sides and
+  joins the partitions on N threads.
+
+Steps with subqueries are not parallelized, because subqueries run in the
+query's thread.
+
+### Concurrency
+
+A `SharedDatabase` lets many sessions read at once, or one write, as SQLite
+does. A writer holds the database until its statement commits, or with
+`BEGIN`, until its transaction ends. A waiting writer goes before readers that
+arrive after it. A session waits at most its busy timeout (5 seconds by
+default) and then fails with "database is locked". A session dropped inside a
+transaction rolls it back. Below this lock, the buffer pool, B+ trees and hash
+files are safe for concurrent use with page latches, which parallel queries
+rely on.
+
+## Settings and switches
+
+Per session, at runtime (on `Database` and `Session`):
+
+| Setting | Default | Method |
+|---|---|---|
+| sort memory | 4 MB | `set_sort_memory` |
+| block nested loop join memory | 4 MB | `set_join_memory` |
+| hash join and hash aggregation memory | 16 MB | `set_hash_memory` |
+| execution model | chosen per query | `set_execution_model`, `.model` |
+| scan and hash join workers | 1 | `set_scan_workers`, `set_join_workers`, `.workers` |
+| forced join method | none | `set_force_join` |
+| busy timeout (sessions only) | 5 s | `set_busy_timeout` |
+
+Per database, at runtime: the replacement policy (`set_replacement_policy`,
+`--replacer`, `.replacer`).
+
+At compile time, by editing a constant:
+
+| Constant | Default | File |
+|---|---|---|
+| `REPLACEMENT_POLICY` | `Policy::Arc` | `src/storage/buffer/pool.rs` |
+| `BUFFER_POOL_FRAMES`, `BUFFER_POOL_SHARDS` | 256, 8 | `src/database.rs` |
+| `MEMTABLE` | `MemTableKind::Art` | `src/storage/lsm/memtable.rs` |
+| `COMPACTION` | `Compaction::Level` | `src/storage/lsm/tree.rs` |
+| `HASH_SCHEME` | `HashScheme::Extendible` | `src/storage/hash/mod.rs` |
+| `CHECKPOINT_BYTES` | 4 MB | `src/storage/io/disk.rs` |
+
+Files written with another MemTable, compaction strategy or hash scheme still
+open.
+
+## Limits
+
+- **Row size**: a row must fit in one page, at most 4080 bytes encoded (a few
+  bytes less in an LSM table, which stores the key with it). There are no
+  overflow pages.
+- **Index entries** are at most 1024 bytes (keys, included columns and row id).
+- **Column tables** hold at most about 1000 row groups (about a million rows),
+  because the manifest is one page.
+- **One writer at a time**: there is no MVCC and no row locking, so a long
+  write transaction blocks every other session.
+- **No statistics**: the planner knows row counts but not value
+  distributions, and does not reorder joins.
+- **Small default cache**: the buffer pool is 1 MB unless the constants are changed.
+- **No page checksums** in the database file; only the log is checksummed.
+- **Startup work**: LSM SSTable summaries and Bloom filters are not stored and
+  are rebuilt by reading every SSTable when a table is opened; heap
+  free-space maps are rebuilt on first write.
+- Heap pages are never released back to the free list while the table exists.
+
+## Testing
+
+```bash
+cargo test --release
 ```
-EXPLAIN SELECT city, COUNT(*) FROM users WHERE active GROUP BY city HAVING COUNT(*) > 1 ORDER BY city LIMIT 5;
 
-PROJECT city, COUNT(*)
-  SORT BY city (TOP 5)
-    FILTER COUNT(*) > 1
-      AGGREGATE COUNT(*) BY city
-        FILTER active
-          SCAN users
+- Unit tests sit next to the code, including crash and I/O error tests on a
+  simulated disk (`storage/io/medium.rs`) that keeps only what was synced.
+- `tests/sql.rs` runs SQL end to end. Set `SEQUOIA_MODEL` to run every query
+  in one execution model:
+
+  ```bash
+  SEQUOIA_MODEL=vectorized cargo test --release --test sql
+  ```
+
+- `tests/differential.rs` generates random schemas, rows, queries, changes
+  and transactions, runs them on Sequoia and on SQLite (through the `sqlite3`
+  command, skipped if missing), and fails if the results differ. Each case
+  also runs in every execution model, and with memory budgets small enough
+  to force spilling, which must return exactly the same rows and errors. It
+  runs 40 cases by default:
+
+  ```bash
+  SEQUOIA_DIFF_CASES=2000 SEQUOIA_DIFF_SEED=7 cargo test --release --test differential -- --nocapture
+  ```
+
+- `tests/concurrency.rs` and `tests/server.rs` test sessions and the TCP server.
+
+CI (`.github/workflows/ci.yml`) runs `cargo test --release` on Linux, macOS
+and Windows, with `sqlite3` installed so the differential tests run.
+
+## Benchmarks
+
+Each benchmark is a plain program (`harness = false`). Pass group names to run
+only those groups, and `--no-sqlite` to skip the SQLite comparison where there
+is one:
+
+```bash
+cargo bench --bench joins
+cargo bench --bench sort -- spill top
+cargo bench --bench scan -- --no-sqlite
 ```
 
-Scans, filters, limits and projections hand rows on one at a time, so a
-`LIMIT` without `ORDER BY` stops the scan once it has enough, and
-`Database::query` returns a `SELECT`'s rows as they are made instead of
-collecting them (`execute` collects them). Sorts and aggregates need all of
-their input before their first row.
+| Bench | Measures | SQLite column |
+|---|---|---|
+| `joins` | every join method on the same queries, 200,000 rows by 50,000, including parallel hash and index joins | |
+| `sort` | `ORDER BY` in memory, with spilling at smaller and smaller budgets, and top-N | yes |
+| `aggregate` | `GROUP BY` with few to many groups, each aggregate, `DISTINCT`, `HAVING` | yes |
+| `scan` | reading rows from each storage engine, zone maps, filters, projections, `LIMIT`, parallel scans | yes |
+| `lookup` | point and range lookups through B+ tree, hash and LSM keys, against full scans | yes |
+| `writes` | inserts per engine and index count, small commits, updates, deletes, checkpoints | yes |
+| `subquery` | uncorrelated, correlated and derived-table subqueries | yes |
+| `models` | the same queries in each execution model | |
+| `buffer_pool` | hit rate and cost of each replacement policy on access patterns | |
+| `lsm` | level against universal compaction: write amplification, reads | |
+| `column_encoding` | size and speed of each column encoding | |
+| `hash` | extendible and linear hashing against a B+ tree | |
+| `trie` | trie, radix tree and ART against `BTreeMap` and the skip list | |
 
-**Expressions** are evaluated by walking their tree (`sql/eval.rs`): in the
-iterator and materialization models once per row, in the vectorized model
-once per batch, each node a loop over a column (`vectorized/expr.rs`).
-There is no compilation to machine code. When a step starts, the columns of
-its expressions are found among the columns of the rows it reads, which it
-works out then anyway, and replaced by their positions (`sql::eval::locate`),
-so no step looks a column up by name for each row; the plan itself, as
-`EXPLAIN` shows it, keeps their names. The expressions of `UPDATE`,
-`DELETE`, `RETURNING` and of index keys are located once too.
-
-`EXPLAIN ANALYZE` runs a `SELECT`, reading all of its rows, and shows each
-step of its plan with the rows it returned and the time it took, the time of
-the steps below it included, and a last line with the query's rows and time:
-
-```
-EXPLAIN ANALYZE SELECT g, COUNT(*) FROM a WHERE k < 5000 GROUP BY g ORDER BY g;
-
-PROJECT g, COUNT(*)  (10 rows, 4.0 ms)
-  SORT BY g  (10 rows, 4.0 ms)
-    AGGREGATE COUNT(*) BY g  (10 rows, 4.0 ms)
-      FILTER k < 5000  (9993 rows, 2.9 ms)
-        SCAN a  (20000 rows, 1.4 ms)
-10 rows in 4.0 ms
-```
-
-A step that runs more than once, as the right side of a block nested loop
-join does for each block of left rows, says how often, with its rows counted
-over all of its runs; an index join's lookups are counted with the join. Each
-step's time includes timing it, about the cost of reading the clock twice for
-each row it returns.
-
-**Joins**: the tables of `FROM` are joined left to right. Every column
-reference is first bound to its table; an unqualified name that several
-tables have is an error. `WHERE`, and the `ON` of inner joins, are split at
-their `AND`s: a condition on one table is pushed down to that table's scan,
-where it may pick an index, and one on several tables goes to the join that
-brings in the last of them. A `LEFT JOIN` keeps every left row, so only the
-parts of its `ON` about the right table alone are pushed down, and `WHERE`
-conditions on its right table are checked after it, on the NULL-padded rows
-too. Each join then finds the right rows that may match a left row from its
-equalities `left = right column`: an **index join** looks them up in an
-index of the right table on that column (a hash index on it alone before
-a B+ tree it is the first key of, or an LSM primary key), once per
-left row, when that is cheaper than a hash join; otherwise a **hash join**
-reads the right table once into a hash table keyed by the equalities;
-failing any equality, a **block nested loop join** reads the left rows a
-block at a time, as many as fit in its budget (4 MB by default;
-`Database::set_join_memory` changes it), and reads the right table again
-for each block, unless its rows fit in the budget too and are kept from the
-first read, trying every pair. The rest of the condition is checked on each
-pair. Keys are compared as values, so a NULL key matches nothing, and
-neither do keys of different types, where `=` would report an error. A
-block nested loop join holds one block of left rows, and the right rows if
-it keeps them.
-
-A hash join holds its right side in a hash table up to a budget (16 MB by
-default; `Database::set_hash_memory` changes it). Past it, the join is a
-**hybrid hash join**: the table splits into 16 partitions by a hash of the
-keys, and the largest are written to temporary files until the rest fit,
-later right rows of those partitions following them. A left row of a
-partition in memory is joined at once; one of a partition on disk is
-written after it. Once the left side runs out, each partition on disk is
-joined in turn: its right rows are read into a table, split again by the
-next bits of the hash if they still do not fit (up to 8 times; past that,
-or if every row has one key, the table is held whole), and its left rows
-read back to probe it. So left rows of spilled partitions come out last,
-and a hash join that must keep its left side's order (after a merge join,
-below) sorts its rows back into it by their left rows' numbers.
-
-Whether lookups are cheaper depends on how many there are against how many
-rows a hash join would read. The planner counts each table's rows the first
-time it needs them (writes keep the count up to date after that; a rollback
-makes it count again), and with no statistics guesses what share of them a
-condition keeps as PostgreSQL does without any: 1 in 200 for an equality,
-a third for a comparison. A lookup costs about 6 rows read when it goes
-through an index, and 2 for an LSM primary key; a hash join about 2 per right
-row and 0.4 per left row (measured with `benches/joins.rs`). So an index
-join over 200,000 rows into 50,000 becomes a hash join, about 3 times faster,
-while one of up to about a third as many rows as the right side stays.
-
-A **sort-merge join** sorts both sides by the equalities, with the same
-external sort as `ORDER BY` (and its budget), and walks them together; its
-rows come out in key order. There are no statistics to weigh it against a
-hash join, so it is picked only when that order saves a sort: when `ORDER BY`
-starts with a join's keys, follows them only with columns of the tables
-before it, and every later join is a hash or index join, which keep their
-left side's order. That join becomes a merge join and the `ORDER BY` needs
-no sort of its own (`EXPLAIN` shows `MERGE JOIN ... (SORTED BY ...)` and no
-`SORT BY`).
-
-**Grouping**: a `SELECT` with `GROUP BY`, `HAVING` or an aggregate gets an
-aggregate step, which works by hash aggregation. Each expression of its
-select list, `HAVING` and `ORDER BY` is first rewritten to read the
-aggregate's rows: a `GROUP BY` expression and each distinct aggregate become
-columns named by their SQL text (`city`, `COUNT(*)`), and any column left
-over is an error, since it is neither grouped nor aggregated. The step folds
-each row into its group's accumulators, in a hash table with one entry per
-group, held in memory up to the hash join's budget. Past it, rows of the
-groups in memory still add to them, but a row of a new group is written
-out (its key and aggregate arguments) to one of 16 partitions by a hash of
-its key; after the last row, the groups in memory come out, then each
-partition is aggregated in turn the same way, spilling into partitions of
-its own if it too outgrows the budget. Groups come out in the order their
-first row was read, those of rows written out after the others; without
-`GROUP BY` all rows form one group, even when there are none. The values
-that `DISTINCT` aggregates remember cannot be written out, and grow the
-groups past the budget.
-
-**Sorting**: `ORDER BY` buffers rows in memory up to a budget (4 MB by
-default; `Database::set_sort_memory` changes it). Past that, it sorts what it
-holds and writes it to a temporary file as a sorted run, and at the end
-merges the runs, with the last rows still in memory, through a tournament
-tree. A merge reads 16 runs at once, or one per 64 KB of the budget (up to
-256); if there are more, the smallest are merged first, as few as it takes
-for every later pass to merge a full set. Sort keys are encoded as bytes
-that compare as the values do (NULL first, then each type's values apart),
-so comparing rows compares bytes, and a key of up to eight bytes, as most
-INT keys are, compares as one number. The temporary file is removed as soon
-as it is opened, so it vanishes with the sort, and it bypasses the
-write-ahead log. With `LIMIT n`, the buffer is instead a heap of the best `n`
-rows so far, so sorting `m` rows takes O(m log n) time and memory for `n`
-rows, and once a run of `n` rows is written, later rows that sort after its
-last are dropped as they arrive. Rows with equal keys keep the order they
-were read in.
-
-**The write-ahead log** (`<file>-wal`) makes every statement atomic. The
-DiskManager never writes the database file directly: each page write, the
-header page's included, is appended to the log as a frame holding the whole
-page, and reads find a page's newest frame through an in-memory map. When a
-statement that changes data succeeds, its dirty pages are written back from
-the buffer pool and a commit frame is appended and synced: one sync per
-statement. When it fails, it is rolled back: the log is cut back to the last
-commit frame, the buffer pool drops its cached pages, and the catalog is
-opened again from the committed pages. Each frame carries a checksum of
-itself and the frame before it, so opening the log after a crash keeps the
-frames up to the last valid commit frame and cuts off the rest: a statement
-is either all there or not at all. A **checkpoint** copies the newest
-committed version of each page into the database file, syncs it, and only
-then empties the log, so a crash during one leaves the log to be copied
-again. It runs after a commit that leaves the log at 4 MB or more, on
-`CHECKPOINT`, when the database is closed (which also removes the log), and
-when it is opened after a crash. Crash tests run every kind of statement on
-simulated files that stop at an arbitrary write, and check that every table
-and index afterwards shows the statement entirely or not at all.
-
-Primary key checks use the key's index on heap tables, look the key up on LSM
-tables and read the key column on column tables (heap tables in files written
-before indexes existed have no key index and scan the table). A row must fit
-in one page (about 4 KB), and an index entry in 1 KB.
+Each prints the fastest of a few runs, and most check that the plan uses the
+method they mean to time.
