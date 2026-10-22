@@ -22,11 +22,24 @@
 //!   flushed, and is durable only once the disk commits (see `storage/io/disk.rs`).
 //!   Dropping the pool writes nothing back.
 //!
-//! Locking: one mutex (`state`) over all metadata, plus one RwLock per frame
-//! over its bytes. While holding `state`, the pool only locks frames that are
-//! unpinned, and no guard holds an unpinned frame (guards release the lock
-//! before unpinning), so that never waits. A thread must not fetch a page it
-//! already holds a write guard on, or flush a page it holds any guard on.
+//! **Shards.** The frames may be split into shards ([`BufferPool::sharded`]),
+//! each a pool of its own: its frames, its page table, its replacer, its
+//! counts and its lock. A page always goes to the shard a hash of its id
+//! picks, so threads fetching different pages mostly take different locks,
+//! where with one shard every fetch and every unpin of every thread takes
+//! the same one. Each shard evicts its own pages only, by its policy: the
+//! pool as a whole follows the policy only roughly, and a shard whose
+//! frames are all pinned fails a fetch though another has room. A pool made
+//! with [`BufferPool::new`] has one shard, and is exactly the pool above.
+//!
+//! Locking: in each shard, one mutex (`state`) over its metadata, plus one
+//! RwLock per frame over its bytes. While holding `state`, a shard only
+//! locks frames that are unpinned, and no guard holds an unpinned frame
+//! (guards release the lock before unpinning), so that never waits. A thread
+//! must not fetch a page it already holds a write guard on, or flush a page
+//! it holds any guard on. Only [`BufferPool::discard_all`] holds more than
+//! one shard's lock: all of them, taken in order, so it waits for no one
+//! that waits for it.
 
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
@@ -47,13 +60,18 @@ pub const REPLACEMENT_POLICY: Policy = Policy::Arc;
 
 pub struct BufferPool {
     disk: Arc<DiskManager>,
+    shards: Box<[Shard]>,
+}
+
+/// A part of the pool: the frames of the pages whose ids hash to it.
+struct Shard {
     frames: Box<[RwLock<Page>]>,
     state: Mutex<State>,
 }
 
 struct State {
     page_table: HashMap<PageId, usize>,
-    /// Metadata of each frame, indexed like `BufferPool::frames`.
+    /// Metadata of each frame, indexed like `Shard::frames`.
     meta: Vec<FrameMeta>,
     /// Frames that hold no page.
     free: Vec<usize>,
@@ -88,42 +106,60 @@ struct FrameMeta {
 }
 
 impl BufferPool {
-    /// Creates a pool of `capacity` frames using [`REPLACEMENT_POLICY`].
-    /// Callers that pin several pages at once (e.g. the table heap pins two)
-    /// need at least that many.
+    /// Creates a pool of `capacity` frames, one shard, using
+    /// [`REPLACEMENT_POLICY`]. Callers that pin several pages at once (e.g.
+    /// the table heap pins two) need at least that many.
     pub fn new(disk: Arc<DiskManager>, capacity: usize) -> Self {
         Self::with_policy(disk, capacity, REPLACEMENT_POLICY)
     }
 
-    /// Creates a pool of `capacity` frames using `policy`.
+    /// Creates a pool of `capacity` frames, one shard, using `policy`.
     pub fn with_policy(disk: Arc<DiskManager>, capacity: usize, policy: Policy) -> Self {
-        let pool = Self::with_replacer(disk, capacity, policy.replacer(capacity));
-        pool.state.lock().unwrap().policy = Some(policy);
-        pool
+        Self::shards_of(disk, capacity, 1, policy)
     }
 
-    /// Creates a pool with a given replacer, which must be able to track
-    /// `capacity` resident pages.
+    /// Creates a pool of `capacity` frames split into `shards` shards, as
+    /// evenly as they go, using [`REPLACEMENT_POLICY`]. A shard needs as
+    /// many frames as its pages can be pinned at once.
+    pub fn sharded(disk: Arc<DiskManager>, capacity: usize, shards: usize) -> Self {
+        Self::shards_of(disk, capacity, shards, REPLACEMENT_POLICY)
+    }
+
+    fn shards_of(disk: Arc<DiskManager>, capacity: usize, shards: usize, policy: Policy) -> Self {
+        assert!(
+            shards > 0 && capacity >= shards,
+            "a buffer pool needs a frame for each shard"
+        );
+        let shards = (0..shards)
+            .map(|i| {
+                let frames = capacity / shards + (i < capacity % shards) as usize;
+                let shard = Shard::new(frames, policy.replacer(frames));
+                shard.state.lock().unwrap().policy = Some(policy);
+                shard
+            })
+            .collect();
+        BufferPool { disk, shards }
+    }
+
+    /// Creates a pool of one shard with a given replacer, which must be able
+    /// to track `capacity` resident pages.
     pub fn with_replacer(
         disk: Arc<DiskManager>,
         capacity: usize,
         replacer: Box<dyn Replacer>,
     ) -> Self {
-        assert!(capacity > 0, "a buffer pool needs at least one frame");
-        let state = State {
-            page_table: HashMap::new(),
-            meta: (0..capacity).map(|_| FrameMeta::default()).collect(),
-            free: (0..capacity).rev().collect(),
-            replacer,
-            policy: None,
-            stats: Stats::default(),
-        };
-        let frames = (0..capacity).map(|_| RwLock::new([0; PAGE_SIZE])).collect();
-        Self {
+        BufferPool {
             disk,
-            frames,
-            state: Mutex::new(state),
+            shards: Box::new([Shard::new(capacity, replacer)]),
         }
+    }
+
+    /// The shard of the page: by a multiplicative hash of its id, so that
+    /// neighbouring pages, which are often read together, go to different
+    /// shards.
+    fn shard(&self, id: PageId) -> &Shard {
+        let hash = (id.0 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32;
+        &self.shards[hash as usize % self.shards.len()]
     }
 
     /// Switches to another replacement policy. The pages cached stay, and
@@ -132,26 +168,35 @@ impl BufferPool {
     /// pages it evicted) is lost. The counts of [`BufferPool::stats`] start
     /// over.
     pub fn set_policy(&self, policy: Policy) {
-        let mut state = self.state.lock().unwrap();
-        let mut replacer = policy.replacer(self.capacity());
-        state
-            .meta
-            .iter()
-            .filter_map(|meta| meta.page)
-            .for_each(|page| replacer.record_access(page));
-        state.replacer = replacer;
-        state.policy = Some(policy);
-        state.stats = Stats::default();
+        for shard in self.shards.iter() {
+            let mut state = shard.state.lock().unwrap();
+            let mut replacer = policy.replacer(shard.frames.len());
+            state
+                .meta
+                .iter()
+                .filter_map(|meta| meta.page)
+                .for_each(|page| replacer.record_access(page));
+            state.replacer = replacer;
+            state.policy = Some(policy);
+            state.stats = Stats::default();
+        }
     }
 
     /// The replacement policy, unless the pool was given a replacer of its own.
     pub fn policy(&self) -> Option<Policy> {
-        self.state.lock().unwrap().policy
+        self.shards[0].state.lock().unwrap().policy
     }
 
-    /// Hits and misses since the pool was made or its policy last set.
+    /// Hits and misses since the pool was made or its policy last set, of
+    /// every shard.
     pub fn stats(&self) -> Stats {
-        self.state.lock().unwrap().stats
+        self.shards.iter().fold(Stats::default(), |total, shard| {
+            let stats = shard.state.lock().unwrap().stats;
+            Stats {
+                hits: total.hits + stats.hits,
+                misses: total.misses + stats.misses,
+            }
+        })
     }
 
     /// The underlying disk, for file-level operations (root page, sync).
@@ -159,49 +204,76 @@ impl BufferPool {
         &self.disk
     }
 
+    /// Frames, of every shard.
     pub fn capacity(&self) -> usize {
-        self.frames.len()
+        self.shards.iter().map(|shard| shard.frames.len()).sum()
+    }
+
+    pub fn shards(&self) -> usize {
+        self.shards.len()
     }
 
     /// Returns a page for reading, loading it from disk if it is not cached.
     pub fn fetch_read(&self, id: PageId) -> Result<PageReadGuard<'_>> {
-        let frame = self.pin(id)?;
+        let shard = self.shard(id);
+        let frame = shard.pin(&self.disk, id)?;
         Ok(PageReadGuard {
-            pool: self,
+            shard,
             id,
             frame,
-            data: Some(self.frames[frame].read().unwrap()),
+            data: Some(shard.frames[frame].read().unwrap()),
         })
     }
 
     /// Returns a page for writing, loading it from disk if it is not cached.
     pub fn fetch_write(&self, id: PageId) -> Result<PageWriteGuard<'_>> {
-        let frame = self.pin(id)?;
-        Ok(self.write_guard(id, frame))
+        let shard = self.shard(id);
+        let frame = shard.pin(&self.disk, id)?;
+        Ok(shard.write_guard(id, frame))
     }
 
-    /// Allocates a zeroed page on disk and returns it for writing.
+    /// Allocates a zeroed page on disk and returns it for writing. With one
+    /// shard, a frame is found first; with more, the page is, to know its
+    /// shard, and freed again if that shard has no frame for it.
     pub fn new_page(&self) -> Result<PageWriteGuard<'_>> {
-        let mut state = self.state.lock().unwrap();
-        let frame = self.take_frame(&mut state)?;
-        let id = match self.disk.allocate_page() {
-            Ok(id) => id,
+        if self.shards.len() == 1 {
+            let shard = &self.shards[0];
+            let mut state = shard.state.lock().unwrap();
+            let frame = shard.take_frame(&self.disk, &mut state)?;
+            let id = match self.disk.allocate_page() {
+                Ok(id) => id,
+                Err(e) => {
+                    state.free.push(frame);
+                    return Err(e);
+                }
+            };
+            *shard.frames[frame].write().unwrap() = [0; PAGE_SIZE];
+            state.install(frame, id);
+            drop(state);
+            return Ok(shard.write_guard(id, frame));
+        }
+        let id = self.disk.allocate_page()?;
+        let shard = self.shard(id);
+        let mut state = shard.state.lock().unwrap();
+        let frame = match shard.take_frame(&self.disk, &mut state) {
+            Ok(frame) => frame,
             Err(e) => {
-                state.free.push(frame);
+                drop(state);
+                self.disk.deallocate_page(id)?;
                 return Err(e);
             }
         };
-        *self.frames[frame].write().unwrap() = [0; PAGE_SIZE];
+        *shard.frames[frame].write().unwrap() = [0; PAGE_SIZE];
         state.install(frame, id);
         drop(state);
-        Ok(self.write_guard(id, frame))
+        Ok(shard.write_guard(id, frame))
     }
 
     /// Removes a page from the pool, discarding unwritten changes, and frees
     /// it on disk. Fails if the page is pinned.
     pub fn delete_page(&self, id: PageId) -> Result<()> {
         // Held across the deallocation so no one can load the page meanwhile.
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.shard(id).state.lock().unwrap();
         if let Some(&frame) = state.page_table.get(&id) {
             if state.meta[frame].pins > 0 {
                 return err(format!("cannot delete pinned page {}", id.0));
@@ -227,7 +299,7 @@ impl BufferPool {
     }
 
     fn is_pinned(&self, id: PageId) -> bool {
-        let state = self.state.lock().unwrap();
+        let state = self.shard(id).state.lock().unwrap();
         state
             .page_table
             .get(&id)
@@ -236,8 +308,9 @@ impl BufferPool {
 
     /// Writes a page back to disk if it is cached and dirty. Does not sync.
     pub fn flush_page(&self, id: PageId) -> Result<()> {
+        let shard = self.shard(id);
         let frame = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = shard.state.lock().unwrap();
             let Some(&frame) = state.page_table.get(&id) else {
                 return Ok(());
             };
@@ -250,9 +323,9 @@ impl BufferPool {
         };
 
         // Waits out any writer; no one can change the page while this is held.
-        let data = self.frames[frame].read().unwrap();
+        let data = shard.frames[frame].read().unwrap();
         let result = self.disk.write_page(id, &data);
-        let mut state = self.state.lock().unwrap();
+        let mut state = shard.state.lock().unwrap();
         if result.is_ok() {
             state.meta[frame].dirty = false;
         }
@@ -261,39 +334,77 @@ impl BufferPool {
         result
     }
 
-    /// Writes every dirty page back to disk. Does not sync.
+    /// Writes every dirty page back to disk, in page order. Does not sync.
     pub fn flush_all(&self) -> Result<()> {
         let mut pages: Vec<PageId> = self
-            .state
-            .lock()
-            .unwrap()
-            .page_table
-            .keys()
-            .copied()
+            .shards
+            .iter()
+            .flat_map(|shard| {
+                let state = shard.state.lock().unwrap();
+                state.page_table.keys().copied().collect::<Vec<_>>()
+            })
             .collect();
         pages.sort();
         pages.into_iter().try_for_each(|id| self.flush_page(id))
     }
 
     /// Forgets every cached page without writing it back, as after a
-    /// rollback undid the writes below. Fails if a page is pinned.
+    /// rollback undid the writes below. Fails, forgetting none, if a page is
+    /// pinned.
     pub fn discard_all(&self) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
-        if state.meta.iter().any(|meta| meta.pins > 0) {
+        let mut states: Vec<_> = self
+            .shards
+            .iter()
+            .map(|shard| shard.state.lock().unwrap())
+            .collect();
+        if states
+            .iter()
+            .any(|state| state.meta.iter().any(|meta| meta.pins > 0))
+        {
             return err("cannot discard pinned pages");
         }
-        for frame in 0..self.capacity() {
-            if let Some(page) = state.meta[frame].page {
-                state.clear_frame(frame);
-                state.replacer.remove(page);
-                state.free.push(frame);
+        for state in &mut states {
+            for frame in 0..state.meta.len() {
+                if let Some(page) = state.meta[frame].page {
+                    state.clear_frame(frame);
+                    state.replacer.remove(page);
+                    state.free.push(frame);
+                }
             }
         }
         Ok(())
     }
 
+    #[cfg(test)]
+    fn is_cached(&self, id: PageId) -> bool {
+        self.shard(id)
+            .state
+            .lock()
+            .unwrap()
+            .page_table
+            .contains_key(&id)
+    }
+}
+
+impl Shard {
+    fn new(capacity: usize, replacer: Box<dyn Replacer>) -> Self {
+        assert!(capacity > 0, "a buffer pool needs at least one frame");
+        let state = State {
+            page_table: HashMap::new(),
+            meta: (0..capacity).map(|_| FrameMeta::default()).collect(),
+            free: (0..capacity).rev().collect(),
+            replacer,
+            policy: None,
+            stats: Stats::default(),
+        };
+        Shard {
+            frames: (0..capacity).map(|_| RwLock::new([0; PAGE_SIZE])).collect(),
+            state: Mutex::new(state),
+        }
+    }
+
     /// Pins the frame holding `id`, loading the page into one if needed.
-    fn pin(&self, id: PageId) -> Result<usize> {
+    fn pin(&self, disk: &DiskManager, id: PageId) -> Result<usize> {
         let mut state = self.state.lock().unwrap();
         if let Some(&frame) = state.page_table.get(&id) {
             state.meta[frame].pins += 1;
@@ -303,11 +414,8 @@ impl BufferPool {
         }
 
         state.stats.misses += 1;
-        let frame = self.take_frame(&mut state)?;
-        if let Err(e) = self
-            .disk
-            .read_page(id, &mut self.frames[frame].write().unwrap())
-        {
+        let frame = self.take_frame(disk, &mut state)?;
+        if let Err(e) = disk.read_page(id, &mut self.frames[frame].write().unwrap()) {
             state.free.push(frame);
             return Err(e);
         }
@@ -317,7 +425,7 @@ impl BufferPool {
 
     /// Returns a frame that holds no page: a free one, or an evicted victim
     /// whose page is written back first if dirty.
-    fn take_frame(&self, state: &mut State) -> Result<usize> {
+    fn take_frame(&self, disk: &DiskManager, state: &mut State) -> Result<usize> {
         if let Some(frame) = state.free.pop() {
             return Ok(frame);
         }
@@ -332,14 +440,13 @@ impl BufferPool {
             .ok_or_else(|| {
                 Error(format!(
                     "buffer pool is full: all {} frames are pinned",
-                    self.capacity()
+                    self.frames.len()
                 ))
             })?;
         let frame = page_table[&page];
         if meta[frame].dirty {
             // On failure the victim stays cached and dirty.
-            self.disk
-                .write_page(page, &self.frames[frame].read().unwrap())?;
+            disk.write_page(page, &self.frames[frame].read().unwrap())?;
         }
         state.clear_frame(frame);
         state.replacer.evict(page);
@@ -348,7 +455,7 @@ impl BufferPool {
 
     fn write_guard(&self, id: PageId, frame: usize) -> PageWriteGuard<'_> {
         PageWriteGuard {
-            pool: self,
+            shard: self,
             id,
             frame,
             modified: false,
@@ -361,11 +468,6 @@ impl BufferPool {
         let meta = &mut state.meta[frame];
         meta.pins -= 1;
         meta.dirty |= dirty;
-    }
-
-    #[cfg(test)]
-    fn is_cached(&self, id: PageId) -> bool {
-        self.state.lock().unwrap().page_table.contains_key(&id)
     }
 }
 
@@ -394,7 +496,7 @@ impl State {
 
 /// Shared access to a cached page. Unpins it when dropped.
 pub struct PageReadGuard<'a> {
-    pool: &'a BufferPool,
+    shard: &'a Shard,
     id: PageId,
     frame: usize,
     /// `Some` until drop, which releases the lock before unpinning.
@@ -418,14 +520,14 @@ impl Deref for PageReadGuard<'_> {
 impl Drop for PageReadGuard<'_> {
     fn drop(&mut self) {
         self.data = None;
-        self.pool.unpin(self.frame, false);
+        self.shard.unpin(self.frame, false);
     }
 }
 
 /// Exclusive access to a cached page. Unpins it when dropped, marking it
 /// dirty if it was borrowed mutably.
 pub struct PageWriteGuard<'a> {
-    pool: &'a BufferPool,
+    shard: &'a Shard,
     id: PageId,
     frame: usize,
     modified: bool,
@@ -457,7 +559,7 @@ impl DerefMut for PageWriteGuard<'_> {
 impl Drop for PageWriteGuard<'_> {
     fn drop(&mut self) {
         self.data = None;
-        self.pool.unpin(self.frame, self.modified);
+        self.shard.unpin(self.frame, self.modified);
     }
 }
 
@@ -596,7 +698,7 @@ mod tests {
         let pinned = pool.fetch_read(ids[0]).unwrap();
         drop(pool.fetch_read(ids[1]).unwrap());
         let cached = |pool: &BufferPool| {
-            let mut pages: Vec<PageId> = pool
+            let mut pages: Vec<PageId> = pool.shards[0]
                 .state
                 .lock()
                 .unwrap()
@@ -658,6 +760,143 @@ mod tests {
         pool.flush_all().unwrap();
         for &id in &ids {
             assert_eq!(on_disk(&pool, id)[0], ROUNDS / 2);
+        }
+    }
+
+    fn sharded(capacity: usize, shards: usize) -> BufferPool {
+        BufferPool::sharded(Arc::new(DiskManager::in_memory()), capacity, shards)
+    }
+
+    /// How many pages each shard holds.
+    fn per_shard(pool: &BufferPool) -> Vec<usize> {
+        pool.shards
+            .iter()
+            .map(|shard| shard.state.lock().unwrap().page_table.len())
+            .collect()
+    }
+
+    #[test]
+    fn a_sharded_pool_spreads_pages_and_keeps_them_as_one_does() {
+        let pool = sharded(64, 4);
+        assert_eq!((pool.capacity(), pool.shards()), (64, 4));
+        let ids: Vec<PageId> = (0..40).map(|i| new_filled(&pool, i as u8)).collect();
+        // Neighbouring pages go to different shards, about evenly.
+        assert!(
+            per_shard(&pool).iter().all(|&n| n >= 5),
+            "{:?}",
+            per_shard(&pool)
+        );
+        // More pages than frames: each shard evicts its own, writing them back.
+        let more: Vec<PageId> = (0..100).map(|i| new_filled(&pool, 100 + i as u8)).collect();
+        for (i, &id) in ids.iter().enumerate() {
+            assert_eq!(*pool.fetch_read(id).unwrap(), filled(i as u8));
+        }
+        for (i, &id) in more.iter().enumerate() {
+            assert_eq!(*pool.fetch_read(id).unwrap(), filled(100 + i as u8));
+        }
+        let stats = pool.stats();
+        assert_eq!(
+            stats.hits + stats.misses,
+            140,
+            "the shards' counts, added up"
+        );
+
+        // A policy for every shard, its pages kept.
+        let cached: usize = per_shard(&pool).iter().sum();
+        pool.set_policy(Policy::Clock);
+        assert_eq!(
+            (pool.policy(), pool.stats()),
+            (Some(Policy::Clock), Stats::default())
+        );
+        assert_eq!(per_shard(&pool).iter().sum::<usize>(), cached);
+
+        // Flushed in every shard; discarded in every shard, or in none.
+        pool.flush_all().unwrap();
+        assert_eq!(on_disk(&pool, ids[3]), filled(3));
+        let pinned = pool.fetch_read(ids[0]).unwrap();
+        assert!(pool.discard_all().is_err());
+        assert!(per_shard(&pool).iter().sum::<usize>() > 0);
+        drop(pinned);
+        pool.discard_all().unwrap();
+        assert!(per_shard(&pool).iter().all(|&n| n == 0));
+        assert_eq!(*pool.fetch_read(ids[5]).unwrap(), filled(5));
+    }
+
+    #[test]
+    fn a_full_shard_fails_its_pages_only_and_frees_a_new_one() {
+        // Two shards of one frame each.
+        let pool = sharded(2, 2);
+        let pages: Vec<PageId> = (0..6).map(|i| new_filled(&pool, i)).collect();
+        let shard_of = |id: PageId| {
+            pool.shards
+                .iter()
+                .position(|s| std::ptr::eq(s, pool.shard(id)))
+                .unwrap()
+        };
+        let (a, b) = (
+            pages[0],
+            pages
+                .iter()
+                .copied()
+                .find(|&p| shard_of(p) != shard_of(pages[0]))
+                .unwrap(),
+        );
+        let guard = pool.fetch_read(a).unwrap();
+        // The other shard still has its frame.
+        assert_eq!(
+            *pool.fetch_read(b).unwrap(),
+            filled(pages.iter().position(|&p| p == b).unwrap() as u8)
+        );
+        let same = pages
+            .iter()
+            .copied()
+            .find(|&p| p != a && shard_of(p) == shard_of(a))
+            .unwrap();
+        match pool.fetch_read(same) {
+            Err(e) => assert!(e.to_string().contains("buffer pool is full"), "{e}"),
+            Ok(_) => panic!("the shard's only frame is pinned"),
+        }
+        // A new page whose shard is full fails, and its page is freed for the next.
+        let mut failed = 0;
+        loop {
+            match pool.new_page() {
+                Ok(page) if shard_of(page.id()) != shard_of(a) => continue,
+                Ok(_) => unreachable!("the shard's only frame is pinned"),
+                Err(e) => {
+                    assert!(e.to_string().contains("buffer pool is full"), "{e}");
+                    failed += 1;
+                    break;
+                }
+            }
+        }
+        assert_eq!(failed, 1);
+        drop(guard);
+        let page = pool.new_page().unwrap();
+        assert!(!pages.contains(&page.id()));
+    }
+
+    #[test]
+    fn threads_read_and_write_a_sharded_pool_at_once() {
+        const THREADS: usize = 8;
+        const ROUNDS: u8 = 200;
+        let pool = sharded(64, 8);
+        let ids: Vec<PageId> = (0..4 * THREADS).map(|_| new_filled(&pool, 0)).collect();
+        std::thread::scope(|s| {
+            for pages in ids.chunks(4) {
+                let (pool, all) = (&pool, &ids);
+                s.spawn(move || {
+                    for round in 0..ROUNDS {
+                        let mut page = pool.fetch_write(pages[round as usize % 4]).unwrap();
+                        page[0] += 1;
+                        drop(page);
+                        // And reads of every page, whichever shard.
+                        drop(pool.fetch_read(all[round as usize % all.len()]).unwrap());
+                    }
+                });
+            }
+        });
+        for &id in &ids {
+            assert_eq!(pool.fetch_read(id).unwrap()[0], ROUNDS / 4);
         }
     }
 }

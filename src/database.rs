@@ -40,6 +40,11 @@ use crate::storage::{BufferPool, DiskManager, Policy, Stats};
 
 /// Frames in the buffer pool: 256 x 4 KB = 1 MB of cached pages.
 const BUFFER_POOL_FRAMES: usize = 256;
+/// Shards the frames are split into, each with a lock of its own, so that
+/// threads reading pages at once mostly wait for no one (see
+/// `storage/buffer/pool.rs`): 32 frames each, more than the pages the
+/// threads of a query pin at once.
+const BUFFER_POOL_SHARDS: usize = 8;
 
 pub struct Database {
     core: Core,
@@ -84,7 +89,11 @@ impl Core {
     }
 
     fn with_disk(disk: DiskManager) -> Result<Self> {
-        let pool = Arc::new(BufferPool::new(Arc::new(disk), BUFFER_POOL_FRAMES));
+        let pool = Arc::new(BufferPool::sharded(
+            Arc::new(disk),
+            BUFFER_POOL_FRAMES,
+            BUFFER_POOL_SHARDS,
+        ));
         let mut catalog = Catalog::open(pool.clone())?;
         catalog.save()?; // a new database's empty catalog
         pool.disk().commit()?;
