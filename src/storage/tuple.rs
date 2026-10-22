@@ -18,7 +18,11 @@ use crate::types::{Column, DataType, Value, ordered_real};
 
 pub fn encode(columns: &[Column], row: &[Value]) -> Result<Vec<u8>> {
     if row.len() != columns.len() {
-        return err(format!("expected {} values, got {}", columns.len(), row.len()));
+        return err(format!(
+            "expected {} values, got {}",
+            columns.len(),
+            row.len()
+        ));
     }
 
     let mut bytes = vec![0u8; columns.len().div_ceil(8)];
@@ -30,13 +34,21 @@ pub fn encode(columns: &[Column], row: &[Value]) -> Result<Vec<u8>> {
             (Value::Real(r), DataType::Real) => bytes.extend_from_slice(&r.to_le_bytes()),
             (Value::Text(s), DataType::Text) => {
                 let Ok(len) = u16::try_from(s.len()) else {
-                    return err(format!("text in column {} is longer than {} bytes", column.name, u16::MAX));
+                    return err(format!(
+                        "text in column {} is longer than {} bytes",
+                        column.name,
+                        u16::MAX
+                    ));
                 };
                 bytes.extend_from_slice(&len.to_le_bytes());
                 bytes.extend_from_slice(s.as_bytes());
             }
             (value, data_type) => {
-                return err(format!("column {} expects {data_type}, got {}", column.name, value.to_sql()));
+                return err(format!(
+                    "column {} expects {data_type}, got {}",
+                    column.name,
+                    value.to_sql()
+                ));
             }
         }
     }
@@ -59,7 +71,11 @@ pub fn decode_prefix(columns: &[Column], bytes: &[u8]) -> Result<(Vec<Value>, us
     decode_from(columns, bytes, |_| true)
 }
 
-fn decode_with(columns: &[Column], bytes: &[u8], needed: impl Fn(usize) -> bool) -> Result<Vec<Value>> {
+fn decode_with(
+    columns: &[Column],
+    bytes: &[u8],
+    needed: impl Fn(usize) -> bool,
+) -> Result<Vec<Value>> {
     let (row, end) = decode_from(columns, bytes, needed)?;
     if end != bytes.len() {
         return err("corrupted row: trailing bytes");
@@ -67,7 +83,11 @@ fn decode_with(columns: &[Column], bytes: &[u8], needed: impl Fn(usize) -> bool)
     Ok(row)
 }
 
-fn decode_from(columns: &[Column], bytes: &[u8], needed: impl Fn(usize) -> bool) -> Result<(Vec<Value>, usize)> {
+fn decode_from(
+    columns: &[Column],
+    bytes: &[u8],
+    needed: impl Fn(usize) -> bool,
+) -> Result<(Vec<Value>, usize)> {
     let mut reader = Reader { bytes, pos: 0 };
     let bitmap = reader.take(columns.len().div_ceil(8))?;
 
@@ -158,7 +178,11 @@ mod tests {
     use super::*;
 
     fn column(name: &str, data_type: DataType) -> Column {
-        Column { name: name.into(), data_type, primary_key: false }
+        Column {
+            name: name.into(),
+            data_type,
+            primary_key: false,
+        }
     }
 
     fn text(s: &str) -> Value {
@@ -185,7 +209,9 @@ mod tests {
     #[test]
     fn round_trips_every_type_across_a_multi_byte_bitmap() {
         let types = [DataType::Int, DataType::Text, DataType::Bool];
-        let columns: Vec<Column> = (0..10).map(|i| column(&format!("c{i}"), types[i % 3])).collect();
+        let columns: Vec<Column> = (0..10)
+            .map(|i| column(&format!("c{i}"), types[i % 3]))
+            .collect();
         let row = vec![
             Value::Int(i64::MIN),
             text(""),
@@ -200,23 +226,35 @@ mod tests {
         ];
 
         let bytes = encode(&columns, &row).unwrap();
-        assert_eq!(bytes[1], 0b0000_0010, "column 9 is bit 1 of the second byte");
+        assert_eq!(
+            bytes[1], 0b0000_0010,
+            "column 9 is bit 1 of the second byte"
+        );
         assert_eq!(decode(&columns, &bytes).unwrap(), row);
     }
 
     #[test]
     fn nulls_store_only_the_bitmap() {
         let columns = [column("a", DataType::Int), column("b", DataType::Text)];
-        assert_eq!(encode(&columns, &[Value::Null, Value::Null]).unwrap(), vec![0b11]);
+        assert_eq!(
+            encode(&columns, &[Value::Null, Value::Null]).unwrap(),
+            vec![0b11]
+        );
     }
 
     #[test]
     fn encode_rejects_bad_rows() {
         let columns = [column("a", DataType::Int), column("b", DataType::Text)];
         assert!(encode(&columns, &[Value::Int(1)]).is_err(), "wrong arity");
-        assert!(encode(&columns, &[text("x"), text("y")]).is_err(), "wrong type");
+        assert!(
+            encode(&columns, &[text("x"), text("y")]).is_err(),
+            "wrong type"
+        );
         let long = text(&"x".repeat(u16::MAX as usize + 1));
-        assert!(encode(&columns, &[Value::Int(1), long]).is_err(), "text too long");
+        assert!(
+            encode(&columns, &[Value::Int(1), long]).is_err(),
+            "text too long"
+        );
     }
 
     #[test]
@@ -241,8 +279,14 @@ mod tests {
         let good = encode(&columns, &[Value::Bool(true), text("ok")]).unwrap();
         assert!(decode(&columns, &good).is_ok());
 
-        assert!(decode(&columns, &good[..good.len() - 1]).is_err(), "truncated");
-        assert!(decode(&columns, &[good.as_slice(), &[0]].concat()).is_err(), "trailing bytes");
+        assert!(
+            decode(&columns, &good[..good.len() - 1]).is_err(),
+            "truncated"
+        );
+        assert!(
+            decode(&columns, &[good.as_slice(), &[0]].concat()).is_err(),
+            "trailing bytes"
+        );
 
         let mut bad_bool = good.clone();
         bad_bool[1] = 7;

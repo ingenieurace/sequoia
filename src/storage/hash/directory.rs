@@ -41,7 +41,11 @@ impl Slots {
 
     /// How many directory pages `count` slots take.
     fn pages(&self, count: usize) -> usize {
-        if count <= self.inline() { 0 } else { count.div_ceil(self.per_page()) }
+        if count <= self.inline() {
+            0
+        } else {
+            count.div_ceil(self.per_page())
+        }
     }
 
     fn page(&self, root: &Page, k: usize) -> PageId {
@@ -49,7 +53,14 @@ impl Slots {
     }
 
     /// Calls `f` with slot `i` of `count`.
-    pub fn read<T>(&self, pool: &BufferPool, root: &Page, count: usize, i: usize, f: impl FnOnce(&[u8]) -> T) -> Result<T> {
+    pub fn read<T>(
+        &self,
+        pool: &BufferPool,
+        root: &Page,
+        count: usize,
+        i: usize,
+        f: impl FnOnce(&[u8]) -> T,
+    ) -> Result<T> {
         debug_assert!(i < count);
         if self.pages(count) == 0 {
             let at = self.header + i * self.size;
@@ -61,7 +72,14 @@ impl Slots {
     }
 
     /// Sets slot `i` of `count` to `bytes`.
-    pub fn write(&self, pool: &BufferPool, root: &mut Page, count: usize, i: usize, bytes: &[u8]) -> Result<()> {
+    pub fn write(
+        &self,
+        pool: &BufferPool,
+        root: &mut Page,
+        count: usize,
+        i: usize,
+        bytes: &[u8],
+    ) -> Result<()> {
         debug_assert!(i < count && bytes.len() == self.size);
         if self.pages(count) == 0 {
             let at = self.header + i * self.size;
@@ -93,7 +111,13 @@ impl Slots {
     /// Replaces `old` slots with those in `bytes`, as many as they hold,
     /// moving them between the root and directory pages, and adding or
     /// freeing directory pages, as their number needs.
-    pub fn store(&self, pool: &BufferPool, root: &mut Page, old: usize, bytes: &[u8]) -> Result<()> {
+    pub fn store(
+        &self,
+        pool: &BufferPool,
+        root: &mut Page,
+        old: usize,
+        bytes: &[u8],
+    ) -> Result<()> {
         let count = bytes.len() / self.size;
         self.repage(pool, root, old, count)?;
         let pages = self.pages(count);
@@ -150,7 +174,10 @@ mod tests {
     #[test]
     fn slots_move_between_the_root_and_directory_pages() {
         let pool = pool(16);
-        let slots = Slots { header: 10, size: 5 };
+        let slots = Slots {
+            header: 10,
+            size: 5,
+        };
         let mut root = [0; crate::storage::PAGE_SIZE];
         let slot = |i: usize| [(i % 251) as u8, (i / 251) as u8, 7, 8, 9];
         let mut count = 0;
@@ -161,7 +188,11 @@ mod tests {
             }
             count = new;
             for i in 0..count {
-                assert_eq!(slots.read(&pool, &root, count, i, |b| b.to_vec()).unwrap(), slot(i), "{i} of {count}");
+                assert_eq!(
+                    slots.read(&pool, &root, count, i, |b| b.to_vec()).unwrap(),
+                    slot(i),
+                    "{i} of {count}"
+                );
             }
             let all = slots.load(&pool, &root, count).unwrap();
             assert_eq!(all, (0..count).flat_map(slot).collect::<Vec<_>>());

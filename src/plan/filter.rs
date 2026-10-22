@@ -9,7 +9,11 @@ use crate::types::Value;
 
 /// Marks the columns of `table`, which goes by `qualifier`, that the
 /// expressions use, so that a scan may skip the others.
-pub fn needed_columns<'a>(table: &Table, qualifier: &str, exprs: impl IntoIterator<Item = &'a Expr>) -> Vec<bool> {
+pub fn needed_columns<'a>(
+    table: &Table,
+    qualifier: &str,
+    exprs: impl IntoIterator<Item = &'a Expr>,
+) -> Vec<bool> {
     let mut needed = vec![false; table.columns.len()];
     for expr in exprs {
         visit_columns(expr, &mut |column| {
@@ -28,7 +32,9 @@ pub fn visit_columns(expr: &Expr, f: &mut impl FnMut(&ColumnRef)) {
     match expr {
         Expr::Literal(_) | Expr::Aggregate(_, None, _) => {}
         Expr::Column(column) | Expr::Outer(column) | Expr::Slot(_, column) => f(column),
-        Expr::Unary(_, inner) | Expr::IsNull(inner, _) | Expr::Aggregate(_, Some(inner), _) => visit_columns(inner, f),
+        Expr::Unary(_, inner) | Expr::IsNull(inner, _) | Expr::Aggregate(_, Some(inner), _) => {
+            visit_columns(inner, f)
+        }
         Expr::Binary(left, _, right) => {
             visit_columns(left, f);
             visit_columns(right, f);
@@ -42,7 +48,9 @@ pub fn visit_columns(expr: &Expr, f: &mut impl FnMut(&ColumnRef)) {
             visit_columns(left, f);
             visit_outer(query, f);
         }
-        Expr::Case { .. } | Expr::Function(..) => expr.parts().into_iter().for_each(|e| visit_columns(e, f)),
+        Expr::Case { .. } | Expr::Function(..) => {
+            expr.parts().into_iter().for_each(|e| visit_columns(e, f))
+        }
     }
 }
 
@@ -96,8 +104,13 @@ pub fn conjuncts(expr: &Expr) -> Vec<&Expr> {
 /// `qualifier`, with its columns unqualified, as a partial index's condition
 /// is written.
 pub fn own_conjuncts(table: &Table, qualifier: &str, filter: &Option<Expr>) -> Vec<Expr> {
-    let Some(filter) = filter else { return Vec::new() };
-    conjuncts(filter).into_iter().filter_map(|e| own_expr(table, qualifier, e)).collect()
+    let Some(filter) = filter else {
+        return Vec::new();
+    };
+    conjuncts(filter)
+        .into_iter()
+        .filter_map(|e| own_expr(table, qualifier, e))
+        .collect()
 }
 
 /// The conditions among the conjuncts of a WHERE clause on `table`, which
@@ -113,10 +126,14 @@ pub fn own_conjuncts(table: &Table, qualifier: &str, filter: &Option<Expr>) -> V
 /// there (`1 / 0`) is not raised; nor is the error of comparing an
 /// expression an index has with a value of another type.
 pub fn conditions(table: &Table, qualifier: &str, filter: &Option<Expr>) -> Vec<Condition> {
-    let Some(filter) = filter else { return Vec::new() };
+    let Some(filter) = filter else {
+        return Vec::new();
+    };
     let mut conditions = Vec::new();
     for part in conjuncts(filter) {
-        let Expr::Binary(left, op, right) = part else { continue };
+        let Expr::Binary(left, op, right) = part else {
+            continue;
+        };
         let op = match op {
             BinaryOp::Eq => Compare::Eq,
             BinaryOp::NotEq => Compare::NotEq,
@@ -132,11 +149,16 @@ pub fn conditions(table: &Table, qualifier: &str, filter: &Option<Expr>) -> Vec<
             _ => continue,
         };
         let (expr, literal, op) = sides;
-        let Some(expr) = own_expr(table, qualifier, expr) else { continue };
+        let Some(expr) = own_expr(table, qualifier, expr) else {
+            continue;
+        };
         // As a value of the column's type, which an index or a chunk holds:
         // `price > 10` on a REAL column compares with 10.0.
         let literal = match &expr {
-            Expr::Column(column) => table.column_index(&column.name).ok().and_then(|i| literal.coerce(table.columns[i].data_type)),
+            Expr::Column(column) => table
+                .column_index(&column.name)
+                .ok()
+                .and_then(|i| literal.coerce(table.columns[i].data_type)),
             _ => Some(literal),
         };
         if let Some(literal) = literal.filter(|l| !l.is_null()) {
@@ -152,8 +174,14 @@ pub fn predicates(table: &Table, conditions: &[Condition]) -> Vec<Predicate> {
     conditions
         .iter()
         .filter_map(|Condition { expr, op, literal }| {
-            let Expr::Column(column) = expr else { return None };
-            Some(Predicate { column: table.column_index(&column.name).ok()?, op: *op, literal: literal.clone() })
+            let Expr::Column(column) = expr else {
+                return None;
+            };
+            Some(Predicate {
+                column: table.column_index(&column.name).ok()?,
+                op: *op,
+                literal: literal.clone(),
+            })
         })
         .collect()
 }
@@ -163,12 +191,17 @@ pub fn predicates(table: &Table, conditions: &[Condition]) -> Vec<Predicate> {
 /// columns, subquery or aggregate.
 fn own_expr(table: &Table, qualifier: &str, expr: &Expr) -> Option<Expr> {
     if let Expr::Column(column) = expr {
-        return own_column(table, qualifier, column).map(|_| Expr::Column(ColumnRef::bare(&column.name)));
+        return own_column(table, qualifier, column)
+            .map(|_| Expr::Column(ColumnRef::bare(&column.name)));
     }
     let mut own = true;
     expr.visit(&mut |e| match e {
         Expr::Column(column) => own &= own_column(table, qualifier, column).is_some(),
-        Expr::Outer(_) | Expr::Aggregate(..) | Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(..) => own = false,
+        Expr::Outer(_)
+        | Expr::Aggregate(..)
+        | Expr::Subquery(_)
+        | Expr::Exists(_)
+        | Expr::InSubquery(..) => own = false,
         _ => {}
     });
     let expr = expr.replace(&mut |e| match e {
@@ -186,10 +219,16 @@ fn constant(expr: &Expr) -> Option<Value> {
             Expr::Column(_) | Expr::Outer(_) | Expr::Slot(..) => true,
             Expr::Unary(_, inner) | Expr::IsNull(inner, _) => reads_columns(inner),
             Expr::InList(left, items, _) => reads_columns(left) || items.iter().any(reads_columns),
-            Expr::Aggregate(..) | Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(..) => true,
+            Expr::Aggregate(..) | Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(..) => {
+                true
+            }
             Expr::Binary(left, _, right) => reads_columns(left) || reads_columns(right),
             Expr::Case { .. } | Expr::Function(..) => expr.parts().into_iter().any(reads_columns),
         }
     }
-    if reads_columns(expr) { None } else { eval(expr, &[], &[]).ok() }
+    if reads_columns(expr) {
+        None
+    } else {
+        eval(expr, &[], &[]).ok()
+    }
 }

@@ -158,8 +158,17 @@ impl Gen {
 
     fn leaf(&mut self, ty: Type, s: &Scope) -> String {
         let choices: Vec<String> = match &s.groups {
-            Some(groups) => groups.iter().filter(|(_, t)| *t == ty).map(|(e, _)| e.clone()).collect(),
-            None => s.cols.iter().filter(|(_, t)| *t == ty).map(|(c, _)| c.clone()).collect(),
+            Some(groups) => groups
+                .iter()
+                .filter(|(_, t)| *t == ty)
+                .map(|(e, _)| e.clone())
+                .collect(),
+            None => s
+                .cols
+                .iter()
+                .filter(|(_, t)| *t == ty)
+                .map(|(c, _)| c.clone())
+                .collect(),
         };
         if s.groups.is_some() && self.rng.chance(35) {
             return self.aggregate(ty, s);
@@ -194,10 +203,19 @@ impl Gen {
             Type::Text => match self.rng.below(10) {
                 0 if subquery => self.scalar_subquery(ty, s),
                 1 => format!("({} || {})", self.expr(ty, s, b), self.expr(ty, s, b)),
-                2 => format!("{}({})", self.rng.pick(&["UPPER", "LOWER"]), self.expr(ty, s, b)),
+                2 => format!(
+                    "{}({})",
+                    self.rng.pick(&["UPPER", "LOWER"]),
+                    self.expr(ty, s, b)
+                ),
                 3 => match self.rng.chance(50) {
                     true => format!("SUBSTR({}, {})", self.expr(ty, s, b), self.rng.range(-3, 4)),
-                    false => format!("SUBSTR({}, {}, {})", self.expr(ty, s, b), self.rng.range(-3, 4), self.rng.range(-2, 3)),
+                    false => format!(
+                        "SUBSTR({}, {}, {})",
+                        self.expr(ty, s, b),
+                        self.rng.range(-3, 4),
+                        self.rng.range(-2, 3)
+                    ),
                 },
                 4 => format!("COALESCE({}, {})", self.expr(ty, s, b), self.expr(ty, s, b)),
                 5 => self.case_expr(ty, s, b),
@@ -207,7 +225,11 @@ impl Gen {
                 0 => format!("({} + {})", self.expr(ty, s, b), self.expr(ty, s, b)),
                 1 => format!("({} - {})", self.expr(ty, s, b), self.expr(Type::Int, s, b)),
                 2 => format!("({} * {})", self.expr(Type::Int, s, b), self.expr(ty, s, b)),
-                3 => format!("({} / {})", self.expr(ty, s, b), self.rng.pick(&["2.0", "0.5", "4"])),
+                3 => format!(
+                    "({} / {})",
+                    self.expr(ty, s, b),
+                    self.rng.pick(&["2.0", "0.5", "4"])
+                ),
                 4 => format!("(- {})", self.expr(ty, s, b)),
                 5 => format!("ABS({})", self.expr(ty, s, b)),
                 6 => match self.rng.chance(50) {
@@ -233,11 +255,20 @@ impl Gen {
                 12 => {
                     let t = *self.rng.pick(&[Type::Int, Type::Real, Type::Text]);
                     let not = if self.rng.chance(30) { "NOT " } else { "" };
-                    format!("({} {not}BETWEEN {} AND {})", self.expr(t, s, b), self.expr(t, s, 0), self.expr(t, s, 0))
+                    format!(
+                        "({} {not}BETWEEN {} AND {})",
+                        self.expr(t, s, b),
+                        self.expr(t, s, 0),
+                        self.expr(t, s, 0)
+                    )
                 }
                 13 => {
                     let not = if self.rng.chance(30) { "NOT " } else { "" };
-                    format!("({} {not}LIKE '{}')", self.expr(Type::Text, s, b), self.rng.pick(&PATTERNS))
+                    format!(
+                        "({} {not}LIKE '{}')",
+                        self.expr(Type::Text, s, b),
+                        self.rng.pick(&PATTERNS)
+                    )
                 }
                 3 => format!("({} AND {})", self.expr(ty, s, b), self.expr(ty, s, b)),
                 4 => format!("({} OR {})", self.expr(ty, s, b), self.expr(ty, s, b)),
@@ -249,14 +280,20 @@ impl Gen {
                 }
                 7 => {
                     let t = *self.rng.pick(&TYPES);
-                    let items: Vec<String> = (0..1 + self.rng.below(3)).map(|_| self.expr(t, s, 0)).collect();
+                    let items: Vec<String> = (0..1 + self.rng.below(3))
+                        .map(|_| self.expr(t, s, 0))
+                        .collect();
                     let not = if self.rng.chance(30) { "NOT " } else { "" };
                     format!("({} {not}IN ({}))", self.expr(t, s, b), items.join(", "))
                 }
                 8 if subquery => {
                     let t = *self.rng.pick(&TYPES);
                     let not = if self.rng.chance(30) { "NOT " } else { "" };
-                    format!("({} {not}IN ({}))", self.expr(t, s, b), self.column_subquery(t, s))
+                    format!(
+                        "({} {not}IN ({}))",
+                        self.expr(t, s, b),
+                        self.column_subquery(t, s)
+                    )
                 }
                 9 if subquery => {
                     let not = if self.rng.chance(30) { "NOT " } else { "" };
@@ -270,7 +307,10 @@ impl Gen {
     /// `CASE`, with or without an operand, of type `ty`.
     fn case_expr(&mut self, ty: Type, s: &Scope, b: u32) -> String {
         let mut sql = String::from("(CASE");
-        let operand = self.rng.chance(40).then(|| *self.rng.pick(&[Type::Int, Type::Text]));
+        let operand = self
+            .rng
+            .chance(40)
+            .then(|| *self.rng.pick(&[Type::Int, Type::Text]));
         if let Some(t) = operand {
             sql += &format!(" {}", self.expr(t, s, b));
         }
@@ -301,7 +341,10 @@ impl Gen {
 
     /// An aggregate over the rows of `s`, which must have row columns.
     fn aggregate(&mut self, ty: Type, s: &Scope) -> String {
-        let rows = Scope { cols: s.cols.clone(), ..Scope::default() };
+        let rows = Scope {
+            cols: s.cols.clone(),
+            ..Scope::default()
+        };
         let distinct = if self.rng.chance(25) { "DISTINCT " } else { "" };
         match ty {
             Type::Int => match self.rng.below(5) {
@@ -322,7 +365,11 @@ impl Gen {
                 3 => format!("MIN({})", self.expr(ty, &rows, 1)),
                 _ => format!("MAX({distinct}{})", self.expr(ty, &rows, 1)),
             },
-            _ => format!("{}({distinct}{})", self.rng.pick(&["MIN", "MAX"]), self.expr(ty, &rows, 1)),
+            _ => format!(
+                "{}({distinct}{})",
+                self.rng.pick(&["MIN", "MAX"]),
+                self.expr(ty, &rows, 1)
+            ),
         }
     }
 
@@ -333,8 +380,11 @@ impl Gen {
     fn sub_from(&mut self, s: &Scope) -> (String, Scope, Scope) {
         let t = *self.rng.pick(&s.sub_tables);
         let alias = format!("s{}", s.depth + 1);
-        let own: Vec<(String, Type)> =
-            self.tables[t].columns.iter().map(|(c, ty)| (format!("{alias}.{c}"), *ty)).collect();
+        let own: Vec<(String, Type)> = self.tables[t]
+            .columns
+            .iter()
+            .map(|(c, ty)| (format!("{alias}.{c}"), *ty))
+            .collect();
         let mut cols = own.clone();
         if s.groups.is_none() {
             cols.extend(s.outer.iter().cloned());
@@ -348,7 +398,10 @@ impl Gen {
             depth: s.depth + 1,
         };
         // Aggregates read only the subquery's own table.
-        let own = Scope { cols: own, ..Scope::default() };
+        let own = Scope {
+            cols: own,
+            ..Scope::default()
+        };
         (format!("{} {alias}", self.tables[t].name), inner, own)
     }
 
@@ -361,16 +414,32 @@ impl Gen {
 
     fn scalar_subquery(&mut self, ty: Type, s: &Scope) -> String {
         let (from, inner, own) = self.sub_from(s);
-        let own = Scope { groups: Some(Vec::new()), ..own };
+        let own = Scope {
+            groups: Some(Vec::new()),
+            ..own
+        };
         let value = self.aggregate(ty, &own);
-        format!("(SELECT {value} FROM {from}{})", self.where_clause(&inner, 70))
+        format!(
+            "(SELECT {value} FROM {from}{})",
+            self.where_clause(&inner, 70)
+        )
     }
 
     fn column_subquery(&mut self, ty: Type, s: &Scope) -> String {
         let (from, inner, _) = self.sub_from(s);
         let distinct = if self.rng.chance(20) { "DISTINCT " } else { "" };
-        let value = self.expr(ty, &Scope { subqueries: false, ..inner.clone() }, 1);
-        format!("SELECT {distinct}{value} FROM {from}{}", self.where_clause(&inner, 70))
+        let value = self.expr(
+            ty,
+            &Scope {
+                subqueries: false,
+                ..inner.clone()
+            },
+            1,
+        );
+        format!(
+            "SELECT {distinct}{value} FROM {from}{}",
+            self.where_clause(&inner, 70)
+        )
     }
 
     fn exists_subquery(&mut self, s: &Scope) -> String {
@@ -395,27 +464,50 @@ impl Gen {
                 }
                 false => {
                     let t = self.rng.below(self.tables.len());
-                    (self.tables[t].name.clone(), self.tables[t].columns.clone(), false)
+                    (
+                        self.tables[t].name.clone(),
+                        self.tables[t].columns.clone(),
+                        false,
+                    )
                 }
             };
             let bare = n == 1 && !derived && self.rng.chance(30);
             let alias = format!("a{i}");
             let own: Vec<(String, Type)> = columns
                 .iter()
-                .map(|(c, ty)| (if bare { c.clone() } else { format!("{alias}.{c}") }, *ty))
+                .map(|(c, ty)| {
+                    (
+                        if bare {
+                            c.clone()
+                        } else {
+                            format!("{alias}.{c}")
+                        },
+                        *ty,
+                    )
+                })
                 .collect();
             if bare {
                 from = name.clone();
-                outer = columns.iter().map(|(c, ty)| (format!("{name}.{c}"), *ty)).collect();
+                outer = columns
+                    .iter()
+                    .map(|(c, ty)| (format!("{name}.{c}"), *ty))
+                    .collect();
             } else if i == 0 {
                 from = format!("{name} {alias}");
             } else {
-                let on_scope = Scope { cols: [cols.clone(), own.clone()].concat(), ..Scope::default() };
+                let on_scope = Scope {
+                    cols: [cols.clone(), own.clone()].concat(),
+                    ..Scope::default()
+                };
                 let condition = |g: &mut Gen| {
                     // Mostly an equality between the new table and one before it, for hash and index joins.
                     let pairs: Vec<(String, String)> = own
                         .iter()
-                        .flat_map(|(a, ta)| cols.iter().filter(move |(_, tb)| tb == ta).map(|(b, _)| (a.clone(), b.clone())))
+                        .flat_map(|(a, ta)| {
+                            cols.iter()
+                                .filter(move |(_, tb)| tb == ta)
+                                .map(|(b, _)| (a.clone(), b.clone()))
+                        })
                         .collect();
                     let mut on = match g.rng.chance(75) && !pairs.is_empty() {
                         true => {
@@ -441,7 +533,14 @@ impl Gen {
         if outer.is_empty() {
             outer = cols.clone();
         }
-        let rows = Scope { cols: cols.clone(), outer, groups: None, subqueries: true, sub_tables: all, depth: 0 };
+        let rows = Scope {
+            cols: cols.clone(),
+            outer,
+            groups: None,
+            subqueries: true,
+            sub_tables: all,
+            depth: 0,
+        };
         let filter = self.where_clause(&rows, 70);
 
         let grouped = self.rng.chance(30);
@@ -450,18 +549,33 @@ impl Gen {
             if self.rng.chance(85) {
                 for _ in 0..1 + self.rng.below(2) {
                     let (c, ty) = self.rng.pick(&cols).clone();
-                    let ints: Vec<&(String, Type)> = cols.iter().filter(|(_, t)| *t == Type::Int).collect();
+                    let ints: Vec<&(String, Type)> =
+                        cols.iter().filter(|(_, t)| *t == Type::Int).collect();
                     groups.push(match self.rng.chance(30) && !ints.is_empty() {
-                        true => (format!("({} + {})", self.rng.pick(&ints).0, self.rng.range(1, 3)), Type::Int),
+                        true => (
+                            format!("({} + {})", self.rng.pick(&ints).0, self.rng.range(1, 3)),
+                            Type::Int,
+                        ),
                         false => (c, ty),
                     });
                 }
             }
             let group_by = match groups.is_empty() {
                 true => String::new(),
-                false => format!(" GROUP BY {}", groups.iter().map(|(e, _)| e.as_str()).collect::<Vec<_>>().join(", ")),
+                false => format!(
+                    " GROUP BY {}",
+                    groups
+                        .iter()
+                        .map(|(e, _)| e.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             };
-            let scope = Scope { groups: Some(groups), outer: Vec::new(), ..rows.clone() };
+            let scope = Scope {
+                groups: Some(groups),
+                outer: Vec::new(),
+                ..rows.clone()
+            };
             let having = match self.rng.chance(40) {
                 true => format!(" HAVING {}", self.expr(Type::Bool, &scope, 2)),
                 false => String::new(),
@@ -477,7 +591,9 @@ impl Gen {
             true => Vec::new(),
             false => (0..1 + self.rng.below(3))
                 .map(|_| match &scope.groups {
-                    Some(groups) if !groups.is_empty() && self.rng.chance(40) => self.rng.pick(groups).0.clone(),
+                    Some(groups) if !groups.is_empty() && self.rng.chance(40) => {
+                        self.rng.pick(groups).0.clone()
+                    }
                     _ => {
                         let ty = *self.rng.pick(&TYPES);
                         self.key(ty, &scope, 2)
@@ -491,8 +607,9 @@ impl Gen {
             projection[0] = self.aggregate(ty, &scope);
         }
         // Some get an AS name, which ORDER BY may use in their place.
-        let names: Vec<Option<String>> =
-            (0..projection.len()).map(|i| self.rng.chance(30).then(|| format!("o{i}"))).collect();
+        let names: Vec<Option<String>> = (0..projection.len())
+            .map(|i| self.rng.chance(30).then(|| format!("o{i}")))
+            .collect();
         let by_name = |g: &mut Gen, i: usize| match &names[i] {
             Some(name) if g.rng.chance(50) => name.clone(),
             _ => projection[i].clone(),
@@ -500,7 +617,13 @@ impl Gen {
 
         // ORDER BY: one that fixes the order (it sorts by every selected
         // expression), one that does not, or none.
-        let direction = |g: &mut Gen, e: String| if g.rng.chance(40) { format!("{e} DESC") } else { e };
+        let direction = |g: &mut Gen, e: String| {
+            if g.rng.chance(40) {
+                format!("{e} DESC")
+            } else {
+                e
+            }
+        };
         let mut kind = Kind::Unordered;
         let mut keys: Vec<String> = Vec::new();
         if !star && self.rng.chance(60) {
@@ -567,11 +690,17 @@ impl Gen {
     /// types, maybe sorted by every column (which fixes the order), then
     /// limited and offset.
     fn union(&mut self) -> Stmt {
-        let types: Vec<Type> = (0..1 + self.rng.below(2)).map(|_| *self.rng.pick(&TYPES)).collect();
+        let types: Vec<Type> = (0..1 + self.rng.below(2))
+            .map(|_| *self.rng.pick(&TYPES))
+            .collect();
         let mut sql = String::new();
         for part in 0..2 + self.rng.below(2) {
             if part > 0 {
-                sql += if self.rng.chance(50) { " UNION ALL " } else { " UNION " };
+                sql += if self.rng.chance(50) {
+                    " UNION ALL "
+                } else {
+                    " UNION "
+                };
             }
             let t = self.rng.below(self.tables.len());
             let s = self.table_scope(t, Vec::new());
@@ -584,12 +713,23 @@ impl Gen {
                 })
                 .collect();
             let filter = self.where_clause(&s, 50);
-            sql += &format!("SELECT {} FROM {}{filter}", items.join(", "), self.tables[t].name);
+            sql += &format!(
+                "SELECT {} FROM {}{filter}",
+                items.join(", "),
+                self.tables[t].name
+            );
         }
         let mut kind = Kind::Unordered;
         if self.rng.chance(50) {
-            let keys: Vec<String> =
-                (0..types.len()).map(|i| if self.rng.chance(40) { format!("u{i} DESC") } else { format!("u{i}") }).collect();
+            let keys: Vec<String> = (0..types.len())
+                .map(|i| {
+                    if self.rng.chance(40) {
+                        format!("u{i} DESC")
+                    } else {
+                        format!("u{i}")
+                    }
+                })
+                .collect();
             sql += &format!(" ORDER BY {}", keys.join(", "));
             kind = Kind::Ordered;
             if self.rng.chance(60) {
@@ -606,7 +746,12 @@ impl Gen {
     /// table goes by `s1`, so that subqueries inside it start from `s2`.
     fn derived(&mut self) -> (String, Vec<(String, Type)>) {
         let all: Vec<usize> = (0..self.tables.len()).collect();
-        let s = Scope { depth: 0, sub_tables: all, subqueries: true, ..Scope::default() };
+        let s = Scope {
+            depth: 0,
+            sub_tables: all,
+            subqueries: true,
+            ..Scope::default()
+        };
         let (from, inner, _) = self.sub_from(&s);
         let filter = self.where_clause(&inner, 50);
         let mut columns = Vec::new();
@@ -616,7 +761,10 @@ impl Gen {
             // Grouped by one column, with aggregates.
             // Its scope has only its own table's columns: a derived table sees no other.
             let (group, ty) = self.rng.pick(&inner.cols).clone();
-            let grouped = Scope { groups: Some(vec![(group.clone(), ty)]), ..inner.clone() };
+            let grouped = Scope {
+                groups: Some(vec![(group.clone(), ty)]),
+                ..inner.clone()
+            };
             items.push(group.clone());
             columns.push(ty);
             for _ in 0..1 + self.rng.below(2) {
@@ -624,18 +772,43 @@ impl Gen {
                 items.push(self.aggregate(ty, &grouped));
                 columns.push(ty);
             }
-            let names: Vec<(String, Type)> = columns.iter().enumerate().map(|(i, ty)| (format!("x{i}"), *ty)).collect();
-            let list: Vec<String> = items.iter().enumerate().map(|(i, e)| format!("{e} AS x{i}")).collect();
-            return (format!("(SELECT {distinct}{} FROM {from}{filter} GROUP BY {group})", list.join(", ")), names);
+            let names: Vec<(String, Type)> = columns
+                .iter()
+                .enumerate()
+                .map(|(i, ty)| (format!("x{i}"), *ty))
+                .collect();
+            let list: Vec<String> = items
+                .iter()
+                .enumerate()
+                .map(|(i, e)| format!("{e} AS x{i}"))
+                .collect();
+            return (
+                format!(
+                    "(SELECT {distinct}{} FROM {from}{filter} GROUP BY {group})",
+                    list.join(", ")
+                ),
+                names,
+            );
         }
         for _ in 0..1 + self.rng.below(3) {
             let ty = *self.rng.pick(&TYPES);
             items.push(self.expr(ty, &inner, 2));
             columns.push(ty);
         }
-        let names: Vec<(String, Type)> = columns.iter().enumerate().map(|(i, ty)| (format!("x{i}"), *ty)).collect();
-        let list: Vec<String> = items.iter().enumerate().map(|(i, e)| format!("{e} AS x{i}")).collect();
-        (format!("(SELECT {distinct}{} FROM {from}{filter})", list.join(", ")), names)
+        let names: Vec<(String, Type)> = columns
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| (format!("x{i}"), *ty))
+            .collect();
+        let list: Vec<String> = items
+            .iter()
+            .enumerate()
+            .map(|(i, e)| format!("{e} AS x{i}"))
+            .collect();
+        (
+            format!("(SELECT {distinct}{} FROM {from}{filter})", list.join(", ")),
+            names,
+        )
     }
 
     // ---- changes ----
@@ -646,17 +819,39 @@ impl Gen {
         let cols: Vec<(String, Type)> = table
             .columns
             .iter()
-            .map(|(c, ty)| (if qualified { format!("{}.{c}", table.name) } else { c.clone() }, *ty))
+            .map(|(c, ty)| {
+                (
+                    if qualified {
+                        format!("{}.{c}", table.name)
+                    } else {
+                        c.clone()
+                    },
+                    *ty,
+                )
+            })
             .collect();
-        let outer = table.columns.iter().map(|(c, ty)| (format!("{}.{c}", table.name), *ty)).collect();
-        Scope { cols, outer, groups: None, subqueries: !sub_tables.is_empty(), sub_tables, depth: 0 }
+        let outer = table
+            .columns
+            .iter()
+            .map(|(c, ty)| (format!("{}.{c}", table.name), *ty))
+            .collect();
+        Scope {
+            cols,
+            outer,
+            groups: None,
+            subqueries: !sub_tables.is_empty(),
+            sub_tables,
+            depth: 0,
+        }
     }
 
     fn insert(&mut self) -> Stmt {
         let t = self.rng.below(self.tables.len());
         let columns = self.tables[t].columns.clone();
         let named: Vec<usize> = match self.rng.chance(30) {
-            true => (0..columns.len()).filter(|&i| i == 0 || self.rng.chance(50)).collect(),
+            true => (0..columns.len())
+                .filter(|&i| i == 0 || self.rng.chance(50))
+                .collect(),
             false => (0..columns.len()).collect(),
         };
         let rows: Vec<String> = (0..1 + self.rng.below(3))
@@ -678,11 +873,25 @@ impl Gen {
             .collect();
         let list = match named.len() == columns.len() {
             true => String::new(),
-            false => format!(" ({})", named.iter().map(|&i| columns[i].0.as_str()).collect::<Vec<_>>().join(", ")),
+            false => format!(
+                " ({})",
+                named
+                    .iter()
+                    .map(|&i| columns[i].0.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         };
         let s = self.table_scope(t, Vec::new());
         let (returning, kind) = self.returning(&s);
-        stmt(format!("INSERT INTO {}{list} VALUES {}{returning}", self.tables[t].name, rows.join(", ")), kind)
+        stmt(
+            format!(
+                "INSERT INTO {}{list} VALUES {}{returning}",
+                self.tables[t].name,
+                rows.join(", ")
+            ),
+            kind,
+        )
     }
 
     /// Maybe a RETURNING list for a change to the table of `s`, and the
@@ -693,14 +902,22 @@ impl Gen {
         if !self.rng.chance(30) {
             return (String::new(), Kind::Other);
         }
-        let s = Scope { subqueries: false, sub_tables: Vec::new(), ..s.clone() };
+        let s = Scope {
+            subqueries: false,
+            sub_tables: Vec::new(),
+            ..s.clone()
+        };
         let list = match self.rng.chance(25) {
             true => "*".to_string(),
             false => (0..1 + self.rng.below(3))
                 .map(|i| {
                     let ty = *self.rng.pick(&TYPES);
                     let e = self.expr(ty, &s, 2);
-                    if self.rng.chance(30) { format!("{e} AS r{i}") } else { e }
+                    if self.rng.chance(30) {
+                        format!("{e} AS r{i}")
+                    } else {
+                        e
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join(", "),
@@ -722,7 +939,14 @@ impl Gen {
         }
         let filter = self.where_clause(&s, 75);
         let (returning, kind) = self.returning(&s);
-        stmt(format!("UPDATE {} SET {}{filter}{returning}", self.tables[t].name, sets.join(", ")), kind)
+        stmt(
+            format!(
+                "UPDATE {} SET {}{filter}{returning}",
+                self.tables[t].name,
+                sets.join(", ")
+            ),
+            kind,
+        )
     }
 
     fn delete(&mut self) -> Stmt {
@@ -731,11 +955,17 @@ impl Gen {
         let s = self.table_scope(t, all);
         let filter = self.where_clause(&s, 85);
         let (returning, kind) = self.returning(&s);
-        stmt(format!("DELETE FROM {}{filter}{returning}", self.tables[t].name), kind)
+        stmt(
+            format!("DELETE FROM {}{filter}{returning}", self.tables[t].name),
+            kind,
+        )
     }
 
     fn contents(&self, t: usize) -> Stmt {
-        stmt(format!("SELECT * FROM {} ORDER BY id", self.tables[t].name), Kind::Ordered)
+        stmt(
+            format!("SELECT * FROM {} ORDER BY id", self.tables[t].name),
+            Kind::Ordered,
+        )
     }
 
     /// A change, then each table's rows.
@@ -758,15 +988,23 @@ impl Gen {
     fn index(&mut self) -> Stmt {
         if !self.indexes.is_empty() && self.rng.chance(30) {
             let i = self.rng.below(self.indexes.len());
-            return stmt(format!("DROP INDEX {}", self.indexes.swap_remove(i).name), Kind::Other);
+            return stmt(
+                format!("DROP INDEX {}", self.indexes.swap_remove(i).name),
+                Kind::Other,
+            );
         }
-        let indexable: Vec<usize> = (0..self.tables.len()).filter(|&t| self.tables[t].storage != "COLUMN").collect();
+        let indexable: Vec<usize> = (0..self.tables.len())
+            .filter(|&t| self.tables[t].storage != "COLUMN")
+            .collect();
         if indexable.is_empty() {
             return self.insert();
         }
         let t = *self.rng.pick(&indexable);
         let columns = self.tables[t].columns.clone();
-        let rows = Scope { cols: columns.clone(), ..Scope::default() };
+        let rows = Scope {
+            cols: columns.clone(),
+            ..Scope::default()
+        };
         let keys: Vec<(String, Type)> = match self.rng.chance(40) {
             true => vec![self.rng.pick(&columns[1..]).clone()],
             false => (0..1 + self.rng.below(3))
@@ -780,7 +1018,11 @@ impl Gen {
                 .collect(),
         };
         let include: Vec<String> = match self.rng.chance(30) {
-            true => columns.iter().filter(|_| self.rng.chance(50)).map(|(c, _)| c.clone()).collect(),
+            true => columns
+                .iter()
+                .filter(|_| self.rng.chance(50))
+                .map(|(c, _)| c.clone())
+                .collect(),
             false => Vec::new(),
         };
         let predicate = match self.rng.below(10) {
@@ -790,17 +1032,37 @@ impl Gen {
         };
         let hash = self.rng.chance(30);
         let name = format!("ix{}", self.rng.next() % 1_000_000);
-        let list = keys.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(", ");
+        let list = keys
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         let table = &self.tables[t].name;
         let sqlite = format!("CREATE INDEX {name} ON {table} ({list})");
         let using = if hash { " USING HASH" } else { "" };
-        let filter = predicate.as_ref().map_or(String::new(), |p| format!(" WHERE {p}"));
+        let filter = predicate
+            .as_ref()
+            .map_or(String::new(), |p| format!(" WHERE {p}"));
         let sequoia = match include.is_empty() {
             true => format!("CREATE INDEX {name} ON {table}{using} ({list}){filter}"),
-            false => format!("CREATE INDEX {name} ON {table}{using} ({list}) INCLUDE ({}){filter}", include.join(", ")),
+            false => format!(
+                "CREATE INDEX {name} ON {table}{using} ({list}) INCLUDE ({}){filter}",
+                include.join(", ")
+            ),
         };
-        self.indexes.push(Index { name, table: t, keys, include, predicate, hash });
-        Stmt { sequoia, sqlite: format!("{sqlite}{filter}"), kind: Kind::Other }
+        self.indexes.push(Index {
+            name,
+            table: t,
+            keys,
+            include,
+            predicate,
+            hash,
+        });
+        Stmt {
+            sequoia,
+            sqlite: format!("{sqlite}{filter}"),
+            kind: Kind::Other,
+        }
     }
 
     /// A query on one table meant to use one of its indexes: conditions on
@@ -812,8 +1074,21 @@ impl Gen {
             return self.select();
         }
         let index = self.rng.below(self.indexes.len());
-        let Index { table, keys, include, predicate, hash, .. } = &self.indexes[index];
-        let (table, keys, include, predicate, hash) = (*table, keys.clone(), include.clone(), predicate.clone(), *hash);
+        let Index {
+            table,
+            keys,
+            include,
+            predicate,
+            hash,
+            ..
+        } = &self.indexes[index];
+        let (table, keys, include, predicate, hash) = (
+            *table,
+            keys.clone(),
+            include.clone(),
+            predicate.clone(),
+            *hash,
+        );
         let mut conditions = Vec::new();
         for (i, (key, ty)) in keys.iter().enumerate() {
             let equal = match hash {
@@ -841,7 +1116,13 @@ impl Gen {
             false => columns.join(", "),
         };
         let name = &self.tables[table].name;
-        stmt(format!("SELECT {projection} FROM {name} WHERE {}", conditions.join(" AND ")), Kind::Unordered)
+        stmt(
+            format!(
+                "SELECT {projection} FROM {name} WHERE {}",
+                conditions.join(" AND ")
+            ),
+            Kind::Unordered,
+        )
     }
 
     /// A transaction of changes, queries and savepoints, committed or rolled back.
@@ -857,7 +1138,11 @@ impl Gen {
                 _ => self.change(out),
             }
         }
-        let end = if self.rng.chance(60) { "COMMIT" } else { "ROLLBACK" };
+        let end = if self.rng.chance(60) {
+            "COMMIT"
+        } else {
+            "ROLLBACK"
+        };
         out.push(stmt(end.into(), Kind::Other));
         for t in 0..self.tables.len() {
             out.push(self.contents(t));
@@ -867,7 +1152,11 @@ impl Gen {
     // ---- a case ----
 
     fn case(seed: u64) -> Vec<Stmt> {
-        let mut g = Gen { rng: Rng::new(seed), tables: Vec::new(), indexes: Vec::new() };
+        let mut g = Gen {
+            rng: Rng::new(seed),
+            tables: Vec::new(),
+            indexes: Vec::new(),
+        };
         let mut out = Vec::new();
         for t in 0..2 + g.rng.below(2) {
             let mut columns = vec![("id".to_string(), Type::Int)];
@@ -877,29 +1166,46 @@ impl Gen {
             let storage = *g.rng.pick(&["HEAP", "LSM", "COLUMN"]);
             let name = format!("t{t}");
             let ddl = |types: &dyn Fn(Type) -> &'static str, pk: &str| {
-                let rest: Vec<String> = columns[1..].iter().map(|(c, ty)| format!("{c} {}", types(*ty))).collect();
+                let rest: Vec<String> = columns[1..]
+                    .iter()
+                    .map(|(c, ty)| format!("{c} {}", types(*ty)))
+                    .collect();
                 format!("CREATE TABLE {name} (id INT {pk}, {})", rest.join(", "))
             };
             let sequoia = format!(
                 "{} USING {storage}",
-                ddl(&|ty| match ty {
-                    Type::Int => "INT",
-                    Type::Text => "TEXT",
-                    Type::Bool => "BOOL",
-                    Type::Real => "REAL",
-                }, "PRIMARY KEY")
+                ddl(
+                    &|ty| match ty {
+                        Type::Int => "INT",
+                        Type::Text => "TEXT",
+                        Type::Bool => "BOOL",
+                        Type::Real => "REAL",
+                    },
+                    "PRIMARY KEY"
+                )
             );
             // STRICT, so that SQLite checks types; it has no BOOL, and lets a PRIMARY KEY be NULL unless told not to.
             let sqlite = format!(
                 "{} STRICT",
-                ddl(&|ty| match ty {
-                    Type::Text => "TEXT",
-                    Type::Real => "REAL",
-                    _ => "INT",
-                }, "NOT NULL PRIMARY KEY")
+                ddl(
+                    &|ty| match ty {
+                        Type::Text => "TEXT",
+                        Type::Real => "REAL",
+                        _ => "INT",
+                    },
+                    "NOT NULL PRIMARY KEY"
+                )
             );
-            out.push(Stmt { sequoia, sqlite, kind: Kind::Other });
-            g.tables.push(Table { name, columns, storage });
+            out.push(Stmt {
+                sequoia,
+                sqlite,
+                kind: Kind::Other,
+            });
+            g.tables.push(Table {
+                name,
+                columns,
+                storage,
+            });
         }
         for t in 0..g.tables.len() {
             let mut ids: Vec<i64> = (0..40).collect();
@@ -910,12 +1216,20 @@ impl Gen {
                 .iter()
                 .map(|id| {
                     let columns = g.tables[t].columns.clone();
-                    let values: Vec<String> = columns[1..].iter().map(|(_, ty)| g.literal(*ty)).collect();
+                    let values: Vec<String> =
+                        columns[1..].iter().map(|(_, ty)| g.literal(*ty)).collect();
                     format!("({id}, {})", values.join(", "))
                 })
                 .collect();
             if !rows.is_empty() {
-                out.push(stmt(format!("INSERT INTO {} VALUES {}", g.tables[t].name, rows.join(", ")), Kind::Other));
+                out.push(stmt(
+                    format!(
+                        "INSERT INTO {} VALUES {}",
+                        g.tables[t].name,
+                        rows.join(", ")
+                    ),
+                    Kind::Other,
+                ));
             }
             if g.rng.chance(50) {
                 let index = g.index();
@@ -936,7 +1250,11 @@ impl Gen {
 }
 
 fn stmt(sequoia: String, kind: Kind) -> Stmt {
-    Stmt { sqlite: sequoia.clone(), sequoia, kind }
+    Stmt {
+        sqlite: sequoia.clone(),
+        sequoia,
+        kind,
+    }
 }
 
 /// Whether an expression names a column (`id`, `c1` or a derived table's
@@ -955,7 +1273,9 @@ fn reads_column(e: &str) -> bool {
         words.push(std::mem::take(&mut word));
     }
     let numbered = |w: &str| w.len() > 1 && w[1..].bytes().all(|b| b.is_ascii_digit());
-    words.iter().any(|w| w == "id" || ((w.starts_with('c') || w.starts_with('x')) && numbered(w)))
+    words
+        .iter()
+        .any(|w| w == "id" || ((w.starts_with('c') || w.starts_with('x')) && numbered(w)))
 }
 
 /// Whether an expression has an `x IS NULL` that SQLite folds to 0 because
@@ -988,11 +1308,15 @@ fn never_null(e: &str) -> bool {
     if e.starts_with('\'') || e.parse::<f64>().is_ok() {
         return true;
     }
-    let Some(inner) = e.strip_prefix('(').and_then(|e| e.strip_suffix(')')) else { return false };
+    let Some(inner) = e.strip_prefix('(').and_then(|e| e.strip_suffix(')')) else {
+        return false;
+    };
     match inner.strip_prefix("- ") {
         Some(negated) => never_null(negated),
         None => {
-            let operand = inner.strip_suffix(" IS NULL").or_else(|| inner.strip_suffix(" IS NOT NULL"));
+            let operand = inner
+                .strip_suffix(" IS NULL")
+                .or_else(|| inner.strip_suffix(" IS NOT NULL"));
             operand.is_some_and(never_null)
         }
     }
@@ -1071,7 +1395,9 @@ fn run_sequoia(script: &[Stmt], model: Option<Model>, memory: Option<usize>) -> 
         .map(|s| match db.execute(&s.sequoia) {
             Ok(mut results) => match results.pop() {
                 Some(QueryResult::Rows { rows, .. }) => Outcome::Rows(
-                    rows.iter().map(|row| row.iter().map(quote).collect::<Vec<_>>().join(",")).collect(),
+                    rows.iter()
+                        .map(|row| row.iter().map(quote).collect::<Vec<_>>().join(","))
+                        .collect(),
                 ),
                 _ => Outcome::Rows(Vec::new()),
             },
@@ -1112,8 +1438,13 @@ fn run_sqlite(script: &[Stmt]) -> Option<Vec<Outcome>> {
     }
     assert_eq!(outcomes.len(), script.len(), "sqlite3 output: {stdout}");
     for line in String::from_utf8(output.stderr).unwrap().lines() {
-        let Some(at) = line.find("near line ") else { continue };
-        let digits: String = line[at + 10..].chars().take_while(char::is_ascii_digit).collect();
+        let Some(at) = line.find("near line ") else {
+            continue;
+        };
+        let digits: String = line[at + 10..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
         let line_number: usize = digits.parse().unwrap();
         outcomes[(line_number - 2) / 2] = Outcome::Error(line.to_string());
     }
@@ -1146,7 +1477,10 @@ fn agree(kind: Kind, a: &Outcome, b: &Outcome) -> bool {
 }
 
 fn env(name: &str, default: u64) -> u64 {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 /// The memory budgets of the second run of each case, which spills.
@@ -1164,7 +1498,10 @@ fn sequoia_agrees_with_sqlite() {
             return;
         };
         statements += script.len();
-        queries += script.iter().filter(|s| matches!(s.kind, Kind::Ordered | Kind::Unordered)).count();
+        queries += script
+            .iter()
+            .filter(|s| matches!(s.kind, Kind::Ordered | Kind::Unordered))
+            .count();
         returning += script.iter().filter(|s| s.kind == Kind::Returned).count();
         // Again with budgets so small that every sort, join and aggregation spills.
         'runs: for memory in [None, Some(SPILL_MEMORY)] {
@@ -1187,11 +1524,25 @@ fn sequoia_agrees_with_sqlite() {
                     true if found[i] != iterator[i] => Some("the iterator model"),
                     true => None,
                 };
-                let Some((i, against)) = (0..script.len()).find_map(|i| Some((i, wrong(i)?))) else { continue };
-                let setup: Vec<String> = script[..i].iter().map(|s| format!("{};", s.sequoia)).collect();
-                let budgets = memory.map_or(String::new(), |bytes| format!(", memory budgets of {bytes} bytes"));
-                let model = model.map_or("models chosen per query".to_string(), |m| format!("{m} model"));
-                let other = if against == "sqlite" { &expected[i] } else { &iterator[i] };
+                let Some((i, against)) = (0..script.len()).find_map(|i| Some((i, wrong(i)?)))
+                else {
+                    continue;
+                };
+                let setup: Vec<String> = script[..i]
+                    .iter()
+                    .map(|s| format!("{};", s.sequoia))
+                    .collect();
+                let budgets = memory.map_or(String::new(), |bytes| {
+                    format!(", memory budgets of {bytes} bytes")
+                });
+                let model = model.map_or("models chosen per query".to_string(), |m| {
+                    format!("{m} model")
+                });
+                let other = if against == "sqlite" {
+                    &expected[i]
+                } else {
+                    &iterator[i]
+                };
                 mismatches.push(format!(
                     "seed {seed}, statement {i} ({model}{budgets}), against {against}:\n  {}\n  sequoia: {:?}\n  {against}: {:?}\n  sqlite statement: {}\n  script:\n{}\n{};",
                     script[i].sequoia,
@@ -1211,7 +1562,10 @@ fn sequoia_agrees_with_sqlite() {
     );
     if let Some(first) = mismatches.first() {
         // Each one's first five lines: where, the statement, and both outcomes.
-        let all: Vec<String> = mismatches.iter().map(|m| m.lines().take(5).collect::<Vec<_>>().join("\n")).collect();
+        let all: Vec<String> = mismatches
+            .iter()
+            .map(|m| m.lines().take(5).collect::<Vec<_>>().join("\n"))
+            .collect();
         panic!(
             "{} of {cases} cases disagree:\n\n{}\n\nThe first in full:\n{first}",
             mismatches.len(),

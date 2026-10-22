@@ -27,7 +27,13 @@ use crate::types::StorageKind;
 /// its condition's conjuncts is one of the WHERE's, or is implied by one of
 /// its conditions (`x > 5` implies `x > 0`, `x = 1` implies `x != 2`), or
 /// is `e IS NOT NULL` for an `e` the WHERE compares with a value.
-pub fn choose(table: &Table, qualifier: &str, filter: &Option<Expr>, conditions: &[Condition], needed: &[bool]) -> Access {
+pub fn choose(
+    table: &Table,
+    qualifier: &str,
+    filter: &Option<Expr>,
+    conditions: &[Condition],
+    needed: &[bool],
+) -> Access {
     let mut own = None; // the WHERE's conjuncts, once a partial index needs them
     let mut best: Option<((usize, bool, bool), Access)> = None;
     match table.storage_kind() {
@@ -35,7 +41,10 @@ pub fn choose(table: &Table, qualifier: &str, filter: &Option<Expr>, conditions:
         StorageKind::Lsm => {
             if let Some(pk) = table.primary_key() {
                 let key = Expr::Column(ColumnRef::bare(&table.columns[pk].name));
-                if let Some(c) = conditions.iter().find(|c| c.expr == key && c.op == Compare::Eq) {
+                if let Some(c) = conditions
+                    .iter()
+                    .find(|c| c.expr == key && c.op == Compare::Eq)
+                {
                     return Access::Key(c.literal.clone());
                 }
                 let (equal, lower, upper) = range(conditions, &key);
@@ -50,7 +59,13 @@ pub fn choose(table: &Table, qualifier: &str, filter: &Option<Expr>, conditions:
 
     for (i, index) in table.indexes().iter().enumerate() {
         if let Some(predicate) = &index.predicate
-            && !implied(table, qualifier, predicate, own.get_or_insert_with(|| filter::own_conjuncts(table, qualifier, filter)), conditions)
+            && !implied(
+                table,
+                qualifier,
+                predicate,
+                own.get_or_insert_with(|| filter::own_conjuncts(table, qualifier, filter)),
+                conditions,
+            )
         {
             continue;
         }
@@ -74,7 +89,16 @@ pub fn choose(table: &Table, qualifier: &str, filter: &Option<Expr>, conditions:
         score += 3 * index.predicate.is_some() as usize;
         let rank = (score, index.covers(needed), index.is_hash());
         if score > 0 && best.as_ref().is_none_or(|(best, _)| rank > *best) {
-            best = Some((rank, Access::Index { index: i, equal, lower, upper, covering: rank.1 }));
+            best = Some((
+                rank,
+                Access::Index {
+                    index: i,
+                    equal,
+                    lower,
+                    upper,
+                    covering: rank.1,
+                },
+            ));
         }
     }
     best.map_or(Access::Scan, |(_, access)| access)
@@ -85,7 +109,12 @@ pub fn choose(table: &Table, qualifier: &str, filter: &Option<Expr>, conditions:
 fn range(conditions: &[Condition], expr: &Expr) -> (bool, Option<Bound>, Option<Bound>) {
     let (mut lower, mut upper, mut equal) = (None, None, false);
     for c in conditions.iter().filter(|c| c.expr == *expr) {
-        let bound = |inclusive| Some(Bound { value: c.literal.clone(), inclusive });
+        let bound = |inclusive| {
+            Some(Bound {
+                value: c.literal.clone(),
+                inclusive,
+            })
+        };
         match c.op {
             Compare::Eq => {
                 equal = true;
@@ -104,7 +133,13 @@ fn range(conditions: &[Condition], expr: &Expr) -> (bool, Option<Bound>, Option<
 
 /// Whether a partial index's condition holds for every row that the
 /// conjuncts of a WHERE clause, and the conditions among them, hold for.
-fn implied(table: &Table, qualifier: &str, predicate: &Expr, own: &[Expr], conditions: &[Condition]) -> bool {
+fn implied(
+    table: &Table,
+    qualifier: &str,
+    predicate: &Expr,
+    own: &[Expr],
+    conditions: &[Condition],
+) -> bool {
     conjuncts(predicate).into_iter().all(|part| {
         if own.contains(part) {
             return true;
@@ -122,7 +157,12 @@ fn implied(table: &Table, qualifier: &str, predicate: &Expr, own: &[Expr], condi
 /// Whether every value that condition `a` holds for is one `b` holds for.
 fn implies(a: &Condition, b: &Condition) -> bool {
     use Compare::*;
-    let Some(ord) = (a.expr == b.expr).then(|| a.literal.compare(&b.literal)).flatten() else { return false };
+    let Some(ord) = (a.expr == b.expr)
+        .then(|| a.literal.compare(&b.literal))
+        .flatten()
+    else {
+        return false;
+    };
     match (a.op, b.op) {
         // `x = 3` implies whatever 3 satisfies.
         (Eq, op) => op.holds(ord),
@@ -143,20 +183,47 @@ pub fn describe(table: &Table, name: &str, predicates: &[Predicate], access: &Ac
         Access::Scan if table.storage_kind() == StorageKind::Column && !predicates.is_empty() => {
             let filters: Vec<String> = predicates
                 .iter()
-                .map(|p| format!("{} {} {}", table.columns[p.column].name, p.op.symbol(), p.literal.to_sql()))
+                .map(|p| {
+                    format!(
+                        "{} {} {}",
+                        table.columns[p.column].name,
+                        p.op.symbol(),
+                        p.literal.to_sql()
+                    )
+                })
                 .collect();
-            format!("SCAN {name} FILTERING COMPRESSED CHUNKS ON {}", filters.join(" AND "))
+            format!(
+                "SCAN {name} FILTERING COMPRESSED CHUNKS ON {}",
+                filters.join(" AND ")
+            )
         }
         Access::Scan => format!("SCAN {name}"),
         Access::Key(value) => {
-            let pk = table.primary_key().expect("a key lookup needs a primary key");
-            format!("SEARCH {name} USING PRIMARY KEY ({} = {})", table.columns[pk].name, value.to_sql())
+            let pk = table
+                .primary_key()
+                .expect("a key lookup needs a primary key");
+            format!(
+                "SEARCH {name} USING PRIMARY KEY ({} = {})",
+                table.columns[pk].name,
+                value.to_sql()
+            )
         }
         Access::KeyRange { lower, upper } => {
-            let pk = table.primary_key().expect("a key range needs a primary key");
-            format!("SEARCH {name} USING PRIMARY KEY ({})", describe_range(&table.columns[pk].name, lower, upper))
+            let pk = table
+                .primary_key()
+                .expect("a key range needs a primary key");
+            format!(
+                "SEARCH {name} USING PRIMARY KEY ({})",
+                describe_range(&table.columns[pk].name, lower, upper)
+            )
         }
-        Access::Index { index, equal, lower, upper, covering } => {
+        Access::Index {
+            index,
+            equal,
+            lower,
+            upper,
+            covering,
+        } => {
             let index = &table.indexes()[index];
             let kind = match (covering, index.is_hash()) {
                 (false, false) => "INDEX",
@@ -165,14 +232,21 @@ pub fn describe(table: &Table, name: &str, predicates: &[Predicate], access: &Ac
                 (true, true) => "COVERING HASH INDEX",
             };
             let key = |i: usize| key_name(index, i);
-            let mut parts: Vec<String> =
-                equal.iter().enumerate().map(|(i, value)| format!("{} = {}", key(i), value.to_sql())).collect();
+            let mut parts: Vec<String> = equal
+                .iter()
+                .enumerate()
+                .map(|(i, value)| format!("{} = {}", key(i), value.to_sql()))
+                .collect();
             if lower.is_some() || upper.is_some() {
                 parts.push(describe_range(&key(equal.len()), lower, upper));
             }
             match parts.is_empty() {
                 true => format!("SCAN {name} USING {kind} {}", index.name),
-                false => format!("SEARCH {name} USING {kind} {} ({})", index.name, parts.join(" AND ")),
+                false => format!(
+                    "SEARCH {name} USING {kind} {} ({})",
+                    index.name,
+                    parts.join(" AND ")
+                ),
             }
         }
     }
@@ -195,7 +269,11 @@ fn describe_range(column: &str, lower: Option<Bound>, upper: Option<Bound>) -> S
             };
             let lower = lower.map(|b| describe(b, Compare::GtEq, Compare::Gt));
             let upper = upper.map(|b| describe(b, Compare::LtEq, Compare::Lt));
-            lower.into_iter().chain(upper).collect::<Vec<_>>().join(" AND ")
+            lower
+                .into_iter()
+                .chain(upper)
+                .collect::<Vec<_>>()
+                .join(" AND ")
         }
     }
 }
@@ -203,7 +281,9 @@ fn describe_range(column: &str, lower: Option<Bound>, upper: Option<Bound>) -> S
 /// The tighter of two lower bounds (`lower`) or upper bounds: the larger
 /// lower or smaller upper value, and of equal values the exclusive one.
 fn tighter(current: Option<Bound>, new: Option<Bound>, lower: bool) -> Option<Bound> {
-    let (Some(current), Some(new)) = (&current, &new) else { return current.or(new) };
+    let (Some(current), Some(new)) = (&current, &new) else {
+        return current.or(new);
+    };
     let ord = new.value.sort_cmp(&current.value);
     let better = if lower { ord.is_gt() } else { ord.is_lt() } || (ord.is_eq() && !new.inclusive);
     Some(if better { new.clone() } else { current.clone() })

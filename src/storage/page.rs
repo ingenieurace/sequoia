@@ -27,7 +27,9 @@
 
 use std::ops::{Deref, DerefMut};
 
-use crate::storage::io::disk::{PAGE_USABLE, Page, PageId, decode_id, encode_id, read_u32, write_u32};
+use crate::storage::io::disk::{
+    PAGE_USABLE, Page, PageId, decode_id, encode_id, read_u32, write_u32,
+};
 
 const HEADER_SIZE: usize = 8;
 const SLOT_SIZE: usize = 4;
@@ -75,7 +77,11 @@ impl<P: Deref<Target = Page>> SlottedPage<P> {
     /// Size of the largest tuple [`SlottedPage::insert`] will accept, counting
     /// holes left by deleted tuples and the slot a new tuple may need.
     pub fn room(&self) -> usize {
-        let slot_cost = if self.unused_slot().is_some() { 0 } else { SLOT_SIZE };
+        let slot_cost = if self.unused_slot().is_some() {
+            0
+        } else {
+            SLOT_SIZE
+        };
         self.total_free_space().saturating_sub(slot_cost)
     }
 

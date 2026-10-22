@@ -56,11 +56,19 @@ impl Output {
         while wanted.is_none_or(|wanted| read.len() < wanted) {
             match rows.next() {
                 Some(Ok(row)) => read.push(row),
-                Some(Err(e)) => return Output { rows: read, error: Some(e) },
+                Some(Err(e)) => {
+                    return Output {
+                        rows: read,
+                        error: Some(e),
+                    };
+                }
                 None => break,
             }
         }
-        Output { rows: read, error: None }
+        Output {
+            rows: read,
+            error: None,
+        }
     }
 
     /// The rows a step made, and then the error of the step below it,
@@ -68,11 +76,17 @@ impl Output {
     /// asked would never read the rows after them, nor so their error.
     fn ended(rows: Vec<Row>, error: Option<Error>, wanted: Option<usize>) -> Output {
         let enough = wanted.is_some_and(|wanted| rows.len() >= wanted);
-        Output { rows, error: error.filter(|_| !enough) }
+        Output {
+            rows,
+            error: error.filter(|_| !enough),
+        }
     }
 
     fn failed(e: Error) -> Output {
-        Output { rows: Vec::new(), error: Some(e) }
+        Output {
+            rows: Vec::new(),
+            error: Some(e),
+        }
     }
 
     fn into_rows<'a>(self) -> Rows<'a> {
@@ -82,13 +96,24 @@ impl Output {
 
 /// Opens a plan, its steps counted in `step` if given. It runs when its
 /// first row is asked for.
-pub(super) fn open<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step: Step) -> Rows<'a> {
+pub(super) fn open<'a>(
+    node: Node<'a>,
+    catalog: &'a Catalog,
+    settings: &Settings,
+    step: Step,
+) -> Rows<'a> {
     let settings = settings.clone();
     deferred(move || Ok(run(node, catalog, &settings, &step, None).into_rows()))
 }
 
 /// Runs a step and everything below it, for `wanted` rows if not all of them.
-fn run<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step: &Step, wanted: Option<usize>) -> Output {
+fn run<'a>(
+    node: Node<'a>,
+    catalog: &'a Catalog,
+    settings: &Settings,
+    step: &Step,
+    wanted: Option<usize>,
+) -> Output {
     let start = Instant::now();
     let output = run_node(node, catalog, settings, step, wanted);
     if let Some((profile, id)) = step {
@@ -97,13 +122,28 @@ fn run<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step: &Ste
     output
 }
 
-fn run_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step: &Step, wanted: Option<usize>) -> Output {
+fn run_node<'a>(
+    node: Node<'a>,
+    catalog: &'a Catalog,
+    settings: &Settings,
+    step: &Step,
+    wanted: Option<usize>,
+) -> Output {
     let run = |node, step, wanted| run(node, catalog, settings, &step, wanted);
     let enough = |rows: &Vec<Row>| wanted.is_some_and(|wanted| rows.len() >= wanted);
     match node {
-        Node::Scan { table, needed, predicates, access, .. } => {
-            Output::read(table.scan_filtered(&needed, &predicates, &access).map(|item| item.map(|(_, row)| row)), wanted)
-        }
+        Node::Scan {
+            table,
+            needed,
+            predicates,
+            access,
+            ..
+        } => Output::read(
+            table
+                .scan_filtered(&needed, &predicates, &access)
+                .map(|item| item.map(|(_, row)| row)),
+            wanted,
+        ),
         Node::Lookup { .. } => unreachable!("a lookup is only an index join's right side"),
         Node::Filter { input, predicate } => {
             let fields = input.columns();
@@ -118,7 +158,12 @@ fn run_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step:
                 match matches_with(&predicate, &fields, &row, &mut subqueries) {
                     Ok(true) => rows.push(row),
                     Ok(false) => {}
-                    Err(e) => return Output { rows, error: Some(e) },
+                    Err(e) => {
+                        return Output {
+                            rows,
+                            error: Some(e),
+                        };
+                    }
                 }
             }
             Output::ended(rows, input.error, wanted)
@@ -130,20 +175,42 @@ fn run_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step:
             let mut subqueries = Runner::new(catalog, settings);
             let mut rows = Vec::with_capacity(input.rows.len());
             for row in input.rows {
-                match exprs.iter().map(|e| eval_with(e, &fields, &row, &mut subqueries)).collect() {
+                match exprs
+                    .iter()
+                    .map(|e| eval_with(e, &fields, &row, &mut subqueries))
+                    .collect()
+                {
                     Ok(row) => rows.push(row),
-                    Err(e) => return Output { rows, error: Some(e) },
+                    Err(e) => {
+                        return Output {
+                            rows,
+                            error: Some(e),
+                        };
+                    }
                 }
             }
             Output::ended(rows, input.error, wanted)
         }
-        Node::Limit { input, count, offset } => {
+        Node::Limit {
+            input,
+            count,
+            offset,
+        } => {
             let count = match (count, wanted) {
                 (Some(count), Some(wanted)) => Some(count.min(wanted)),
                 (count, wanted) => count.or(wanted),
             };
-            let input = run(*input, below(step, 0), count.map(|count| count.saturating_add(offset)));
-            let rows = input.rows.into_iter().skip(offset).take(count.unwrap_or(usize::MAX)).collect();
+            let input = run(
+                *input,
+                below(step, 0),
+                count.map(|count| count.saturating_add(offset)),
+            );
+            let rows = input
+                .rows
+                .into_iter()
+                .skip(offset)
+                .take(count.unwrap_or(usize::MAX))
+                .collect();
             Output::ended(rows, input.error, count)
         }
         Node::Distinct { input } => {
@@ -168,7 +235,11 @@ fn run_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step:
                     break;
                 }
                 let steps = input.steps();
-                let output = run(input, below(step, before), wanted.map(|wanted| wanted - rows.len()));
+                let output = run(
+                    input,
+                    below(step, before),
+                    wanted.map(|wanted| wanted - rows.len()),
+                );
                 before += steps;
                 rows.extend(output.rows);
                 if output.error.is_some() {
@@ -182,20 +253,43 @@ fn run_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step:
             let fields = input.columns();
             let input = run(*input, below(step, 0), None);
             let mut subqueries = Runner::new(catalog, settings);
-            match operator::sort(input.into_rows(), &fields, &keys, limit, settings.sort_memory, &mut subqueries) {
+            match operator::sort(
+                input.into_rows(),
+                &fields,
+                &keys,
+                limit,
+                settings.sort_memory,
+                &mut subqueries,
+            ) {
                 Ok(sorted) => Output::read(sorted, wanted),
                 Err(e) => Output::failed(e),
             }
         }
-        Node::Aggregate { input, group_by, aggregates } => {
+        Node::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
             let fields = input.columns();
             let input = run(*input, below(step, 0), None);
-            match aggregate::fold(input.into_rows(), &fields, &group_by, &aggregates, settings.hash_memory) {
+            match aggregate::fold(
+                input.into_rows(),
+                &fields,
+                &group_by,
+                &aggregates,
+                settings.hash_memory,
+            ) {
                 Ok(groups) => Output::read(groups, wanted),
                 Err(e) => Output::failed(e),
             }
         }
-        Node::Join { left, right, kind, method, condition } => {
+        Node::Join {
+            left,
+            right,
+            kind,
+            method,
+            condition,
+        } => {
             let left_fields = left.columns();
             let right_step = below(step, left.steps());
             let left = run(*left, below(step, 0), None).into_rows();
@@ -206,12 +300,24 @@ fn run_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step:
                 move |node| {
                     let output = kept
                         .borrow_mut()
-                        .get_or_insert_with(|| Rc::new(self::run(node, catalog, &settings, &right_step, None)))
+                        .get_or_insert_with(|| {
+                            Rc::new(self::run(node, catalog, &settings, &right_step, None))
+                        })
                         .clone();
                     replay(output)
                 }
             };
-            let joined = operator::join(left, left_fields, *right, kind, method, condition, settings, &right_step, open_right);
+            let joined = operator::join(
+                left,
+                left_fields,
+                *right,
+                kind,
+                method,
+                condition,
+                settings,
+                &right_step,
+                open_right,
+            );
             Output::read(joined, wanted)
         }
     }

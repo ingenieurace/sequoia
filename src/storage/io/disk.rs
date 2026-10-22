@@ -35,7 +35,7 @@ use std::fs::{OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use super::medium::{FileMedium, MemMedium, Medium};
+use super::medium::{FileMedium, Medium, MemMedium};
 use super::wal::{Wal, WalSavepoint};
 use crate::error::{Error, Result, err};
 
@@ -85,13 +85,23 @@ impl DiskManager {
     /// Fails if another process has the file open.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
         file.try_lock().map_err(|e| match e {
             TryLockError::WouldBlock => Error("database file is in use by another process".into()),
             TryLockError::Error(e) => e.into(),
         })?;
         let wal_path = PathBuf::from(format!("{}-wal", path.display()));
-        let wal = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&wal_path)?;
+        let wal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&wal_path)?;
         let mut disk = Self::init(Box::new(FileMedium(file)), Box::new(FileMedium(wal)))?;
         disk.wal_path = Some(wal_path);
         Ok(disk)
@@ -99,8 +109,11 @@ impl DiskManager {
 
     /// Creates a database that lives only in memory.
     pub fn in_memory() -> Self {
-        Self::init(Box::new(MemMedium::default()), Box::new(MemMedium::default()))
-            .expect("in-memory storage cannot fail")
+        Self::init(
+            Box::new(MemMedium::default()),
+            Box::new(MemMedium::default()),
+        )
+        .expect("in-memory storage cannot fail")
     }
 
     /// Opens a database stored on `db`, with its log on `wal`.
@@ -113,7 +126,11 @@ impl DiskManager {
             return err("not a Sequoia database file");
         }
         let header = if len == 0 {
-            Header { page_count: 1, free_head: None, root: None }
+            Header {
+                page_count: 1,
+                free_head: None,
+                root: None,
+            }
         } else {
             let mut page = ZERO_PAGE;
             db.read_at(0, &mut page)?;
@@ -123,8 +140,16 @@ impl DiskManager {
             }
             header
         };
-        let headers = Mutex::new(Headers { current: header, committed: header });
-        let disk = Self { db, wal: Mutex::new(wal), wal_path: None, header: headers };
+        let headers = Mutex::new(Headers {
+            current: header,
+            committed: header,
+        });
+        let disk = Self {
+            db,
+            wal: Mutex::new(wal),
+            wal_path: None,
+            header: headers,
+        };
         if len == 0 {
             disk.write_header(&header)?;
             disk.commit()?;
@@ -178,7 +203,10 @@ impl DiskManager {
         write_u32(&mut page, 0, encode_id(headers.current.free_head));
         self.write_block(id.0, &page)?;
 
-        let next = Header { free_head: Some(id), ..headers.current };
+        let next = Header {
+            free_head: Some(id),
+            ..headers.current
+        };
         self.write_header(&next)?;
         headers.current = next;
         Ok(())
@@ -194,7 +222,10 @@ impl DiskManager {
         if let Some(id) = root {
             validate(&headers.current, id)?;
         }
-        let next = Header { root, ..headers.current };
+        let next = Header {
+            root,
+            ..headers.current
+        };
         self.write_header(&next)?;
         headers.current = next;
         Ok(())
@@ -231,7 +262,10 @@ impl DiskManager {
     /// Marks the writes so far, for [`DiskManager::rollback_to`] to go back to.
     pub fn savepoint(&self) -> Savepoint {
         let headers = self.header.lock().unwrap();
-        Savepoint { wal: self.wal.lock().unwrap().savepoint(), header: headers.current }
+        Savepoint {
+            wal: self.wal.lock().unwrap().savepoint(),
+            header: headers.current,
+        }
     }
 
     /// Undoes every page write since `savepoint`, allocations included. Fails
@@ -274,7 +308,10 @@ impl Drop for DiskManager {
     /// removes its file. Best effort: on failure the log is recovered on open.
     fn drop(&mut self) {
         let wal = self.wal.get_mut().unwrap();
-        if wal.rollback().and_then(|()| wal.checkpoint(&*self.db)).is_ok()
+        if wal
+            .rollback()
+            .and_then(|()| wal.checkpoint(&*self.db))
+            .is_ok()
             && let Some(path) = &self.wal_path
         {
             let _ = std::fs::remove_file(path);
@@ -357,7 +394,8 @@ mod tests {
 
     impl TempPath {
         fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("sequoia-{name}-{}.db", std::process::id()));
+            let path =
+                std::env::temp_dir().join(format!("sequoia-{name}-{}.db", std::process::id()));
             let _ = std::fs::remove_file(&path);
             TempPath(path)
         }
@@ -435,7 +473,11 @@ mod tests {
         assert_eq!(disk.allocate_page().unwrap(), PageId(3));
         assert_eq!(disk.allocate_page().unwrap(), PageId(1));
         assert_eq!(read(&disk, PageId(1)), ZERO_PAGE, "reused pages are zeroed");
-        assert_eq!(disk.allocate_page().unwrap(), PageId(4), "free list exhausted, file grows");
+        assert_eq!(
+            disk.allocate_page().unwrap(),
+            PageId(4),
+            "free list exhausted, file grows"
+        );
         assert_eq!(disk.page_count(), 5);
     }
 
@@ -453,7 +495,11 @@ mod tests {
         disk.rollback().unwrap();
         assert_eq!((disk.page_count(), disk.root_page()), (2, None));
         assert_eq!(read(&disk, a), filled(1));
-        assert_eq!(disk.allocate_page().unwrap(), b, "the free list is as it was");
+        assert_eq!(
+            disk.allocate_page().unwrap(),
+            b,
+            "the free list is as it was"
+        );
     }
 
     #[test]
@@ -482,7 +528,10 @@ mod tests {
         let savepoint = disk.savepoint();
         disk.write_page(a, &filled(5)).unwrap();
         disk.commit().unwrap();
-        assert!(disk.rollback_to(&savepoint).is_err(), "from before a commit");
+        assert!(
+            disk.rollback_to(&savepoint).is_err(),
+            "from before a commit"
+        );
         assert_eq!(read(&disk, a), filled(5));
     }
 
@@ -497,9 +546,16 @@ mod tests {
             disk.commit().unwrap();
             disk.write_page(id, &filled(2)).unwrap();
             disk.allocate_page().unwrap();
-            assert_eq!(std::fs::metadata(&path.0).unwrap().len(), 0, "nothing is checkpointed yet");
+            assert_eq!(
+                std::fs::metadata(&path.0).unwrap().len(),
+                0,
+                "nothing is checkpointed yet"
+            );
         }
-        assert!(!std::path::Path::new(&wal).exists(), "a clean close removes the log");
+        assert!(
+            !std::path::Path::new(&wal).exists(),
+            "a clean close removes the log"
+        );
         let disk = DiskManager::open(&path.0).unwrap();
         assert_eq!(disk.page_count(), 2);
         assert_eq!(read(&disk, PageId(1)), filled(1));
@@ -517,8 +573,14 @@ mod tests {
     fn rejects_invalid_page_ids() {
         let disk = DiskManager::in_memory();
         let mut page = ZERO_PAGE;
-        assert!(disk.read_page(PageId(0), &mut page).is_err(), "header page is private");
-        assert!(disk.read_page(PageId(1), &mut page).is_err(), "not allocated yet");
+        assert!(
+            disk.read_page(PageId(0), &mut page).is_err(),
+            "header page is private"
+        );
+        assert!(
+            disk.read_page(PageId(1), &mut page).is_err(),
+            "not allocated yet"
+        );
         assert!(disk.write_page(PageId(0), &page).is_err());
         assert!(disk.deallocate_page(PageId(0)).is_err());
         assert!(disk.set_root_page(Some(PageId(5))).is_err());
@@ -534,12 +596,22 @@ mod tests {
         std::fs::write(&path.0, filled(b'x')).unwrap();
         assert!(DiskManager::open(&path.0).is_err(), "bad magic");
 
-        let mut header = Header { page_count: 1, free_head: None, root: None }.encode();
+        let mut header = Header {
+            page_count: 1,
+            free_head: None,
+            root: None,
+        }
+        .encode();
         write_u32(&mut header, 12, 8192);
         std::fs::write(&path.0, header).unwrap();
         assert!(DiskManager::open(&path.0).is_err(), "page size mismatch");
 
-        let header = Header { page_count: 3, free_head: None, root: None }.encode();
+        let header = Header {
+            page_count: 3,
+            free_head: None,
+            root: None,
+        }
+        .encode();
         std::fs::write(&path.0, header).unwrap();
         assert!(DiskManager::open(&path.0).is_err(), "truncated file");
     }

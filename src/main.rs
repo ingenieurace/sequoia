@@ -26,13 +26,16 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             Some("") => args.next().ok_or("--replacer needs a policy")?,
             Some(rest) if rest.starts_with('=') => rest[1..].to_string(),
             _ if arg.starts_with('-') => return Err(format!("unknown option: {arg}")),
-            _ if parsed.path.is_some() => return Err(format!("more than one database file: {arg}")),
+            _ if parsed.path.is_some() => {
+                return Err(format!("more than one database file: {arg}"));
+            }
             _ => {
                 parsed.path = Some(arg);
                 continue;
             }
         };
-        let policy = Policy::from_name(&policy).ok_or(format!("unknown replacement policy: {policy} ({POLICIES})"))?;
+        let policy = Policy::from_name(&policy)
+            .ok_or(format!("unknown replacement policy: {policy} ({POLICIES})"))?;
         parsed.policy = Some(policy);
     }
     Ok(parsed)
@@ -118,13 +121,20 @@ fn command(db: &mut Database, line: &str) -> bool {
         (".model", Some("auto")) => db.set_execution_model(None),
         (".model", Some(name)) => match Model::from_name(name) {
             Some(model) => db.set_execution_model(Some(model)),
-            None => println!("unknown model: {name} (auto, iterator, materialization or vectorized)"),
+            None => {
+                println!("unknown model: {name} (auto, iterator, materialization or vectorized)")
+            }
         },
         (".replacer", None) => {
             let (stats, frames) = db.buffer_stats();
-            let rate = stats.hit_rate().map_or(String::new(), |rate| format!(" ({:.1}% hits)", rate * 100.0));
+            let rate = stats.hit_rate().map_or(String::new(), |rate| {
+                format!(" ({:.1}% hits)", rate * 100.0)
+            });
             println!("{}, {frames} frames", db.replacement_policy());
-            println!("since it was set: {} hits, {} misses{rate}", stats.hits, stats.misses);
+            println!(
+                "since it was set: {} hits, {} misses{rate}",
+                stats.hits, stats.misses
+            );
         }
         (".replacer", Some(name)) => match Policy::from_name(name) {
             Some(policy) => db.set_replacement_policy(policy),
@@ -146,13 +156,36 @@ mod tests {
     #[test]
     fn the_replacer_is_picked_on_the_command_line() {
         assert_eq!(args(""), Ok(Args::default()));
-        assert_eq!(args("my.db"), Ok(Args { path: Some("my.db".into()), policy: None }));
-        let both = Args { path: Some("my.db".into()), policy: Some(Policy::Clock) };
+        assert_eq!(
+            args("my.db"),
+            Ok(Args {
+                path: Some("my.db".into()),
+                policy: None
+            })
+        );
+        let both = Args {
+            path: Some("my.db".into()),
+            policy: Some(Policy::Clock),
+        };
         assert_eq!(args("my.db --replacer clock"), Ok(both));
-        assert_eq!(args("--replacer=LRU-2"), Ok(Args { path: None, policy: Some(Policy::LruK(2)) }));
-        assert_eq!(args("--replacer lru --replacer arc").unwrap().policy, Some(Policy::Arc), "the last wins");
+        assert_eq!(
+            args("--replacer=LRU-2"),
+            Ok(Args {
+                path: None,
+                policy: Some(Policy::LruK(2))
+            })
+        );
+        assert_eq!(
+            args("--replacer lru --replacer arc").unwrap().policy,
+            Some(Policy::Arc),
+            "the last wins"
+        );
         assert!(args("--replacer").unwrap_err().contains("needs a policy"));
-        assert!(args("--replacer fifo").unwrap_err().contains("unknown replacement policy: fifo"));
+        assert!(
+            args("--replacer fifo")
+                .unwrap_err()
+                .contains("unknown replacement policy: fifo")
+        );
         assert!(args("--frames 10").unwrap_err().contains("unknown option"));
         assert!(args("a.db b.db").unwrap_err().contains("more than one"));
     }

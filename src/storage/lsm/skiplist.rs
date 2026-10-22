@@ -53,8 +53,15 @@ struct Node<K, V> {
 
 impl<K: Ord, V> SkipList<K, V> {
     pub fn new() -> Self {
-        let head = Node { entry: None, next: vec![NIL; MAX_LEVEL] };
-        SkipList { nodes: vec![head], levels: 1, rng: 0x9E37_79B9_7F4A_7C15 }
+        let head = Node {
+            entry: None,
+            next: vec![NIL; MAX_LEVEL],
+        };
+        SkipList {
+            nodes: vec![head],
+            levels: 1,
+            rng: 0x9E37_79B9_7F4A_7C15,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -90,8 +97,15 @@ impl<K: Ord, V> SkipList<K, V> {
         // Levels new to the list start at the head, which `before` already says.
         self.levels = self.levels.max(height);
         let id = self.nodes.len();
-        let next = before[..height].iter().enumerate().map(|(level, &node)| self.nodes[node].next[level]).collect();
-        self.nodes.push(Node { entry: Some((key, value)), next });
+        let next = before[..height]
+            .iter()
+            .enumerate()
+            .map(|(level, &node)| self.nodes[node].next[level])
+            .collect();
+        self.nodes.push(Node {
+            entry: Some((key, value)),
+            next,
+        });
         for (level, &node) in before[..height].iter().enumerate() {
             self.nodes[node].next[level] = id;
         }
@@ -111,7 +125,10 @@ impl<K: Ord, V> SkipList<K, V> {
 
     /// Iterates over the entries in key order: level 0 from the head.
     pub fn iter(&self) -> Iter<'_, K, V> {
-        Iter { list: self, node: self.nodes[HEAD].next[0] }
+        Iter {
+            list: self,
+            node: self.nodes[HEAD].next[0],
+        }
     }
 
     /// Iterates over the entries with keys `>= start` in key order: level 0
@@ -120,7 +137,10 @@ impl<K: Ord, V> SkipList<K, V> {
     where
         K: Borrow<Q>,
     {
-        Iter { list: self, node: self.nodes[self.search(start, &mut [HEAD; MAX_LEVEL])].next[0] }
+        Iter {
+            list: self,
+            node: self.nodes[self.search(start, &mut [HEAD; MAX_LEVEL])].next[0],
+        }
     }
 
     pub fn clear(&mut self) {
@@ -231,7 +251,10 @@ mod tests {
 
     impl Rng {
         fn below(&mut self, n: u64) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (self.0 >> 33) % n
         }
     }
@@ -243,7 +266,11 @@ mod tests {
         let mut rng = Rng(7);
         for round in 0..20_000 {
             let key = rng.below(5000);
-            assert_eq!(list.insert(key, round), expected.insert(key, round), "round {round}");
+            assert_eq!(
+                list.insert(key, round),
+                expected.insert(key, round),
+                "round {round}"
+            );
             if round % 997 == 0 {
                 let probe = rng.below(5000);
                 assert_eq!(list.get(&probe), expected.get(&probe));
@@ -251,7 +278,10 @@ mod tests {
             }
         }
         assert_eq!(list.len(), expected.len());
-        assert!(list.iter().eq(expected.iter()), "same entries in the same order");
+        assert!(
+            list.iter().eq(expected.iter()),
+            "same entries in the same order"
+        );
         for key in 0..5000 {
             assert_eq!(list.get(&key), expected.get(&key));
         }
@@ -263,7 +293,11 @@ mod tests {
         list.insert(b"b".to_vec(), Some(b"2".to_vec()));
         list.insert(b"a".to_vec(), None);
         list.insert(b"ab".to_vec(), Some(b"3".to_vec()));
-        assert_eq!(list.get(b"a".as_slice()), Some(&None), "a tombstone is still an entry");
+        assert_eq!(
+            list.get(b"a".as_slice()),
+            Some(&None),
+            "a tombstone is still an entry"
+        );
         assert_eq!(list.get(b"ab".as_slice()), Some(&Some(b"3".to_vec())));
         assert_eq!(list.get(b"c".as_slice()), None);
         let keys: Vec<&[u8]> = list.iter().map(|(k, _)| k.as_slice()).collect();
@@ -276,13 +310,21 @@ mod tests {
         for i in 0..100_000 {
             list.insert(i, ());
         }
-        let on_level = |level: usize| list.nodes[1..].iter().filter(|node| node.next.len() > level).count();
+        let on_level = |level: usize| {
+            list.nodes[1..]
+                .iter()
+                .filter(|node| node.next.len() > level)
+                .count()
+        };
         assert_eq!(on_level(0), 100_000);
         for level in 1..4 {
             let ratio = on_level(level) as f64 / on_level(level - 1) as f64;
             assert!((0.2..0.3).contains(&ratio), "level {level}: {ratio}");
         }
-        assert!(list.levels <= MAX_LEVEL && list.levels >= 7, "about log4(100000) = 8 levels");
+        assert!(
+            list.levels <= MAX_LEVEL && list.levels >= 7,
+            "about log4(100000) = 8 levels"
+        );
     }
 
     #[test]
@@ -295,7 +337,10 @@ mod tests {
         assert_eq!(list.last_key(), Some(&99));
         list.clear();
         assert!(list.is_empty());
-        assert_eq!((list.get(&5), list.last_key(), list.iter().next()), (None, None, None));
+        assert_eq!(
+            (list.get(&5), list.last_key(), list.iter().next()),
+            (None, None, None)
+        );
         list.insert(3, 1);
         assert_eq!(list.iter().collect::<Vec<_>>(), [(&3, &1)]);
     }

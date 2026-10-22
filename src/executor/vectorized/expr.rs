@@ -26,7 +26,12 @@ use crate::sql::eval::{self, Field, Subqueries, eval_with, resolve};
 use crate::types::Value;
 
 /// Evaluates `expr` on every row of `batch`, whose columns are `fields`.
-pub fn eval(expr: &Expr, fields: &[Field], batch: &Batch, subqueries: &mut dyn Subqueries) -> Result<Rc<Vector>> {
+pub fn eval(
+    expr: &Expr,
+    fields: &[Field],
+    batch: &Batch,
+    subqueries: &mut dyn Subqueries,
+) -> Result<Rc<Vector>> {
     let n = batch.rows();
     if n == 0 {
         // Evaluated on no row, it fails on none.
@@ -39,7 +44,9 @@ pub fn eval(expr: &Expr, fields: &[Field], batch: &Batch, subqueries: &mut dyn S
         Expr::IsNull(inner, negated) => {
             let inner = eval(inner, fields, batch, subqueries)?;
             Rc::new(match &*inner {
-                Vector::Const(value, _) => Vector::Const(Value::Bool(value.is_null() != *negated), n),
+                Vector::Const(value, _) => {
+                    Vector::Const(Value::Bool(value.is_null() != *negated), n)
+                }
                 inner => Vector::Bool((0..n).map(|i| inner.is_null(i) != *negated).collect(), None),
             })
         }
@@ -65,15 +72,27 @@ pub fn eval(expr: &Expr, fields: &[Field], batch: &Batch, subqueries: &mut dyn S
                 let equal = binary(&value, BinaryOp::Eq, &item)?;
                 found = binary(&found, BinaryOp::Or, &equal)?;
             }
-            Rc::new(if *negated { unary(UnaryOp::Not, &found)? } else { found })
+            Rc::new(if *negated {
+                unary(UnaryOp::Not, &found)?
+            } else {
+                found
+            })
         }
         // Every argument is evaluated, so a column at a time.
         Expr::Function(function, args) if *function != Function::Coalesce => {
-            let args: Vec<Rc<Vector>> = args.iter().map(|arg| eval(arg, fields, batch, subqueries)).collect::<Result<_>>()?;
+            let args: Vec<Rc<Vector>> = args
+                .iter()
+                .map(|arg| eval(arg, fields, batch, subqueries))
+                .collect::<Result<_>>()?;
             let constant = args.iter().all(|arg| matches!(**arg, Vector::Const(..)));
             let rows = if constant { 1 } else { n };
             let values: Vec<Value> = (0..rows)
-                .map(|i| eval::apply(*function, &args.iter().map(|arg| arg.get(i)).collect::<Vec<_>>()))
+                .map(|i| {
+                    eval::apply(
+                        *function,
+                        &args.iter().map(|arg| arg.get(i)).collect::<Vec<_>>(),
+                    )
+                })
                 .collect::<Result<_>>()?;
             Rc::new(match constant {
                 true => Vector::Const(values.into_iter().next().expect("one row"), n),
@@ -144,7 +163,12 @@ fn spread(part: &Vector, at: &[usize], n: usize, fill: bool) -> Vector {
 }
 
 /// The rows of `batch` a WHERE clause is true for: their numbers, in order.
-pub fn select(predicate: &Expr, fields: &[Field], batch: &Batch, subqueries: &mut dyn Subqueries) -> Result<Vec<usize>> {
+pub fn select(
+    predicate: &Expr,
+    fields: &[Field],
+    batch: &Batch,
+    subqueries: &mut dyn Subqueries,
+) -> Result<Vec<usize>> {
     let n = batch.rows();
     let matches = eval(predicate, fields, batch, subqueries)?;
     Ok(match &*matches {
@@ -160,7 +184,12 @@ pub fn select(predicate: &Expr, fields: &[Field], batch: &Batch, subqueries: &mu
                 match other.get(i) {
                     Value::Bool(true) => keep.push(i),
                     Value::Bool(false) | Value::Null => {}
-                    value => return err(format!("WHERE clause must be boolean, got {}", value.to_sql())),
+                    value => {
+                        return err(format!(
+                            "WHERE clause must be boolean, got {}",
+                            value.to_sql()
+                        ));
+                    }
                 }
             }
             keep
@@ -172,13 +201,23 @@ fn unary(op: UnaryOp, vector: &Vector) -> Result<Vector> {
     let n = vector.len();
     Ok(match (op, vector) {
         (_, Vector::Const(value, _)) => Vector::Const(eval::unary(op, value.clone())?, n),
-        (UnaryOp::Not, Vector::Bool(values, nulls)) => Vector::Bool(values.iter().map(|b| !b).collect(), nulls.clone()),
-        (UnaryOp::Neg, Vector::Real(values, nulls)) => Vector::Real(values.iter().map(|r| -r).collect(), nulls.clone()),
+        (UnaryOp::Not, Vector::Bool(values, nulls)) => {
+            Vector::Bool(values.iter().map(|b| !b).collect(), nulls.clone())
+        }
+        (UnaryOp::Neg, Vector::Real(values, nulls)) => {
+            Vector::Real(values.iter().map(|r| -r).collect(), nulls.clone())
+        }
         (UnaryOp::Neg, Vector::Int(values, nulls)) => {
-            let (values, nulls) = map(n, &Typed::Many(values, nulls.as_deref()), |n| n.checked_neg().ok_or_else(eval::overflow))?;
+            let (values, nulls) = map(n, &Typed::Many(values, nulls.as_deref()), |n| {
+                n.checked_neg().ok_or_else(eval::overflow)
+            })?;
             Vector::Int(values, nulls)
         }
-        _ => Vector::from_values((0..n).map(|i| eval::unary(op, vector.get(i))).collect::<Result<_>>()?),
+        _ => Vector::from_values(
+            (0..n)
+                .map(|i| eval::unary(op, vector.get(i)))
+                .collect::<Result<_>>()?,
+        ),
     })
 }
 
@@ -214,7 +253,11 @@ fn typed(left: &Vector, op: BinaryOp, right: &Vector) -> Option<Result<Vector>> 
             let compared = if let (Some(a), Some(b)) = (ints(left), ints(right)) {
                 map2(n, &a, &b, |a, b| Ok(test(a.cmp(b))))
             } else if let (Some(a), Some(b)) = (reals(left), reals(right)) {
-                map2(n, &a, &b, |a, b| a.partial_cmp(b).map(test).ok_or_else(|| Error("cannot compare".into())))
+                map2(n, &a, &b, |a, b| {
+                    a.partial_cmp(b)
+                        .map(test)
+                        .ok_or_else(|| Error("cannot compare".into()))
+                })
             } else if let (Some(a), Some(b)) = (texts(left), texts(right)) {
                 map2(n, &a, &b, |a, b| Ok(test(a.cmp(b))))
             } else if let (Some(a), Some(b)) = (bools(left), bools(right)) {
@@ -251,7 +294,11 @@ fn typed(left: &Vector, op: BinaryOp, right: &Vector) -> Option<Result<Vector>> 
                     Mul => a * b,
                     _ => a / b,
                 };
-                if r.is_finite() { Ok(r) } else { err("REAL overflow") }
+                if r.is_finite() {
+                    Ok(r)
+                } else {
+                    err("REAL overflow")
+                }
             };
             let result = match (ints(left), reals(left), ints(right), reals(right)) {
                 (_, Some(a), _, Some(b)) => map2(n, &a, &b, |&a, &b| arithmetic(a, b)),
@@ -264,8 +311,10 @@ fn typed(left: &Vector, op: BinaryOp, right: &Vector) -> Option<Result<Vector>> 
         Like | Concat => {
             let (a, b) = (texts(left)?, texts(right)?);
             Some(match op {
-                Like => map2(n, &a, &b, |text, pattern| Ok(eval::like(text, pattern))).map(|(v, nulls)| Vector::Bool(v, nulls)),
-                _ => map2(n, &a, &b, |a, b| Ok(format!("{a}{b}"))).map(|(v, nulls)| Vector::Text(v, nulls)),
+                Like => map2(n, &a, &b, |text, pattern| Ok(eval::like(text, pattern)))
+                    .map(|(v, nulls)| Vector::Bool(v, nulls)),
+                _ => map2(n, &a, &b, |a, b| Ok(format!("{a}{b}")))
+                    .map(|(v, nulls)| Vector::Text(v, nulls)),
             })
         }
     }
@@ -300,7 +349,9 @@ enum Typed<'a, T> {
 impl<T> Typed<'_, T> {
     fn get(&self, i: usize) -> Option<&T> {
         match self {
-            Typed::Many(values, nulls) => (!nulls.is_some_and(|nulls| nulls[i])).then(|| &values[i]),
+            Typed::Many(values, nulls) => {
+                (!nulls.is_some_and(|nulls| nulls[i])).then(|| &values[i])
+            }
             Typed::One(value) => value.as_ref(),
         }
     }
@@ -325,7 +376,11 @@ typed_as!(bools, Bool, bool);
 typed_as!(texts, Text, String);
 
 /// `f` of each value that is not NULL; NULL where it is.
-fn map<A, R: Default>(n: usize, a: &Typed<A>, f: impl Fn(&A) -> Result<R>) -> Result<(Vec<R>, Nulls)> {
+fn map<A, R: Default>(
+    n: usize,
+    a: &Typed<A>,
+    f: impl Fn(&A) -> Result<R>,
+) -> Result<(Vec<R>, Nulls)> {
     map2(n, a, &Typed::<()>::One(Some(())), |a, _| f(a))
 }
 
@@ -339,10 +394,20 @@ fn map2<A, B, R: Default>(
     // The usual cases, without NULLs, as plain loops.
     match (a, b) {
         (Typed::Many(a, None), Typed::Many(b, None)) => {
-            return Ok((a.iter().zip(b.iter()).map(|(a, b)| f(a, b)).collect::<Result<_>>()?, None));
+            return Ok((
+                a.iter()
+                    .zip(b.iter())
+                    .map(|(a, b)| f(a, b))
+                    .collect::<Result<_>>()?,
+                None,
+            ));
         }
-        (Typed::Many(a, None), Typed::One(Some(b))) => return Ok((a.iter().map(|a| f(a, b)).collect::<Result<_>>()?, None)),
-        (Typed::One(Some(a)), Typed::Many(b, None)) => return Ok((b.iter().map(|b| f(a, b)).collect::<Result<_>>()?, None)),
+        (Typed::Many(a, None), Typed::One(Some(b))) => {
+            return Ok((a.iter().map(|a| f(a, b)).collect::<Result<_>>()?, None));
+        }
+        (Typed::One(Some(a)), Typed::Many(b, None)) => {
+            return Ok((b.iter().map(|b| f(a, b)).collect::<Result<_>>()?, None));
+        }
         _ => {}
     }
     let (mut values, mut nulls) = (Vec::with_capacity(n), None);
@@ -361,14 +426,22 @@ fn map2<A, B, R: Default>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::ast::{Projection, SelectItem, Statement};
     use crate::sql::eval::NoSubqueries;
     use crate::sql::parse;
-    use crate::sql::ast::{Projection, SelectItem, Statement};
 
     /// The expression of `SELECT <sql> FROM t`.
     fn expr(sql: &str) -> Expr {
-        let Statement::Select(select) = parse(&format!("SELECT {sql} FROM t")).unwrap().pop().unwrap() else { panic!() };
-        let Projection::Exprs(mut items) = select.projection else { panic!() };
+        let Statement::Select(select) = parse(&format!("SELECT {sql} FROM t"))
+            .unwrap()
+            .pop()
+            .unwrap()
+        else {
+            panic!()
+        };
+        let Projection::Exprs(mut items) = select.projection else {
+            panic!()
+        };
         let SelectItem { expr, .. } = items.remove(0);
         expr
     }
@@ -379,8 +452,12 @@ mod tests {
         let fields = vec![Field::named("a"), Field::named("b")];
         let batch = Batch::from_rows(rows.to_vec(), 2).keep(&(0..rows.len()).collect::<Vec<_>>());
         let expr = expr(sql);
-        let by_row: Result<Vec<Value>> = rows.iter().map(|row| eval_with(&expr, &fields, row, &mut NoSubqueries)).collect();
-        let by_column = eval(&expr, &fields, &batch, &mut NoSubqueries).map(|v| (0..rows.len()).map(|i| v.get(i)).collect());
+        let by_row: Result<Vec<Value>> = rows
+            .iter()
+            .map(|row| eval_with(&expr, &fields, row, &mut NoSubqueries))
+            .collect();
+        let by_column = eval(&expr, &fields, &batch, &mut NoSubqueries)
+            .map(|v| (0..rows.len()).map(|i| v.get(i)).collect());
         match (&by_row, &by_column) {
             (Ok(a), Ok(b)) => assert_eq!(a, b, "{sql}"),
             (Err(_), Err(_)) => {}
@@ -399,23 +476,53 @@ mod tests {
             vec![Int(7), Int(-2)],
         ];
         for sql in [
-            "a + b", "a - b * 2", "a / b", "a * 1.5", "-a", "a < b", "a = 7", "a <> b", "a IS NULL", "b IS NOT NULL",
-            "a > 0 AND b > 0", "a > 0 OR b > 0", "NOT (a > 0)", "a IN (1, 7, NULL)", "a NOT IN (2, 3)",
-            "ABS(a)", "COALESCE(a, b, 0)", "CASE WHEN a > b THEN 'big' ELSE 'small' END", "a + 0.5 > b",
-            "NULLIF(a, 7)", "1 + 2", "a || NULL",
+            "a + b",
+            "a - b * 2",
+            "a / b",
+            "a * 1.5",
+            "-a",
+            "a < b",
+            "a = 7",
+            "a <> b",
+            "a IS NULL",
+            "b IS NOT NULL",
+            "a > 0 AND b > 0",
+            "a > 0 OR b > 0",
+            "NOT (a > 0)",
+            "a IN (1, 7, NULL)",
+            "a NOT IN (2, 3)",
+            "ABS(a)",
+            "COALESCE(a, b, 0)",
+            "CASE WHEN a > b THEN 'big' ELSE 'small' END",
+            "a + 0.5 > b",
+            "NULLIF(a, 7)",
+            "1 + 2",
+            "a || NULL",
         ] {
             both(sql, &rows).unwrap_or_else(|e| panic!("{sql}: {e}"));
         }
         assert_eq!(both("a / b", &rows).unwrap(), [Int(0), Null, Null, Int(-3)]);
-        assert_eq!(both("a < b", &rows).unwrap(), [Bool(true), Null, Null, Bool(false)]);
+        assert_eq!(
+            both("a < b", &rows).unwrap(),
+            [Bool(true), Null, Null, Bool(false)]
+        );
         assert_eq!(both("a * 1.5", &rows).unwrap()[3], Real(10.5));
 
-        let texts = vec![vec![Text("ab".into()), Text("a%".into())], vec![Text("b".into()), Null]];
+        let texts = vec![
+            vec![Text("ab".into()), Text("a%".into())],
+            vec![Text("b".into()), Null],
+        ];
         assert_eq!(both("a LIKE b", &texts).unwrap(), [Bool(true), Null]);
         assert_eq!(both("a || b", &texts).unwrap(), [Text("aba%".into()), Null]);
-        assert_eq!(both("UPPER(a) < 'B'", &texts).unwrap(), [Bool(true), Bool(false)]);
+        assert_eq!(
+            both("UPPER(a) < 'B'", &texts).unwrap(),
+            [Bool(true), Bool(false)]
+        );
         // INTs and REALs compare exactly, as values do.
-        let numbers = vec![vec![Int(9_007_199_254_740_993), Real(9_007_199_254_740_992.0)]];
+        let numbers = vec![vec![
+            Int(9_007_199_254_740_993),
+            Real(9_007_199_254_740_992.0),
+        ]];
         assert_eq!(both("a > b", &numbers).unwrap(), [Bool(true)]);
     }
 
@@ -423,37 +530,87 @@ mod tests {
     fn and_or_evaluate_their_right_side_only_where_the_left_does_not_decide() {
         use Value::{Bool, Int, Null};
         let (t, f) = (Bool(true), Bool(false));
-        let rows = vec![vec![Int(0), Int(1)], vec![Int(2), Int(0)], vec![Null, Int(5)], vec![Int(5), Int(3)]];
+        let rows = vec![
+            vec![Int(0), Int(1)],
+            vec![Int(2), Int(0)],
+            vec![Null, Int(5)],
+            vec![Int(5), Int(3)],
+        ];
         // Each divides by zero on a row whose left side decides: a column at
         // a time, as a row at a time, it fails on none.
         for (sql, want) in [
-            ("a <> 0 AND 10 / a > 1", [f.clone(), t.clone(), Null, t.clone()]),
-            ("b = 0 OR a / b > 0", [f.clone(), t.clone(), Null, t.clone()]),
-            ("a <> 0 AND (b = 0 OR 10 / a / b > 0)", [f.clone(), t.clone(), Null, f.clone()]),
-            ("NOT (a = 0 OR 10 / a < 3)", [f.clone(), t.clone(), Null, f.clone()]),
+            (
+                "a <> 0 AND 10 / a > 1",
+                [f.clone(), t.clone(), Null, t.clone()],
+            ),
+            (
+                "b = 0 OR a / b > 0",
+                [f.clone(), t.clone(), Null, t.clone()],
+            ),
+            (
+                "a <> 0 AND (b = 0 OR 10 / a / b > 0)",
+                [f.clone(), t.clone(), Null, f.clone()],
+            ),
+            (
+                "NOT (a = 0 OR 10 / a < 3)",
+                [f.clone(), t.clone(), Null, f.clone()],
+            ),
             // Decided on every row: the right side runs on none.
-            ("COALESCE(a, 0) >= 0 OR 1 / 0 = 1", [t.clone(), t.clone(), t.clone(), t.clone()]),
-            ("COALESCE(a, 0) < -1 AND 1 / 0 = 1", [f.clone(), f.clone(), f.clone(), f.clone()]),
+            (
+                "COALESCE(a, 0) >= 0 OR 1 / 0 = 1",
+                [t.clone(), t.clone(), t.clone(), t.clone()],
+            ),
+            (
+                "COALESCE(a, 0) < -1 AND 1 / 0 = 1",
+                [f.clone(), f.clone(), f.clone(), f.clone()],
+            ),
             // CASE on the right side, row by row, only on the rows left open.
-            ("a <> 0 AND CASE WHEN 10 / a > 1 THEN TRUE END", [f.clone(), t.clone(), Null, t.clone()]),
+            (
+                "a <> 0 AND CASE WHEN 10 / a > 1 THEN TRUE END",
+                [f.clone(), t.clone(), Null, t.clone()],
+            ),
         ] {
-            assert_eq!(both(sql, &rows).unwrap_or_else(|e| panic!("{sql}: {e}")), want, "{sql}");
+            assert_eq!(
+                both(sql, &rows).unwrap_or_else(|e| panic!("{sql}: {e}")),
+                want,
+                "{sql}"
+            );
         }
         // Where the left side leaves a row open, NULL included, its error is an error.
         assert!(both("a <> 0 AND 10 / b > 1", &rows).is_err());
         assert!(both("a < -1 AND 1 / 0 = 1", &rows).is_err());
         assert!(both("a < -1 AND 1 / 0 = 1", &[vec![Int(-5), Int(0)]]).is_err());
         // A right side of the wrong type, only where it is evaluated.
-        assert!(both("a = 0 AND b", &rows[..1]).unwrap_err().to_string().contains("cannot apply"));
+        assert!(
+            both("a = 0 AND b", &rows[..1])
+                .unwrap_err()
+                .to_string()
+                .contains("cannot apply")
+        );
         let no_nulls = [rows[0].clone(), rows[1].clone(), rows[3].clone()];
-        assert_eq!(both("a = 7 AND b", &no_nulls).unwrap(), [f.clone(), f.clone(), f.clone()]);
-        assert!(both("a = 7 AND b", &rows).is_err(), "NULL = 7 leaves the row open");
+        assert_eq!(
+            both("a = 7 AND b", &no_nulls).unwrap(),
+            [f.clone(), f.clone(), f.clone()]
+        );
+        assert!(
+            both("a = 7 AND b", &rows).is_err(),
+            "NULL = 7 leaves the row open"
+        );
     }
 
     #[test]
     fn errors_are_errors_a_column_at_a_time_too() {
-        let rows = vec![vec![Value::Int(1), Value::Int(0)], vec![Value::Int(i64::MAX), Value::Int(1)]];
-        for sql in ["a / b", "a + a", "a + 'x'", "a AND b", "-(a - a - 9223372036854775807 - 1)"] {
+        let rows = vec![
+            vec![Value::Int(1), Value::Int(0)],
+            vec![Value::Int(i64::MAX), Value::Int(1)],
+        ];
+        for sql in [
+            "a / b",
+            "a + a",
+            "a + 'x'",
+            "a AND b",
+            "-(a - a - 9223372036854775807 - 1)",
+        ] {
             assert!(both(sql, &rows).is_err(), "{sql}");
         }
         // On rows whose values make no error, none.

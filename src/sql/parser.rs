@@ -7,16 +7,19 @@
 //! OR, AND, NOT, comparison / IS NULL / IN, + -, * /, unary -, primary.
 
 use super::ast::{
-    Aggregate, BinaryOp, ColumnRef, CreateIndex, Expr, From, Function, IndexKind, Join, JoinKind, OrderBy, Projection, Select, SelectItem, Statement,
-    TableRef, TableSource, UnaryOp,
+    Aggregate, BinaryOp, ColumnRef, CreateIndex, Expr, From, Function, IndexKind, Join, JoinKind,
+    OrderBy, Projection, Select, SelectItem, Statement, TableRef, TableSource, UnaryOp,
 };
-use crate::error::{Error, Result};
 use super::lexer::{Token, tokenize};
+use crate::error::{Error, Result};
 use crate::types::{Column, DataType, StorageKind, Value};
 
 /// Parses one or more `;`-separated statements.
 pub fn parse(sql: &str) -> Result<Vec<Statement>> {
-    let mut parser = Parser { tokens: tokenize(sql)?, pos: 0 };
+    let mut parser = Parser {
+        tokens: tokenize(sql)?,
+        pos: 0,
+    };
     let mut statements = Vec::new();
     loop {
         while parser.eat_symbol(";") {}
@@ -56,7 +59,10 @@ impl Parser {
                 // Not a keyword, so that it stays free as a name: no statement starts with it.
                 let analyze = matches!(self.peek(), Some(Token::Ident(word)) if word.eq_ignore_ascii_case("ANALYZE"));
                 self.pos += analyze as usize;
-                Ok(Statement::Explain { statement: Box::new(self.statement()?), analyze })
+                Ok(Statement::Explain {
+                    statement: Box::new(self.statement()?),
+                    analyze,
+                })
             }
             "INSERT" => self.insert(),
             "SELECT" => Ok(Statement::Select(self.select()?)),
@@ -68,13 +74,19 @@ impl Parser {
 
     /// BEGIN, COMMIT, ROLLBACK [TO], SAVEPOINT and RELEASE.
     fn transaction(&mut self) -> Result<Statement> {
-        let Some(Token::Keyword(keyword)) = self.peek().cloned() else { unreachable!("checked by statement") };
+        let Some(Token::Keyword(keyword)) = self.peek().cloned() else {
+            unreachable!("checked by statement")
+        };
         self.pos += 1;
         Ok(match keyword.as_str() {
-            "SAVEPOINT" => Statement::Savepoint { name: self.ident()? },
+            "SAVEPOINT" => Statement::Savepoint {
+                name: self.ident()?,
+            },
             "RELEASE" => {
                 self.eat_keyword("SAVEPOINT");
-                Statement::Release { name: self.ident()? }
+                Statement::Release {
+                    name: self.ident()?,
+                }
             }
             keyword => {
                 self.eat_keyword("TRANSACTION");
@@ -83,7 +95,9 @@ impl Parser {
                     "COMMIT" => Statement::Commit,
                     _ if self.eat_keyword("TO") => {
                         self.eat_keyword("SAVEPOINT");
-                        Statement::Rollback { savepoint: Some(self.ident()?) }
+                        Statement::Rollback {
+                            savepoint: Some(self.ident()?),
+                        }
                     }
                     _ => Statement::Rollback { savepoint: None },
                 }
@@ -112,10 +126,18 @@ impl Parser {
                 "HEAP" => StorageKind::Heap,
                 "LSM" => StorageKind::Lsm,
                 "COLUMN" => StorageKind::Column,
-                other => return Err(Error(format!("unknown storage: {other}, expected HEAP, LSM or COLUMN"))),
+                other => {
+                    return Err(Error(format!(
+                        "unknown storage: {other}, expected HEAP, LSM or COLUMN"
+                    )));
+                }
             };
         }
-        Ok(Statement::CreateTable { name, columns, storage })
+        Ok(Statement::CreateTable {
+            name,
+            columns,
+            storage,
+        })
     }
 
     fn column_def(&mut self) -> Result<Column> {
@@ -135,7 +157,11 @@ impl Parser {
         if primary_key {
             self.expect_keyword("KEY")?;
         }
-        Ok(Column { name, data_type, primary_key })
+        Ok(Column {
+            name,
+            data_type,
+            primary_key,
+        })
     }
 
     fn create_index(&mut self) -> Result<Statement> {
@@ -150,7 +176,11 @@ impl Parser {
             using = match self.ident()?.to_uppercase().as_str() {
                 "BTREE" => IndexKind::BTree,
                 "HASH" => IndexKind::Hash,
-                other => return Err(Error(format!("unknown index kind: {other}, expected BTREE or HASH"))),
+                other => {
+                    return Err(Error(format!(
+                        "unknown index kind: {other}, expected BTREE or HASH"
+                    )));
+                }
             };
         }
         self.expect_symbol("(")?;
@@ -167,17 +197,33 @@ impl Parser {
             }
             _ => Vec::new(),
         };
-        let predicate = if self.eat_keyword("WHERE") { Some(self.expr()?) } else { None };
-        Ok(Statement::CreateIndex(CreateIndex { name, table, using, keys, include, predicate, unique }))
+        let predicate = if self.eat_keyword("WHERE") {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        Ok(Statement::CreateIndex(CreateIndex {
+            name,
+            table,
+            using,
+            keys,
+            include,
+            predicate,
+            unique,
+        }))
     }
 
     fn drop(&mut self) -> Result<Statement> {
         self.expect_keyword("DROP")?;
         if self.eat_keyword("INDEX") {
-            return Ok(Statement::DropIndex { name: self.ident()? });
+            return Ok(Statement::DropIndex {
+                name: self.ident()?,
+            });
         }
         self.expect_keyword("TABLE")?;
-        Ok(Statement::DropTable { name: self.ident()? })
+        Ok(Statement::DropTable {
+            name: self.ident()?,
+        })
     }
 
     fn insert(&mut self) -> Result<Statement> {
@@ -199,7 +245,12 @@ impl Parser {
             Ok(values)
         })?;
         let returning = self.returning()?;
-        Ok(Statement::Insert { table, columns, rows, returning })
+        Ok(Statement::Insert {
+            table,
+            columns,
+            rows,
+            returning,
+        })
     }
 
     /// `[RETURNING * | expr [AS name], ...]` at the end of an INSERT, UPDATE or DELETE.
@@ -276,7 +327,18 @@ impl Parser {
             false => None,
         };
         let (order_by, limit, offset, compound) = (Vec::new(), None, None, Vec::new());
-        Ok(Select { distinct, from, projection, filter, group_by, having, order_by, limit, offset, compound })
+        Ok(Select {
+            distinct,
+            from,
+            projection,
+            filter,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
+            compound,
+        })
     }
 
     /// `table [, table | [INNER | LEFT [OUTER] | CROSS] JOIN table [ON expr]]...`
@@ -285,11 +347,19 @@ impl Parser {
         let mut joins = Vec::new();
         loop {
             let kind = if self.eat_symbol(",") {
-                joins.push(Join { kind: JoinKind::Inner, table: self.table_ref()?, on: None });
+                joins.push(Join {
+                    kind: JoinKind::Inner,
+                    table: self.table_ref()?,
+                    on: None,
+                });
                 continue;
             } else if self.eat_keyword("CROSS") {
                 self.expect_keyword("JOIN")?;
-                joins.push(Join { kind: JoinKind::Inner, table: self.table_ref()?, on: None });
+                joins.push(Join {
+                    kind: JoinKind::Inner,
+                    table: self.table_ref()?,
+                    on: None,
+                });
                 continue;
             } else if self.eat_keyword("LEFT") {
                 self.eat_keyword("OUTER");
@@ -305,7 +375,11 @@ impl Parser {
             };
             let table = self.table_ref()?;
             self.expect_keyword("ON")?;
-            joins.push(Join { kind, table, on: Some(self.expr()?) });
+            joins.push(Join {
+                kind,
+                table,
+                on: Some(self.expr()?),
+            });
         }
     }
 
@@ -340,7 +414,12 @@ impl Parser {
         })?;
         let filter = self.where_clause()?;
         let returning = self.returning()?;
-        Ok(Statement::Update { table, assignments, filter, returning })
+        Ok(Statement::Update {
+            table,
+            assignments,
+            filter,
+            returning,
+        })
     }
 
     fn delete(&mut self) -> Result<Statement> {
@@ -349,7 +428,11 @@ impl Parser {
         let table = self.ident()?;
         let filter = self.where_clause()?;
         let returning = self.returning()?;
-        Ok(Statement::Delete { table, filter, returning })
+        Ok(Statement::Delete {
+            table,
+            filter,
+            returning,
+        })
     }
 
     fn where_clause(&mut self) -> Result<Option<Expr>> {
@@ -400,13 +483,23 @@ impl Parser {
         if negated {
             self.pos += 1;
         }
-        let not = |expr: Expr| if negated { Expr::Unary(UnaryOp::Not, Box::new(expr)) } else { expr };
+        let not = |expr: Expr| {
+            if negated {
+                Expr::Unary(UnaryOp::Not, Box::new(expr))
+            } else {
+                expr
+            }
+        };
         if self.eat_keyword("BETWEEN") {
             // `a BETWEEN x AND y` is `a >= x AND a <= y`, which the planner can push down.
             let low = self.additive()?;
             self.expect_keyword("AND")?;
             let high = self.additive()?;
-            return Ok(not(binary(binary(left.clone(), BinaryOp::GtEq, low), BinaryOp::And, binary(left, BinaryOp::LtEq, high))));
+            return Ok(not(binary(
+                binary(left.clone(), BinaryOp::GtEq, low),
+                BinaryOp::And,
+                binary(left, BinaryOp::LtEq, high),
+            )));
         }
         if self.eat_keyword("LIKE") {
             return Ok(not(binary(left, BinaryOp::Like, self.additive()?)));
@@ -500,15 +593,22 @@ impl Parser {
             Some(Token::Number(n)) => Expr::Literal(Value::Int(*n)),
             Some(Token::Real(r)) => Expr::Literal(Value::Real(*r)),
             Some(Token::Str(s)) => Expr::Literal(Value::Text(s.clone())),
-            Some(Token::Ident(name)) if self.tokens.get(self.pos + 1) == Some(&Token::Symbol("(")) => {
+            Some(Token::Ident(name))
+                if self.tokens.get(self.pos + 1) == Some(&Token::Symbol("(")) =>
+            {
                 let name = name.clone();
                 self.pos += 2;
                 return self.aggregate(&name);
             }
-            Some(Token::Ident(table)) if self.tokens.get(self.pos + 1) == Some(&Token::Symbol(".")) => {
+            Some(Token::Ident(table))
+                if self.tokens.get(self.pos + 1) == Some(&Token::Symbol(".")) =>
+            {
                 let table = table.clone();
                 self.pos += 2;
-                return Ok(Expr::Column(ColumnRef { table: Some(table), name: self.ident()? }));
+                return Ok(Expr::Column(ColumnRef {
+                    table: Some(table),
+                    name: self.ident()?,
+                }));
             }
             Some(Token::Ident(name)) => Expr::Column(ColumnRef::bare(name.clone())),
             Some(Token::Keyword(k)) if k == "NULL" => Expr::Literal(Value::Null),
@@ -540,7 +640,11 @@ impl Parser {
             false => None,
         };
         self.expect_keyword("END")?;
-        Ok(Expr::Case { operand, branches, otherwise })
+        Ok(Expr::Case {
+            operand,
+            branches,
+            otherwise,
+        })
     }
 
     /// The rest of `name(...)` after its opening parenthesis: an aggregate or a scalar function.
@@ -557,7 +661,10 @@ impl Parser {
             let (fewest, most) = function.arity();
             if args.len() < fewest || args.len() > most {
                 let name = function.name().to_uppercase();
-                return Err(Error(format!("wrong number of arguments to {name}: {}", args.len())));
+                return Err(Error(format!(
+                    "wrong number of arguments to {name}: {}",
+                    args.len()
+                )));
             }
             return Ok(Expr::Function(function, args));
         };

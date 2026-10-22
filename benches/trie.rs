@@ -59,12 +59,24 @@ const MAPS: [&str; 5] = ["BTreeMap", "SkipList", "Trie", "RadixTree", "ART"];
 const ROWS: [&str; 6] = ["insert", "hit", "miss", "scan", "seek", "memory"];
 
 fn main() {
-    let ints = |seed| random(seed).take(KEYS).map(|x| x.to_be_bytes().to_vec()).collect::<Vec<_>>();
+    let ints = |seed| {
+        random(seed)
+            .take(KEYS)
+            .map(|x| x.to_be_bytes().to_vec())
+            .collect::<Vec<_>>()
+    };
     let fields = ["email", "name", "phone", "address", "created"];
     let texts = |seed| {
         random(seed)
             .take(KEYS)
-            .map(|x| format!("user/{:06}/{}", x % 1_000_000, fields[(x >> 32) as usize % 5]).into_bytes())
+            .map(|x| {
+                format!(
+                    "user/{:06}/{}",
+                    x % 1_000_000,
+                    fields[(x >> 32) as usize % 5]
+                )
+                .into_bytes()
+            })
             .collect::<Vec<_>>()
     };
     for (group, keys, absent) in [("ints", ints(1), ints(2)), ("texts", texts(1), texts(2))] {
@@ -130,7 +142,10 @@ fn measure<M: SortedMap<u64> + Default>(keys: &[Vec<u8>], absent: &[Vec<u8>]) ->
             black_box(map.iter_from(key).take(10).count());
         }
     });
-    Column { times: [insert, hit, miss, scan, seek], memory }
+    Column {
+        times: [insert, hit, miss, scan, seek],
+        memory,
+    }
 }
 
 /// Loads an LSM tree with each kind of MemTable, then looks every key up.
@@ -138,8 +153,15 @@ fn lsm() {
     println!("\n{:<26}{:>16}{:>16}", "lsm: 200000 entries", "load", "get");
     for log_bytes in [64 << 10, 8 << 20] {
         for kind in MemTableKind::ALL {
-            let config = LsmConfig { log_bytes, memtable: kind, ..LsmConfig::default() };
-            let keys: Vec<Vec<u8>> = random(3).take(KEYS).map(|x| x.to_be_bytes().to_vec()).collect();
+            let config = LsmConfig {
+                log_bytes,
+                memtable: kind,
+                ..LsmConfig::default()
+            };
+            let keys: Vec<Vec<u8>> = random(3)
+                .take(KEYS)
+                .map(|x| x.to_be_bytes().to_vec())
+                .collect();
             let load = || {
                 let pool = Arc::new(BufferPool::new(Arc::new(DiskManager::in_memory()), 256));
                 let mut tree = LsmTree::create(pool, config).unwrap();
@@ -150,9 +172,16 @@ fn lsm() {
             };
             let load_time = fastest(|| _ = black_box(load()));
             let tree = load();
-            let get_time = fastest(|| keys.iter().for_each(|k| _ = black_box(tree.get(k).unwrap())));
+            let get_time = fastest(|| {
+                keys.iter()
+                    .for_each(|k| _ = black_box(tree.get(k).unwrap()))
+            });
             let label = format!("{} KB log, {kind:?}", log_bytes >> 10);
-            println!("  {label:<24}{:>16}{:>16}", common::shown(load_time).trim(), common::shown(get_time).trim());
+            println!(
+                "  {label:<24}{:>16}{:>16}",
+                common::shown(load_time).trim(),
+                common::shown(get_time).trim()
+            );
         }
     }
 }

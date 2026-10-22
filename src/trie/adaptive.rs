@@ -48,7 +48,11 @@ pub struct Small<V, const N: usize> {
 
 impl<V, const N: usize> Small<V, N> {
     fn new() -> Self {
-        Small { len: 0, keys: [0; N], children: array::from_fn(|_| None) }
+        Small {
+            len: 0,
+            keys: [0; N],
+            children: array::from_fn(|_| None),
+        }
     }
 
     fn find(&self, byte: u8) -> Result<usize, usize> {
@@ -76,7 +80,10 @@ impl<V, const N: usize> Small<V, N> {
     /// Moves the children, in order, into a larger or smaller kind of node.
     fn drain(&mut self) -> impl Iterator<Item = (u8, Child<V>)> + '_ {
         let len = mem::take(&mut self.len);
-        self.keys[..len].iter().zip(&mut self.children[..len]).map(|(&b, c)| (b, c.take().expect("in use")))
+        self.keys[..len]
+            .iter()
+            .zip(&mut self.children[..len])
+            .map(|(&b, c)| (b, c.take().expect("in use")))
     }
 }
 
@@ -89,11 +96,19 @@ pub struct Node48<V> {
 
 impl<V> Node48<V> {
     fn new() -> Self {
-        Node48 { len: 0, slots: [0; 256], children: array::from_fn(|_| None) }
+        Node48 {
+            len: 0,
+            slots: [0; 256],
+            children: array::from_fn(|_| None),
+        }
     }
 
     fn add(&mut self, byte: u8, child: Child<V>) {
-        let free = self.children.iter().position(Option::is_none).expect("not full");
+        let free = self
+            .children
+            .iter()
+            .position(Option::is_none)
+            .expect("not full");
         self.children[free] = Some(child);
         self.slots[byte as usize] = free as u8 + 1;
         self.len += 1;
@@ -159,7 +174,10 @@ impl<V> Children<V> for Adaptive<V> {
                 *self = Adaptive::N48(bigger);
             }
             Adaptive::N48(n) if n.len == 48 => {
-                let mut bigger = Box::new(Node256 { len: n.len, children: array::from_fn(|_| None) });
+                let mut bigger = Box::new(Node256 {
+                    len: n.len,
+                    children: array::from_fn(|_| None),
+                });
                 for byte in 0..256 {
                     if let slot @ 1.. = n.slots[byte] {
                         bigger.children[byte] = n.children[slot as usize - 1].take();
@@ -207,7 +225,10 @@ impl<V> Children<V> for Adaptive<V> {
                 let mut smaller = Small::new();
                 for byte in 0..256 {
                     if let slot @ 1.. = n.slots[byte] {
-                        smaller.add(byte as u8, n.children[slot as usize - 1].take().expect("in use"));
+                        smaller.add(
+                            byte as u8,
+                            n.children[slot as usize - 1].take().expect("in use"),
+                        );
                     }
                 }
                 *self = Adaptive::N16(Box::new(smaller));
@@ -231,7 +252,9 @@ impl<V> Children<V> for Adaptive<V> {
             Adaptive::N4(n) => next_small(n, from),
             Adaptive::N16(n) => next_small(n, from),
             Adaptive::N48(n) => (from as usize..256).find_map(|b| n.child(b).map(|c| (b as u8, c))),
-            Adaptive::N256(n) => (from as usize..256).find_map(|b| n.children[b].as_ref().map(|c| (b as u8, c))),
+            Adaptive::N256(n) => {
+                (from as usize..256).find_map(|b| n.children[b].as_ref().map(|c| (b as u8, c)))
+            }
         };
         found.map(|(b, c)| (b, &**c))
     }
@@ -285,8 +308,19 @@ mod tests {
             if shrunk.last().map(|(k, _)| *k) != Some(kind) {
                 shrunk.push((kind, art.root.children.len()));
             }
-            assert!(art.iter_from(&[]).map(|(k, _)| k[0]).eq(0..byte), "in order after removing {byte}");
+            assert!(
+                art.iter_from(&[]).map(|(k, _)| k[0]).eq(0..byte),
+                "in order after removing {byte}"
+            );
         }
-        assert_eq!(shrunk, [("Node256", 255), ("Node48", 37), ("Node16", 12), ("Node4", 3)]);
+        assert_eq!(
+            shrunk,
+            [
+                ("Node256", 255),
+                ("Node48", 37),
+                ("Node16", 12),
+                ("Node4", 3)
+            ]
+        );
     }
 }

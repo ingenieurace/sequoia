@@ -30,23 +30,83 @@ fn main() {
         (
             "point",
             vec![
-                points("heap, primary key", 1000, |i| format!("SELECT * FROM t WHERE id = {i}"), &["USING INDEX t_pkey"]),
-                points("heap, INT index", 1000, |i| format!("SELECT * FROM t WHERE k = {}", k(i)), &["USING INDEX t_k"]),
-                points("heap, TEXT index", 1000, |i| format!("SELECT * FROM t WHERE name = '{}'", name(i)), &["t_name"]),
+                points(
+                    "heap, primary key",
+                    1000,
+                    |i| format!("SELECT * FROM t WHERE id = {i}"),
+                    &["USING INDEX t_pkey"],
+                ),
+                points(
+                    "heap, INT index",
+                    1000,
+                    |i| format!("SELECT * FROM t WHERE k = {}", k(i)),
+                    &["USING INDEX t_k"],
+                ),
+                points(
+                    "heap, TEXT index",
+                    1000,
+                    |i| format!("SELECT * FROM t WHERE name = '{}'", name(i)),
+                    &["t_name"],
+                ),
                 // SQLite has no hash indexes: B-trees there.
-                points("heap, INT hash", 1000, |i| format!("SELECT * FROM h WHERE k = {}", k(i)), &["USING HASH INDEX h_k"]),
-                points("heap, TEXT hash", 1000, |i| format!("SELECT * FROM h WHERE name = '{}'", name(i)), &["HASH INDEX h_name"]),
-                points("heap, no such hash", 1000, |i| format!("SELECT * FROM h WHERE k = -1 - {i}"), &["HASH INDEX h_k"]),
-                points("heap, no such key", 1000, |i| format!("SELECT * FROM t WHERE id = {}", ROWS + i), &["t_pkey"]),
-                points("LSM, primary key", 1000, |i| format!("SELECT * FROM l WHERE id = {i}"), &["USING PRIMARY KEY"]),
+                points(
+                    "heap, INT hash",
+                    1000,
+                    |i| format!("SELECT * FROM h WHERE k = {}", k(i)),
+                    &["USING HASH INDEX h_k"],
+                ),
+                points(
+                    "heap, TEXT hash",
+                    1000,
+                    |i| format!("SELECT * FROM h WHERE name = '{}'", name(i)),
+                    &["HASH INDEX h_name"],
+                ),
+                points(
+                    "heap, no such hash",
+                    1000,
+                    |i| format!("SELECT * FROM h WHERE k = -1 - {i}"),
+                    &["HASH INDEX h_k"],
+                ),
+                points(
+                    "heap, no such key",
+                    1000,
+                    |i| format!("SELECT * FROM t WHERE id = {}", ROWS + i),
+                    &["t_pkey"],
+                ),
+                points(
+                    "LSM, primary key",
+                    1000,
+                    |i| format!("SELECT * FROM l WHERE id = {i}"),
+                    &["USING PRIMARY KEY"],
+                ),
                 // Every SSTable's key range holds the key: its Bloom filter rules it out.
-                points("LSM, no such key", 1000, |i| format!("SELECT * FROM l WHERE id = {}", i * 2 + 1), &["PRIMARY KEY"]),
+                points(
+                    "LSM, no such key",
+                    1000,
+                    |i| format!("SELECT * FROM l WHERE id = {}", i * 2 + 1),
+                    &["PRIMARY KEY"],
+                ),
                 // `+ 0` hides the key from the planner: every row is read.
-                points("heap, no index", 10, |i| format!("SELECT * FROM t WHERE id + 0 = {i}"), &["SCAN t"]),
-                points("LSM, no index", 10, |i| format!("SELECT * FROM l WHERE k = {}", k(i)), &["SCAN l"]),
+                points(
+                    "heap, no index",
+                    10,
+                    |i| format!("SELECT * FROM t WHERE id + 0 = {i}"),
+                    &["SCAN t"],
+                ),
+                points(
+                    "LSM, no index",
+                    10,
+                    |i| format!("SELECT * FROM l WHERE k = {}", k(i)),
+                    &["SCAN l"],
+                ),
                 // SQLite finds these by the index of its primary key: nothing to compare.
-                points("column, pushed down", 10, |i| format!("SELECT * FROM c WHERE id = {i}"), &["COMPRESSED CHUNKS"])
-                    .without_sqlite(),
+                points(
+                    "column, pushed down",
+                    10,
+                    |i| format!("SELECT * FROM c WHERE id = {i}"),
+                    &["COMPRESSED CHUNKS"],
+                )
+                .without_sqlite(),
             ],
         ),
         (
@@ -59,32 +119,67 @@ fn main() {
                 ranges("1%, read every row", 20, 10_000, "k + 0", &["SCAN t"]),
                 ranges("10%, read every row", 5, 100_000, "k + 0", &["SCAN t"]),
                 // Rows in `id` order are in the heap's order too: pages in a row.
-                points("1%, primary key", 20, |i| format!("SELECT * FROM t WHERE id >= {i} AND id < {}", i + 2000), &["t_pkey"]),
-                points("1%, one value of g", 20, |i| format!("SELECT * FROM t WHERE g = {}", i % 100), &["USING INDEX t_g"]),
+                points(
+                    "1%, primary key",
+                    20,
+                    |i| format!("SELECT * FROM t WHERE id >= {i} AND id < {}", i + 2000),
+                    &["t_pkey"],
+                ),
+                points(
+                    "1%, one value of g",
+                    20,
+                    |i| format!("SELECT * FROM t WHERE g = {}", i % 100),
+                    &["USING INDEX t_g"],
+                ),
                 // An LSM tree reads only the keys in the range, in key order.
-                points("1%, LSM key range", 5, |i| format!("SELECT * FROM l WHERE id >= {i} AND id < {}", i + 4000), &["USING PRIMARY KEY"]),
+                points(
+                    "1%, LSM key range",
+                    5,
+                    |i| format!("SELECT * FROM l WHERE id >= {i} AND id < {}", i + 4000),
+                    &["USING PRIMARY KEY"],
+                ),
             ],
         ),
     ];
 
-    common::run_queries(groups, &setup(), &format!("{ROWS} rows in each of four tables"));
+    common::run_queries(
+        groups,
+        &setup(),
+        &format!("{ROWS} rows in each of four tables"),
+    );
 }
 
 /// A batch of `count` queries made by `query` from row numbers spread out
 /// over the first 196,000 rows, which leaves 4,000 rows above each.
-fn points(name: &str, count: i64, query: impl Fn(i64) -> String, plan: &'static [&'static str]) -> Batch {
-    let statements = (0..count).map(|j| query(j * 7_919 % (ROWS - 4000))).collect();
+fn points(
+    name: &str,
+    count: i64,
+    query: impl Fn(i64) -> String,
+    plan: &'static [&'static str],
+) -> Batch {
+    let statements = (0..count)
+        .map(|j| query(j * 7_919 % (ROWS - 4000)))
+        .collect();
     batch(name, statements, plan).reading("note")
 }
 
 /// A batch of `count` queries, each reading the rows whose `column`, which
 /// is `k` or an expression of it, is in a range `width` wide, about one
 /// row in five.
-fn ranges(name: &str, count: i64, width: i64, column: &str, plan: &'static [&'static str]) -> Batch {
+fn ranges(
+    name: &str,
+    count: i64,
+    width: i64,
+    column: &str,
+    plan: &'static [&'static str],
+) -> Batch {
     let statements = (0..count)
         .map(|j| {
             let from = j * 104_729 % (P - width);
-            format!("SELECT * FROM t WHERE {column} >= {from} AND {column} < {}", from + width)
+            format!(
+                "SELECT * FROM t WHERE {column} >= {from} AND {column} < {}",
+                from + width
+            )
         })
         .collect();
     batch(name, statements, plan).reading("note")
@@ -108,10 +203,29 @@ fn setup() -> Vec<String> {
         sql.push(format!("CREATE TABLE {table} (id INT PRIMARY KEY, k INT, g INT, name TEXT, note TEXT) USING {engine}"));
         let id = |i: i64| if table == "l" { i * 2 } else { i };
         insert(&mut sql, table, ROWS, |i| {
-            format!("({}, {}, {}, '{}', 'row {i} of the lookup benchmark')", id(i), k(i), i % 100, name(i))
+            format!(
+                "({}, {}, {}, '{}', 'row {i} of the lookup benchmark')",
+                id(i),
+                k(i),
+                i % 100,
+                name(i)
+            )
         });
     }
-    sql.extend(["CREATE UNIQUE INDEX t_k ON t (k)", "CREATE INDEX t_g ON t (g)", "CREATE INDEX t_name ON t (name)"].map(String::from));
-    sql.extend(["CREATE UNIQUE INDEX h_k ON h USING HASH (k)", "CREATE INDEX h_name ON h USING HASH (name)"].map(String::from));
+    sql.extend(
+        [
+            "CREATE UNIQUE INDEX t_k ON t (k)",
+            "CREATE INDEX t_g ON t (g)",
+            "CREATE INDEX t_name ON t (name)",
+        ]
+        .map(String::from),
+    );
+    sql.extend(
+        [
+            "CREATE UNIQUE INDEX h_k ON h USING HASH (k)",
+            "CREATE INDEX h_name ON h USING HASH (name)",
+        ]
+        .map(String::from),
+    );
     sql
 }

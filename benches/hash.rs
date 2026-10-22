@@ -24,7 +24,8 @@ const KEYS: usize = 200_000;
 const RUNS: usize = 5;
 const GROUPS: [&str; 4] = ["insert", "hit", "miss", "delete"];
 /// A B+ tree, then a hash file of each scheme.
-const STRUCTURES: [Option<HashScheme>; 3] = [None, Some(HashScheme::Extendible), Some(HashScheme::Linear)];
+const STRUCTURES: [Option<HashScheme>; 3] =
+    [None, Some(HashScheme::Extendible), Some(HashScheme::Linear)];
 
 fn main() {
     let present = random(1, KEYS);
@@ -39,15 +40,37 @@ fn main() {
     };
     let full: Vec<Paged> = STRUCTURES.iter().map(|&scheme| filled(scheme)).collect();
 
-    println!("{:<12}{:>13}{:>13}{:>13}", format!("{KEYS} entries"), "B+ tree", "Extendible", "Linear");
+    println!(
+        "{:<12}{:>13}{:>13}{:>13}",
+        format!("{KEYS} entries"),
+        "B+ tree",
+        "Extendible",
+        "Linear"
+    );
     for group in GROUPS.into_iter().filter(|group| common::wanted(group)) {
         print!("  {group:<10}");
         for (i, &scheme) in STRUCTURES.iter().enumerate() {
             let time = match group {
-                "insert" => fastest(|| Paged::new(scheme), |paged| present.iter().for_each(|&k| paged.insert(k))),
-                "hit" => fastest(|| (), |_| shuffled.iter().for_each(|&k| assert_eq!(full[i].find(k), 1))),
-                "miss" => fastest(|| (), |_| absent.iter().for_each(|&k| assert_eq!(full[i].find(k), 0))),
-                "delete" => fastest(|| filled(scheme), |paged| shuffled.iter().for_each(|&k| paged.delete(k))),
+                "insert" => fastest(
+                    || Paged::new(scheme),
+                    |paged| present.iter().for_each(|&k| paged.insert(k)),
+                ),
+                "hit" => fastest(
+                    || (),
+                    |_| {
+                        shuffled
+                            .iter()
+                            .for_each(|&k| assert_eq!(full[i].find(k), 1))
+                    },
+                ),
+                "miss" => fastest(
+                    || (),
+                    |_| absent.iter().for_each(|&k| assert_eq!(full[i].find(k), 0)),
+                ),
+                "delete" => fastest(
+                    || filled(scheme),
+                    |paged| shuffled.iter().for_each(|&k| paged.delete(k)),
+                ),
                 _ => unreachable!("a group of GROUPS"),
             };
             print!("{:>13}", common::shown(time).trim());
@@ -74,7 +97,9 @@ impl Paged {
     fn insert(&self, key: u64) {
         match self {
             Paged::Tree(tree) => _ = tree.insert(&entry(key)).unwrap(),
-            Paged::Hash(file) => file.insert(hash::hash(&key.to_be_bytes()), &entry(key)).unwrap(),
+            Paged::Hash(file) => file
+                .insert(hash::hash(&key.to_be_bytes()), &entry(key))
+                .unwrap(),
         }
     }
 
@@ -82,7 +107,10 @@ impl Paged {
     fn find(&self, key: u64) -> usize {
         let key = key.to_be_bytes();
         match self {
-            Paged::Tree(tree) => tree.range(&key).take_while(|e| e.as_ref().unwrap().starts_with(&key)).count(),
+            Paged::Tree(tree) => tree
+                .range(&key)
+                .take_while(|e| e.as_ref().unwrap().starts_with(&key))
+                .count(),
             Paged::Hash(file) => file.find(hash::hash(&key), &key).unwrap().len(),
         }
     }
@@ -90,7 +118,11 @@ impl Paged {
     fn delete(&self, key: u64) {
         match self {
             Paged::Tree(tree) => _ = tree.delete(&entry(key)).unwrap(),
-            Paged::Hash(file) => _ = file.delete(hash::hash(&key.to_be_bytes()), &entry(key)).unwrap(),
+            Paged::Hash(file) => {
+                _ = file
+                    .delete(hash::hash(&key.to_be_bytes()), &entry(key))
+                    .unwrap()
+            }
         }
     }
 }

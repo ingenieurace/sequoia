@@ -38,24 +38,44 @@ pub struct Case {
 }
 
 pub fn case(name: &'static str, sql: &'static str, plan: &'static [&'static str]) -> Case {
-    Case { name, sql, plan, join_memory: JOIN_MEMORY, sort_memory: SORT_MEMORY, hash_memory: HASH_MEMORY, sqlite: true }
+    Case {
+        name,
+        sql,
+        plan,
+        join_memory: JOIN_MEMORY,
+        sort_memory: SORT_MEMORY,
+        hash_memory: HASH_MEMORY,
+        sqlite: true,
+    }
 }
 
 impl Case {
     pub fn without_sqlite(self) -> Case {
-        Case { sqlite: false, ..self }
+        Case {
+            sqlite: false,
+            ..self
+        }
     }
 
     pub fn join_memory(self, bytes: usize) -> Case {
-        Case { join_memory: bytes, ..self }
+        Case {
+            join_memory: bytes,
+            ..self
+        }
     }
 
     pub fn sort_memory(self, bytes: usize) -> Case {
-        Case { sort_memory: bytes, ..self }
+        Case {
+            sort_memory: bytes,
+            ..self
+        }
     }
 
     pub fn hash_memory(self, bytes: usize) -> Case {
-        Case { hash_memory: bytes, ..self }
+        Case {
+            hash_memory: bytes,
+            ..self
+        }
     }
 }
 
@@ -71,7 +91,10 @@ pub fn run(groups: Vec<(&'static str, Vec<Case>)>, setup: &[String], rows: &str)
         false => sqlite(setup, &cases),
     };
     if lite.is_some() {
-        println!("sqlite3 filled the tables and ran every query in {:.1} s", start.elapsed().as_secs_f64());
+        println!(
+            "sqlite3 filled the tables and ran every query in {:.1} s",
+            start.elapsed().as_secs_f64()
+        );
     }
 
     let start = Instant::now();
@@ -79,7 +102,10 @@ pub fn run(groups: Vec<(&'static str, Vec<Case>)>, setup: &[String], rows: &str)
     for sql in setup {
         db.execute(sql).unwrap();
     }
-    println!("{rows}; tables filled in {:.1} s", start.elapsed().as_secs_f64());
+    println!(
+        "{rows}; tables filled in {:.1} s",
+        start.elapsed().as_secs_f64()
+    );
     let mut lite = lite.map(Vec::into_iter);
     for (group, cases) in &groups {
         header(group, lite.is_some());
@@ -169,7 +195,12 @@ fn sqlite(setup: &[String], cases: &[&Case]) -> Option<Vec<(Option<Duration>, Op
             script += &format!("SELECT COUNT(*) FROM ({});\n", case.sql);
         }
     }
-    child.stdin.take().expect("piped").write_all(script.as_bytes()).ok()?;
+    child
+        .stdin
+        .take()
+        .expect("piped")
+        .write_all(script.as_bytes())
+        .ok()?;
     let output = child.wait_with_output().ok()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !stderr.trim().is_empty() {
@@ -182,7 +213,10 @@ fn sqlite(setup: &[String], cases: &[&Case]) -> Option<Vec<(Option<Duration>, Op
         if let Some(i) = line.strip_prefix("@case ") {
             at = i.parse::<usize>().ok();
         } else if let (Some(i), Some(rest)) = (at, line.strip_prefix("Run Time: real ")) {
-            let time = rest.split_whitespace().next().and_then(|s| s.parse::<f64>().ok());
+            let time = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<f64>().ok());
             let time = Duration::from_secs_f64(time?);
             results[i].0 = Some(results[i].0.map_or(time, |best: Duration| best.min(time)));
         } else if let (Some(i), Ok(rows)) = (at, line.trim().parse::<usize>()) {
@@ -217,7 +251,11 @@ fn for_sqlite(sql: &str) -> String {
     if sql == "CHECKPOINT" {
         return "PRAGMA wal_checkpoint(TRUNCATE)".into();
     }
-    ["HEAP", "LSM", "COLUMN", "HASH"].iter().fold(sql.to_string(), |sql, using| sql.replace(&format!(" USING {using}"), ""))
+    ["HEAP", "LSM", "COLUMN", "HASH"]
+        .iter()
+        .fold(sql.to_string(), |sql, using| {
+            sql.replace(&format!(" USING {using}"), "")
+        })
 }
 
 /// Statements timed together, and the words that the plan of the first
@@ -234,8 +272,19 @@ pub struct Batch {
     reading: Option<&'static str>,
 }
 
-pub fn batch(name: impl Into<String>, statements: Vec<String>, plan: &'static [&'static str]) -> Batch {
-    Batch { name: name.into(), setup: Vec::new(), statements, plan, sqlite: true, reading: None }
+pub fn batch(
+    name: impl Into<String>,
+    statements: Vec<String>,
+    plan: &'static [&'static str],
+) -> Batch {
+    Batch {
+        name: name.into(),
+        setup: Vec::new(),
+        statements,
+        plan,
+        sqlite: true,
+        reading: None,
+    }
 }
 
 impl Batch {
@@ -245,14 +294,20 @@ impl Batch {
     }
 
     pub fn without_sqlite(self) -> Batch {
-        Batch { sqlite: false, ..self }
+        Batch {
+            sqlite: false,
+            ..self
+        }
     }
 
     /// Makes SQLite read this column of each row a query returns, which
     /// must be NULL in none. Otherwise, counting the rows of a query that
     /// finds them by an index, SQLite reads only the index.
     pub fn reading(self, column: &'static str) -> Batch {
-        Batch { reading: Some(column), ..self }
+        Batch {
+            reading: Some(column),
+            ..self
+        }
     }
 }
 
@@ -270,12 +325,17 @@ pub fn run_queries(groups: Vec<(&'static str, Vec<Batch>)>, setup: &[String], ro
     let lite = match no_sqlite {
         true => None,
         false => {
-            let mut script: String = setup.iter().map(|sql| format!("{};\n", for_sqlite(sql))).collect();
+            let mut script: String = setup
+                .iter()
+                .map(|sql| format!("{};\n", for_sqlite(sql)))
+                .collect();
             script += ".timer on\n";
             for (i, batch) in batches.iter().enumerate().filter(|(_, batch)| batch.sqlite) {
                 for _ in 0..RUNS {
                     script += &format!(".print @case {i}\n");
-                    let read = batch.reading.map_or(String::new(), |c| format!(" WHERE {c} IS NOT NULL"));
+                    let read = batch
+                        .reading
+                        .map_or(String::new(), |c| format!(" WHERE {c} IS NOT NULL"));
                     for sql in &batch.statements {
                         script += &format!("SELECT COUNT(*) FROM ({sql}){read};\n");
                     }
@@ -285,7 +345,10 @@ pub fn run_queries(groups: Vec<(&'static str, Vec<Batch>)>, setup: &[String], ro
         }
     };
     if lite.is_some() {
-        println!("sqlite3 filled the tables and ran every batch in {:.1} s", start.elapsed().as_secs_f64());
+        println!(
+            "sqlite3 filled the tables and ran every batch in {:.1} s",
+            start.elapsed().as_secs_f64()
+        );
     }
 
     let start = Instant::now();
@@ -293,7 +356,10 @@ pub fn run_queries(groups: Vec<(&'static str, Vec<Batch>)>, setup: &[String], ro
     for sql in setup {
         db.execute(sql).unwrap();
     }
-    println!("{rows}; tables filled in {:.1} s", start.elapsed().as_secs_f64());
+    println!(
+        "{rows}; tables filled in {:.1} s",
+        start.elapsed().as_secs_f64()
+    );
     let mut at = 0;
     for (group, batches) in &groups {
         header(group, lite.is_some());
@@ -306,7 +372,15 @@ pub fn run_queries(groups: Vec<(&'static str, Vec<Batch>)>, setup: &[String], ro
                 rows = batch.statements.iter().map(|sql| count(&mut db, sql)).sum();
                 best = best.min(start.elapsed());
             }
-            println!("{}", line(batch, best, lite.as_ref().map(|lite| &lite[at][..]), Some(rows)));
+            println!(
+                "{}",
+                line(
+                    batch,
+                    best,
+                    lite.as_ref().map(|lite| &lite[at][..]),
+                    Some(rows)
+                )
+            );
             at += 1;
         }
     }
@@ -348,7 +422,10 @@ pub fn run_writes(groups: Vec<(&'static str, Vec<Batch>)>) {
         }
     };
     if lite.is_some() {
-        println!("sqlite3 ran every batch in {:.1} s", start.elapsed().as_secs_f64());
+        println!(
+            "sqlite3 ran every batch in {:.1} s",
+            start.elapsed().as_secs_f64()
+        );
     }
 
     println!("each run writes a new database in {}", dir.display());
@@ -373,7 +450,10 @@ pub fn run_writes(groups: Vec<(&'static str, Vec<Batch>)>) {
                 }
                 best = best.min(start.elapsed());
             }
-            println!("{}", line(batch, best, lite.as_ref().map(|lite| &lite[at][..]), None));
+            println!(
+                "{}",
+                line(batch, best, lite.as_ref().map(|lite| &lite[at][..]), None)
+            );
             at += 1;
         }
     }
@@ -392,12 +472,21 @@ fn remove_database(path: &Path) {
 /// The groups the arguments name, or every group, and whether `--no-sqlite` is given.
 fn pick<T>(groups: Vec<(&'static str, T)>) -> (Vec<(&'static str, T)>, bool) {
     let no_sqlite = std::env::args().any(|a| a == "--no-sqlite");
-    (groups.into_iter().filter(|(group, _)| wanted(group)).collect(), no_sqlite)
+    (
+        groups
+            .into_iter()
+            .filter(|(group, _)| wanted(group))
+            .collect(),
+        no_sqlite,
+    )
 }
 
 /// Whether the arguments name this group, or name no group at all.
 pub fn wanted(group: &str) -> bool {
-    let names: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with("--")).collect();
+    let names: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| !a.starts_with("--"))
+        .collect();
     names.is_empty() || names.iter().any(|name| name == group)
 }
 
@@ -414,7 +503,11 @@ pub fn fastest<T>(mut f: impl FnMut() -> T) -> (Duration, T) {
 }
 
 fn header(group: &str, sqlite: bool) {
-    println!("\n{group:<30} {:>11}{}", "sequoia", if sqlite { "      sqlite3" } else { "" });
+    println!(
+        "\n{group:<30} {:>11}{}",
+        "sequoia",
+        if sqlite { "      sqlite3" } else { "" }
+    );
 }
 
 /// A batch's line: its time, SQLite's beside it if there is a column for
@@ -451,7 +544,11 @@ fn check_plan(db: &mut Database, batch: &Batch) {
     if batch.plan.is_empty() {
         return;
     }
-    let query = batch.statements.iter().find(|sql| ["SELECT", "UPDATE", "DELETE"].iter().any(|k| sql.starts_with(k)));
+    let query = batch.statements.iter().find(|sql| {
+        ["SELECT", "UPDATE", "DELETE"]
+            .iter()
+            .any(|k| sql.starts_with(k))
+    });
     let query = query.unwrap_or_else(|| panic!("{}: no query to check the plan of", batch.name));
     let plan = explain(db, query);
     for word in batch.plan {
@@ -513,7 +610,10 @@ fn sqlite_script(script: &str, batches: usize) -> Option<Vec<Vec<LiteRun>>> {
                 results[i].push(LiteRun::default());
             }
         } else if let (Some(i), Some(rest)) = (at, line.strip_prefix("Run Time: real ")) {
-            let time = rest.split_whitespace().next().and_then(|s| s.parse::<f64>().ok());
+            let time = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<f64>().ok());
             let run: &mut LiteRun = results[i].last_mut().expect("a run begun");
             run.time += Duration::from_secs_f64(time?);
         } else if let (Some(i), Ok(rows)) = (at, line.trim().parse::<usize>()) {

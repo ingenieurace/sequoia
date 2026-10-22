@@ -56,7 +56,9 @@ pub struct StepCount {
 
 impl Profile {
     pub fn new(steps: usize) -> Self {
-        Profile { steps: RefCell::new(vec![StepCount::default(); steps]) }
+        Profile {
+            steps: RefCell::new(vec![StepCount::default(); steps]),
+        }
     }
 
     pub fn counts(&self) -> Vec<StepCount> {
@@ -77,14 +79,22 @@ pub(super) type Step = Option<(Rc<Profile>, usize)>;
 
 /// The step `offset` steps after the first one below `step`.
 pub(super) fn below(step: &Step, offset: usize) -> Step {
-    step.as_ref().map(|(profile, id)| (profile.clone(), id + 1 + offset))
+    step.as_ref()
+        .map(|(profile, id)| (profile.clone(), id + 1 + offset))
 }
 
 /// Opens a plan step and everything below it, on tables of `catalog` (which
 /// subqueries read), its steps counted in `step` if given. No row is read
 /// until asked for.
-pub(super) fn open_step<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step: Step) -> Rows<'a> {
-    let Some((profile, id)) = step else { return open_node(node, catalog, settings, &None) };
+pub(super) fn open_step<'a>(
+    node: Node<'a>,
+    catalog: &'a Catalog,
+    settings: &Settings,
+    step: Step,
+) -> Rows<'a> {
+    let Some((profile, id)) = step else {
+        return open_node(node, catalog, settings, &None);
+    };
     let start = Instant::now();
     let rows = open_node(node, catalog, settings, &Some((profile.clone(), id)));
     profile.add(id, 1, 0, start.elapsed());
@@ -104,19 +114,43 @@ impl Iterator for Profiled<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         let start = Instant::now();
         let item = self.rows.next();
-        self.profile.add(self.id, 0, matches!(item, Some(Ok(_))) as u64, start.elapsed());
+        self.profile.add(
+            self.id,
+            0,
+            matches!(item, Some(Ok(_))) as u64,
+            start.elapsed(),
+        );
         item
     }
 }
 
-fn open_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step: &Step) -> Rows<'a> {
+fn open_node<'a>(
+    node: Node<'a>,
+    catalog: &'a Catalog,
+    settings: &Settings,
+    step: &Step,
+) -> Rows<'a> {
     let open = |node, step| open_step(node, catalog, settings, step);
     match node {
-        Node::Scan { table, needed, predicates, access, .. } => {
-            Box::new(table.scan_filtered(&needed, &predicates, &access).map(|item| item.map(|(_, row)| row)))
-        }
+        Node::Scan {
+            table,
+            needed,
+            predicates,
+            access,
+            ..
+        } => Box::new(
+            table
+                .scan_filtered(&needed, &predicates, &access)
+                .map(|item| item.map(|(_, row)| row)),
+        ),
         Node::Lookup { .. } => unreachable!("a lookup is only an index join's right side"),
-        Node::Join { left, right, kind, method, condition } => {
+        Node::Join {
+            left,
+            right,
+            kind,
+            method,
+            condition,
+        } => {
             let left_fields = left.columns();
             let right_step = below(step, left.steps());
             let left = open(*left, below(step, 0));
@@ -124,14 +158,29 @@ fn open_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step
                 let (settings, right_step) = (settings.clone(), right_step.clone());
                 move |node| open_step(node, catalog, &settings, right_step.clone())
             };
-            join(left, left_fields, *right, kind, method, condition, settings, &right_step, reopen)
+            join(
+                left,
+                left_fields,
+                *right,
+                kind,
+                method,
+                condition,
+                settings,
+                &right_step,
+                reopen,
+            )
         }
         Node::Filter { input, predicate } => {
             let columns = input.columns();
             let predicate = Some(locate(&predicate, &columns));
             let mut subqueries = Runner::new(catalog, settings);
             Box::new(open(*input, below(step, 0)).filter_map(move |item| {
-                match item.and_then(|row| Ok((matches_with(&predicate, &columns, &row, &mut subqueries)?, row))) {
+                match item.and_then(|row| {
+                    Ok((
+                        matches_with(&predicate, &columns, &row, &mut subqueries)?,
+                        row,
+                    ))
+                }) {
                     Ok((true, row)) => Some(Ok(row)),
                     Ok((false, _)) => None,
                     Err(e) => Some(Err(e)),
@@ -145,7 +194,11 @@ fn open_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step
                 Err(_) => true,
             }))
         }
-        Node::Limit { input, count, offset } => {
+        Node::Limit {
+            input,
+            count,
+            offset,
+        } => {
             // Skips rows, not errors, which end the query.
             let mut skipped = 0;
             let rows = open(*input, below(step, 0)).filter(move |item| {
@@ -175,7 +228,10 @@ fn open_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step
             let mut subqueries = Runner::new(catalog, settings);
             Box::new(open(*input, below(step, 0)).map(move |item| {
                 let row = item?;
-                exprs.iter().map(|e| eval_with(e, &columns, &row, &mut subqueries)).collect()
+                exprs
+                    .iter()
+                    .map(|e| eval_with(e, &columns, &row, &mut subqueries))
+                    .collect()
             }))
         }
         Node::Sort { input, keys, limit } => {
@@ -183,13 +239,34 @@ fn open_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step
             let input = open(*input, below(step, 0));
             let budget = settings.sort_memory;
             let mut subqueries = Runner::new(catalog, settings);
-            deferred(move || Ok(Box::new(sort(input, &columns, &keys, limit, budget, &mut subqueries)?)))
+            deferred(move || {
+                Ok(Box::new(sort(
+                    input,
+                    &columns,
+                    &keys,
+                    limit,
+                    budget,
+                    &mut subqueries,
+                )?))
+            })
         }
-        Node::Aggregate { input, group_by, aggregates } => {
+        Node::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
             let columns = input.columns();
             let input = open(*input, below(step, 0));
             let budget = settings.hash_memory;
-            deferred(move || Ok(Box::new(aggregate::fold(input, &columns, &group_by, &aggregates, budget)?)))
+            deferred(move || {
+                Ok(Box::new(aggregate::fold(
+                    input,
+                    &columns,
+                    &group_by,
+                    &aggregates,
+                    budget,
+                )?))
+            })
         }
     }
 }
@@ -215,39 +292,112 @@ pub(super) fn join<'a>(
         JoinMethod::Block => {
             let budget = settings.join_memory;
             let reopen = Box::new(move || open_right(right.clone()));
-            return Box::new(BlockJoin::new(left, left_fields, reopen, right_fields, kind, condition, budget));
+            return Box::new(BlockJoin::new(
+                left,
+                left_fields,
+                reopen,
+                right_fields,
+                kind,
+                condition,
+                budget,
+            ));
         }
-        JoinMethod::Merge { left_keys, right_keys, desc, then } => {
+        JoinMethod::Merge {
+            left_keys,
+            right_keys,
+            desc,
+            then,
+        } => {
             let right = open_right(right);
-            let sort = MergeSort { left_keys, right_keys, desc, then, budget: settings.sort_memory };
-            return Box::new(MergeJoin::new(left, left_fields, right, right_fields, sort, kind, condition));
+            let sort = MergeSort {
+                left_keys,
+                right_keys,
+                desc,
+                then,
+                budget: settings.sort_memory,
+            };
+            return Box::new(MergeJoin::new(
+                left,
+                left_fields,
+                right,
+                right_fields,
+                sort,
+                kind,
+                condition,
+            ));
         }
-        JoinMethod::Hash { left_keys, right_keys, keep_order } => {
+        JoinMethod::Hash {
+            left_keys,
+            right_keys,
+            keep_order,
+        } => {
             let source = open_right(right);
             let budget = settings.hash_memory;
-            let right = Right::hash(source, left_keys, right_keys, &left_fields, right_fields.clone(), budget);
+            let right = Right::hash(
+                source,
+                left_keys,
+                right_keys,
+                &left_fields,
+                right_fields.clone(),
+                budget,
+            );
             let join = Join::new(left, left_fields, right, right_fields, kind, condition);
-            return Box::new(if keep_order { join.keeping_order(settings.sort_memory) } else { join });
+            return Box::new(if keep_order {
+                join.keeping_order(settings.sort_memory)
+            } else {
+                join
+            });
         }
         JoinMethod::Index => {
             if let Some((profile, first)) = right_step {
                 let mut steps = profile.steps.borrow_mut();
-                steps[*first..*first + right.steps()].iter_mut().for_each(|count| count.inside = true);
+                steps[*first..*first + right.steps()]
+                    .iter_mut()
+                    .for_each(|count| count.inside = true);
             }
             let (filter, lookup) = match right {
                 Node::Filter { input, predicate } => (Some(predicate), *input),
                 node => (None, node),
             };
-            let Node::Lookup { table, qualifier, needed, column, key, left_key } = lookup else {
+            let Node::Lookup {
+                table,
+                qualifier,
+                needed,
+                column,
+                key,
+                left_key,
+            } = lookup
+            else {
                 unreachable!("an index join reads its right side through a lookup");
             };
             let fields = Field::of_table(&qualifier, &table.columns);
-            let (left_key, filter) = (locate(&left_key, &left_fields), filter.map(|f| locate(&f, &fields)));
-            let lookup = Lookup { table, needed, column, key, left_key, filter, fields };
-            Right::Index { lookup, rows: Vec::new() }
+            let (left_key, filter) = (
+                locate(&left_key, &left_fields),
+                filter.map(|f| locate(&f, &fields)),
+            );
+            let lookup = Lookup {
+                table,
+                needed,
+                column,
+                key,
+                left_key,
+                filter,
+                fields,
+            };
+            Right::Index {
+                lookup,
+                rows: Vec::new(),
+            }
         }
     };
-    Box::new(Join::new(left, left_fields, right, right_fields, kind, condition))
+    Box::new(Join::new(
+        left,
+        left_fields,
+        right,
+        right_fields,
+        kind,
+        condition,
+    ))
 }
 
 /// Reads all of `input`, whose columns are `columns`, and sorts it by
@@ -276,7 +426,10 @@ pub(super) fn sort(
 
 /// Rows that `start` produces, called when the first one is asked for.
 pub(super) fn deferred<'a>(start: impl FnOnce() -> Result<Rows<'a>> + 'a) -> Rows<'a> {
-    Box::new(Deferred { start: Some(Box::new(start)), rows: None })
+    Box::new(Deferred {
+        start: Some(Box::new(start)),
+        rows: None,
+    })
 }
 
 struct Deferred<'a> {

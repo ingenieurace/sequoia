@@ -53,16 +53,32 @@ pub type Batches<'a> = Box<dyn Iterator<Item = Result<Batch>> + 'a>;
 
 /// Opens a plan step and everything below it, its steps counted in `step`
 /// if given. No row is read until asked for.
-pub(super) fn open<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step: Step) -> Rows<'a> {
+pub(super) fn open<'a>(
+    node: Node<'a>,
+    catalog: &'a Catalog,
+    settings: &Settings,
+    step: Step,
+) -> Rows<'a> {
     rows_of(open_step(node, catalog, settings, step))
 }
 
-fn open_step<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step: Step) -> Batches<'a> {
-    let Some((profile, id)) = step else { return open_node(node, catalog, settings, &None) };
+fn open_step<'a>(
+    node: Node<'a>,
+    catalog: &'a Catalog,
+    settings: &Settings,
+    step: Step,
+) -> Batches<'a> {
+    let Some((profile, id)) = step else {
+        return open_node(node, catalog, settings, &None);
+    };
     let start = Instant::now();
     let batches = open_node(node, catalog, settings, &Some((profile.clone(), id)));
     profile.add(id, 1, 0, start.elapsed());
-    Box::new(Profiled { batches, profile, id })
+    Box::new(Profiled {
+        batches,
+        profile,
+        id,
+    })
 }
 
 /// A step's batches, their rows counted as they are asked for.
@@ -78,17 +94,31 @@ impl Iterator for Profiled<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         let start = Instant::now();
         let item = self.batches.next();
-        let rows = item.as_ref().and_then(|item| item.as_ref().ok()).map_or(0, Batch::rows);
+        let rows = item
+            .as_ref()
+            .and_then(|item| item.as_ref().ok())
+            .map_or(0, Batch::rows);
         self.profile.add(self.id, 0, rows as u64, start.elapsed());
         item
     }
 }
 
-fn open_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step: &Step) -> Batches<'a> {
+fn open_node<'a>(
+    node: Node<'a>,
+    catalog: &'a Catalog,
+    settings: &Settings,
+    step: &Step,
+) -> Batches<'a> {
     let open = |node, step| open_step(node, catalog, settings, step);
     let width = node.columns().len();
     match node {
-        Node::Scan { table, needed, predicates, access, .. } => scan(table, &needed, &predicates, &access),
+        Node::Scan {
+            table,
+            needed,
+            predicates,
+            access,
+            ..
+        } => scan(table, &needed, &predicates, &access),
         Node::Lookup { .. } => unreachable!("a lookup is only an index join's right side"),
         Node::Filter { input, predicate } => {
             let fields = input.columns();
@@ -115,14 +145,20 @@ fn open_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step
             let exprs = locate_all(&exprs, &fields);
             let mut subqueries = Runner::new(catalog, settings);
             each_batch(open(*input, below(step, 0)), move |batch| {
-                let columns = exprs.iter().map(|e| expr::eval(e, &fields, &batch, &mut subqueries));
+                let columns = exprs
+                    .iter()
+                    .map(|e| expr::eval(e, &fields, &batch, &mut subqueries));
                 if let Ok(columns) = columns.collect::<Result<Vec<_>>>() {
                     return (Batch::new(columns, batch.rows()), None);
                 }
                 let mut rows = Vec::new();
                 for i in 0..batch.rows() {
                     let row = batch.row(i);
-                    match exprs.iter().map(|e| eval_with(e, &fields, &row, &mut subqueries)).collect() {
+                    match exprs
+                        .iter()
+                        .map(|e| eval_with(e, &fields, &row, &mut subqueries))
+                        .collect()
+                    {
                         Ok(row) => rows.push(row),
                         Err(e) => return (Batch::from_rows(rows, exprs.len()), Some(e)),
                     }
@@ -130,13 +166,23 @@ fn open_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step
                 (Batch::from_rows(rows, exprs.len()), None)
             })
         }
-        Node::Limit { input, count, offset } => {
-            Box::new(Limit { input: open(*input, below(step, 0)), count, offset, skipped: 0, taken: 0 })
-        }
+        Node::Limit {
+            input,
+            count,
+            offset,
+        } => Box::new(Limit {
+            input: open(*input, below(step, 0)),
+            count,
+            offset,
+            skipped: 0,
+            taken: 0,
+        }),
         Node::Distinct { input } => {
             let mut seen = HashSet::new();
             each_batch(open(*input, below(step, 0)), move |batch| {
-                let keep: Vec<usize> = (0..batch.rows()).filter(|&i| seen.insert(batch.row(i))).collect();
+                let keep: Vec<usize> = (0..batch.rows())
+                    .filter(|&i| seen.insert(batch.row(i)))
+                    .collect();
                 (batch.keep(&keep), None)
             })
         }
@@ -156,17 +202,44 @@ fn open_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step
             let input = rows_of(open(*input, below(step, 0)));
             let budget = settings.sort_memory;
             let mut subqueries = Runner::new(catalog, settings);
-            let sorted = deferred(move || Ok(Box::new(operator::sort(input, &fields, &keys, limit, budget, &mut subqueries)?)));
+            let sorted = deferred(move || {
+                Ok(Box::new(operator::sort(
+                    input,
+                    &fields,
+                    &keys,
+                    limit,
+                    budget,
+                    &mut subqueries,
+                )?))
+            });
             batches_of(sorted, width)
         }
-        Node::Aggregate { input, group_by, aggregates } => {
+        Node::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
             let fields = input.columns();
             let input = open(*input, below(step, 0));
             let budget = settings.hash_memory;
-            let groups = deferred(move || Ok(Box::new(aggregate(input, &fields, &group_by, &aggregates, budget)?)));
+            let groups = deferred(move || {
+                Ok(Box::new(aggregate(
+                    input,
+                    &fields,
+                    &group_by,
+                    &aggregates,
+                    budget,
+                )?))
+            });
             batches_of(groups, width)
         }
-        Node::Join { left, right, kind, method, condition } => {
+        Node::Join {
+            left,
+            right,
+            kind,
+            method,
+            condition,
+        } => {
             let left_fields = left.columns();
             let right_step = below(step, left.steps());
             let left = rows_of(open(*left, below(step, 0)));
@@ -174,7 +247,17 @@ fn open_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step
                 let (settings, right_step) = (settings.clone(), right_step.clone());
                 move |node| rows_of(open_step(node, catalog, &settings, right_step.clone()))
             };
-            let joined = operator::join(left, left_fields, *right, kind, method, condition, settings, &right_step, reopen);
+            let joined = operator::join(
+                left,
+                left_fields,
+                *right,
+                kind,
+                method,
+                condition,
+                settings,
+                &right_step,
+                reopen,
+            );
             batches_of(joined, width)
         }
     }
@@ -182,7 +265,12 @@ fn open_node<'a>(node: Node<'a>, catalog: &'a Catalog, settings: &Settings, step
 
 /// Reads a table's rows as `scan_filtered` does, in batches: a column
 /// table's straight from its columns, others' taken apart into columns.
-fn scan<'a>(table: &'a Table, needed: &[bool], predicates: &[Predicate], access: &Access) -> Batches<'a> {
+fn scan<'a>(
+    table: &'a Table,
+    needed: &[bool],
+    predicates: &[Predicate],
+    access: &Access,
+) -> Batches<'a> {
     if let Some(chunks) = table.scan_by_column(needed, predicates, BATCH_SIZE) {
         return Box::new(chunks.map(|chunk| {
             let chunk = chunk?;
@@ -193,7 +281,9 @@ fn scan<'a>(table: &'a Table, needed: &[bool], predicates: &[Predicate], access:
             Ok(Batch::new(columns.collect(), rows))
         }));
     }
-    let rows = table.scan_filtered(needed, predicates, access).map(|item| item.map(|(_, row)| row));
+    let rows = table
+        .scan_filtered(needed, predicates, access)
+        .map(|item| item.map(|(_, row)| row));
     batches_of(Box::new(rows), table.columns.len())
 }
 
@@ -206,7 +296,10 @@ fn aggregate(
     aggregates: &[AggregateCall],
     budget: usize,
 ) -> Result<Groups> {
-    let (group_by, aggregates) = (locate_all(group_by, fields), aggregate::locate(aggregates, fields));
+    let (group_by, aggregates) = (
+        locate_all(group_by, fields),
+        aggregate::locate(aggregates, fields),
+    );
     let (group_by, aggregates) = (&group_by[..], &aggregates[..]);
     let mut folder = Folder::new(group_by.len(), aggregates, budget);
     for batch in input {
@@ -214,7 +307,10 @@ fn aggregate(
         let rows = batch.rows();
         let eval = |e: &Expr| expr::eval(e, fields, &batch, &mut NoSubqueries);
         let keys = group_by.iter().map(eval).collect::<Result<Vec<_>>>();
-        let args = aggregates.iter().map(|(_, arg, _)| arg.as_ref().map(eval).transpose()).collect::<Result<Vec<_>>>();
+        let args = aggregates
+            .iter()
+            .map(|(_, arg, _)| arg.as_ref().map(eval).transpose())
+            .collect::<Result<Vec<_>>>();
         match (keys, args) {
             (Ok(keys), Ok(args)) => {
                 if keys.is_empty() && folder.add_columns(rows, &args) {
@@ -222,7 +318,10 @@ fn aggregate(
                 }
                 for i in 0..rows {
                     let key = keys.iter().map(|key| key.get(i)).collect();
-                    folder.add(key, args.iter().map(|arg| arg.as_ref().map(|arg| arg.get(i))))?;
+                    folder.add(
+                        key,
+                        args.iter().map(|arg| arg.as_ref().map(|arg| arg.get(i))),
+                    )?;
                 }
             }
             _ => {
@@ -237,8 +336,16 @@ fn aggregate(
 
 /// Applies `f` to each batch of `input` with rows in it: `f` returns the
 /// batch to pass on, and the error to report after it, if it failed.
-fn each_batch<'a>(input: Batches<'a>, f: impl FnMut(Batch) -> (Batch, Option<Error>) + 'a) -> Batches<'a> {
-    Box::new(EachBatch { input, f, error: None, done: false })
+fn each_batch<'a>(
+    input: Batches<'a>,
+    f: impl FnMut(Batch) -> (Batch, Option<Error>) + 'a,
+) -> Batches<'a> {
+    Box::new(EachBatch {
+        input,
+        f,
+        error: None,
+        done: false,
+    })
 }
 
 struct EachBatch<'a, F> {
@@ -305,7 +412,9 @@ impl Iterator for Limit<'_> {
             let rows = batch.rows();
             let skip = (self.offset - self.skipped).min(rows);
             self.skipped += skip;
-            let take = self.count.map_or(rows - skip, |count| (count - self.taken).min(rows - skip));
+            let take = self
+                .count
+                .map_or(rows - skip, |count| (count - self.taken).min(rows - skip));
             self.taken += take;
             if take > 0 {
                 return Some(Ok(batch.keep(&(skip..skip + take).collect::<Vec<_>>())));
@@ -316,7 +425,10 @@ impl Iterator for Limit<'_> {
 
 /// The rows of batches, one at a time.
 fn rows_of(batches: Batches) -> Rows {
-    Box::new(RowsOf { batches, rows: Vec::new().into_iter() })
+    Box::new(RowsOf {
+        batches,
+        rows: Vec::new().into_iter(),
+    })
 }
 
 struct RowsOf<'a> {
@@ -343,7 +455,12 @@ impl Iterator for RowsOf<'_> {
 /// Rows `width` values long, put into batches of [`BATCH_SIZE`]; an error
 /// comes after a batch of the rows before it.
 fn batches_of(rows: Rows, width: usize) -> Batches {
-    Box::new(BatchesOf { rows, width, error: None, done: false })
+    Box::new(BatchesOf {
+        rows,
+        width,
+        error: None,
+        done: false,
+    })
 }
 
 struct BatchesOf<'a> {

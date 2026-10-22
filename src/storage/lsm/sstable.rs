@@ -20,10 +20,10 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::bloom::{self, Bloom};
+use crate::error::{Result, err};
 use crate::storage::buffer::pool::{BufferPool, PageWriteGuard};
 use crate::storage::io::disk::{PAGE_SIZE, Page, PageId};
 use crate::storage::page::SlottedPage;
-use crate::error::{Result, err};
 
 /// A key and its value, or `None` if the key was deleted.
 pub type Entry = (Vec<u8>, Option<Vec<u8>>);
@@ -39,7 +39,10 @@ pub struct SsTable {
 impl SsTable {
     /// Writes sorted entries to new pages and flushes them. Returns `None`,
     /// writing nothing, if there are no entries. Keys must be strictly increasing.
-    pub fn write(pool: Arc<BufferPool>, entries: impl IntoIterator<Item = Result<Entry>>) -> Result<Option<Self>> {
+    pub fn write(
+        pool: Arc<BufferPool>,
+        entries: impl IntoIterator<Item = Result<Entry>>,
+    ) -> Result<Option<Self>> {
         let mut pages: Vec<(PageId, Vec<u8>)> = Vec::new();
         let mut hashes = Vec::new();
         let mut max_key: Option<Vec<u8>> = None;
@@ -47,7 +50,10 @@ impl SsTable {
 
         for entry in entries {
             let (key, value) = entry?;
-            debug_assert!(max_key.as_ref().is_none_or(|max| *max < key), "keys must be sorted");
+            debug_assert!(
+                max_key.as_ref().is_none_or(|max| *max < key),
+                "keys must be sorted"
+            );
             let bytes = encode_entry(&key, value.as_deref());
             let fits = match &mut current {
                 Some(guard) => SlottedPage::new(&mut **guard).insert(&bytes).is_some(),
@@ -55,7 +61,9 @@ impl SsTable {
             };
             if !fits {
                 let mut new = pool.new_page()?;
-                SlottedPage::init(&mut *new).insert(&bytes).expect("an entry fits in an empty page");
+                SlottedPage::init(&mut *new)
+                    .insert(&bytes)
+                    .expect("an entry fits in an empty page");
                 let id = new.id();
                 if let Some(mut previous) = current.replace(new) {
                     SlottedPage::new(&mut *previous).set_next_page(Some(id));
@@ -67,11 +75,18 @@ impl SsTable {
         }
         drop(current);
 
-        let Some(max_key) = max_key else { return Ok(None) };
+        let Some(max_key) = max_key else {
+            return Ok(None);
+        };
         for &(id, _) in &pages {
             pool.flush_page(id)?;
         }
-        Ok(Some(SsTable { pool, pages, max_key, bloom: Bloom::new(&hashes) }))
+        Ok(Some(SsTable {
+            pool,
+            pages,
+            max_key,
+            bloom: Bloom::new(&hashes),
+        }))
     }
 
     /// Opens an SSTable written earlier, reading all of it to rebuild the summary.
@@ -94,9 +109,17 @@ impl SsTable {
             }
         }
         let Some(max_key) = max_key else {
-            return err(format!("corrupted SSTable at page {}: no entries", first_page.0));
+            return err(format!(
+                "corrupted SSTable at page {}: no entries",
+                first_page.0
+            ));
         };
-        Ok(SsTable { pool, pages, max_key, bloom: Bloom::new(&hashes) })
+        Ok(SsTable {
+            pool,
+            pages,
+            max_key,
+            bloom: Bloom::new(&hashes),
+        })
     }
 
     pub fn first_page(&self) -> PageId {
@@ -119,14 +142,19 @@ impl SsTable {
             return Ok(None);
         }
         // The last page whose first key is <= key.
-        let index = self.pages.partition_point(|(_, first)| first.as_slice() <= key) - 1;
+        let index = self
+            .pages
+            .partition_point(|(_, first)| first.as_slice() <= key)
+            - 1;
         let guard = self.pool.fetch_read(self.pages[index].0)?;
         let page = SlottedPage::new(&*guard);
 
         let (mut low, mut high) = (0, page.slot_count());
         while low < high {
             let mid = low + (high - low) / 2;
-            let Some(bytes) = page.get(mid) else { return err("corrupted SSTable: empty slot") };
+            let Some(bytes) = page.get(mid) else {
+                return err("corrupted SSTable: empty slot");
+            };
             let (found, value) = decode_entry(bytes)?;
             match found.cmp(key) {
                 std::cmp::Ordering::Less => low = mid + 1,
@@ -139,7 +167,11 @@ impl SsTable {
 
     /// Iterates over all entries in key order, tombstones included.
     pub fn iter(&self) -> Iter<'_> {
-        Iter { pool: &self.pool, next_page: Some(self.first_page()), pending: Vec::new().into_iter() }
+        Iter {
+            pool: &self.pool,
+            next_page: Some(self.first_page()),
+            pending: Vec::new().into_iter(),
+        }
     }
 
     /// A cursor at the first entry with a key `>= start`, tombstones
@@ -148,10 +180,20 @@ impl SsTable {
     pub fn cursor(&self, start: &[u8]) -> Result<Cursor<'_>> {
         let first = (start <= self.max_key.as_slice()).then(|| {
             // The last page whose first key is <= start, or the first page.
-            self.pages[self.pages.partition_point(|(_, first)| first.as_slice() <= start).saturating_sub(1)].0
+            self.pages[self
+                .pages
+                .partition_point(|(_, first)| first.as_slice() <= start)
+                .saturating_sub(1)]
+            .0
         });
-        let mut cursor =
-            Cursor { pool: &self.pool, page: Box::new([0; PAGE_SIZE]), next_page: first, slot: 0, slots: 0, current: None };
+        let mut cursor = Cursor {
+            pool: &self.pool,
+            page: Box::new([0; PAGE_SIZE]),
+            next_page: first,
+            slot: 0,
+            slots: 0,
+            current: None,
+        };
         cursor.load()?;
         while cursor.entry().is_some_and(|(key, _)| key < start) {
             cursor.advance()?;
@@ -161,7 +203,9 @@ impl SsTable {
 
     /// Returns all of the SSTable's pages to the free list.
     pub fn destroy(self) -> Result<()> {
-        self.pages.iter().try_for_each(|&(id, _)| self.pool.delete_page(id))
+        self.pages
+            .iter()
+            .try_for_each(|&(id, _)| self.pool.delete_page(id))
     }
 }
 
@@ -218,7 +262,10 @@ impl Cursor<'_> {
     /// The current entry: its key and value (`None` for a tombstone), or `None` once exhausted.
     pub fn entry(&self) -> Option<(&[u8], Option<&[u8]>)> {
         let (key, value) = self.current.as_ref()?;
-        Some((&self.page[key.clone()], value.clone().map(|value| &self.page[value])))
+        Some((
+            &self.page[key.clone()],
+            value.clone().map(|value| &self.page[value]),
+        ))
     }
 
     /// Moves to the next entry, reading the next page if this one is done.
@@ -282,7 +329,9 @@ pub fn entry_len(key: &[u8], value: &[u8]) -> usize {
 }
 
 pub fn decode_entry(bytes: &[u8]) -> Result<(&[u8], Option<&[u8]>)> {
-    let Some(len) = bytes.get(..2) else { return err("corrupted entry: too short") };
+    let Some(len) = bytes.get(..2) else {
+        return err("corrupted entry: too short");
+    };
     let key_end = 2 + u16::from_le_bytes([len[0], len[1]]) as usize;
     match (bytes.get(2..key_end), bytes.get(key_end)) {
         (Some(key), Some(0)) if bytes.len() == key_end + 1 => Ok((key, None)),
@@ -314,7 +363,10 @@ mod tests {
     #[test]
     fn entry_round_trip() {
         let put = encode_entry(b"k", Some(b"value"));
-        assert_eq!(decode_entry(&put).unwrap(), (&b"k"[..], Some(&b"value"[..])));
+        assert_eq!(
+            decode_entry(&put).unwrap(),
+            (&b"k"[..], Some(&b"value"[..]))
+        );
         assert_eq!(put.len(), entry_len(b"k", b"value"));
         let tombstone = encode_entry(b"k", None);
         assert_eq!(decode_entry(&tombstone).unwrap(), (&b"k"[..], None));
@@ -324,7 +376,9 @@ mod tests {
 
     #[test]
     fn get_finds_every_key_across_pages() {
-        let table = SsTable::write(pool(), entries().into_iter().map(Ok)).unwrap().unwrap();
+        let table = SsTable::write(pool(), entries().into_iter().map(Ok))
+            .unwrap()
+            .unwrap();
         assert!(table.page_count() > 10);
         assert_eq!(table.max_key(), key(1998));
 
@@ -340,7 +394,9 @@ mod tests {
     #[test]
     fn iter_and_reopen_return_the_same_entries() {
         let pool = pool();
-        let table = SsTable::write(pool.clone(), entries().into_iter().map(Ok)).unwrap().unwrap();
+        let table = SsTable::write(pool.clone(), entries().into_iter().map(Ok))
+            .unwrap()
+            .unwrap();
         let all: Vec<Entry> = table.iter().collect::<Result<_>>().unwrap();
         assert_eq!(all, entries());
 
@@ -354,17 +410,25 @@ mod tests {
     fn writing_nothing_allocates_nothing() {
         let pool = pool();
         let pages = pool.disk().page_count();
-        assert!(SsTable::write(pool.clone(), std::iter::empty()).unwrap().is_none());
+        assert!(
+            SsTable::write(pool.clone(), std::iter::empty())
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(pool.disk().page_count(), pages);
     }
 
     #[test]
     fn destroy_frees_every_page() {
         let pool = pool();
-        let table = SsTable::write(pool.clone(), entries().into_iter().map(Ok)).unwrap().unwrap();
+        let table = SsTable::write(pool.clone(), entries().into_iter().map(Ok))
+            .unwrap()
+            .unwrap();
         let pages = pool.disk().page_count();
         table.destroy().unwrap();
-        SsTable::write(pool.clone(), entries().into_iter().map(Ok)).unwrap().unwrap();
+        SsTable::write(pool.clone(), entries().into_iter().map(Ok))
+            .unwrap()
+            .unwrap();
         assert_eq!(pool.disk().page_count(), pages, "freed pages are reused");
     }
 }

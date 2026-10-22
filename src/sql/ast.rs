@@ -18,7 +18,10 @@ pub enum Statement {
     /// `EXPLAIN statement`: describes how the statement would read its table.
     /// `EXPLAIN ANALYZE` (of a SELECT) also runs it, and tells how many rows
     /// each step returned and how long it took.
-    Explain { statement: Box<Statement>, analyze: bool },
+    Explain {
+        statement: Box<Statement>,
+        analyze: bool,
+    },
     /// Copies the committed pages from the write-ahead log into the database file.
     Checkpoint,
     /// `BEGIN [TRANSACTION]`: the statements up to COMMIT or ROLLBACK form one transaction.
@@ -26,11 +29,17 @@ pub enum Statement {
     /// `COMMIT [TRANSACTION]`
     Commit,
     /// `ROLLBACK [TRANSACTION]`, or with a name, `ROLLBACK [TRANSACTION] TO [SAVEPOINT] name`.
-    Rollback { savepoint: Option<String> },
+    Rollback {
+        savepoint: Option<String>,
+    },
     /// `SAVEPOINT name`
-    Savepoint { name: String },
+    Savepoint {
+        name: String,
+    },
     /// `RELEASE [SAVEPOINT] name`
-    Release { name: String },
+    Release {
+        name: String,
+    },
     Insert {
         table: String,
         columns: Option<Vec<String>>,
@@ -91,7 +100,12 @@ impl std::fmt::Display for IndexKind {
 impl std::fmt::Display for CreateIndex {
     /// Writes the statement as SQL that parses back to it, as the catalog stores it.
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let keys = self.keys.iter().map(Expr::to_string).collect::<Vec<_>>().join(", ");
+        let keys = self
+            .keys
+            .iter()
+            .map(Expr::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
         let unique = if self.unique { "UNIQUE " } else { "" };
         write!(f, "CREATE {unique}INDEX {} ON {}", self.name, self.table)?;
         if self.using != IndexKind::BTree {
@@ -189,7 +203,12 @@ impl Select {
         for on in query.from.joins.iter_mut().filter_map(|j| j.on.as_mut()) {
             *on = f(on)?;
         }
-        for e in query.filter.iter_mut().chain(&mut query.group_by).chain(&mut query.having) {
+        for e in query
+            .filter
+            .iter_mut()
+            .chain(&mut query.group_by)
+            .chain(&mut query.having)
+        {
             *e = f(e)?;
         }
         for o in &mut query.order_by {
@@ -237,7 +256,10 @@ pub enum TableSource {
 impl TableRef {
     /// A table of the database, under its own name.
     pub fn table(name: impl Into<String>) -> Self {
-        TableRef { source: TableSource::Table(name.into()), alias: None }
+        TableRef {
+            source: TableSource::Table(name.into()),
+            alias: None,
+        }
     }
 
     /// What its columns are qualified by: the alias, or else the table's name.
@@ -276,7 +298,10 @@ pub struct ColumnRef {
 impl ColumnRef {
     /// A column referred to by name alone.
     pub fn bare(name: impl Into<String>) -> Self {
-        ColumnRef { table: None, name: name.into() }
+        ColumnRef {
+            table: None,
+            name: name.into(),
+        }
     }
 }
 
@@ -336,7 +361,11 @@ pub enum Expr {
     /// branch whose `a` equals the operand, or without one, whose `a` is
     /// true; else `c`, or NULL. Only the branches up to the one taken are
     /// evaluated, and of those only their `a`.
-    Case { operand: Option<Box<Expr>>, branches: Vec<(Expr, Expr)>, otherwise: Option<Box<Expr>> },
+    Case {
+        operand: Option<Box<Expr>>,
+        branches: Vec<(Expr, Expr)>,
+        otherwise: Option<Box<Expr>>,
+    },
     /// A scalar function of its arguments.
     Function(Function, Vec<Expr>),
     /// A column found already among the columns of the rows the expression
@@ -427,27 +456,46 @@ impl Expr {
             Expr::Unary(op, inner) => Expr::Unary(*op, sub(inner)?),
             Expr::Binary(left, op, right) => Expr::Binary(sub(left)?, *op, sub(right)?),
             Expr::IsNull(inner, negated) => Expr::IsNull(sub(inner)?, *negated),
-            Expr::Aggregate(function, arg, distinct) => {
-                Expr::Aggregate(*function, arg.as_deref().map(&mut sub).transpose()?, *distinct)
-            }
+            Expr::Aggregate(function, arg, distinct) => Expr::Aggregate(
+                *function,
+                arg.as_deref().map(&mut sub).transpose()?,
+                *distinct,
+            ),
             Expr::InList(left, items, negated) => {
                 let items = items.iter().map(|e| e.replace(f)).collect::<Result<_>>()?;
                 Expr::InList(Box::new(left.replace(f)?), items, *negated)
             }
-            Expr::Subquery(query) => Expr::Subquery(Box::new(query.try_map(&mut |e| e.replace(f))?)),
+            Expr::Subquery(query) => {
+                Expr::Subquery(Box::new(query.try_map(&mut |e| e.replace(f))?))
+            }
             Expr::Exists(query) => Expr::Exists(Box::new(query.try_map(&mut |e| e.replace(f))?)),
             Expr::InSubquery(left, query, negated) => {
                 let left = Box::new(left.replace(f)?);
-                Expr::InSubquery(left, Box::new(query.try_map(&mut |e| e.replace(f))?), *negated)
+                Expr::InSubquery(
+                    left,
+                    Box::new(query.try_map(&mut |e| e.replace(f))?),
+                    *negated,
+                )
             }
-            Expr::Case { operand, branches, otherwise } => Expr::Case {
+            Expr::Case {
+                operand,
+                branches,
+                otherwise,
+            } => Expr::Case {
                 operand: operand.as_deref().map(&mut sub).transpose()?,
-                branches: branches.iter().map(|(w, t)| Ok((w.replace(f)?, t.replace(f)?))).collect::<Result<_>>()?,
-                otherwise: otherwise.as_deref().map(|e| e.replace(f).map(Box::new)).transpose()?,
+                branches: branches
+                    .iter()
+                    .map(|(w, t)| Ok((w.replace(f)?, t.replace(f)?)))
+                    .collect::<Result<_>>()?,
+                otherwise: otherwise
+                    .as_deref()
+                    .map(|e| e.replace(f).map(Box::new))
+                    .transpose()?,
             },
-            Expr::Function(function, args) => {
-                Expr::Function(*function, args.iter().map(|e| e.replace(f)).collect::<Result<_>>()?)
-            }
+            Expr::Function(function, args) => Expr::Function(
+                *function,
+                args.iter().map(|e| e.replace(f)).collect::<Result<_>>()?,
+            ),
         })
     }
 
@@ -455,8 +503,14 @@ impl Expr {
     pub fn visit(&self, f: &mut dyn FnMut(&Expr)) {
         f(self);
         match self {
-            Expr::Literal(_) | Expr::Column(_) | Expr::Outer(_) | Expr::Slot(..) | Expr::Aggregate(_, None, _) => {}
-            Expr::Unary(_, inner) | Expr::IsNull(inner, _) | Expr::Aggregate(_, Some(inner), _) => inner.visit(f),
+            Expr::Literal(_)
+            | Expr::Column(_)
+            | Expr::Outer(_)
+            | Expr::Slot(..)
+            | Expr::Aggregate(_, None, _) => {}
+            Expr::Unary(_, inner) | Expr::IsNull(inner, _) | Expr::Aggregate(_, Some(inner), _) => {
+                inner.visit(f)
+            }
             Expr::Binary(left, _, right) => {
                 left.visit(f);
                 right.visit(f);
@@ -465,19 +519,27 @@ impl Expr {
                 left.visit(f);
                 items.iter().for_each(|e| e.visit(f));
             }
-            Expr::Subquery(query) | Expr::Exists(query) => query.exprs().into_iter().for_each(|e| e.visit(f)),
+            Expr::Subquery(query) | Expr::Exists(query) => {
+                query.exprs().into_iter().for_each(|e| e.visit(f))
+            }
             Expr::InSubquery(left, query, _) => {
                 left.visit(f);
                 query.exprs().into_iter().for_each(|e| e.visit(f));
             }
-            Expr::Case { .. } | Expr::Function(..) => self.parts().into_iter().for_each(|e| e.visit(f)),
+            Expr::Case { .. } | Expr::Function(..) => {
+                self.parts().into_iter().for_each(|e| e.visit(f))
+            }
         }
     }
 
     /// The expressions a CASE or a function call is made of, in order; none for others.
     pub fn parts(&self) -> Vec<&Expr> {
         match self {
-            Expr::Case { operand, branches, otherwise } => operand
+            Expr::Case {
+                operand,
+                branches,
+                otherwise,
+            } => operand
                 .as_deref()
                 .into_iter()
                 .chain(branches.iter().flat_map(|(w, t)| [w, t]))
@@ -492,12 +554,24 @@ impl Expr {
     /// [`Expr::parts`]) replaced by `f`'s result; others as they are.
     pub fn try_map_parts(&self, f: &mut dyn FnMut(&Expr) -> Result<Expr>) -> Result<Expr> {
         Ok(match self {
-            Expr::Case { operand, branches, otherwise } => Expr::Case {
+            Expr::Case {
+                operand,
+                branches,
+                otherwise,
+            } => Expr::Case {
                 operand: operand.as_deref().map(|e| f(e).map(Box::new)).transpose()?,
-                branches: branches.iter().map(|(w, t)| Ok((f(w)?, f(t)?))).collect::<Result<_>>()?,
-                otherwise: otherwise.as_deref().map(|e| f(e).map(Box::new)).transpose()?,
+                branches: branches
+                    .iter()
+                    .map(|(w, t)| Ok((f(w)?, f(t)?)))
+                    .collect::<Result<_>>()?,
+                otherwise: otherwise
+                    .as_deref()
+                    .map(|e| f(e).map(Box::new))
+                    .transpose()?,
             },
-            Expr::Function(function, args) => Expr::Function(*function, args.iter().map(f).collect::<Result<_>>()?),
+            Expr::Function(function, args) => {
+                Expr::Function(*function, args.iter().map(f).collect::<Result<_>>()?)
+            }
             other => other.clone(),
         })
     }
@@ -505,7 +579,12 @@ impl Expr {
     /// Whether the expression has a subquery in it.
     pub fn has_subquery(&self) -> bool {
         let mut found = false;
-        self.visit(&mut |e| found |= matches!(e, Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(..)));
+        self.visit(&mut |e| {
+            found |= matches!(
+                e,
+                Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(..)
+            )
+        });
         found
     }
 }
@@ -585,32 +664,61 @@ impl std::fmt::Display for Expr {
         };
         match self {
             Expr::Literal(value) => f.write_str(&value.to_sql()),
-            Expr::Column(column) | Expr::Outer(column) | Expr::Slot(_, column) => write!(f, "{column}"),
+            Expr::Column(column) | Expr::Outer(column) | Expr::Slot(_, column) => {
+                write!(f, "{column}")
+            }
             Expr::Unary(UnaryOp::Not, inner) => write!(f, "NOT {}", operand(inner)),
             Expr::Unary(UnaryOp::Neg, inner) => match operand(inner) {
                 // Not `--`, which starts a comment.
                 inner if inner.starts_with('-') => write!(f, "-({inner})"),
                 inner => write!(f, "-{inner}"),
             },
-            Expr::Binary(left, op, right) => write!(f, "{} {} {}", operand(left), op.symbol(), operand(right)),
-            Expr::IsNull(inner, negated) => {
-                write!(f, "{} IS {}NULL", operand(inner), if *negated { "NOT " } else { "" })
+            Expr::Binary(left, op, right) => {
+                write!(f, "{} {} {}", operand(left), op.symbol(), operand(right))
             }
-            Expr::Aggregate(function, None, _) => write!(f, "{}(*)", function.name().to_uppercase()),
+            Expr::IsNull(inner, negated) => {
+                write!(
+                    f,
+                    "{} IS {}NULL",
+                    operand(inner),
+                    if *negated { "NOT " } else { "" }
+                )
+            }
+            Expr::Aggregate(function, None, _) => {
+                write!(f, "{}(*)", function.name().to_uppercase())
+            }
             Expr::Aggregate(function, Some(arg), distinct) => {
                 let distinct = if *distinct { "DISTINCT " } else { "" };
                 write!(f, "{}({distinct}{arg})", function.name().to_uppercase())
             }
             Expr::InList(left, items, negated) => {
-                let items = items.iter().map(Expr::to_string).collect::<Vec<_>>().join(", ");
-                write!(f, "{} {}IN ({items})", operand(left), if *negated { "NOT " } else { "" })
+                let items = items
+                    .iter()
+                    .map(Expr::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "{} {}IN ({items})",
+                    operand(left),
+                    if *negated { "NOT " } else { "" }
+                )
             }
             Expr::Subquery(query) => write!(f, "({query})"),
             Expr::Exists(query) => write!(f, "EXISTS ({query})"),
             Expr::InSubquery(left, query, negated) => {
-                write!(f, "{} {}IN ({query})", operand(left), if *negated { "NOT " } else { "" })
+                write!(
+                    f,
+                    "{} {}IN ({query})",
+                    operand(left),
+                    if *negated { "NOT " } else { "" }
+                )
             }
-            Expr::Case { operand, branches, otherwise } => {
+            Expr::Case {
+                operand,
+                branches,
+                otherwise,
+            } => {
                 f.write_str("CASE")?;
                 if let Some(operand) = operand {
                     write!(f, " {operand}")?;
@@ -624,7 +732,11 @@ impl std::fmt::Display for Expr {
                 f.write_str(" END")
             }
             Expr::Function(function, args) => {
-                let args = args.iter().map(Expr::to_string).collect::<Vec<_>>().join(", ");
+                let args = args
+                    .iter()
+                    .map(Expr::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 write!(f, "{}({args})", function.name().to_uppercase())
             }
         }
@@ -635,7 +747,11 @@ impl std::fmt::Display for Select {
     /// Writes the query as SQL that parses back to it.
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let list = |exprs: &mut dyn Iterator<Item = String>| exprs.collect::<Vec<_>>().join(", ");
-        f.write_str(if self.distinct { "SELECT DISTINCT " } else { "SELECT " })?;
+        f.write_str(if self.distinct {
+            "SELECT DISTINCT "
+        } else {
+            "SELECT "
+        })?;
         match &self.projection {
             Projection::All => f.write_str("*")?,
             Projection::Exprs(items) => {
@@ -663,7 +779,11 @@ impl std::fmt::Display for Select {
             write!(f, " WHERE {filter}")?;
         }
         if !self.group_by.is_empty() {
-            write!(f, " GROUP BY {}", list(&mut self.group_by.iter().map(Expr::to_string)))?;
+            write!(
+                f,
+                " GROUP BY {}",
+                list(&mut self.group_by.iter().map(Expr::to_string))
+            )?;
         }
         if let Some(having) = &self.having {
             write!(f, " HAVING {having}")?;
@@ -672,7 +792,10 @@ impl std::fmt::Display for Select {
             write!(f, " UNION {}{part}", if *all { "ALL " } else { "" })?;
         }
         if !self.order_by.is_empty() {
-            let keys = self.order_by.iter().map(|o| format!("{}{}", o.expr, if o.desc { " DESC" } else { "" }));
+            let keys = self
+                .order_by
+                .iter()
+                .map(|o| format!("{}{}", o.expr, if o.desc { " DESC" } else { "" }));
             write!(f, " ORDER BY {}", list(&mut keys.into_iter()))?;
         }
         if let Some(limit) = self.limit {
@@ -725,8 +848,14 @@ mod tests {
     use crate::sql::parse;
 
     fn where_clause(sql: &str) -> Expr {
-        match parse(&format!("SELECT * FROM t WHERE {sql}")).unwrap().pop() {
-            Some(Statement::Select(Select { filter: Some(filter), .. })) => filter,
+        match parse(&format!("SELECT * FROM t WHERE {sql}"))
+            .unwrap()
+            .pop()
+        {
+            Some(Statement::Select(Select {
+                filter: Some(filter),
+                ..
+            })) => filter,
             other => panic!("{other:?}"),
         }
     }
@@ -758,9 +887,16 @@ mod tests {
             "x IN (SELECT a FROM t UNION ALL SELECT b FROM u UNION SELECT c FROM v ORDER BY a LIMIT 3 OFFSET 1)",
         ] {
             let expr = where_clause(sql);
-            assert_eq!(where_clause(&expr.to_string()), expr, "{sql} printed as {expr}");
+            assert_eq!(
+                where_clause(&expr.to_string()),
+                expr,
+                "{sql} printed as {expr}"
+            );
         }
         assert_eq!(where_clause("a + b * c").to_string(), "a + (b * c)");
-        assert_eq!(where_clause("count(*) + sum(x)").to_string(), "COUNT(*) + SUM(x)");
+        assert_eq!(
+            where_clause("count(*) + sum(x)").to_string(),
+            "COUNT(*) + SUM(x)"
+        );
     }
 }

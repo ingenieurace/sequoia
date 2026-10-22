@@ -8,7 +8,10 @@ pub enum QueryResult {
     /// A status message, e.g. "2 row(s) inserted".
     Message(String),
     /// Rows returned by SELECT.
-    Rows { columns: Vec<String>, rows: Vec<Row> },
+    Rows {
+        columns: Vec<String>,
+        rows: Vec<Row>,
+    },
 }
 
 impl fmt::Display for QueryResult {
@@ -27,15 +30,21 @@ impl fmt::Display for QueryResult {
             .iter()
             .enumerate()
             .map(|(i, name)| {
-                cells.iter().map(|row| row[i].chars().count()).fold(name.chars().count(), usize::max)
+                cells
+                    .iter()
+                    .map(|row| row[i].chars().count())
+                    .fold(name.chars().count(), usize::max)
             })
             .collect();
 
         let separator: Vec<String> = widths.iter().map(|w| "-".repeat(w + 2)).collect();
         let separator = format!("+{}+", separator.join("+"));
         let write_line = |f: &mut fmt::Formatter, items: &[String]| {
-            let padded: Vec<String> =
-                items.iter().zip(&widths).map(|(item, w)| format!(" {item:<w$} ")).collect();
+            let padded: Vec<String> = items
+                .iter()
+                .zip(&widths)
+                .map(|(item, w)| format!(" {item:<w$} "))
+                .collect();
             writeln!(f, "|{}|", padded.join("|"))
         };
 

@@ -182,7 +182,11 @@ fn main() {
         ),
     ];
 
-    common::run(groups.into(), &setup(), &format!("{LEFT} rows joined with {RIGHT}"));
+    common::run(
+        groups.into(),
+        &setup(),
+        &format!("{LEFT} rows joined with {RIGHT}"),
+    );
 }
 
 /// The statements that fill the tables: `a` (LEFT rows) and three with the
@@ -202,7 +206,9 @@ fn setup() -> Vec<String> {
         format!("({i}, {}, {name}, {name})", i % RIGHT)
     });
     for table in ["b", "bi", "bl"] {
-        insert(&mut sql, table, RIGHT, |i| format!("({i}, {i}, 'customer {i}')"));
+        insert(&mut sql, table, RIGHT, |i| {
+            format!("({i}, {i}, 'customer {i}')")
+        });
     }
     sql.push("CREATE INDEX bi_k ON bi (k)".into());
     sql

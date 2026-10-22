@@ -44,7 +44,10 @@ use crate::error::Result;
 use crate::storage::buffer::pool::BufferPool;
 use crate::storage::io::disk::{Page, PageId, read_u32, write_u32};
 
-const SLOTS: Slots = Slots { header: 14, size: 4 };
+const SLOTS: Slots = Slots {
+    header: 14,
+    size: 4,
+};
 
 /// The part of the buckets' first pages that entries may take before a bucket splits.
 pub const SPLIT_LOAD: f64 = 0.75;
@@ -66,7 +69,11 @@ struct State {
 impl State {
     fn read(root: &Page) -> State {
         let bytes = u64::from_le_bytes(root[6..14].try_into().unwrap());
-        State { level: root[1] as u32, next: read_u32(root, 2), bytes }
+        State {
+            level: root[1] as u32,
+            next: read_u32(root, 2),
+            bytes,
+        }
     }
 
     fn write(&self, root: &mut Page) {
@@ -81,7 +88,11 @@ impl State {
 
     fn bucket_of(&self, hash: u32) -> u32 {
         let i = hash & mask(self.level);
-        if i < self.next { hash & mask(self.level + 1) } else { i }
+        if i < self.next {
+            hash & mask(self.level + 1)
+        } else {
+            i
+        }
     }
 
     /// The load the entries put on the buckets' first pages.
@@ -101,7 +112,12 @@ impl Linear {
         let root = {
             let mut page = pool.new_page()?;
             page[0] = LINEAR;
-            State { level: 0, next: 0, bytes: 0 }.write(&mut page);
+            State {
+                level: 0,
+                next: 0,
+                bytes: 0,
+            }
+            .write(&mut page);
             SLOTS.write(&pool, &mut page, 1, 0, &bucket.0.to_le_bytes())?;
             page.id()
         };
@@ -119,7 +135,11 @@ impl Linear {
     pub fn find(&self, hash: u32, key: &[u8]) -> Result<Vec<Vec<u8>>> {
         let root = self.pool.fetch_read(self.root)?;
         let state = State::read(&root);
-        let head = self.pool.fetch_read(self.bucket(&root, state.buckets(), state.bucket_of(hash) as usize)?)?;
+        let head = self.pool.fetch_read(self.bucket(
+            &root,
+            state.buckets(),
+            state.bucket_of(hash) as usize,
+        )?)?;
         drop(root);
         let mut out = Vec::new();
         bucket::find(&self.pool, &head, hash, key, &mut out)?;
@@ -159,8 +179,12 @@ impl Linear {
     fn split(&self, root: &mut Page, state: &mut State) -> Result<()> {
         let n = state.buckets();
         let bit = 1 << state.level;
-        let mut head = self.pool.fetch_write(self.bucket(root, n, state.next as usize)?)?;
-        let (stay, go): (Vec<_>, Vec<_>) = bucket::all(&self.pool, &head)?.into_iter().partition(|(h, _)| h & bit == 0);
+        let mut head = self
+            .pool
+            .fetch_write(self.bucket(root, n, state.next as usize)?)?;
+        let (stay, go): (Vec<_>, Vec<_>) = bucket::all(&self.pool, &head)?
+            .into_iter()
+            .partition(|(h, _)| h & bit == 0);
         let mut new = self.pool.new_page()?;
         bucket::init(&mut new);
         bucket::rewrite(&self.pool, &mut new, &go)?;
@@ -186,7 +210,10 @@ impl Linear {
             0 => (state.level - 1, (1 << (state.level - 1)) - 1),
             next => (state.level, next - 1),
         };
-        let (last, into) = (self.bucket(root, n, n - 1)?, self.bucket(root, n, next as usize)?);
+        let (last, into) = (
+            self.bucket(root, n, n - 1)?,
+            self.bucket(root, n, next as usize)?,
+        );
         let mut head = self.pool.fetch_write(into)?;
         let mut entries = bucket::all(&self.pool, &head)?;
         entries.extend(bucket::all(&self.pool, &*self.pool.fetch_read(last)?)?);
@@ -200,7 +227,9 @@ impl Linear {
 
     /// The first page of bucket `i` of `n`.
     fn bucket(&self, root: &Page, n: usize, i: usize) -> Result<PageId> {
-        SLOTS.read(&self.pool, root, n, i, |s| PageId(u32::from_le_bytes(s.try_into().unwrap())))
+        SLOTS.read(&self.pool, root, n, i, |s| {
+            PageId(u32::from_le_bytes(s.try_into().unwrap()))
+        })
     }
 
     pub fn destroy(self) -> Result<()> {
@@ -208,7 +237,10 @@ impl Linear {
         let n = State::read(&root).buckets();
         let slots = SLOTS.load(&self.pool, &root, n)?;
         for slot in slots.chunks(4) {
-            bucket::destroy(&self.pool, PageId(u32::from_le_bytes(slot.try_into().unwrap())))?;
+            bucket::destroy(
+                &self.pool,
+                PageId(u32::from_le_bytes(slot.try_into().unwrap())),
+            )?;
         }
         SLOTS.destroy(&self.pool, &root, n)?;
         drop(root);

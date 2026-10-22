@@ -93,7 +93,11 @@ pub struct Node<V, C> {
 
 impl<V, C: Children<V>> Node<V, C> {
     fn new(prefix: Vec<u8>) -> Self {
-        Node { prefix, entry: None, children: C::default() }
+        Node {
+            prefix,
+            entry: None,
+            children: C::default(),
+        }
     }
 }
 
@@ -118,7 +122,10 @@ impl<V, C: Children<V>, const COMPRESS: bool> Default for Tree<V, C, COMPRESS> {
 
 impl<V, C: Children<V>, const COMPRESS: bool> Tree<V, C, COMPRESS> {
     pub fn new() -> Self {
-        Tree { root: Node::new(Vec::new()), len: 0 }
+        Tree {
+            root: Node::new(Vec::new()),
+            len: 0,
+        }
     }
 
     /// The nodes of the tree, for seeing what a kind of tree costs.
@@ -205,7 +212,12 @@ impl<V, C: Children<V>, const COMPRESS: bool> SortedMap<V> for Tree<V, C, COMPRE
                 depth += 1 + node.prefix.len();
                 continue;
             };
-            let shared = child.prefix.iter().zip(rest).take_while(|(a, b)| a == b).count();
+            let shared = child
+                .prefix
+                .iter()
+                .zip(rest)
+                .take_while(|(a, b)| a == b)
+                .count();
             if shared < child.prefix.len() {
                 let branch = child.prefix[shared];
                 let head = child.prefix[..shared].to_vec();
@@ -237,7 +249,10 @@ impl<V, C: Children<V>, const COMPRESS: bool> SortedMap<V> for Tree<V, C, COMPRE
     /// hold the keys above `start`. A node whose prefix sorts above
     /// `start`'s bytes is wholly above it, one below wholly below.
     fn iter_from(&self, start: &[u8]) -> Iter<'_, V, C> {
-        let mut iter = Iter { stack: Vec::new(), pending: None };
+        let mut iter = Iter {
+            stack: Vec::new(),
+            pending: None,
+        };
         let mut node = &self.root;
         let mut depth = 0;
         loop {
@@ -289,7 +304,8 @@ fn leaf<V, C: Children<V>, const COMPRESS: bool>(rest: &[u8]) -> Node<V, C> {
     match rest.split_first() {
         Some((&first, more)) if !COMPRESS => {
             let mut node: Node<V, C> = Node::new(Vec::new());
-            node.children.add(first, Box::new(leaf::<V, C, COMPRESS>(more)));
+            node.children
+                .add(first, Box::new(leaf::<V, C, COMPRESS>(more)));
             node
         }
         _ => Node::new(if COMPRESS { rest.to_vec() } else { Vec::new() }),
@@ -329,7 +345,10 @@ impl<'a, V, C: Children<V>> Iterator for Iter<'a, V, C> {
 
 impl<V> SortedMap<V> for BTreeMap<Vec<u8>, V> {
     type Iter<'a>
-        = std::iter::Map<btree_map::Range<'a, Vec<u8>, V>, fn((&'a Vec<u8>, &'a V)) -> (&'a [u8], &'a V)>
+        = std::iter::Map<
+        btree_map::Range<'a, Vec<u8>, V>,
+        fn((&'a Vec<u8>, &'a V)) -> (&'a [u8], &'a V),
+    >
     where
         V: 'a;
 
@@ -342,7 +361,8 @@ impl<V> SortedMap<V> for BTreeMap<Vec<u8>, V> {
     }
 
     fn iter_from(&self, start: &[u8]) -> Self::Iter<'_> {
-        self.range::<[u8], _>((Bound::Included(start), Bound::Unbounded)).map(|(k, v)| (k.as_slice(), v))
+        self.range::<[u8], _>((Bound::Included(start), Bound::Unbounded))
+            .map(|(k, v)| (k.as_slice(), v))
     }
 
     fn last_key(&self) -> Option<&[u8]> {
@@ -365,7 +385,9 @@ mod tests {
     /// Random inserts, lookups, removes and scans on `map`, over short keys
     /// from a few bytes so that many share prefixes or are prefixes of
     /// others, checked against a `BTreeMap`.
-    fn agrees_with_btreemap<C: Children<u64>, const COMPRESS: bool>(mut map: Tree<u64, C, COMPRESS>) {
+    fn agrees_with_btreemap<C: Children<u64>, const COMPRESS: bool>(
+        mut map: Tree<u64, C, COMPRESS>,
+    ) {
         let mut expected = BTreeMap::new();
         let mut x: u64 = 0x2545_f491_4f6c_dd1d;
         let mut random = || {
@@ -376,13 +398,19 @@ mod tests {
         };
         let key = |r: u64| -> Vec<u8> {
             let alphabet = [0u8, 1, 97, 98, 255];
-            (0..r % 6).map(|i| alphabet[(r >> (8 + i * 3)) as usize % alphabet.len()]).collect()
+            (0..r % 6)
+                .map(|i| alphabet[(r >> (8 + i * 3)) as usize % alphabet.len()])
+                .collect()
         };
         for step in 0..30_000u64 {
             let r = random();
             let k = key(r);
             match r >> 60 {
-                0..=6 => assert_eq!(map.insert(k.clone(), step), expected.insert(k.clone(), step), "insert {k:?}"),
+                0..=6 => assert_eq!(
+                    map.insert(k.clone(), step),
+                    expected.insert(k.clone(), step),
+                    "insert {k:?}"
+                ),
                 7..=10 => assert_eq!(map.remove(&k), expected.remove(&k), "remove {k:?}"),
                 11..=13 => assert_eq!(map.get(&k), expected.get(&k), "get {k:?}"),
                 _ => {

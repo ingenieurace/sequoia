@@ -47,8 +47,17 @@ use crate::types::Value;
 /// Reads every row of `input` (whose columns are `columns`) and returns one
 /// row per group: its `group_by` values, then the result of each aggregate,
 /// holding groups within `budget` bytes, about.
-pub fn fold(input: Rows, columns: &[Field], group_by: &[Expr], aggregates: &[AggregateCall], budget: usize) -> Result<Groups> {
-    let (group_by, aggregates) = (crate::sql::eval::locate_all(group_by, columns), locate(aggregates, columns));
+pub fn fold(
+    input: Rows,
+    columns: &[Field],
+    group_by: &[Expr],
+    aggregates: &[AggregateCall],
+    budget: usize,
+) -> Result<Groups> {
+    let (group_by, aggregates) = (
+        crate::sql::eval::locate_all(group_by, columns),
+        locate(aggregates, columns),
+    );
     let mut folder = Folder::new(group_by.len(), &aggregates, budget);
     for row in input {
         folder.add_row(&row?, columns, &group_by)?;
@@ -61,7 +70,14 @@ pub fn fold(input: Rows, columns: &[Field], group_by: &[Expr], aggregates: &[Agg
 pub fn locate(aggregates: &[AggregateCall], columns: &[Field]) -> Vec<AggregateCall> {
     aggregates
         .iter()
-        .map(|(function, arg, distinct)| (*function, arg.as_ref().map(|arg| crate::sql::eval::locate(arg, columns)), *distinct))
+        .map(|(function, arg, distinct)| {
+            (
+                *function,
+                arg.as_ref()
+                    .map(|arg| crate::sql::eval::locate(arg, columns)),
+                *distinct,
+            )
+        })
         .collect()
 }
 
@@ -77,21 +93,44 @@ pub struct Folder {
 
 impl Folder {
     pub fn new(keys: usize, aggregates: &[AggregateCall], budget: usize) -> Self {
-        Folder { table: Table::new(0), scratch: Vec::new(), aggregates: aggregates.to_vec(), keys, budget }
+        Folder {
+            table: Table::new(0),
+            scratch: Vec::new(),
+            aggregates: aggregates.to_vec(),
+            keys,
+            budget,
+        }
     }
 
     /// Adds a row whose columns are `columns`, grouped by `group_by`.
     pub fn add_row(&mut self, row: &[Value], columns: &[Field], group_by: &[Expr]) -> Result<()> {
-        let key: Row = group_by.iter().map(|e| eval(e, columns, row)).collect::<Result<_>>()?;
-        let Folder { table, scratch, aggregates, budget, .. } = self;
-        let args = aggregates.iter().map(|(_, arg, _)| arg.as_ref().map(|arg| eval(arg, columns, row)).transpose());
+        let key: Row = group_by
+            .iter()
+            .map(|e| eval(e, columns, row))
+            .collect::<Result<_>>()?;
+        let Folder {
+            table,
+            scratch,
+            aggregates,
+            budget,
+            ..
+        } = self;
+        let args = aggregates
+            .iter()
+            .map(|(_, arg, _)| arg.as_ref().map(|arg| eval(arg, columns, row)).transpose());
         table.add(key, args, aggregates, *budget, scratch)
     }
 
     /// Adds a row of this group key and these aggregate arguments (`None`
     /// for `COUNT(*)`), evaluated already.
     pub fn add(&mut self, key: Row, args: impl Iterator<Item = Option<Value>>) -> Result<()> {
-        self.table.add(key, args.map(Ok), &self.aggregates, self.budget, &mut self.scratch)
+        self.table.add(
+            key,
+            args.map(Ok),
+            &self.aggregates,
+            self.budget,
+            &mut self.scratch,
+        )
     }
 
     /// Adds `rows` rows to the one group of an aggregation without `GROUP
@@ -107,7 +146,10 @@ impl Folder {
         }
         let group = self.table.group(Vec::new(), &self.aggregates);
         let states = &mut self.table.groups[group].1;
-        let mut added: Vec<Accumulator> = states.iter().map(|state| state.accumulator.clone()).collect();
+        let mut added: Vec<Accumulator> = states
+            .iter()
+            .map(|state| state.accumulator.clone())
+            .collect();
         for (accumulator, arg) in added.iter_mut().zip(args) {
             let result = match arg.as_deref() {
                 None => {
@@ -115,7 +157,9 @@ impl Folder {
                     Ok(())
                 }
                 Some(Vector::Int(values, nulls)) => accumulator.add_ints(values, nulls.as_deref()),
-                Some(Vector::Real(values, nulls)) => accumulator.add_reals(values, nulls.as_deref()),
+                Some(Vector::Real(values, nulls)) => {
+                    accumulator.add_reals(values, nulls.as_deref())
+                }
                 Some(Vector::Const(Value::Null, _)) => Ok(()), // skipped by every aggregate
                 Some(_) => return false,
             };
@@ -123,7 +167,10 @@ impl Folder {
                 return false;
             }
         }
-        states.iter_mut().zip(added).for_each(|(state, accumulator)| state.accumulator = accumulator);
+        states
+            .iter_mut()
+            .zip(added)
+            .for_each(|(state, accumulator)| state.accumulator = accumulator);
         true
     }
 
@@ -131,10 +178,24 @@ impl Folder {
     /// rows form one group, which exists even when there are none.
     pub fn finish(mut self) -> Groups {
         if self.keys == 0 && self.table.groups.is_empty() {
-            self.table.groups.push((Vec::new(), fresh(&self.aggregates)));
+            self.table
+                .groups
+                .push((Vec::new(), fresh(&self.aggregates)));
         }
-        let Folder { table, aggregates, keys, budget, .. } = self;
-        let mut groups = Groups { aggregates, keys, budget, rows: Vec::new().into_iter(), pending: Vec::new() };
+        let Folder {
+            table,
+            aggregates,
+            keys,
+            budget,
+            ..
+        } = self;
+        let mut groups = Groups {
+            aggregates,
+            keys,
+            budget,
+            rows: Vec::new().into_iter(),
+            pending: Vec::new(),
+        };
         groups.start(table);
         groups
     }
@@ -156,7 +217,13 @@ impl Groups {
     /// Makes the groups of `table` the next to come out, and its partitions pending.
     fn start(&mut self, table: Table) {
         let level = table.level + 1;
-        self.pending.extend(table.spilled.into_iter().filter(|file| file.rows() > 0).map(|file| (file, level)));
+        self.pending.extend(
+            table
+                .spilled
+                .into_iter()
+                .filter(|file| file.rows() > 0)
+                .map(|file| (file, level)),
+        );
         let rows: Vec<Row> = table
             .groups
             .into_iter()
@@ -176,9 +243,18 @@ impl Groups {
         for record in file.read() {
             let mut values = record?.into_iter();
             let key: Row = values.by_ref().take(self.keys).collect();
-            let args: Vec<Option<Value>> =
-                self.aggregates.iter().map(|(_, arg, _)| arg.as_ref().map(|_| values.next().expect("written"))).collect();
-            table.add(key, args.into_iter().map(Ok), &self.aggregates, self.budget, &mut scratch)?;
+            let args: Vec<Option<Value>> = self
+                .aggregates
+                .iter()
+                .map(|(_, arg, _)| arg.as_ref().map(|_| values.next().expect("written")))
+                .collect();
+            table.add(
+                key,
+                args.into_iter().map(Ok),
+                &self.aggregates,
+                self.budget,
+                &mut scratch,
+            )?;
         }
         self.start(table);
         Ok(())
@@ -216,7 +292,13 @@ struct Table {
 
 impl Table {
     fn new(level: u32) -> Self {
-        Table { level, groups: Vec::new(), index: HashMap::new(), bytes: 0, spilled: Vec::new() }
+        Table {
+            level,
+            groups: Vec::new(),
+            index: HashMap::new(),
+            bytes: 0,
+            spilled: Vec::new(),
+        }
     }
 
     /// Adds a row with this key and these aggregate arguments (`None` for
@@ -266,7 +348,8 @@ impl Table {
         if let Some(&i) = self.index.get(&key) {
             return i;
         }
-        self.bytes += 2 * (24 + key.iter().map(value_size).sum::<usize>()) + 16 + 48 * aggregates.len();
+        self.bytes +=
+            2 * (24 + key.iter().map(value_size).sum::<usize>()) + 16 + 48 * aggregates.len();
         self.index.insert(key.clone(), self.groups.len());
         self.groups.push((key, fresh(aggregates)));
         self.groups.len() - 1
@@ -275,7 +358,10 @@ impl Table {
 
 /// The states of a new group's aggregates.
 fn fresh(aggregates: &[AggregateCall]) -> Vec<State> {
-    aggregates.iter().map(|(function, _, distinct)| State::new(*function, *distinct)).collect()
+    aggregates
+        .iter()
+        .map(|(function, _, distinct)| State::new(*function, *distinct))
+        .collect()
 }
 
 /// One aggregate in one group: its accumulator, and for `DISTINCT` the
@@ -289,7 +375,10 @@ struct State {
 impl State {
     fn new(function: Aggregate, distinct: bool) -> Self {
         let tracks = distinct && !matches!(function, Aggregate::Min | Aggregate::Max);
-        State { accumulator: Accumulator::new(function), seen: tracks.then(HashSet::new) }
+        State {
+            accumulator: Accumulator::new(function),
+            seen: tracks.then(HashSet::new),
+        }
     }
 }
 
@@ -303,7 +392,11 @@ enum Accumulator {
     Max(Option<Value>),
     /// INTs summed wider than INT, so that only the average must fit in one;
     /// REALs summed apart.
-    Avg { ints: i128, reals: f64, count: i64 },
+    Avg {
+        ints: i128,
+        reals: f64,
+        count: i64,
+    },
 }
 
 impl Accumulator {
@@ -313,7 +406,11 @@ impl Accumulator {
             Aggregate::Sum => Accumulator::Sum(None),
             Aggregate::Min => Accumulator::Min(None),
             Aggregate::Max => Accumulator::Max(None),
-            Aggregate::Avg => Accumulator::Avg { ints: 0, reals: 0.0, count: 0 },
+            Aggregate::Avg => Accumulator::Avg {
+                ints: 0,
+                reals: 0.0,
+                count: 0,
+            },
         }
     }
 
@@ -335,9 +432,10 @@ impl Accumulator {
                 number(&value, "SUM")?;
                 *sum = Some(match (sum.take(), value) {
                     (None, value) => value,
-                    (Some(Value::Int(a)), Value::Int(b)) => {
-                        Value::Int(a.checked_add(b).ok_or_else(|| Error("integer overflow".into()))?)
-                    }
+                    (Some(Value::Int(a)), Value::Int(b)) => Value::Int(
+                        a.checked_add(b)
+                            .ok_or_else(|| Error("integer overflow".into()))?,
+                    ),
                     (Some(a), b) => {
                         let total = a.as_real().expect("a number") + b.as_real().expect("a number");
                         if !total.is_finite() {
@@ -370,7 +468,11 @@ impl Accumulator {
     /// Adds the INTs that are not NULL, in order, as [`Accumulator::add`]
     /// would one by one.
     fn add_ints(&mut self, values: &[i64], nulls: Option<&[bool]>) -> Result<()> {
-        let mut present = values.iter().enumerate().filter(|(i, _)| nulls.is_none_or(|nulls| !nulls[*i])).map(|(_, &n)| n);
+        let mut present = values
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| nulls.is_none_or(|nulls| !nulls[*i]))
+            .map(|(_, &n)| n);
         match self {
             Accumulator::Count(n) => *n += present.count() as i64,
             Accumulator::Sum(sum) => loop {
@@ -381,7 +483,9 @@ impl Accumulator {
                     },
                     Some(Value::Int(total)) => {
                         for n in present.by_ref() {
-                            *total = total.checked_add(n).ok_or_else(|| Error("integer overflow".into()))?;
+                            *total = total
+                                .checked_add(n)
+                                .ok_or_else(|| Error("integer overflow".into()))?;
                         }
                         break;
                     }
@@ -417,7 +521,11 @@ impl Accumulator {
     /// Adds the REALs that are not NULL, in order, as [`Accumulator::add`]
     /// would one by one.
     fn add_reals(&mut self, values: &[f64], nulls: Option<&[bool]>) -> Result<()> {
-        let mut present = values.iter().enumerate().filter(|(i, _)| nulls.is_none_or(|nulls| !nulls[*i])).map(|(_, &r)| r);
+        let mut present = values
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| nulls.is_none_or(|nulls| !nulls[*i]))
+            .map(|(_, &r)| r);
         // The first of the values that compares to all the others as `wanted`
         // or equal, as `keep` keeps.
         let best = |values: &mut dyn Iterator<Item = f64>, wanted: Ordering| {
@@ -429,7 +537,9 @@ impl Accumulator {
         match self {
             Accumulator::Count(n) => *n += present.count() as i64,
             Accumulator::Sum(sum) => {
-                let Some(first) = present.next() else { return Ok(()) };
+                let Some(first) = present.next() else {
+                    return Ok(());
+                };
                 let mut total = match sum {
                     Some(total) => finite(total.as_real().expect("a sum is a number") + first)?,
                     None => first,
@@ -465,14 +575,20 @@ impl Accumulator {
             Accumulator::Sum(sum) => sum.clone().unwrap_or(Value::Null),
             Accumulator::Min(best) | Accumulator::Max(best) => best.clone().unwrap_or(Value::Null),
             Accumulator::Avg { count: 0, .. } => Value::Null,
-            Accumulator::Avg { ints, reals, count } => Value::Real((*ints as f64 + reals) / *count as f64),
+            Accumulator::Avg { ints, reals, count } => {
+                Value::Real((*ints as f64 + reals) / *count as f64)
+            }
         }
     }
 }
 
 /// A sum of REALs, if it is not too big to be one.
 fn finite(total: f64) -> Result<f64> {
-    if total.is_finite() { Ok(total) } else { err("REAL overflow") }
+    if total.is_finite() {
+        Ok(total)
+    } else {
+        err("REAL overflow")
+    }
 }
 
 /// Replaces `best` by `value` if there is none yet or `value` compares to it as `wanted`.
@@ -481,7 +597,13 @@ fn keep(best: &mut Option<Value>, value: Value, wanted: Ordering) -> Result<()> 
         match value.compare(current) {
             Some(ord) if ord != wanted => return Ok(()),
             Some(_) => {}
-            None => return err(format!("cannot compare {} and {}", value.to_sql(), current.to_sql())),
+            None => {
+                return err(format!(
+                    "cannot compare {} and {}",
+                    value.to_sql(),
+                    current.to_sql()
+                ));
+            }
         }
     }
     *best = Some(value);
@@ -491,6 +613,9 @@ fn keep(best: &mut Option<Value>, value: Value, wanted: Ordering) -> Result<()> 
 fn number<'v>(value: &'v Value, function: &str) -> Result<&'v Value> {
     match value {
         Value::Int(_) | Value::Real(_) => Ok(value),
-        other => err(format!("{function} expects a number, got {}", other.to_sql())),
+        other => err(format!(
+            "{function} expects a number, got {}",
+            other.to_sql()
+        )),
     }
 }

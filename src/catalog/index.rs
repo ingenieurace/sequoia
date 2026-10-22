@@ -89,7 +89,11 @@ enum Store {
 impl Index {
     /// Creates an empty index on a table with these columns; the table adds
     /// its rows. A hash index's file is of the scheme [`HASH_SCHEME`] says.
-    pub fn create(pool: Arc<BufferPool>, definition: &CreateIndex, columns: &[Column]) -> Result<Self> {
+    pub fn create(
+        pool: Arc<BufferPool>,
+        definition: &CreateIndex,
+        columns: &[Column],
+    ) -> Result<Self> {
         Self::new(definition, columns, || match definition.using {
             IndexKind::BTree => Ok(Store::BTree(BPlusTree::create(pool)?)),
             IndexKind::Hash => Ok(Store::Hash(HashFile::create(pool, HASH_SCHEME)?)),
@@ -97,7 +101,12 @@ impl Index {
     }
 
     /// Opens an index the catalog recorded, whose root page is `root`.
-    pub fn open(pool: Arc<BufferPool>, definition: &CreateIndex, columns: &[Column], root: PageId) -> Result<Self> {
+    pub fn open(
+        pool: Arc<BufferPool>,
+        definition: &CreateIndex,
+        columns: &[Column],
+        root: PageId,
+    ) -> Result<Self> {
         Self::new(definition, columns, || match definition.using {
             IndexKind::BTree => Ok(Store::BTree(BPlusTree::open(pool, root))),
             IndexKind::Hash => Ok(Store::Hash(HashFile::open(pool, root)?)),
@@ -106,8 +115,20 @@ impl Index {
 
     /// Checks a definition against the table's columns, and only then makes
     /// the index's tree or file with `store`.
-    fn new(definition: &CreateIndex, columns: &[Column], store: impl FnOnce() -> Result<Store>) -> Result<Self> {
-        let CreateIndex { name, table, using: _, keys, include, predicate, unique } = definition;
+    fn new(
+        definition: &CreateIndex,
+        columns: &[Column],
+        store: impl FnOnce() -> Result<Store>,
+    ) -> Result<Self> {
+        let CreateIndex {
+            name,
+            table,
+            using: _,
+            keys,
+            include,
+            predicate,
+            unique,
+        } = definition;
         let own = |expr: &Expr, what: &str| own_expr(expr, table, columns, what);
         let keys: Vec<Key> = keys
             .iter()
@@ -118,8 +139,14 @@ impl Index {
                 })
             })
             .collect::<Result<_>>()?;
-        let include: Vec<usize> = include.iter().map(|c| column_index(columns, c)).collect::<Result<_>>()?;
-        let predicate = predicate.as_ref().map(|p| own(p, "an index's WHERE")).transpose()?;
+        let include: Vec<usize> = include
+            .iter()
+            .map(|c| column_index(columns, c))
+            .collect::<Result<_>>()?;
+        let predicate = predicate
+            .as_ref()
+            .map(|p| own(p, "an index's WHERE"))
+            .transpose()?;
 
         let mut reads = Vec::new();
         for key in &keys {
@@ -227,7 +254,9 @@ impl Index {
 
     /// The entry of a row with id `id`, or `None` if the row is not indexed.
     pub fn entry(&self, row: &[Value], id: &[u8]) -> Result<Option<Vec<u8>>> {
-        let Some(keys) = self.key_values(row)? else { return Ok(None) };
+        let Some(keys) = self.key_values(row)? else {
+            return Ok(None);
+        };
         let mut entry = encode_keys(&keys);
         let included: Vec<Value> = self.include.iter().map(|&i| row[i].clone()).collect();
         entry.extend(tuple::encode(&self.included, &included)?);
@@ -241,7 +270,10 @@ impl Index {
             && entry.len() > MAX_KEY_SIZE
         {
             let len = entry.len();
-            return err(format!("value is too long for index {}: {len} bytes, the maximum is {MAX_KEY_SIZE}", self.name));
+            return err(format!(
+                "value is too long for index {}: {len} bytes, the maximum is {MAX_KEY_SIZE}",
+                self.name
+            ));
         }
         Ok(())
     }
@@ -274,7 +306,9 @@ impl Index {
     pub fn delete_entry(&mut self, entry: &[u8]) -> Result<()> {
         match &self.store {
             Store::BTree(tree) => tree.delete(entry).map(|_| ()),
-            Store::Hash(file) => file.delete(hash::hash(&entry[..self.keys_end(entry)?]), entry).map(|_| ()),
+            Store::Hash(file) => file
+                .delete(hash::hash(&entry[..self.keys_end(entry)?]), entry)
+                .map(|_| ()),
         }
     }
 
@@ -295,7 +329,10 @@ impl Index {
             }
             Store::Hash(file) => file.find(hash::hash(keys), keys)?,
         };
-        entries.iter().map(|entry| Ok(self.row_id(entry)?.to_vec())).collect()
+        entries
+            .iter()
+            .map(|entry| Ok(self.row_id(entry)?.to_vec()))
+            .collect()
     }
 
     /// The entries whose first keys equal `equal`, and whose next key lies
@@ -304,13 +341,21 @@ impl Index {
     ///
     /// A hash index takes only values for every key and no bounds, and
     /// returns its entries in no order.
-    pub fn scan(&self, equal: &[Value], lower: Option<&Bound>, upper: Option<&Bound>) -> Result<Vec<Vec<u8>>> {
+    pub fn scan(
+        &self,
+        equal: &[Value],
+        lower: Option<&Bound>,
+        upper: Option<&Bound>,
+    ) -> Result<Vec<Vec<u8>>> {
         let prefix = encode_keys(equal);
         let tree = match &self.store {
             Store::BTree(tree) => tree,
             Store::Hash(file) => {
                 if equal.len() < self.keys.len() || lower.is_some() || upper.is_some() {
-                    return err(format!("hash index {} finds only rows whose every key equals a value", self.name));
+                    return err(format!(
+                        "hash index {} finds only rows whose every key equals a value",
+                        self.name
+                    ));
                 }
                 return file.find(hash::hash(&prefix), &prefix);
             }
@@ -368,7 +413,9 @@ impl Index {
                 && needed[*i]
             {
                 // A REAL equal to an INT was stored as one.
-                row[*i] = value.coerce(self.types[*i]).ok_or_else(|| Error("corrupted index entry".into()))?;
+                row[*i] = value
+                    .coerce(self.types[*i])
+                    .ok_or_else(|| Error("corrupted index entry".into()))?;
             }
         }
         let (included, _) = tuple::decode_prefix(&self.included, &entry[pos..])?;
@@ -416,11 +463,15 @@ fn own_expr(expr: &Expr, table: &str, columns: &[Column], what: &str) -> Result<
     let mut problem = None;
     expr.visit(&mut |e| match e {
         Expr::Column(column) => {
-            if column.table.as_ref().is_some_and(|t| t != table) || column_index(columns, &column.name).is_err() {
+            if column.table.as_ref().is_some_and(|t| t != table)
+                || column_index(columns, &column.name).is_err()
+            {
                 problem.get_or_insert_with(|| format!("unknown column: {column}"));
             }
         }
-        Expr::Aggregate(..) => _ = problem.get_or_insert_with(|| format!("{what} cannot use an aggregate")),
+        Expr::Aggregate(..) => {
+            _ = problem.get_or_insert_with(|| format!("{what} cannot use an aggregate"))
+        }
         Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(..) | Expr::Outer(_) => {
             _ = problem.get_or_insert_with(|| format!("{what} cannot use a subquery"))
         }
@@ -443,26 +494,45 @@ mod tests {
     use crate::storage::DiskManager;
 
     fn columns() -> Vec<Column> {
-        [("id", DataType::Int), ("name", DataType::Text), ("score", DataType::Real), ("n", DataType::Int)]
-            .map(|(name, data_type)| Column { name: name.into(), data_type, primary_key: false })
-            .into()
+        [
+            ("id", DataType::Int),
+            ("name", DataType::Text),
+            ("score", DataType::Real),
+            ("n", DataType::Int),
+        ]
+        .map(|(name, data_type)| Column {
+            name: name.into(),
+            data_type,
+            primary_key: false,
+        })
+        .into()
     }
 
     fn index(sql: &str) -> Index {
-        let Some(Statement::CreateIndex(definition)) = parse(sql).unwrap().pop() else { panic!("{sql}") };
+        let Some(Statement::CreateIndex(definition)) = parse(sql).unwrap().pop() else {
+            panic!("{sql}")
+        };
         let pool = Arc::new(BufferPool::new(Arc::new(DiskManager::in_memory()), 16));
         Index::create(pool, &definition, &columns()).unwrap()
     }
 
     fn row(id: i64, name: Option<&str>, score: f64, n: Option<i64>) -> Vec<Value> {
         let name = name.map_or(Value::Null, |s| Value::Text(s.into()));
-        vec![Value::Int(id), name, Value::Real(score), n.map_or(Value::Null, Value::Int)]
+        vec![
+            Value::Int(id),
+            name,
+            Value::Real(score),
+            n.map_or(Value::Null, Value::Int),
+        ]
     }
 
     /// The first byte of each row id an index scan returns.
     fn ids(index: &Index, equal: &[Value], lower: Option<Bound>, upper: Option<Bound>) -> Vec<u8> {
         let entries = index.scan(equal, lower.as_ref(), upper.as_ref()).unwrap();
-        entries.iter().map(|e| index.row_id(e).unwrap()[0]).collect()
+        entries
+            .iter()
+            .map(|e| index.row_id(e).unwrap()[0])
+            .collect()
     }
 
     #[test]
@@ -477,30 +547,66 @@ mod tests {
             row(5, Some("b"), 0.0, Some(7)),
         ];
         for row in &rows {
-            index.insert(row, &[row[0].to_sql().parse::<u8>().unwrap(), 9, 9]).unwrap();
+            index
+                .insert(row, &[row[0].to_sql().parse::<u8>().unwrap(), 9, 9])
+                .unwrap();
         }
         let b = [Value::Text("b".into())];
-        let bound = |n, inclusive| Some(Bound { value: Value::Int(n), inclusive });
-        assert_eq!(ids(&index, &b, None, None), [2, 3, 0, 5], "NULL first, then by n");
+        let bound = |n, inclusive| {
+            Some(Bound {
+                value: Value::Int(n),
+                inclusive,
+            })
+        };
+        assert_eq!(
+            ids(&index, &b, None, None),
+            [2, 3, 0, 5],
+            "NULL first, then by n"
+        );
         assert_eq!(ids(&index, &b, bound(-1, false), bound(7, false)), [0]);
         assert_eq!(ids(&index, &b, bound(-1, true), bound(7, true)), [3, 0, 5]);
-        assert_eq!(ids(&index, &b, None, bound(2, true)), [3, 0], "a range leaves NULL out");
+        assert_eq!(
+            ids(&index, &b, None, bound(2, true)),
+            [3, 0],
+            "a range leaves NULL out"
+        );
         assert_eq!(ids(&index, &[], None, None), [4, 1, 2, 3, 0, 5]);
         assert_eq!(ids(&index, &[Value::Null], None, None), [4]);
 
         index.delete(&rows[3], &[3, 9, 9]).unwrap();
         assert_eq!(ids(&index, &b, None, None), [2, 0, 5]);
-        assert_eq!(index.find(&encode_keys(&[b[0].clone(), Value::Int(7)])).unwrap(), [vec![5, 9, 9]]);
+        assert_eq!(
+            index
+                .find(&encode_keys(&[b[0].clone(), Value::Int(7)]))
+                .unwrap(),
+            [vec![5, 9, 9]]
+        );
     }
 
     #[test]
     fn entries_hold_expressions_included_columns_and_ids_of_any_length() {
-        let index = index("CREATE INDEX i ON t (LOWER(name), score) INCLUDE (n, name) WHERE n IS NOT NULL");
+        let index =
+            index("CREATE INDEX i ON t (LOWER(name), score) INCLUDE (n, name) WHERE n IS NOT NULL");
         assert_eq!(index.reads(), [1, 2, 3]);
-        assert!(index.entry(&row(1, Some("A"), 1.0, None), b"id").unwrap().is_none(), "left out by the WHERE");
+        assert!(
+            index
+                .entry(&row(1, Some("A"), 1.0, None), b"id")
+                .unwrap()
+                .is_none(),
+            "left out by the WHERE"
+        );
 
-        let entry = index.entry(&row(1, Some("A\0b"), 2.0, Some(-3)), b"an LSM key \0 of any length").unwrap().unwrap();
-        assert_eq!(index.row_id(&entry).unwrap(), b"an LSM key \0 of any length");
+        let entry = index
+            .entry(
+                &row(1, Some("A\0b"), 2.0, Some(-3)),
+                b"an LSM key \0 of any length",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            index.row_id(&entry).unwrap(),
+            b"an LSM key \0 of any length"
+        );
         let needed = [false, true, true, true];
         assert!(index.covers(&needed));
         assert!(!index.covers(&[true, false, false, false]));
@@ -518,18 +624,34 @@ mod tests {
     fn definitions_are_checked_against_the_columns() {
         let pool = Arc::new(BufferPool::new(Arc::new(DiskManager::in_memory()), 16));
         let pages = pool.disk().page_count();
-        for sql in ["CREATE INDEX i ON t (nope)", "CREATE INDEX i ON t (u.name)", "CREATE INDEX i ON t (n) WHERE SUM(n) > 1"] {
-            let Some(Statement::CreateIndex(definition)) = parse(sql).unwrap().pop() else { unreachable!() };
-            assert!(Index::create(pool.clone(), &definition, &columns()).is_err(), "{sql}");
+        for sql in [
+            "CREATE INDEX i ON t (nope)",
+            "CREATE INDEX i ON t (u.name)",
+            "CREATE INDEX i ON t (n) WHERE SUM(n) > 1",
+        ] {
+            let Some(Statement::CreateIndex(definition)) = parse(sql).unwrap().pop() else {
+                unreachable!()
+            };
+            assert!(
+                Index::create(pool.clone(), &definition, &columns()).is_err(),
+                "{sql}"
+            );
         }
         assert_eq!(pool.disk().page_count(), pages, "no tree was made");
         let index = index("CREATE INDEX i ON t (t.n, n + 1) WHERE t.name > 'a'");
         assert_eq!(index.keys, [Key::Column(3), Key::Expr(parse_expr("n + 1"))]);
-        assert_eq!(index.predicate, Some(parse_expr("name > 'a'")), "columns unqualified");
+        assert_eq!(
+            index.predicate,
+            Some(parse_expr("name > 'a'")),
+            "columns unqualified"
+        );
     }
 
     fn parse_expr(sql: &str) -> Expr {
-        let Some(Statement::Select(query)) = parse(&format!("SELECT * FROM t WHERE {sql}")).unwrap().pop() else {
+        let Some(Statement::Select(query)) = parse(&format!("SELECT * FROM t WHERE {sql}"))
+            .unwrap()
+            .pop()
+        else {
             unreachable!()
         };
         query.filter.unwrap()

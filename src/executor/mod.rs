@@ -52,13 +52,26 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { sort_memory: SORT_MEMORY, join_memory: JOIN_MEMORY, hash_memory: HASH_MEMORY, model: None }
+        Settings {
+            sort_memory: SORT_MEMORY,
+            join_memory: JOIN_MEMORY,
+            hash_memory: HASH_MEMORY,
+            model: None,
+        }
     }
 }
 
-pub fn execute(catalog: &mut Catalog, statement: Statement, settings: &Settings) -> Result<QueryResult> {
+pub fn execute(
+    catalog: &mut Catalog,
+    statement: Statement,
+    settings: &Settings,
+) -> Result<QueryResult> {
     match statement {
-        Statement::CreateTable { name, columns, storage } => {
+        Statement::CreateTable {
+            name,
+            columns,
+            storage,
+        } => {
             catalog.create_table(name.clone(), columns, storage)?;
             Ok(message(format!("table {name} created")))
         }
@@ -75,15 +88,24 @@ pub fn execute(catalog: &mut Catalog, statement: Statement, settings: &Settings)
             catalog.drop_index(&name)?;
             Ok(message(format!("index {name} dropped")))
         }
-        Statement::Explain { statement, analyze: false } => explain(catalog, *statement),
-        Statement::Explain { statement, analyze: true } => match *statement {
+        Statement::Explain {
+            statement,
+            analyze: false,
+        } => explain(catalog, *statement),
+        Statement::Explain {
+            statement,
+            analyze: true,
+        } => match *statement {
             Statement::Select(query) => explain_analyze(catalog, query, settings),
             _ => err("EXPLAIN ANALYZE supports only SELECT"),
         },
         Statement::Select(query) => {
             let query = select(catalog, query, settings)?;
             let columns = query.columns.clone();
-            Ok(QueryResult::Rows { columns, rows: query.collect::<Result<_>>()? })
+            Ok(QueryResult::Rows {
+                columns,
+                rows: query.collect::<Result<_>>()?,
+            })
         }
         Statement::Checkpoint => {
             catalog.checkpoint()?;
@@ -94,13 +116,23 @@ pub fn execute(catalog: &mut Catalog, statement: Statement, settings: &Settings)
         | Statement::Rollback { .. }
         | Statement::Savepoint { .. }
         | Statement::Release { .. } => err("transaction statements are run by the database"),
-        Statement::Insert { table, columns, rows, returning } => {
-            insert(catalog, &table, columns, rows, returning, settings)
-        }
-        Statement::Update { table, assignments, filter, returning } => {
-            update(catalog, &table, assignments, filter, returning, settings)
-        }
-        Statement::Delete { table, filter, returning } => delete(catalog, &table, filter, returning, settings),
+        Statement::Insert {
+            table,
+            columns,
+            rows,
+            returning,
+        } => insert(catalog, &table, columns, rows, returning, settings),
+        Statement::Update {
+            table,
+            assignments,
+            filter,
+            returning,
+        } => update(catalog, &table, assignments, filter, returning, settings),
+        Statement::Delete {
+            table,
+            filter,
+            returning,
+        } => delete(catalog, &table, filter, returning, settings),
     }
 }
 
@@ -121,7 +153,10 @@ impl Iterator for Query<'_> {
 /// Plans a SELECT and starts running it; no row is read until asked for.
 pub fn select<'a>(catalog: &'a Catalog, query: Select, settings: &Settings) -> Result<Query<'a>> {
     let plan = query::select(catalog, query)?;
-    Ok(Query { columns: plan.columns, rows: model::open(plan.root, catalog, settings) })
+    Ok(Query {
+        columns: plan.columns,
+        rows: model::open(plan.root, catalog, settings),
+    })
 }
 
 /// Describes how a statement would run: its plan, one step per line, the
@@ -131,7 +166,9 @@ fn explain(catalog: &Catalog, statement: Statement) -> Result<QueryResult> {
         Statement::Select(query) => query::select(catalog, query)?.root,
         Statement::Update { table, filter, .. } | Statement::Delete { table, filter, .. } => {
             let table = catalog.get(&table)?;
-            let filter = filter.map(|f| query::bind(catalog, Some(table), &f)).transpose()?;
+            let filter = filter
+                .map(|f| query::bind(catalog, Some(table), &f))
+                .transpose()?;
             query::scan(table, &table.name, &filter, vec![true; table.columns.len()])
         }
         _ => return err("EXPLAIN supports only SELECT, UPDATE and DELETE"),
@@ -152,8 +189,13 @@ fn explain_analyze(catalog: &Catalog, query: Select, settings: &Settings) -> Res
     let (model, why) = model::choose(&root, settings);
     let profile = Rc::new(Profile::new(lines.len()));
     let zones = |catalog: &Catalog| -> Vec<(String, (u64, u64))> {
-        let tables = catalog.table_names().into_iter().filter_map(|name| catalog.get(name).ok());
-        tables.filter_map(|table| Some((table.name.clone(), table.zone_stats()?))).collect()
+        let tables = catalog
+            .table_names()
+            .into_iter()
+            .filter_map(|name| catalog.get(name).ok());
+        tables
+            .filter_map(|table| Some((table.name.clone(), table.zone_stats()?)))
+            .collect()
     };
     let before = zones(catalog);
     let start = Instant::now();
@@ -166,22 +208,36 @@ fn explain_analyze(catalog: &Catalog, query: Select, settings: &Settings) -> Res
     let after = zones(catalog);
 
     let mut out = vec![format!("MODEL {model}  ({why})")];
-    out.extend(lines
-        .into_iter()
-        .zip(profile.counts())
-        .map(|(line, count)| {
-            let did = match count {
-                StepCount { inside: true, .. } => "counted with the join above".to_string(),
-                StepCount { runs: 0, .. } => "never run".to_string(),
-                StepCount { runs: 1, rows, time, .. } => format!("{}, {}", rows_of(rows), ms(time)),
-                StepCount { runs, rows, time, .. } => format!("{} in {runs} runs, {}", rows_of(rows), ms(time)),
-            };
-            format!("{line}  ({did})")
-        }));
-    for ((table, (read, skipped)), (_, (read_before, skipped_before))) in after.into_iter().zip(before) {
+    out.extend(
+        lines
+            .into_iter()
+            .zip(profile.counts())
+            .map(|(line, count)| {
+                let did = match count {
+                    StepCount { inside: true, .. } => "counted with the join above".to_string(),
+                    StepCount { runs: 0, .. } => "never run".to_string(),
+                    StepCount {
+                        runs: 1,
+                        rows,
+                        time,
+                        ..
+                    } => format!("{}, {}", rows_of(rows), ms(time)),
+                    StepCount {
+                        runs, rows, time, ..
+                    } => format!("{} in {runs} runs, {}", rows_of(rows), ms(time)),
+                };
+                format!("{line}  ({did})")
+            }),
+    );
+    for ((table, (read, skipped)), (_, (read_before, skipped_before))) in
+        after.into_iter().zip(before)
+    {
         let (read, skipped) = (read - read_before, skipped - skipped_before);
         if read + skipped > 0 {
-            out.push(format!("ZONE MAPS {table}  ({skipped} of {} row groups skipped)", read + skipped));
+            out.push(format!(
+                "ZONE MAPS {table}  ({skipped} of {} row groups skipped)",
+                read + skipped
+            ));
         }
     }
     out.push(format!("{} in {}", rows_of(returned), ms(time)));
@@ -214,19 +270,31 @@ fn insert(
         let returning = Returning::bind(catalog, table, returning)?;
         // Which column each supplied value goes to; omitted columns become NULL.
         let targets: Vec<usize> = match columns {
-            Some(names) => names.iter().map(|n| table.column_index(n)).collect::<Result<_>>()?,
+            Some(names) => names
+                .iter()
+                .map(|n| table.column_index(n))
+                .collect::<Result<_>>()?,
             None => (0..table.columns.len()).collect(),
         };
         let mut subqueries = Runner::new(catalog, settings);
         let mut new_rows = Vec::new();
         for exprs in rows {
             if exprs.len() != targets.len() {
-                return err(format!("expected {} values, got {}", targets.len(), exprs.len()));
+                return err(format!(
+                    "expected {} values, got {}",
+                    targets.len(),
+                    exprs.len()
+                ));
             }
             let mut row = vec![Value::Null; table.columns.len()];
             forbid(&exprs, "VALUES")?;
             for (&i, expr) in targets.iter().zip(&exprs) {
-                row[i] = eval_with(&query::bind(catalog, None, expr)?, &[], &[], &mut subqueries)?;
+                row[i] = eval_with(
+                    &query::bind(catalog, None, expr)?,
+                    &[],
+                    &[],
+                    &mut subqueries,
+                )?;
             }
             new_rows.push(row);
         }
@@ -256,10 +324,17 @@ fn update(
         let catalog: &Catalog = catalog;
         let table = catalog.get(table)?;
         let returning = Returning::bind(catalog, table, returning)?;
-        let filter = filter.map(|f| query::bind(catalog, Some(table), &f)).transpose()?;
+        let filter = filter
+            .map(|f| query::bind(catalog, Some(table), &f))
+            .transpose()?;
         let assignments: Vec<(usize, Expr)> = assignments
             .into_iter()
-            .map(|(name, expr)| Ok((table.column_index(&name)?, query::bind(catalog, Some(table), &expr)?)))
+            .map(|(name, expr)| {
+                Ok((
+                    table.column_index(&name)?,
+                    query::bind(catalog, Some(table), &expr)?,
+                ))
+            })
             .collect::<Result<_>>()?;
 
         // Collect every change before writing, so the scan never sees its own
@@ -267,7 +342,10 @@ fn update(
         let fields = Field::of_table(&table.name, &table.columns);
         // Found once among the table's columns, not by name for each row.
         let located = filter.as_ref().map(|f| locate(f, &fields));
-        let assignments: Vec<(usize, Expr)> = assignments.iter().map(|(i, e)| (*i, locate(e, &fields))).collect();
+        let assignments: Vec<(usize, Expr)> = assignments
+            .iter()
+            .map(|(i, e)| (*i, locate(e, &fields)))
+            .collect();
         let mut subqueries = Runner::new(catalog, settings);
         let mut changes = Vec::new();
         for item in scan(table, &vec![true; table.columns.len()], &filter) {
@@ -313,7 +391,9 @@ fn delete(
         let catalog: &Catalog = catalog;
         let table = catalog.get(table)?;
         let returning = Returning::bind(catalog, table, returning)?;
-        let filter = filter.map(|f| query::bind(catalog, Some(table), &f)).transpose()?;
+        let filter = filter
+            .map(|f| query::bind(catalog, Some(table), &f))
+            .transpose()?;
         let fields = Field::of_table(&table.name, &table.columns);
         let mut subqueries = Runner::new(catalog, settings);
         // The filter's columns, and the indexed ones, whose entries the delete
@@ -322,7 +402,10 @@ fn delete(
             Some(_) => vec![true; table.columns.len()],
             None => filter::needed_columns(table, &table.name, &filter),
         };
-        needed.iter_mut().zip(table.indexed_columns()).for_each(|(needed, indexed)| *needed |= indexed);
+        needed
+            .iter_mut()
+            .zip(table.indexed_columns())
+            .for_each(|(needed, indexed)| *needed |= indexed);
         let located = filter.as_ref().map(|f| locate(f, &fields));
         let mut rows = Vec::new();
         for item in scan(table, &needed, &filter) {
@@ -356,13 +439,20 @@ struct Returning {
 
 impl Returning {
     /// Binds a RETURNING list to `table`, if there is one. `*` is every column of the table.
-    fn bind(catalog: &Catalog, table: &Table, projection: Option<Projection>) -> Result<Option<Returning>> {
+    fn bind(
+        catalog: &Catalog,
+        table: &Table,
+        projection: Option<Projection>,
+    ) -> Result<Option<Returning>> {
         let items = match projection {
             None => return Ok(None),
             Some(Projection::All) => table
                 .columns
                 .iter()
-                .map(|column| SelectItem { expr: Expr::Column(ColumnRef::bare(column.name.clone())), alias: None })
+                .map(|column| SelectItem {
+                    expr: Expr::Column(ColumnRef::bare(column.name.clone())),
+                    alias: None,
+                })
                 .collect(),
             Some(Projection::Exprs(items)) => items,
         };
@@ -374,9 +464,18 @@ impl Returning {
         let fields = Field::of_table(&table.name, &table.columns);
         let exprs = items
             .iter()
-            .map(|item| Ok(locate(&query::bind(catalog, Some(table), &item.expr)?, &fields)))
+            .map(|item| {
+                Ok(locate(
+                    &query::bind(catalog, Some(table), &item.expr)?,
+                    &fields,
+                ))
+            })
             .collect::<Result<_>>()?;
-        Ok(Some(Returning { columns, exprs, fields }))
+        Ok(Some(Returning {
+            columns,
+            exprs,
+            fields,
+        }))
     }
 
     /// The rows it gives for these rows of its table, in their order.
@@ -384,9 +483,17 @@ impl Returning {
         let mut subqueries = Runner::new(catalog, settings);
         let rows = rows
             .iter()
-            .map(|row| self.exprs.iter().map(|e| eval_with(e, &self.fields, row, &mut subqueries)).collect())
+            .map(|row| {
+                self.exprs
+                    .iter()
+                    .map(|e| eval_with(e, &self.fields, row, &mut subqueries))
+                    .collect()
+            })
             .collect::<Result<_>>()?;
-        Ok(QueryResult::Rows { columns: self.columns, rows })
+        Ok(QueryResult::Rows {
+            columns: self.columns,
+            rows,
+        })
     }
 }
 

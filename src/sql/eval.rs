@@ -30,12 +30,21 @@ pub struct Field {
 impl Field {
     /// The fields of a table's rows, qualified by `qualifier` (its name or alias).
     pub fn of_table(qualifier: &str, columns: &[Column]) -> Vec<Field> {
-        columns.iter().map(|c| Field { table: Some(qualifier.into()), name: c.name.clone() }).collect()
+        columns
+            .iter()
+            .map(|c| Field {
+                table: Some(qualifier.into()),
+                name: c.name.clone(),
+            })
+            .collect()
     }
 
     /// A field that only its name refers to.
     pub fn named(name: impl Into<String>) -> Field {
-        Field { table: None, name: name.into() }
+        Field {
+            table: None,
+            name: name.into(),
+        }
     }
 
     /// Whether the column reference may name this field.
@@ -74,7 +83,10 @@ impl Subqueries for NoSubqueries {
 /// Finds the field a column reference names: the one with its name, and
 /// from its table if it names one. Fails if there is none, or more than one.
 pub fn resolve(fields: &[Field], column: &ColumnRef) -> Result<usize> {
-    let mut found = fields.iter().enumerate().filter(|(_, f)| f.is_named_by(column));
+    let mut found = fields
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.is_named_by(column));
     match (found.next(), found.next()) {
         (Some((i, _)), None) => Ok(i),
         (None, _) => err(format!("unknown column: {column}")),
@@ -95,9 +107,11 @@ pub fn locate(expr: &Expr, fields: &[Field]) -> Expr {
             Err(_) => e.clone(),
         })),
         Expr::Subquery(_) | Expr::Exists(_) => Some(Ok(e.clone())),
-        Expr::InSubquery(left, query, negated) => {
-            Some(Ok(Expr::InSubquery(Box::new(locate(left, fields)), query.clone(), *negated)))
-        }
+        Expr::InSubquery(left, query, negated) => Some(Ok(Expr::InSubquery(
+            Box::new(locate(left, fields)),
+            query.clone(),
+            *negated,
+        ))),
         _ => None,
     });
     located.expect("locating columns cannot fail")
@@ -124,7 +138,10 @@ pub fn matches_with(
     match eval_with(expr, fields, row, subqueries)? {
         Value::Bool(b) => Ok(b),
         Value::Null => Ok(false),
-        other => err(format!("WHERE clause must be boolean, got {}", other.to_sql())),
+        other => err(format!(
+            "WHERE clause must be boolean, got {}",
+            other.to_sql()
+        )),
     }
 }
 
@@ -134,7 +151,12 @@ pub fn eval(expr: &Expr, fields: &[Field], row: &[Value]) -> Result<Value> {
 }
 
 /// Evaluates an expression against one row, running its subqueries with `subqueries`.
-pub fn eval_with(expr: &Expr, fields: &[Field], row: &[Value], subqueries: &mut dyn Subqueries) -> Result<Value> {
+pub fn eval_with(
+    expr: &Expr,
+    fields: &[Field],
+    row: &[Value],
+    subqueries: &mut dyn Subqueries,
+) -> Result<Value> {
     let mut eval = |e: &Expr| eval_with(e, fields, row, subqueries);
     match expr {
         Expr::Literal(value) => Ok(value.clone()),
@@ -142,7 +164,10 @@ pub fn eval_with(expr: &Expr, fields: &[Field], row: &[Value], subqueries: &mut 
         Expr::Column(column) => Ok(row[resolve(fields, column)?].clone()),
         Expr::IsNull(inner, negated) => Ok(Value::Bool(eval(inner)?.is_null() != *negated)),
         // Grouped queries replace aggregates by their results before evaluating.
-        Expr::Aggregate(function, ..) => err(format!("{} is not allowed here", function.name().to_uppercase())),
+        Expr::Aggregate(function, ..) => err(format!(
+            "{} is not allowed here",
+            function.name().to_uppercase()
+        )),
         Expr::Unary(op, inner) => unary(*op, eval(inner)?),
         // FALSE AND x is FALSE, and TRUE OR x TRUE, whatever x: x is not
         // evaluated, so it fails on no row the left side decides.
@@ -158,11 +183,21 @@ pub fn eval_with(expr: &Expr, fields: &[Field], row: &[Value], subqueries: &mut 
             let value = eval(left)?;
             let mut found = Value::Bool(false);
             for item in items {
-                found = binary(found, BinaryOp::Or, binary(value.clone(), BinaryOp::Eq, eval(item)?)?)?;
+                found = binary(
+                    found,
+                    BinaryOp::Or,
+                    binary(value.clone(), BinaryOp::Eq, eval(item)?)?,
+                )?;
             }
-            if *negated { unary(UnaryOp::Not, found) } else { Ok(found) }
+            if *negated {
+                unary(UnaryOp::Not, found)
+            } else {
+                Ok(found)
+            }
         }
-        Expr::Outer(column) => err(format!("column {column} of an outer query cannot be used here")),
+        Expr::Outer(column) => err(format!(
+            "column {column} of an outer query cannot be used here"
+        )),
         Expr::Subquery(_) | Expr::Exists(_) => match &*subqueries.answer(expr, fields, row)? {
             Answer::Value(value) => Ok(value.clone()),
             Answer::Exists(found) => Ok(Value::Bool(*found)),
@@ -171,7 +206,9 @@ pub fn eval_with(expr: &Expr, fields: &[Field], row: &[Value], subqueries: &mut 
         Expr::InSubquery(left, _, negated) => {
             let value = eval(left)?;
             let answer = subqueries.answer(expr, fields, row)?;
-            let Answer::Values { values, null } = &*answer else { unreachable!("IN asks for values") };
+            let Answer::Values { values, null } = &*answer else {
+                unreachable!("IN asks for values")
+            };
             let found = match value {
                 _ if values.is_empty() && !null => Value::Bool(false),
                 Value::Null => Value::Null,
@@ -179,18 +216,33 @@ pub fn eval_with(expr: &Expr, fields: &[Field], row: &[Value], subqueries: &mut 
                 _ if *null => Value::Null,
                 _ => Value::Bool(false),
             };
-            if *negated { unary(UnaryOp::Not, found) } else { Ok(found) }
+            if *negated {
+                unary(UnaryOp::Not, found)
+            } else {
+                Ok(found)
+            }
         }
-        Expr::Case { operand, branches, otherwise } => {
+        Expr::Case {
+            operand,
+            branches,
+            otherwise,
+        } => {
             let operand = operand.as_deref().map(&mut eval).transpose()?;
             for (when, then) in branches {
                 let when = eval(when)?;
                 let taken = match &operand {
-                    Some(operand) => binary(operand.clone(), BinaryOp::Eq, when)? == Value::Bool(true),
+                    Some(operand) => {
+                        binary(operand.clone(), BinaryOp::Eq, when)? == Value::Bool(true)
+                    }
                     None => match when {
                         Value::Bool(b) => b,
                         Value::Null => false,
-                        other => return err(format!("CASE WHEN must be boolean, got {}", other.to_sql())),
+                        other => {
+                            return err(format!(
+                                "CASE WHEN must be boolean, got {}",
+                                other.to_sql()
+                            ));
+                        }
                     },
                 };
                 if taken {
@@ -204,7 +256,11 @@ pub fn eval_with(expr: &Expr, fields: &[Field], row: &[Value], subqueries: &mut 
 }
 
 /// Calls a scalar function on its arguments, which `eval` evaluates.
-fn call(function: Function, args: &[Expr], eval: &mut dyn FnMut(&Expr) -> Result<Value>) -> Result<Value> {
+fn call(
+    function: Function,
+    args: &[Expr],
+    eval: &mut dyn FnMut(&Expr) -> Result<Value>,
+) -> Result<Value> {
     if function == Function::Coalesce {
         for arg in args {
             let value = eval(arg)?;
@@ -224,33 +280,52 @@ pub(crate) fn apply(function: Function, values: &[Value]) -> Result<Value> {
     use Value::{Int, Null, Real, Text};
 
     if function == Function::Coalesce {
-        return Ok(values.iter().find(|v| !v.is_null()).cloned().unwrap_or(Null));
+        return Ok(values
+            .iter()
+            .find(|v| !v.is_null())
+            .cloned()
+            .unwrap_or(Null));
     }
     let wrong = |value: &Value, expected: &str| {
-        err(format!("{} expects {expected}, got {}", function.name().to_uppercase(), value.to_sql()))
+        err(format!(
+            "{} expects {expected}, got {}",
+            function.name().to_uppercase(),
+            value.to_sql()
+        ))
     };
     match (function, values) {
-        (Function::Nullif, [a, b]) => {
-            Ok(if binary(a.clone(), BinaryOp::Eq, b.clone())? == Value::Bool(true) { Null } else { a.clone() })
-        }
+        (Function::Nullif, [a, b]) => Ok(
+            if binary(a.clone(), BinaryOp::Eq, b.clone())? == Value::Bool(true) {
+                Null
+            } else {
+                a.clone()
+            },
+        ),
         (_, values) if values.iter().any(Value::is_null) => Ok(Null),
         (Function::Length, [Text(s)]) => Ok(Int(s.chars().count() as i64)),
         (Function::Upper, [Text(s)]) => Ok(Text(s.to_ascii_uppercase())),
         (Function::Lower, [Text(s)]) => Ok(Text(s.to_ascii_lowercase())),
         (Function::Substr, [Text(s), Int(start)]) => Ok(Text(substr(s, *start, None))),
-        (Function::Substr, [Text(s), Int(start), Int(len)]) => Ok(Text(substr(s, *start, Some(*len)))),
+        (Function::Substr, [Text(s), Int(start), Int(len)]) => {
+            Ok(Text(substr(s, *start, Some(*len))))
+        }
         (Function::Abs, [Int(n)]) => n.checked_abs().map(Int).ok_or_else(overflow),
         (Function::Abs, [Real(r)]) => Ok(Real(r.abs())),
         (Function::Round, [x]) if x.as_real().is_some() => Ok(Real(round(x.as_real().unwrap(), 0))),
-        (Function::Round, [x, Int(digits)]) if x.as_real().is_some() => Ok(Real(round(x.as_real().unwrap(), *digits))),
+        (Function::Round, [x, Int(digits)]) if x.as_real().is_some() => {
+            Ok(Real(round(x.as_real().unwrap(), *digits)))
+        }
         (Function::Length | Function::Upper | Function::Lower | Function::Substr, [value, ..])
             if !matches!(value, Text(_)) =>
         {
             wrong(value, "TEXT")
         }
-        (Function::Substr, [_, rest @ ..]) => {
-            wrong(rest.iter().find(|v| !matches!(v, Int(_))).expect("one is not INT"), "INT")
-        }
+        (Function::Substr, [_, rest @ ..]) => wrong(
+            rest.iter()
+                .find(|v| !matches!(v, Int(_)))
+                .expect("one is not INT"),
+            "INT",
+        ),
         (Function::Abs, [value]) => wrong(value, "a number"),
         (Function::Round, [x, ..]) if x.as_real().is_none() => wrong(x, "a number"),
         (Function::Round, [_, digits]) => wrong(digits, "INT"),
@@ -285,7 +360,11 @@ fn substr(s: &str, start: i64, len: Option<i64>) -> String {
         }
     }
     let end = from.saturating_add(count).min(total);
-    if from >= end { String::new() } else { chars[from as usize..end as usize].iter().collect() }
+    if from >= end {
+        String::new()
+    } else {
+        chars[from as usize..end as usize].iter().collect()
+    }
 }
 
 /// `ROUND`, as SQLite computes it: to `digits` decimal places (none if
@@ -318,14 +397,21 @@ fn round(x: f64, digits: i64) -> f64 {
         }
     }
     let (whole, fraction) = kept.split_at(kept.len() - digits);
-    let rounded: f64 = format!("{}.{}", String::from_utf8_lossy(whole), String::from_utf8_lossy(fraction)).parse().unwrap();
+    let rounded: f64 = format!(
+        "{}.{}",
+        String::from_utf8_lossy(whole),
+        String::from_utf8_lossy(fraction)
+    )
+    .parse()
+    .unwrap();
     rounded.copysign(x)
 }
 
 /// Whether `text` matches a LIKE `pattern`: `%` matches any characters, `_`
 /// any one, and ASCII letters match in either case, as in SQLite.
 pub(crate) fn like(text: &str, pattern: &str) -> bool {
-    let (text, pattern): (Vec<char>, Vec<char>) = (text.chars().collect(), pattern.chars().collect());
+    let (text, pattern): (Vec<char>, Vec<char>) =
+        (text.chars().collect(), pattern.chars().collect());
     let (mut t, mut p) = (0, 0);
     // After the last `%` passed: where the pattern goes on, and the text
     // position it was tried from.
@@ -367,7 +453,13 @@ pub(crate) fn binary(left: Value, op: BinaryOp, right: Value) -> Result<Value> {
     use BinaryOp::*;
     use Value::{Bool, Int, Null, Text};
 
-    let type_error = |l: &Value, r: &Value| err(format!("cannot apply {op:?} to {} and {}", l.to_sql(), r.to_sql()));
+    let type_error = |l: &Value, r: &Value| {
+        err(format!(
+            "cannot apply {op:?} to {} and {}",
+            l.to_sql(),
+            r.to_sql()
+        ))
+    };
 
     match op {
         // Three-valued logic: NULL means "unknown".
@@ -387,7 +479,9 @@ pub(crate) fn binary(left: Value, op: BinaryOp, right: Value) -> Result<Value> {
             if left.is_null() || right.is_null() {
                 return Ok(Null);
             }
-            let Some(ord) = left.compare(&right) else { return type_error(&left, &right) };
+            let Some(ord) = left.compare(&right) else {
+                return type_error(&left, &right);
+            };
             Ok(Bool(match op {
                 Eq => ord.is_eq(),
                 NotEq => ord.is_ne(),
@@ -454,31 +548,60 @@ mod tests {
 
     /// The expression of `SELECT <sql> FROM t`.
     fn expr(sql: &str) -> Expr {
-        let Statement::Select(select) = parse(&format!("SELECT {sql} FROM t")).unwrap().pop().unwrap() else { panic!() };
-        let Projection::Exprs(mut items) = select.projection else { panic!() };
+        let Statement::Select(select) = parse(&format!("SELECT {sql} FROM t"))
+            .unwrap()
+            .pop()
+            .unwrap()
+        else {
+            panic!()
+        };
+        let Projection::Exprs(mut items) = select.projection else {
+            panic!()
+        };
         let SelectItem { expr, .. } = items.remove(0);
         expr
     }
 
     #[test]
     fn located_columns_evaluate_and_print_as_named_ones() {
-        let fields = vec![Field { table: Some("t".into()), name: "a".into() }, Field { table: Some("t".into()), name: "b".into() }];
+        let fields = vec![
+            Field {
+                table: Some("t".into()),
+                name: "a".into(),
+            },
+            Field {
+                table: Some("t".into()),
+                name: "b".into(),
+            },
+        ];
         let row = [Value::Int(6), Value::Int(-2)];
-        for sql in ["a + b", "t.b * 2 > a", "CASE WHEN a > 0 THEN b END", "COALESCE(NULL, t.a)", "a IN (b, 6)", "-a"] {
+        for sql in [
+            "a + b",
+            "t.b * 2 > a",
+            "CASE WHEN a > 0 THEN b END",
+            "COALESCE(NULL, t.a)",
+            "a IN (b, 6)",
+            "-a",
+        ] {
             let named = expr(sql);
             let located = locate(&named, &fields);
             assert_ne!(located, named, "{sql}");
             assert_eq!(located.to_string(), named.to_string(), "{sql}");
-            assert_eq!(eval(&located, &fields, &row).unwrap(), eval(&named, &fields, &row).unwrap(), "{sql}");
+            assert_eq!(
+                eval(&located, &fields, &row).unwrap(),
+                eval(&named, &fields, &row).unwrap(),
+                "{sql}"
+            );
         }
         assert!(matches!(locate(&expr("t.b"), &fields), Expr::Slot(1, _)));
         // A subquery's columns are its own tables', found when it runs.
         let sub = expr("(SELECT MAX(a) FROM u WHERE EXISTS (SELECT b FROM v))");
         assert_eq!(locate(&sub, &fields), sub);
         // Of `x IN (SELECT ...)`, x is located, not the subquery.
-        let (Expr::InSubquery(left, query, _), Expr::InSubquery(_, original, _)) =
-            (locate(&expr("b IN (SELECT a FROM u)"), &fields), expr("b IN (SELECT a FROM u)"))
-        else {
+        let (Expr::InSubquery(left, query, _), Expr::InSubquery(_, original, _)) = (
+            locate(&expr("b IN (SELECT a FROM u)"), &fields),
+            expr("b IN (SELECT a FROM u)"),
+        ) else {
             panic!()
         };
         assert!(matches!(*left, Expr::Slot(1, _)));
@@ -503,7 +626,10 @@ mod tests {
         assert!(at("NULLIF(x, x) = 1 AND 1 / 0 = 1", Int(1)).is_err());
         assert!(at("x = 1 AND 1 / 0 = 1", Int(1)).is_err());
         assert!(at("x = 0 OR 1 / 0 = 1", Int(1)).is_err());
-        assert_eq!(at("NULLIF(x, x) = 1 AND x = 2", Int(1)).unwrap(), Bool(false));
+        assert_eq!(
+            at("NULLIF(x, x) = 1 AND x = 2", Int(1)).unwrap(),
+            Bool(false)
+        );
         assert_eq!(at("NULLIF(x, x) = 1 OR x = 1", Int(1)).unwrap(), Bool(true));
         assert_eq!(at("NULLIF(x, x) = 1 OR x = 2", Int(1)).unwrap(), Null);
         // A right side of the wrong type fails only where it is evaluated.

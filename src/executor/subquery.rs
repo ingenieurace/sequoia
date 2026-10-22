@@ -27,7 +27,11 @@ pub struct Runner<'a> {
 
 impl<'a> Runner<'a> {
     pub fn new(catalog: &'a Catalog, settings: &Settings) -> Self {
-        Runner { catalog, settings: settings.clone(), answers: HashMap::new() }
+        Runner {
+            catalog,
+            settings: settings.clone(),
+            answers: HashMap::new(),
+        }
     }
 }
 
@@ -43,13 +47,23 @@ impl Subqueries for Runner<'_> {
                 columns.push(column.clone());
             }
         });
-        let values = columns.iter().map(|c| Ok(row[resolve(fields, c)?].clone())).collect::<Result<Vec<_>>>()?;
-        if let Some(answer) = self.answers.get(query).and_then(|answers| answers.get(&values)) {
+        let values = columns
+            .iter()
+            .map(|c| Ok(row[resolve(fields, c)?].clone()))
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(answer) = self
+            .answers
+            .get(query)
+            .and_then(|answers| answers.get(&values))
+        {
             return Ok(answer.clone());
         }
 
         let bound = query::substitute(query, &mut |column| {
-            let i = columns.iter().position(|c| c == column).expect("collected above");
+            let i = columns
+                .iter()
+                .position(|c| c == column)
+                .expect("collected above");
             Ok(values[i].clone())
         })?;
         let plan = query::select(self.catalog, bound)?;
@@ -57,7 +71,10 @@ impl Subqueries for Runner<'_> {
         let answer = match subquery {
             Expr::Exists(_) => Answer::Exists(rows.next().transpose()?.is_some()),
             Expr::Subquery(_) => {
-                let value = rows.next().transpose()?.map_or(Value::Null, |mut row| row.swap_remove(0));
+                let value = rows
+                    .next()
+                    .transpose()?
+                    .map_or(Value::Null, |mut row| row.swap_remove(0));
                 if rows.next().transpose()?.is_some() {
                     return err("more than one row returned by a subquery used as a value");
                 }
@@ -77,7 +94,10 @@ impl Subqueries for Runner<'_> {
             }
         };
         let answer = Rc::new(answer);
-        self.answers.entry(query.clone()).or_default().insert(values, answer.clone());
+        self.answers
+            .entry(query.clone())
+            .or_default()
+            .insert(values, answer.clone());
         Ok(answer)
     }
 }

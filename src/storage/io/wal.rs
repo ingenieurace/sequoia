@@ -180,7 +180,12 @@ impl Wal {
 
     /// Marks the current end of the log, to roll back to.
     pub fn savepoint(&self) -> WalSavepoint {
-        WalSavepoint { pending: self.pending.clone(), end: self.end, checksum: self.checksum, epoch: self.epoch }
+        WalSavepoint {
+            pending: self.pending.clone(),
+            end: self.end,
+            checksum: self.checksum,
+            epoch: self.epoch,
+        }
     }
 
     /// Forgets every page written since `savepoint` and cuts them off the log.
@@ -204,7 +209,11 @@ impl Wal {
         if self.end == 0 {
             return Ok(());
         }
-        let mut pages: Vec<(PageId, u64)> = self.committed.iter().map(|(&id, &offset)| (id, offset)).collect();
+        let mut pages: Vec<(PageId, u64)> = self
+            .committed
+            .iter()
+            .map(|(&id, &offset)| (id, offset))
+            .collect();
         pages.sort();
         let mut page = [0; PAGE_SIZE];
         for (id, offset) in pages {
@@ -230,7 +239,12 @@ impl Wal {
 /// FNV-1a over the previous checksum, the page id and the page.
 fn checksum(previous: u64, id: u32, page: &[u8]) -> u64 {
     let mut hash = SEED;
-    for &byte in previous.to_le_bytes().iter().chain(&id.to_le_bytes()).chain(page) {
+    for &byte in previous
+        .to_le_bytes()
+        .iter()
+        .chain(&id.to_le_bytes())
+        .chain(page)
+    {
         hash = (hash ^ byte as u64).wrapping_mul(0x0100_0000_01b3);
     }
     hash
@@ -284,7 +298,11 @@ mod tests {
         // Everything reached the disk except a commit frame.
         let wal = Wal::open(sim.crashed(usize::MAX).file(0)).unwrap();
         assert_eq!((read(&wal, 1), read(&wal, 2)), (Some(1), None));
-        assert_eq!(wal.size(), PAGE_FRAME + FRAME_HEADER, "the uncommitted frames were cut off");
+        assert_eq!(
+            wal.size(),
+            PAGE_FRAME + FRAME_HEADER,
+            "the uncommitted frames were cut off"
+        );
     }
 
     #[test]
@@ -301,11 +319,16 @@ mod tests {
         let file = sim.file(0);
         file.set_len(len - 1).unwrap();
         let wal = Wal::open(sim.file(0)).unwrap();
-        assert_eq!((read(&wal, 2), read(&wal, 3)), (Some(2), None), "the last commit frame is cut short");
+        assert_eq!(
+            (read(&wal, 2), read(&wal, 3)),
+            (Some(2), None),
+            "the last commit frame is cut short"
+        );
         drop(wal);
 
         // A changed byte in the second page fails its checksum and every later one.
-        file.write_at(PAGE_FRAME + FRAME_HEADER + FRAME_HEADER + 7, &[9]).unwrap();
+        file.write_at(PAGE_FRAME + FRAME_HEADER + FRAME_HEADER + 7, &[9])
+            .unwrap();
         let wal = Wal::open(sim.file(0)).unwrap();
         assert_eq!((read(&wal, 1), read(&wal, 2)), (Some(1), None));
     }

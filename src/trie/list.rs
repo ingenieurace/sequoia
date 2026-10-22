@@ -11,7 +11,9 @@ pub struct List<V> {
 
 impl<V> Default for List<V> {
     fn default() -> Self {
-        List { children: Vec::new() }
+        List {
+            children: Vec::new(),
+        }
     }
 }
 

@@ -16,7 +16,9 @@ impl Bloom {
     /// Builds a filter holding the keys with these [`hash`]es.
     pub fn new(hashes: &[u64]) -> Self {
         let words = (hashes.len() * BITS_PER_KEY).div_ceil(64).max(1);
-        let mut bloom = Bloom { bits: vec![0; words] };
+        let mut bloom = Bloom {
+            bits: vec![0; words],
+        };
         for &hash in hashes {
             for bit in bloom.probes(hash) {
                 bloom.bits[bit / 64] |= 1 << (bit % 64);
@@ -27,7 +29,8 @@ impl Bloom {
 
     /// False means the key was certainly not added; true means it may have been.
     pub fn may_contain(&self, key: &[u8]) -> bool {
-        self.probes(hash(key)).all(|bit| self.bits[bit / 64] & (1 << (bit % 64)) != 0)
+        self.probes(hash(key))
+            .all(|bit| self.bits[bit / 64] & (1 << (bit % 64)) != 0)
     }
 
     fn probes(&self, hash: u64) -> impl Iterator<Item = usize> + use<> {
@@ -63,7 +66,9 @@ mod tests {
         let bloom = Bloom::new(&hashes);
         assert!((0..1000).all(|i| bloom.may_contain(&key(i))));
 
-        let false_positives = (1000..11_000).filter(|&i| bloom.may_contain(&key(i))).count();
+        let false_positives = (1000..11_000)
+            .filter(|&i| bloom.may_contain(&key(i)))
+            .count();
         assert!(false_positives < 300, "{false_positives} of 10000");
     }
 

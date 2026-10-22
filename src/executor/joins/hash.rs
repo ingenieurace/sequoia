@@ -79,7 +79,10 @@ enum Part {
     Memory(Buckets),
     /// Written out: the right rows of the partition, then those of its
     /// left rows that came to probe it.
-    Spilled { right: RowFile, left: RowFile },
+    Spilled {
+        right: RowFile,
+        left: RowFile,
+    },
 }
 
 /// Rows with equal keys, together.
@@ -178,7 +181,9 @@ impl<'a> HashSide<'a> {
                     self.pending.push(Pending { right, left, level });
                 }
             }
-            let Some(Pending { right, left, level }) = self.pending.pop() else { return Ok(None) };
+            let Some(Pending { right, left, level }) = self.pending.pop() else {
+                return Ok(None);
+            };
             self.build(Box::new(right.read()), level)?;
             self.deferred = Some(left.read());
         }
@@ -186,7 +191,11 @@ impl<'a> HashSide<'a> {
 
     /// Fills the table with `rows`, partitioning them at `level` if they outgrow the budget.
     fn build(&mut self, rows: Rows, level: u32) -> Result<()> {
-        self.table = Table { level, parts: vec![Part::Memory(Buckets::default())], bytes: 0 };
+        self.table = Table {
+            level,
+            parts: vec![Part::Memory(Buckets::default())],
+            bytes: 0,
+        };
         let mut keys = Vec::new();
         for row in rows {
             let row = row?;
@@ -225,7 +234,9 @@ impl Table {
     /// any out.
     fn shrink(&mut self, budget: usize, scratch: &mut Vec<u8>) -> Result<bool> {
         if self.parts.len() == 1 {
-            let Part::Memory(all) = &mut self.parts[0] else { unreachable!("one part is in memory") };
+            let Part::Memory(all) = &mut self.parts[0] else {
+                unreachable!("one part is in memory")
+            };
             if self.level > MAX_LEVEL || all.index.len() < 2 {
                 return Ok(false);
             }
@@ -244,19 +255,30 @@ impl Table {
 
         let mut spilled = false;
         while self.bytes > budget {
-            let largest = self.parts.iter().enumerate().filter_map(|(i, part)| match part {
-                Part::Memory(buckets) if buckets.bytes > 0 => Some((buckets.bytes, i)),
-                _ => None,
-            });
-            let Some((bytes, i)) = largest.max() else { break };
-            let Part::Memory(buckets) = std::mem::replace(&mut self.parts[i], Part::Memory(Buckets::default())) else {
+            let largest = self
+                .parts
+                .iter()
+                .enumerate()
+                .filter_map(|(i, part)| match part {
+                    Part::Memory(buckets) if buckets.bytes > 0 => Some((buckets.bytes, i)),
+                    _ => None,
+                });
+            let Some((bytes, i)) = largest.max() else {
+                break;
+            };
+            let Part::Memory(buckets) =
+                std::mem::replace(&mut self.parts[i], Part::Memory(Buckets::default()))
+            else {
                 unreachable!("chosen in memory")
             };
             let mut right = RowFile::new();
             for row in buckets.rows.iter().flatten() {
                 right.push(row)?;
             }
-            self.parts[i] = Part::Spilled { right, left: RowFile::new() };
+            self.parts[i] = Part::Spilled {
+                right,
+                left: RowFile::new(),
+            };
             self.bytes -= bytes;
             spilled = true;
         }

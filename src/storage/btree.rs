@@ -68,9 +68,11 @@
 use std::mem;
 use std::sync::Arc;
 
-use crate::storage::buffer::pool::{BufferPool, PageWriteGuard};
-use crate::storage::io::disk::{PAGE_SIZE, PAGE_USABLE, Page, PageId, decode_id, encode_id, read_u32, write_u32};
 use crate::error::{Result, err};
+use crate::storage::buffer::pool::{BufferPool, PageWriteGuard};
+use crate::storage::io::disk::{
+    PAGE_SIZE, PAGE_USABLE, Page, PageId, decode_id, encode_id, read_u32, write_u32,
+};
 
 /// The longest key the tree accepts. Small enough that a full node always
 /// splits into two halves that fit in a page.
@@ -87,15 +89,25 @@ pub struct BPlusTree {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Node {
-    Leaf { keys: Vec<Vec<u8>>, next: Option<PageId> },
-    Internal { keys: Vec<Vec<u8>>, children: Vec<PageId> },
+    Leaf {
+        keys: Vec<Vec<u8>>,
+        next: Option<PageId>,
+    },
+    Internal {
+        keys: Vec<Vec<u8>>,
+        children: Vec<PageId>,
+    },
 }
 
 impl BPlusTree {
     /// Creates an empty tree: a root page that is an empty leaf.
     pub fn create(pool: Arc<BufferPool>) -> Result<Self> {
         let mut page = pool.new_page()?;
-        Node::Leaf { keys: Vec::new(), next: None }.write(&mut page);
+        Node::Leaf {
+            keys: Vec::new(),
+            next: None,
+        }
+        .write(&mut page);
         let root = page.id();
         drop(page);
         Ok(BPlusTree { pool, root })
@@ -112,7 +124,10 @@ impl BPlusTree {
 
     pub fn check_key(key: &[u8]) -> Result<()> {
         if key.len() > MAX_KEY_SIZE {
-            return err(format!("index key is {} bytes, the maximum is {MAX_KEY_SIZE}", key.len()));
+            return err(format!(
+                "index key is {} bytes, the maximum is {MAX_KEY_SIZE}",
+                key.len()
+            ));
         }
         Ok(())
     }
@@ -165,7 +180,14 @@ impl BPlusTree {
     /// Each leaf is read when the scan reaches it, so changes made during the
     /// scan may be seen. Callers that modify the tree should collect first.
     pub fn range(&self, start: &[u8]) -> Range<'_> {
-        Range { tree: self, next: Some(start.to_vec()), leaf: None, left: 0, pos: 0, bound: None }
+        Range {
+            tree: self,
+            next: Some(start.to_vec()),
+            leaf: None,
+            left: 0,
+            pos: 0,
+            bound: None,
+        }
     }
 
     /// The leaf that holds `key` or would, write-latched. The way down is
@@ -211,10 +233,18 @@ impl BPlusTree {
                 path.clear(); // releases the ancestors, from the top
             }
             let child = match &node {
-                Node::Internal { keys, children } => Some(child_index(keys, key)).map(|i| (i, children[i])),
+                Node::Internal { keys, children } => {
+                    Some(child_index(keys, key)).map(|i| (i, children[i]))
+                }
                 Node::Leaf { .. } => None,
             };
-            path.push(Level { id, guard, node, child: child.map_or(0, |(i, _)| i), changed: false });
+            path.push(Level {
+                id,
+                guard,
+                node,
+                child: child.map_or(0, |(i, _)| i),
+                changed: false,
+            });
             match child {
                 Some((_, child)) => id = child,
                 None => break,
@@ -222,7 +252,9 @@ impl BPlusTree {
         }
 
         let leaf = path.last_mut().expect("the leaf");
-        let Node::Leaf { keys, .. } = &mut leaf.node else { unreachable!("the path ends at a leaf") };
+        let Node::Leaf { keys, .. } = &mut leaf.node else {
+            unreachable!("the path ends at a leaf")
+        };
         match (keys.binary_search_by(|k| k.as_slice().cmp(key)), change) {
             (Err(i), Change::Insert) => keys.insert(i, key.to_vec()),
             (Ok(i), Change::Delete) => _ = keys.remove(i),
@@ -239,12 +271,17 @@ impl BPlusTree {
                     // The root moves its keys into two new pages and becomes their parent.
                     let right_id = self.allocate(&right)?;
                     let left_id = self.allocate(&left.with_next(Some(right_id)))?;
-                    level.node = Node::Internal { keys: vec![separator], children: vec![left_id, right_id] };
+                    level.node = Node::Internal {
+                        keys: vec![separator],
+                        children: vec![left_id, right_id],
+                    };
                 } else {
                     let parent = parent.expect("an unsafe node's parent is held");
                     let right_id = self.allocate(&right)?;
                     level.node = left.with_next(Some(right_id));
-                    let Node::Internal { keys, children } = &mut parent.node else { unreachable!("a parent") };
+                    let Node::Internal { keys, children } = &mut parent.node else {
+                        unreachable!("a parent")
+                    };
                     keys.insert(parent.child, separator);
                     children.insert(parent.child + 1, right_id);
                     parent.changed = true;
@@ -288,7 +325,9 @@ impl BPlusTree {
     /// evenly. Returns true if `level` merged into its left sibling, for the
     /// caller to free its page.
     fn rebalance(&self, level: &mut Level, parent: &mut Level) -> Result<bool> {
-        let Node::Internal { keys, children } = &mut parent.node else { unreachable!("a parent") };
+        let Node::Internal { keys, children } = &mut parent.node else {
+            unreachable!("a parent")
+        };
         let i = parent.child;
         let pair = i.min(children.len() - 2); // the pair is children `pair` and `pair + 1`
         let sibling_id = children[if pair == i { i + 1 } else { pair }];
@@ -304,14 +343,23 @@ impl BPlusTree {
                 Node::Leaf { keys: left, next }
             }
             (
-                Node::Internal { keys: mut left, children: mut left_children },
-                Node::Internal { keys: right, children: right_children },
+                Node::Internal {
+                    keys: mut left,
+                    children: mut left_children,
+                },
+                Node::Internal {
+                    keys: right,
+                    children: right_children,
+                },
             ) => {
                 // The separator comes down between the two halves.
                 left.push(keys[pair].clone());
                 left.extend(right);
                 left_children.extend(right_children);
-                Node::Internal { keys: left, children: left_children }
+                Node::Internal {
+                    keys: left,
+                    children: left_children,
+                }
             }
             _ => return err("corrupted B+ tree: siblings of different kinds"),
         };
@@ -458,7 +506,10 @@ fn leaf_search(page: &Page, key: &[u8]) -> Result<(usize, bool, usize)> {
 impl Node {
     /// A leaf with no keys, which a node taken out to change stands in for.
     fn empty() -> Node {
-        Node::Leaf { keys: Vec::new(), next: None }
+        Node::Leaf {
+            keys: Vec::new(),
+            next: None,
+        }
     }
 
     /// Whether a change of `key` below this node cannot spread above it: an
@@ -470,9 +521,15 @@ impl Node {
         match (self, change) {
             (Node::Leaf { .. }, Change::Insert) => size + 2 + key_len <= PAGE_USABLE,
             (Node::Internal { .. }, Change::Insert) => size + MAX_ENTRY <= PAGE_USABLE,
-            (Node::Leaf { .. }, Change::Delete) => root || size.saturating_sub(2 + key_len) >= PAGE_USABLE / 4,
+            (Node::Leaf { .. }, Change::Delete) => {
+                root || size.saturating_sub(2 + key_len) >= PAGE_USABLE / 4
+            }
             (Node::Internal { keys, .. }, Change::Delete) => {
-                let stays = if root { keys.len() >= 2 } else { size.saturating_sub(MAX_ENTRY) >= PAGE_USABLE / 4 };
+                let stays = if root {
+                    keys.len() >= 2
+                } else {
+                    size.saturating_sub(MAX_ENTRY) >= PAGE_USABLE / 4
+                };
                 stays && size + MAX_ENTRY <= PAGE_USABLE
             }
         }
@@ -486,7 +543,12 @@ impl Node {
 
     /// Bytes the node takes in a page.
     fn size(&self) -> usize {
-        HEADER_SIZE + self.keys().iter().map(|k| self.entry_size(k)).sum::<usize>()
+        HEADER_SIZE
+            + self
+                .keys()
+                .iter()
+                .map(|k| self.entry_size(k))
+                .sum::<usize>()
     }
 
     /// Bytes one key takes in this node.
@@ -522,16 +584,26 @@ impl Node {
             Node::Leaf { mut keys, next } => {
                 let right = keys.split_off(mid);
                 let separator = right[0].clone();
-                (Node::Leaf { keys, next }, separator, Node::Leaf { keys: right, next })
+                (
+                    Node::Leaf { keys, next },
+                    separator,
+                    Node::Leaf { keys: right, next },
+                )
             }
-            Node::Internal { mut keys, mut children } => {
+            Node::Internal {
+                mut keys,
+                mut children,
+            } => {
                 let right_keys = keys.split_off(mid + 1);
                 let separator = keys.pop().expect("mid >= 1");
                 let right_children = children.split_off(mid + 1);
                 (
                     Node::Internal { keys, children },
                     separator,
-                    Node::Internal { keys: right_keys, children: right_children },
+                    Node::Internal {
+                        keys: right_keys,
+                        children: right_children,
+                    },
                 )
             }
         }
@@ -569,7 +641,10 @@ impl Node {
             }
         }
         match page[0] {
-            LEAF => Ok(Node::Leaf { keys, next: decode_id(first) }),
+            LEAF => Ok(Node::Leaf {
+                keys,
+                next: decode_id(first),
+            }),
             INTERNAL => Ok(Node::Internal { keys, children }),
             kind => err(format!("corrupted B+ tree node: kind {kind}")),
         }
@@ -662,7 +737,9 @@ impl Range<'_> {
                 return Ok(Some(key));
             }
             // The next leaf holds the keys from this one's upper bound on.
-            let Some(start) = self.next.take() else { return Ok(None) };
+            let Some(start) = self.next.take() else {
+                return Ok(None);
+            };
             self.seek(&start)?;
             self.next = self.bound.take();
         }
@@ -725,14 +802,27 @@ mod tests {
         let node = tree.read(id).unwrap();
         let keys = node.keys();
         assert!(node.size() <= PAGE_USABLE, "node {} overflows", id.0);
-        assert!(keys.windows(2).all(|w| w[0] < w[1]), "node {} unsorted", id.0);
-        assert!(keys.iter().all(|k| low.is_none_or(|l| k.as_slice() >= l) && high.is_none_or(|h| k.as_slice() < h)));
+        assert!(
+            keys.windows(2).all(|w| w[0] < w[1]),
+            "node {} unsorted",
+            id.0
+        );
+        assert!(keys.iter().all(
+            |k| low.is_none_or(|l| k.as_slice() >= l) && high.is_none_or(|h| k.as_slice() < h)
+        ));
         match node {
             Node::Leaf { .. } => 1,
             Node::Internal { keys, children } => {
                 let bound = |i: usize| keys.get(i).map(Vec::as_slice);
                 let heights: BTreeSet<usize> = (0..children.len())
-                    .map(|i| check(tree, children[i], if i == 0 { low } else { bound(i - 1) }, bound(i).or(high)))
+                    .map(|i| {
+                        check(
+                            tree,
+                            children[i],
+                            if i == 0 { low } else { bound(i - 1) },
+                            bound(i).or(high),
+                        )
+                    })
                     .collect();
                 assert_eq!(heights.len(), 1, "unbalanced below {}", id.0);
                 heights.first().unwrap() + 1
@@ -779,9 +869,15 @@ mod tests {
                 s.spawn(move || {
                     while !done.load(std::sync::atomic::Ordering::Relaxed) {
                         let keys = all(tree);
-                        assert!(keys.windows(2).all(|w| w[0] < w[1]), "a scan returns keys in order, each once");
+                        assert!(
+                            keys.windows(2).all(|w| w[0] < w[1]),
+                            "a scan returns keys in order, each once"
+                        );
                         let found: BTreeSet<&Vec<u8>> = keys.iter().collect();
-                        assert!(stable.iter().all(|k| found.contains(k)), "a scan misses no key that stays");
+                        assert!(
+                            stable.iter().all(|k| found.contains(k)),
+                            "a scan misses no key that stays"
+                        );
                         for k in stable.iter().step_by(17) {
                             assert_eq!(tree.range(k).next().unwrap().unwrap(), *k);
                         }
@@ -794,7 +890,10 @@ mod tests {
             results.into_iter().for_each(|r| r.unwrap());
         });
 
-        let mut expected: BTreeSet<Vec<u8>> = (0..KEYS * WRITERS).filter(|i| i % 3 == 0 || i % 9 == 1).map(key).collect();
+        let mut expected: BTreeSet<Vec<u8>> = (0..KEYS * WRITERS)
+            .filter(|i| i % 3 == 0 || i % 9 == 1)
+            .map(key)
+            .collect();
         expected.extend(stable.iter().cloned());
         assert_eq!(all(tree), expected.into_iter().collect::<Vec<_>>());
         check(tree, tree.root, None, None);
@@ -811,7 +910,11 @@ mod tests {
             let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
             for _ in 0..8000 {
                 let i = rng.below(300);
-                let len = if rng.below(3) == 0 { 600 + rng.below(MAX_KEY_SIZE as u32 - 600) } else { 4 + rng.below(8) };
+                let len = if rng.below(3) == 0 {
+                    600 + rng.below(MAX_KEY_SIZE as u32 - 600)
+                } else {
+                    4 + rng.below(8)
+                };
                 let mut k = i.to_be_bytes().to_vec();
                 k.resize(len as usize, b'x');
                 if rng.below(2) == 0 {
@@ -820,7 +923,11 @@ mod tests {
                     assert_eq!(tree.insert(&k).unwrap(), expected.insert(k));
                 }
             }
-            assert_eq!(all(&tree), expected.into_iter().collect::<Vec<_>>(), "seed {seed}");
+            assert_eq!(
+                all(&tree),
+                expected.into_iter().collect::<Vec<_>>(),
+                "seed {seed}"
+            );
             check(&tree, tree.root, None, None);
         }
     }
@@ -845,7 +952,11 @@ mod tests {
         }
         assert!(!tree.insert(&key(42)).unwrap(), "already there");
         assert_eq!(all(&tree), (0..20_000).map(key).collect::<Vec<_>>());
-        assert_eq!(height(&tree, tree.root), 3, "20000 keys need two levels of internal nodes");
+        assert_eq!(
+            height(&tree, tree.root),
+            3,
+            "20000 keys need two levels of internal nodes"
+        );
     }
 
     #[test]
@@ -892,9 +1003,17 @@ mod tests {
         for round in 0..20_000 {
             let k = key(rng.below(3000));
             if rng.below(3) == 0 {
-                assert_eq!(tree.delete(&k).unwrap(), expected.remove(&k), "round {round}");
+                assert_eq!(
+                    tree.delete(&k).unwrap(),
+                    expected.remove(&k),
+                    "round {round}"
+                );
             } else {
-                assert_eq!(tree.insert(&k).unwrap(), expected.insert(k), "round {round}");
+                assert_eq!(
+                    tree.insert(&k).unwrap(),
+                    expected.insert(k),
+                    "round {round}"
+                );
             }
         }
         assert_eq!(all(&tree), expected.into_iter().collect::<Vec<_>>());

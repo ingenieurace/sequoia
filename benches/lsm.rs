@@ -27,7 +27,10 @@ const VALUE: usize = 100;
 const LOOKUPS: u64 = 10_000;
 
 fn main() {
-    let strategies = [("level", Compaction::Level), ("universal", Compaction::Universal)];
+    let strategies = [
+        ("level", Compaction::Level),
+        ("universal", Compaction::Universal),
+    ];
     if common::wanted("write") {
         header("write", &strategies);
         let loads: [(&str, fn(u64) -> u64); 3] = [
@@ -45,8 +48,12 @@ fn main() {
                     }
                     tree.pages_written()
                 });
-                let amplification = (written * PAGE_SIZE) as f64 / (ENTRIES as usize * (8 + VALUE)) as f64;
-                print!("{:>26}", format!("{}, {amplification:.1}x written", ms(time)));
+                let amplification =
+                    (written * PAGE_SIZE) as f64 / (ENTRIES as usize * (8 + VALUE)) as f64;
+                print!(
+                    "{:>26}",
+                    format!("{}, {amplification:.1}x written", ms(time))
+                );
             }
             println!();
         }
@@ -65,11 +72,19 @@ fn main() {
             })
             .collect();
         let cases: [(&str, &dyn Fn(&LsmTree) -> usize); 3] = [
-            ("10,000 keys it has", &|tree| (0..LOOKUPS).filter(|&i| tree.get(&encode(scatter(i) * 2)).unwrap().is_some()).count()),
-            ("10,000 keys it lacks", &|tree| {
-                (0..LOOKUPS).filter(|&i| tree.get(&encode(scatter(i) * 2 + 1)).unwrap().is_some()).count()
+            ("10,000 keys it has", &|tree| {
+                (0..LOOKUPS)
+                    .filter(|&i| tree.get(&encode(scatter(i) * 2)).unwrap().is_some())
+                    .count()
             }),
-            ("scan every key", &|tree| tree.scan().map(Result::unwrap).count()),
+            ("10,000 keys it lacks", &|tree| {
+                (0..LOOKUPS)
+                    .filter(|&i| tree.get(&encode(scatter(i) * 2 + 1)).unwrap().is_some())
+                    .count()
+            }),
+            ("scan every key", &|tree| {
+                tree.scan().map(Result::unwrap).count()
+            }),
         ];
         for (name, case) in cases {
             print!("  {name:<34}");
@@ -97,7 +112,14 @@ fn ms(time: Duration) -> String {
 /// A new tree, in a pool of its own, compacted by this strategy.
 fn tree(compaction: Compaction) -> LsmTree {
     let pool = Arc::new(BufferPool::new(Arc::new(DiskManager::in_memory()), 256));
-    LsmTree::create(pool, LsmConfig { compaction, ..LsmConfig::default() }).unwrap()
+    LsmTree::create(
+        pool,
+        LsmConfig {
+            compaction,
+            ..LsmConfig::default()
+        },
+    )
+    .unwrap()
 }
 
 /// Key `i` of ENTRIES, in no order: `i * m mod p` for a prime `p` above them.

@@ -32,9 +32,9 @@ use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use crate::storage::io::disk::{DiskManager, PAGE_SIZE, Page, PageId};
 use super::replacer::{Policy, Replacer};
 use crate::error::{Error, Result, err};
+use crate::storage::io::disk::{DiskManager, PAGE_SIZE, Page, PageId};
 
 /// The page replacement policy of `BufferPool::new`. Edit this line to
 /// change the default, like a `#define` in C, or switch a running pool with
@@ -104,7 +104,11 @@ impl BufferPool {
 
     /// Creates a pool with a given replacer, which must be able to track
     /// `capacity` resident pages.
-    pub fn with_replacer(disk: Arc<DiskManager>, capacity: usize, replacer: Box<dyn Replacer>) -> Self {
+    pub fn with_replacer(
+        disk: Arc<DiskManager>,
+        capacity: usize,
+        replacer: Box<dyn Replacer>,
+    ) -> Self {
         assert!(capacity > 0, "a buffer pool needs at least one frame");
         let state = State {
             page_table: HashMap::new(),
@@ -115,7 +119,11 @@ impl BufferPool {
             stats: Stats::default(),
         };
         let frames = (0..capacity).map(|_| RwLock::new([0; PAGE_SIZE])).collect();
-        Self { disk, frames, state: Mutex::new(state) }
+        Self {
+            disk,
+            frames,
+            state: Mutex::new(state),
+        }
     }
 
     /// Switches to another replacement policy. The pages cached stay, and
@@ -126,7 +134,11 @@ impl BufferPool {
     pub fn set_policy(&self, policy: Policy) {
         let mut state = self.state.lock().unwrap();
         let mut replacer = policy.replacer(self.capacity());
-        state.meta.iter().filter_map(|meta| meta.page).for_each(|page| replacer.record_access(page));
+        state
+            .meta
+            .iter()
+            .filter_map(|meta| meta.page)
+            .for_each(|page| replacer.record_access(page));
         state.replacer = replacer;
         state.policy = Some(policy);
         state.stats = Stats::default();
@@ -154,7 +166,12 @@ impl BufferPool {
     /// Returns a page for reading, loading it from disk if it is not cached.
     pub fn fetch_read(&self, id: PageId) -> Result<PageReadGuard<'_>> {
         let frame = self.pin(id)?;
-        Ok(PageReadGuard { pool: self, id, frame, data: Some(self.frames[frame].read().unwrap()) })
+        Ok(PageReadGuard {
+            pool: self,
+            id,
+            frame,
+            data: Some(self.frames[frame].read().unwrap()),
+        })
     }
 
     /// Returns a page for writing, loading it from disk if it is not cached.
@@ -211,14 +228,19 @@ impl BufferPool {
 
     fn is_pinned(&self, id: PageId) -> bool {
         let state = self.state.lock().unwrap();
-        state.page_table.get(&id).is_some_and(|&frame| state.meta[frame].pins > 0)
+        state
+            .page_table
+            .get(&id)
+            .is_some_and(|&frame| state.meta[frame].pins > 0)
     }
 
     /// Writes a page back to disk if it is cached and dirty. Does not sync.
     pub fn flush_page(&self, id: PageId) -> Result<()> {
         let frame = {
             let mut state = self.state.lock().unwrap();
-            let Some(&frame) = state.page_table.get(&id) else { return Ok(()) };
+            let Some(&frame) = state.page_table.get(&id) else {
+                return Ok(());
+            };
             if !state.meta[frame].dirty {
                 return Ok(());
             }
@@ -241,7 +263,14 @@ impl BufferPool {
 
     /// Writes every dirty page back to disk. Does not sync.
     pub fn flush_all(&self) -> Result<()> {
-        let mut pages: Vec<PageId> = self.state.lock().unwrap().page_table.keys().copied().collect();
+        let mut pages: Vec<PageId> = self
+            .state
+            .lock()
+            .unwrap()
+            .page_table
+            .keys()
+            .copied()
+            .collect();
         pages.sort();
         pages.into_iter().try_for_each(|id| self.flush_page(id))
     }
@@ -275,7 +304,10 @@ impl BufferPool {
 
         state.stats.misses += 1;
         let frame = self.take_frame(&mut state)?;
-        if let Err(e) = self.disk.read_page(id, &mut self.frames[frame].write().unwrap()) {
+        if let Err(e) = self
+            .disk
+            .read_page(id, &mut self.frames[frame].write().unwrap())
+        {
             state.free.push(frame);
             return Err(e);
         }
@@ -289,14 +321,25 @@ impl BufferPool {
         if let Some(frame) = state.free.pop() {
             return Ok(frame);
         }
-        let State { page_table, meta, replacer, .. } = state;
+        let State {
+            page_table,
+            meta,
+            replacer,
+            ..
+        } = state;
         let page = replacer
             .victim(&|page| meta[page_table[&page]].pins == 0)
-            .ok_or_else(|| Error(format!("buffer pool is full: all {} frames are pinned", self.capacity())))?;
+            .ok_or_else(|| {
+                Error(format!(
+                    "buffer pool is full: all {} frames are pinned",
+                    self.capacity()
+                ))
+            })?;
         let frame = page_table[&page];
         if meta[frame].dirty {
             // On failure the victim stays cached and dirty.
-            self.disk.write_page(page, &self.frames[frame].read().unwrap())?;
+            self.disk
+                .write_page(page, &self.frames[frame].read().unwrap())?;
         }
         state.clear_frame(frame);
         state.replacer.evict(page);
@@ -304,7 +347,13 @@ impl BufferPool {
     }
 
     fn write_guard(&self, id: PageId, frame: usize) -> PageWriteGuard<'_> {
-        PageWriteGuard { pool: self, id, frame, modified: false, data: Some(self.frames[frame].write().unwrap()) }
+        PageWriteGuard {
+            pool: self,
+            id,
+            frame,
+            modified: false,
+            data: Some(self.frames[frame].write().unwrap()),
+        }
     }
 
     fn unpin(&self, frame: usize, dirty: bool) {
@@ -324,7 +373,11 @@ impl State {
     /// Puts `id` in a frame taken from `take_frame`, pinned once.
     fn install(&mut self, frame: usize, id: PageId) {
         self.page_table.insert(id, frame);
-        self.meta[frame] = FrameMeta { page: Some(id), pins: 1, dirty: false };
+        self.meta[frame] = FrameMeta {
+            page: Some(id),
+            pins: 1,
+            dirty: false,
+        };
         self.replacer.record_access(id);
     }
 
@@ -439,7 +492,11 @@ mod tests {
         let id = new_filled(&pool, 7);
 
         assert_eq!(*pool.fetch_read(id).unwrap(), filled(7));
-        assert_eq!(on_disk(&pool, id), filled(0), "write-back, not write-through");
+        assert_eq!(
+            on_disk(&pool, id),
+            filled(0),
+            "write-back, not write-through"
+        );
 
         pool.flush_page(id).unwrap();
         assert_eq!(on_disk(&pool, id), filled(7));
@@ -518,7 +575,11 @@ mod tests {
     fn fetches_are_counted_as_hits_or_misses() {
         let pool = pool(2);
         let [a, b, c] = [1, 2, 3].map(|byte| new_filled(&pool, byte));
-        assert_eq!((pool.stats(), pool.stats().hit_rate()), (Stats::default(), None), "allocating is no fetch");
+        assert_eq!(
+            (pool.stats(), pool.stats().hit_rate()),
+            (Stats::default(), None),
+            "allocating is no fetch"
+        );
         drop(pool.fetch_read(c).unwrap());
         drop(pool.fetch_read(a).unwrap()); // read back after b and c pushed it out
         drop(pool.fetch_write(a).unwrap());
@@ -535,14 +596,24 @@ mod tests {
         let pinned = pool.fetch_read(ids[0]).unwrap();
         drop(pool.fetch_read(ids[1]).unwrap());
         let cached = |pool: &BufferPool| {
-            let mut pages: Vec<PageId> = pool.state.lock().unwrap().page_table.keys().copied().collect();
+            let mut pages: Vec<PageId> = pool
+                .state
+                .lock()
+                .unwrap()
+                .page_table
+                .keys()
+                .copied()
+                .collect();
             pages.sort();
             pages
         };
         for policy in [Policy::Clock, Policy::LruK(2), Policy::Arc, Policy::LruK(1)] {
             let before = cached(&pool);
             pool.set_policy(policy);
-            assert_eq!((pool.policy(), pool.stats()), (Some(policy), Stats::default()));
+            assert_eq!(
+                (pool.policy(), pool.stats()),
+                (Some(policy), Stats::default())
+            );
             // The pages stay cached, dirty ones too, and the new policy can evict them.
             assert_eq!(cached(&pool), before);
             for byte in 4..=8 {
@@ -553,7 +624,11 @@ mod tests {
         }
         drop(pinned);
         for (byte, &id) in (1..=3).zip(&ids) {
-            assert_eq!(*pool.fetch_read(id).unwrap(), filled(byte), "written back when evicted");
+            assert_eq!(
+                *pool.fetch_read(id).unwrap(),
+                filled(byte),
+                "written back when evicted"
+            );
         }
     }
 

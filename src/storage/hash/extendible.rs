@@ -130,7 +130,14 @@ impl Extendible {
     /// `depth`, which `hash`'s slot points to, by bit `depth` of its
     /// entries' hashes, doubling the directory first if no slot is left to
     /// tell them apart by.
-    fn split(&self, root: &mut Page, id: PageId, head: &mut Page, hash: u32, depth: u32) -> Result<()> {
+    fn split(
+        &self,
+        root: &mut Page,
+        id: PageId,
+        head: &mut Page,
+        hash: u32,
+        depth: u32,
+    ) -> Result<()> {
         let global = root[1] as u32;
         if depth == global {
             let count = 1 << global;
@@ -142,7 +149,9 @@ impl Extendible {
         let global = root[1] as u32;
 
         let bit = 1 << depth;
-        let (stay, go): (Vec<_>, Vec<_>) = bucket::all(&self.pool, head)?.into_iter().partition(|(h, _)| h & bit == 0);
+        let (stay, go): (Vec<_>, Vec<_>) = bucket::all(&self.pool, head)?
+            .into_iter()
+            .partition(|(h, _)| h & bit == 0);
         let mut new = self.pool.new_page()?;
         bucket::init(&mut new);
         bucket::rewrite(&self.pool, &mut new, &go)?;
@@ -152,7 +161,13 @@ impl Extendible {
 
         for i in self.slots_of(hash, depth, global) {
             let to = if i & bit == 0 { id } else { new_id };
-            SLOTS.write(&self.pool, root, 1 << global, i as usize, &slot(to, depth + 1))?;
+            SLOTS.write(
+                &self.pool,
+                root,
+                1 << global,
+                i as usize,
+                &slot(to, depth + 1),
+            )?;
         }
         Ok(())
     }
@@ -178,7 +193,13 @@ impl Extendible {
                 break;
             }
             for i in self.slots_of(hash, depth - 1, global) {
-                SLOTS.write(&self.pool, &mut root, 1 << global, i as usize, &slot(buddy, depth - 1))?;
+                SLOTS.write(
+                    &self.pool,
+                    &mut root,
+                    1 << global,
+                    i as usize,
+                    &slot(buddy, depth - 1),
+                )?;
             }
             drop(head);
             // Unreachable now, but a reader that found it may still be leaving.
@@ -212,7 +233,9 @@ impl Extendible {
     }
 
     fn slot_at(&self, root: &Page, i: u32) -> Result<(PageId, u32)> {
-        SLOTS.read(&self.pool, root, 1 << root[1], i as usize, |s| (PageId(read_u32_at(s)), s[4] as u32))
+        SLOTS.read(&self.pool, root, 1 << root[1], i as usize, |s| {
+            (PageId(read_u32_at(s)), s[4] as u32)
+        })
     }
 
     pub fn destroy(self) -> Result<()> {
@@ -272,10 +295,17 @@ mod tests {
             file.insert(*h, e).unwrap();
         }
         let grown = global_depth(&file);
-        assert!(grown >= 6, "5000 entries of ~34 bytes take 42 pages or more: depth {grown}");
+        assert!(
+            grown >= 6,
+            "5000 entries of ~34 bytes take 42 pages or more: depth {grown}"
+        );
         for (h, _, e) in &entries {
             file.delete(*h, e).unwrap();
         }
-        assert_eq!(global_depth(&file), 0, "every bucket emptied and merged back");
+        assert_eq!(
+            global_depth(&file),
+            0,
+            "every bucket emptied and merged back"
+        );
     }
 }

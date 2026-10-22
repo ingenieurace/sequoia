@@ -27,15 +27,31 @@ fn main() {
             "uncorrelated",
             vec![
                 // What the queries below cost beyond this is the subquery's.
-                case("no subquery", "SELECT id FROM o WHERE amount >= 0", &["SCAN o"]),
-                case("IN, 1% of customers", "SELECT id FROM o WHERE customer IN (SELECT id FROM c WHERE region = 7)", &[
-                    "IN (SELECT",
-                ]),
-                case("NOT IN, 1% of customers", "SELECT id FROM o WHERE customer NOT IN (SELECT id FROM c WHERE region = 7)", &[
-                    "NOT IN (SELECT",
-                ]),
-                case("scalar, an aggregate", "SELECT id FROM o WHERE amount > (SELECT AVG(amount) FROM o)", &["(SELECT AVG"]),
-                case("EXISTS", "SELECT id FROM o WHERE EXISTS (SELECT id FROM c WHERE region = 7)", &["EXISTS (SELECT"]),
+                case(
+                    "no subquery",
+                    "SELECT id FROM o WHERE amount >= 0",
+                    &["SCAN o"],
+                ),
+                case(
+                    "IN, 1% of customers",
+                    "SELECT id FROM o WHERE customer IN (SELECT id FROM c WHERE region = 7)",
+                    &["IN (SELECT"],
+                ),
+                case(
+                    "NOT IN, 1% of customers",
+                    "SELECT id FROM o WHERE customer NOT IN (SELECT id FROM c WHERE region = 7)",
+                    &["NOT IN (SELECT"],
+                ),
+                case(
+                    "scalar, an aggregate",
+                    "SELECT id FROM o WHERE amount > (SELECT AVG(amount) FROM o)",
+                    &["(SELECT AVG"],
+                ),
+                case(
+                    "EXISTS",
+                    "SELECT id FROM o WHERE EXISTS (SELECT id FROM c WHERE region = 7)",
+                    &["EXISTS (SELECT"],
+                ),
             ],
         ),
         (
@@ -112,7 +128,11 @@ fn main() {
         ),
     ];
 
-    common::run(groups, &setup(), &format!("{ORDERS} orders of {CUSTOMERS} customers"));
+    common::run(
+        groups,
+        &setup(),
+        &format!("{ORDERS} orders of {CUSTOMERS} customers"),
+    );
 }
 
 /// The statements that fill `c` and `o`, and index `o` by customer. A
@@ -126,8 +146,12 @@ fn setup() -> Vec<String> {
         "CREATE TABLE c (id INT PRIMARY KEY, region INT, credit INT)".to_string(),
         "CREATE TABLE o (id INT PRIMARY KEY, customer INT, kind INT, amount INT)".to_string(),
     ];
-    insert(&mut sql, "c", CUSTOMERS, |i| format!("({i}, {}, {})", i % 100, i * 911 % P));
-    insert(&mut sql, "o", ORDERS, |i| format!("({i}, {}, {}, {})", i % CUSTOMERS, i % 10, i * 48_271 % P));
+    insert(&mut sql, "c", CUSTOMERS, |i| {
+        format!("({i}, {}, {})", i % 100, i * 911 % P)
+    });
+    insert(&mut sql, "o", ORDERS, |i| {
+        format!("({i}, {}, {}, {})", i % CUSTOMERS, i % 10, i * 48_271 % P)
+    });
     sql.push("CREATE INDEX o_customer ON o (customer)".into());
     sql
 }

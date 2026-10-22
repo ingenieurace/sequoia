@@ -49,9 +49,17 @@ pub fn partition(keys: &[Value], level: u32, scratch: &mut Vec<u8>) -> usize {
 /// Opens a temporary file that is removed at once, so it lives only as long as it is open.
 pub fn temp_file() -> Result<Arc<dyn Medium>> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let name = format!("sequoia-spill-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
+    let name = format!(
+        "sequoia-spill-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
     let path = std::env::temp_dir().join(name);
-    let file = OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
     std::fs::remove_file(&path)?;
     Ok(Arc::new(FileMedium(file)))
 }
@@ -84,7 +92,9 @@ pub fn encode_value(value: &Value, out: &mut Vec<u8>) {
 /// Decodes the value [`encode_value`] wrote at `*pos`, and moves `*pos` past it.
 pub fn decode_value(bytes: &[u8], pos: &mut usize) -> Result<Value> {
     let mut take = |n: usize| -> Result<&[u8]> {
-        let slice = bytes.get(*pos..*pos + n).ok_or_else(|| Error("corrupted temporary file".into()))?;
+        let slice = bytes
+            .get(*pos..*pos + n)
+            .ok_or_else(|| Error("corrupted temporary file".into()))?;
         *pos += n;
         Ok(slice)
     };
@@ -159,12 +169,25 @@ impl RowFile {
 
     /// The rows written, in order: those in the file, then those still in memory.
     pub fn read(self) -> RowReader {
-        let RowFile { file, end, chunk, rows } = self;
+        let RowFile {
+            file,
+            end,
+            chunk,
+            rows,
+        } = self;
         let (chunk, tail) = match file {
             Some(_) => (Vec::new(), Some(chunk)),
             None => (chunk, None),
         };
-        RowReader { file, pos: 0, end, chunk, at: 0, tail, left: rows }
+        RowReader {
+            file,
+            pos: 0,
+            end,
+            chunk,
+            at: 0,
+            tail,
+            left: rows,
+        }
     }
 }
 
@@ -191,7 +214,10 @@ impl RowReader {
                 let read = IO_CHUNK.max(n).min((self.end - self.pos) as usize);
                 let old = self.chunk.len();
                 self.chunk.resize(old + read, 0);
-                self.file.as_ref().expect("bytes were written").read_at(self.pos, &mut self.chunk[old..])?;
+                self.file
+                    .as_ref()
+                    .expect("bytes were written")
+                    .read_at(self.pos, &mut self.chunk[old..])?;
                 self.pos += read as u64;
             } else if let Some(tail) = self.tail.take() {
                 self.chunk.extend_from_slice(&tail);
@@ -255,10 +281,16 @@ mod tests {
             encode_value(value, &mut bytes);
         }
         let mut pos = 0;
-        let decoded: Vec<Value> = values.iter().map(|_| decode_value(&bytes, &mut pos).unwrap()).collect();
+        let decoded: Vec<Value> = values
+            .iter()
+            .map(|_| decode_value(&bytes, &mut pos).unwrap())
+            .collect();
         assert_eq!((decoded, pos), (values, bytes.len()));
         assert!(decode_value(&[9], &mut 0).is_err());
-        assert!(decode_value(&[3, 5, 0, 0, 0, b'a'], &mut 0).is_err(), "cut short");
+        assert!(
+            decode_value(&[3, 5, 0, 0, 0, b'a'], &mut 0).is_err(),
+            "cut short"
+        );
     }
 
     #[test]
@@ -266,7 +298,13 @@ mod tests {
         for count in [0, 3, 20_000] {
             let mut file = RowFile::new();
             let rows: Vec<Row> = (0..count)
-                .map(|i| vec![Value::Int(i), Value::Text("x".repeat(i as usize % 50)), Value::Null])
+                .map(|i| {
+                    vec![
+                        Value::Int(i),
+                        Value::Text("x".repeat(i as usize % 50)),
+                        Value::Null,
+                    ]
+                })
                 .collect();
             for row in &rows {
                 file.push(row).unwrap();
@@ -282,13 +320,22 @@ mod tests {
         let mut scratch = Vec::new();
         assert_eq!(MAX_LEVEL, 7);
         let p = |keys: &[Value], level, scratch: &mut Vec<u8>| partition(keys, level, scratch);
-        assert_eq!(p(&[Value::Int(3)], 0, &mut scratch), p(&[Value::Real(3.0)], 0, &mut scratch));
+        assert_eq!(
+            p(&[Value::Int(3)], 0, &mut scratch),
+            p(&[Value::Real(3.0)], 0, &mut scratch)
+        );
         // Keys of one partition at a level spread over every partition at the next.
-        let keys: Vec<Value> = (0..20_000).map(Value::Int).filter(|k| p(std::slice::from_ref(k), 0, &mut scratch) == 5).collect();
+        let keys: Vec<Value> = (0..20_000)
+            .map(Value::Int)
+            .filter(|k| p(std::slice::from_ref(k), 0, &mut scratch) == 5)
+            .collect();
         let mut counts = [0; FANOUT];
         for key in &keys {
             counts[p(std::slice::from_ref(key), 1, &mut scratch)] += 1;
         }
-        assert!(counts.iter().all(|&n| n > keys.len() / FANOUT / 2), "{counts:?}");
+        assert!(
+            counts.iter().all(|&n| n > keys.len() / FANOUT / 2),
+            "{counts:?}"
+        );
     }
 }

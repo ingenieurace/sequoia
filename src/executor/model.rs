@@ -64,7 +64,9 @@ impl Model {
 
     /// The model with this name, in any case.
     pub fn from_name(name: &str) -> Option<Model> {
-        Model::ALL.into_iter().find(|model| model.name().eq_ignore_ascii_case(name))
+        Model::ALL
+            .into_iter()
+            .find(|model| model.name().eq_ignore_ascii_case(name))
     }
 }
 
@@ -101,27 +103,40 @@ pub fn choose(root: &Node, settings: &Settings) -> (Model, String) {
             _ => {}
         }
     });
-    let rows = format!("{most:.0} row{}", if most.round() == 1.0 { "" } else { "s" });
+    let rows = format!(
+        "{most:.0} row{}",
+        if most.round() == 1.0 { "" } else { "s" }
+    );
     if most <= FEW_ROWS {
-        return (Model::Materialization, format!("at most about {rows} at any step: each step hands all of its rows on at once"));
+        return (
+            Model::Materialization,
+            format!("at most about {rows} at any step: each step hands all of its rows on at once"),
+        );
     }
     let why = match (joins, subqueries) {
         (_, true) => "with subqueries, which run once per row",
         (true, _) => "through a join, which works on rows",
         _ if most >= MANY_ROWS => {
-            let why = format!("about {rows} at a step, no join: steps hand on batches of {BATCH_SIZE} rows, a column at a time");
+            let why = format!(
+                "about {rows} at a step, no join: steps hand on batches of {BATCH_SIZE} rows, a column at a time"
+            );
             return (Model::Vectorized, why);
         }
         _ => "too many to hold at once, too few for batches to pay",
     };
-    (Model::Iterator, format!("up to about {rows} at a step, {why}: each step hands rows on one at a time"))
+    (
+        Model::Iterator,
+        format!("up to about {rows} at a step, {why}: each step hands rows on one at a time"),
+    )
 }
 
 /// Roughly how many rows a step reads or returns, whichever is more: a scan
 /// of a whole table (a column table's is always) reads every row.
 fn rows(node: &Node) -> f64 {
     match node {
-        Node::Scan { table, access, .. } if *access == Access::Scan || table.storage_kind() == StorageKind::Column => {
+        Node::Scan { table, access, .. }
+            if *access == Access::Scan || table.storage_kind() == StorageKind::Column =>
+        {
             table.row_count().map_or(1000.0, |rows| rows as f64)
         }
         node => estimate(node),
@@ -141,7 +156,13 @@ pub fn open<'a>(root: Node<'a>, catalog: &'a Catalog, settings: &Settings) -> Ro
 }
 
 /// Opens a plan in `model`, counting what its steps do in `step` if given.
-pub(super) fn open_in<'a>(model: Model, root: Node<'a>, catalog: &'a Catalog, settings: &Settings, step: Step) -> Rows<'a> {
+pub(super) fn open_in<'a>(
+    model: Model,
+    root: Node<'a>,
+    catalog: &'a Catalog,
+    settings: &Settings,
+    step: Step,
+) -> Rows<'a> {
     match model {
         Model::Iterator => operator::open_step(root, catalog, settings, step),
         Model::Materialization => materialize::open(root, catalog, settings, step),

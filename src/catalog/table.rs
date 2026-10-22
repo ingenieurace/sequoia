@@ -8,8 +8,8 @@ use crate::error::{Error, Result, err};
 use crate::predicate::Predicate;
 use crate::sql::ast::CreateIndex;
 use crate::storage::{
-    BufferPool, ColumnChunk, ColumnConfig, ColumnStore, LsmConfig, LsmTree, MAX_TUPLE_SIZE, PageId, Position,
-    RecordId, TableHeap, tuple,
+    BufferPool, ColumnChunk, ColumnConfig, ColumnStore, LsmConfig, LsmTree, MAX_TUPLE_SIZE, PageId,
+    Position, RecordId, TableHeap, tuple,
 };
 use crate::types::{Column, StorageKind, Value, column_index};
 
@@ -54,7 +54,10 @@ enum Storage {
     Heap(TableHeap),
     /// Rows are keyed by their primary key or, in a table without one, by a
     /// hidden rowid: 1, 2, 3, ... in insertion order.
-    Lsm { tree: LsmTree, next_rowid: i64 },
+    Lsm {
+        tree: LsmTree,
+        next_rowid: i64,
+    },
     Column(ColumnStore),
 }
 
@@ -67,27 +70,51 @@ pub enum Access {
     Key(Value),
     /// Read the rows of an LSM tree whose primary keys lie between two
     /// bounds, in key order. A missing bound leaves that end open.
-    KeyRange { lower: Option<Bound>, upper: Option<Bound> },
+    KeyRange {
+        lower: Option<Bound>,
+        upper: Option<Bound>,
+    },
     /// Read the rows of an index whose first keys equal `equal` and whose
     /// next key lies between two bounds, in index order. A covering index
     /// holds every column the scan needs: the rows are read from its entries,
     /// not from the table.
-    Index { index: usize, equal: Vec<Value>, lower: Option<Bound>, upper: Option<Bound>, covering: bool },
+    Index {
+        index: usize,
+        equal: Vec<Value>,
+        lower: Option<Bound>,
+        upper: Option<Bound>,
+        covering: bool,
+    },
 }
 
 impl Table {
     /// Creates an empty table.
-    pub fn create(pool: Arc<BufferPool>, name: String, columns: Vec<Column>, kind: StorageKind) -> Result<Self> {
+    pub fn create(
+        pool: Arc<BufferPool>,
+        name: String,
+        columns: Vec<Column>,
+        kind: StorageKind,
+    ) -> Result<Self> {
         let storage = match kind {
             StorageKind::Heap => Storage::Heap(TableHeap::create(pool.clone())?),
-            StorageKind::Lsm => {
-                Storage::Lsm { tree: LsmTree::create(pool.clone(), LsmConfig::default())?, next_rowid: 1 }
-            }
-            StorageKind::Column => {
-                Storage::Column(ColumnStore::create(pool.clone(), columns.clone(), ColumnConfig::default())?)
-            }
+            StorageKind::Lsm => Storage::Lsm {
+                tree: LsmTree::create(pool.clone(), LsmConfig::default())?,
+                next_rowid: 1,
+            },
+            StorageKind::Column => Storage::Column(ColumnStore::create(
+                pool.clone(),
+                columns.clone(),
+                ColumnConfig::default(),
+            )?),
         };
-        Ok(Table { name, columns, pool, storage, indexes: Vec::new(), rows: AtomicU64::new(0) })
+        Ok(Table {
+            name,
+            columns,
+            pool,
+            storage,
+            indexes: Vec::new(),
+            rows: AtomicU64::new(0),
+        })
     }
 
     /// Opens a table from the pages [`Table::root_pages`] returned. Its
@@ -109,11 +136,21 @@ impl Table {
                 };
                 Storage::Lsm { tree, next_rowid }
             }
-            StorageKind::Column => {
-                Storage::Column(ColumnStore::open(pool.clone(), first, columns.clone(), ColumnConfig::default())?)
-            }
+            StorageKind::Column => Storage::Column(ColumnStore::open(
+                pool.clone(),
+                first,
+                columns.clone(),
+                ColumnConfig::default(),
+            )?),
         };
-        Ok(Table { name, columns, pool, storage, indexes: Vec::new(), rows: AtomicU64::new(UNCOUNTED) })
+        Ok(Table {
+            name,
+            columns,
+            pool,
+            storage,
+            indexes: Vec::new(),
+            rows: AtomicU64::new(UNCOUNTED),
+        })
     }
 
     pub fn storage_kind(&self) -> StorageKind {
@@ -159,14 +196,19 @@ impl Table {
             for item in self.scan() {
                 let (id, row) = item?;
                 let id = id.to_bytes();
-                let Some(entry) = index.entry(&row, &id)? else { continue };
+                let Some(entry) = index.entry(&row, &id)? else {
+                    continue;
+                };
                 index.check(&row, id.len())?;
                 if index.unique
                     && let Some(keys) = unique_keys(&index, &row)?
                     && !index.find(&encode_keys(&keys))?.is_empty()
                 {
                     let name = &index.name;
-                    return err(format!("cannot create unique index {name}: duplicate value {}", show(&keys)));
+                    return err(format!(
+                        "cannot create unique index {name}: duplicate value {}",
+                        show(&keys)
+                    ));
                 }
                 index.insert_entry(&entry)?;
             }
@@ -186,7 +228,12 @@ impl Table {
 
     /// Adds an index the catalog recorded, which already holds the table's rows.
     pub fn open_index(&mut self, definition: &CreateIndex, root: PageId) -> Result<()> {
-        self.indexes.push(Index::open(self.pool.clone(), definition, &self.columns, root)?);
+        self.indexes.push(Index::open(
+            self.pool.clone(),
+            definition,
+            &self.columns,
+            root,
+        )?);
         Ok(())
     }
 
@@ -207,7 +254,10 @@ impl Table {
     /// Like [`Table::scan`], but only the columns marked in `needed` must be
     /// read. Unneeded columns may hold anything, NULL usually: a column store
     /// skips their chunks, and heaps and LSM trees skip their bytes.
-    pub fn scan_columns(&self, needed: &[bool]) -> Box<dyn Iterator<Item = Result<(RowId, Row)>> + '_> {
+    pub fn scan_columns(
+        &self,
+        needed: &[bool],
+    ) -> Box<dyn Iterator<Item = Result<(RowId, Row)>> + '_> {
         self.scan_filtered(needed, &[], &Access::Scan)
     }
 
@@ -230,11 +280,14 @@ impl Table {
             move |bytes: &[u8]| tuple::decode_columns(&self.columns, bytes, &needed)
         };
         match (access.clone(), &self.storage) {
-            (Access::Scan, Storage::Heap(heap)) => {
-                Box::new(heap.scan_map(decode).map(|item| item.map(|(rid, row)| (RowId::Record(rid), row))))
-            }
+            (Access::Scan, Storage::Heap(heap)) => Box::new(
+                heap.scan_map(decode)
+                    .map(|item| item.map(|(rid, row)| (RowId::Record(rid), row))),
+            ),
             (Access::Scan, Storage::Lsm { tree, .. }) => {
-                Box::new(tree.scan_map(&[], move |key, bytes| Ok((RowId::Key(key.to_vec()), decode(bytes)?))))
+                Box::new(tree.scan_map(&[], move |key, bytes| {
+                    Ok((RowId::Key(key.to_vec()), decode(bytes)?))
+                }))
             }
             (_, Storage::Column(store)) => Box::new(
                 store
@@ -243,7 +296,12 @@ impl Table {
             ),
             (Access::Key(value), _) => {
                 let id = RowId::Key(tuple::encode_key(&value));
-                Box::new(self.get(&id).transpose().map(|row| Ok((id, row?))).into_iter())
+                Box::new(
+                    self.get(&id)
+                        .transpose()
+                        .map(|row| Ok((id, row?)))
+                        .into_iter(),
+                )
             }
             (Access::KeyRange { lower, upper }, Storage::Lsm { tree, .. }) => {
                 // Keys are encoded so that their bytes sort as the values do.
@@ -251,7 +309,9 @@ impl Table {
                 let upper = upper.map(|b| (tuple::encode_key(&b.value), b.inclusive));
                 let start = lower.as_ref().map_or(Vec::new(), |(key, _)| key.clone());
                 let below = move |key: &[u8]| {
-                    upper.as_ref().is_none_or(|(upper, inclusive)| key < upper.as_slice() || (*inclusive && key == upper))
+                    upper.as_ref().is_none_or(|(upper, inclusive)| {
+                        key < upper.as_slice() || (*inclusive && key == upper)
+                    })
                 };
                 fn key(item: &Result<(RowId, Row)>) -> Option<&[u8]> {
                     match item {
@@ -267,8 +327,19 @@ impl Table {
                     .take_while(move |item| key(item).is_none_or(&below));
                 Box::new(rows)
             }
-            (Access::KeyRange { .. }, Storage::Heap(_)) => unreachable!("only an LSM tree has key ranges"),
-            (Access::Index { index, equal, lower, upper, covering }, _) => {
+            (Access::KeyRange { .. }, Storage::Heap(_)) => {
+                unreachable!("only an LSM tree has key ranges")
+            }
+            (
+                Access::Index {
+                    index,
+                    equal,
+                    lower,
+                    upper,
+                    covering,
+                },
+                _,
+            ) => {
                 let index = &self.indexes[index];
                 let entries = match index.scan(&equal, lower.as_ref(), upper.as_ref()) {
                     Ok(entries) => entries,
@@ -279,9 +350,9 @@ impl Table {
                     let id = self.row_id(index.row_id(&entry)?.to_vec())?;
                     let row = match covering {
                         true => index.row(&entry, &needed)?,
-                        false => {
-                            self.get(&id)?.ok_or_else(|| Error(format!("index points to a missing row: {id:?}")))?
-                        }
+                        false => self.get(&id)?.ok_or_else(|| {
+                            Error(format!("index points to a missing row: {id:?}"))
+                        })?,
                     };
                     Ok((id, row))
                 }))
@@ -299,7 +370,11 @@ impl Table {
         chunk: usize,
     ) -> Option<Box<dyn Iterator<Item = Result<ColumnChunk>> + '_>> {
         match &self.storage {
-            Storage::Column(store) => Some(Box::new(store.scan_by_column(needed.to_vec(), predicates.to_vec(), chunk))),
+            Storage::Column(store) => Some(Box::new(store.scan_by_column(
+                needed.to_vec(),
+                predicates.to_vec(),
+                chunk,
+            ))),
             _ => None,
         }
     }
@@ -355,16 +430,21 @@ impl Table {
         };
         match &self.storage {
             Storage::Lsm { .. } => {
-                keys.iter().zip(&encoded).try_for_each(|(key, bytes)| LsmTree::check_size(key, bytes))?;
+                keys.iter()
+                    .zip(&encoded)
+                    .try_for_each(|(key, bytes)| LsmTree::check_size(key, bytes))?;
             }
-            _ => encoded.iter().try_for_each(|bytes| check_heap_size(bytes))?,
+            _ => encoded
+                .iter()
+                .try_for_each(|bytes| check_heap_size(bytes))?,
         }
         self.check_index_entries(&rows, |i| keys.get(i).map_or(RECORD_ID_LEN, Vec::len))?;
 
         let ids: Vec<RowId> = match &mut self.storage {
-            Storage::Heap(heap) => {
-                encoded.iter().map(|bytes| Ok(RowId::Record(heap.insert(bytes)?))).collect::<Result<_>>()?
-            }
+            Storage::Heap(heap) => encoded
+                .iter()
+                .map(|bytes| Ok(RowId::Record(heap.insert(bytes)?)))
+                .collect::<Result<_>>()?,
             Storage::Lsm { tree, next_rowid } => {
                 for (key, bytes) in keys.iter().cloned().zip(encoded) {
                     tree.put(key, bytes)?;
@@ -394,8 +474,10 @@ impl Table {
     /// A column store row is deleted and inserted again into the delta store.
     /// Index entries change only for rows whose indexed value or id does.
     pub fn update(&mut self, changes: Vec<(RowId, Row, Row)>) -> Result<()> {
-        let (old_rows, rows): (Vec<(RowId, Row)>, Vec<Row>) =
-            changes.into_iter().map(|(id, old, new)| ((id, old), new)).unzip();
+        let (old_rows, rows): (Vec<(RowId, Row)>, Vec<Row>) = changes
+            .into_iter()
+            .map(|(id, old, new)| ((id, old), new))
+            .unzip();
         let rows = self.coerce_all(rows);
         let ids: Vec<RowId> = old_rows.iter().map(|(id, _)| id.clone()).collect();
         let encoded = self.encode_all(&rows)?;
@@ -414,15 +496,23 @@ impl Table {
         };
         match &self.storage {
             Storage::Lsm { .. } => {
-                new_keys.iter().zip(&encoded).try_for_each(|(key, bytes)| LsmTree::check_size(key, bytes))?;
+                new_keys
+                    .iter()
+                    .zip(&encoded)
+                    .try_for_each(|(key, bytes)| LsmTree::check_size(key, bytes))?;
             }
-            _ => encoded.iter().try_for_each(|bytes| check_heap_size(bytes))?,
+            _ => encoded
+                .iter()
+                .try_for_each(|bytes| check_heap_size(bytes))?,
         }
         self.check_index_entries(&rows, |i| new_keys.get(i).map_or(RECORD_ID_LEN, Vec::len))?;
 
         let new_ids: Vec<RowId> = match &mut self.storage {
             Storage::Heap(heap) => {
-                let rids: Vec<RecordId> = ids.into_iter().map(RowId::into_record).collect::<Result<_>>()?;
+                let rids: Vec<RecordId> = ids
+                    .into_iter()
+                    .map(RowId::into_record)
+                    .collect::<Result<_>>()?;
                 let mut new_rids = rids.clone();
                 let mut moved = Vec::new();
                 for (i, (rid, bytes)) in rids.iter().zip(encoded).enumerate() {
@@ -457,7 +547,10 @@ impl Table {
                 new_keys.into_iter().map(RowId::Key).collect()
             }
             Storage::Column(store) => {
-                let positions: Vec<Position> = ids.into_iter().map(RowId::into_position).collect::<Result<_>>()?;
+                let positions: Vec<Position> = ids
+                    .into_iter()
+                    .map(RowId::into_position)
+                    .collect::<Result<_>>()?;
                 // Deletes first: an insert may migrate the delta store, moving its rows.
                 for position in positions {
                     store.delete(position)?;
@@ -479,7 +572,10 @@ impl Table {
         for index in &mut self.indexes {
             let mut changed = Vec::new();
             for ((old_id, old), (new_id, new)) in old_rows.iter().zip(&new_rows) {
-                let entries = (index.entry(old, &old_id.to_bytes())?, index.entry(new, &new_id.to_bytes())?);
+                let entries = (
+                    index.entry(old, &old_id.to_bytes())?,
+                    index.entry(new, &new_id.to_bytes())?,
+                );
                 if entries.0 != entries.1 {
                     changed.push(entries);
                 }
@@ -540,9 +636,16 @@ impl Table {
         let bytes = match (&self.storage, id) {
             (Storage::Heap(heap), RowId::Record(rid)) => heap.get(*rid)?,
             (Storage::Lsm { tree, .. }, RowId::Key(key)) => tree.get(key)?,
-            _ => return err(format!("cannot read row {id:?} of table {} directly", self.name)),
+            _ => {
+                return err(format!(
+                    "cannot read row {id:?} of table {} directly",
+                    self.name
+                ));
+            }
         };
-        bytes.map(|bytes| tuple::decode(&self.columns, &bytes)).transpose()
+        bytes
+            .map(|bytes| tuple::decode(&self.columns, &bytes))
+            .transpose()
     }
 
     fn add_to_indexes(&mut self, rows: impl IntoIterator<Item = (RowId, Row)>) -> Result<()> {
@@ -614,7 +717,9 @@ impl Table {
 
     /// Encodes rows, which also checks their types.
     fn encode_all(&self, rows: &[Row]) -> Result<Vec<Vec<u8>>> {
-        rows.iter().map(|row| tuple::encode(&self.columns, row)).collect()
+        rows.iter()
+            .map(|row| tuple::encode(&self.columns, row))
+            .collect()
     }
 
     /// Checks that `new_rows`, together with the existing rows except those in
@@ -622,19 +727,30 @@ impl Table {
     /// keys in every unique index. `old_rows` are the rows the new ones
     /// replace, in the same order, if known: keys a row keeps are unique
     /// among the stored rows already, and are checked only against the new ones.
-    fn check_unique(&self, replaced: &HashSet<RowId>, new_rows: &[Row], old_rows: &[(RowId, Row)]) -> Result<()> {
+    fn check_unique(
+        &self,
+        replaced: &HashSet<RowId>,
+        new_rows: &[Row],
+        old_rows: &[(RowId, Row)],
+    ) -> Result<()> {
         let pk = primary_key(&self.columns);
         if let Some(pk) = pk
             && new_rows.iter().any(|row| row[pk].is_null())
         {
-            return err(format!("primary key {} cannot be NULL", self.columns[pk].name));
+            return err(format!(
+                "primary key {} cannot be NULL",
+                self.columns[pk].name
+            ));
         }
         for index in self.indexes.iter().filter(|index| index.unique) {
             let is_pk = pk.is_some_and(|pk| index.is_on_column(pk));
             self.check_unique_index(index, is_pk, replaced, new_rows, old_rows)?;
         }
         if let Some(pk) = pk
-            && !self.indexes.iter().any(|index| index.unique && index.is_on_column(pk))
+            && !self
+                .indexes
+                .iter()
+                .any(|index| index.unique && index.is_on_column(pk))
         {
             self.check_unique_key(pk, replaced, new_rows, old_rows)?;
         }
@@ -653,10 +769,14 @@ impl Table {
     ) -> Result<()> {
         let mut seen = HashSet::new();
         for (i, row) in new_rows.iter().enumerate() {
-            let Some(keys) = unique_keys(index, row)? else { continue };
+            let Some(keys) = unique_keys(index, row)? else {
+                continue;
+            };
             let encoded = encode_keys(&keys);
             let kept = match old_rows.get(i) {
-                Some((_, old)) => unique_keys(index, old)?.is_some_and(|old| encode_keys(&old) == encoded),
+                Some((_, old)) => {
+                    unique_keys(index, old)?.is_some_and(|old| encode_keys(&old) == encoded)
+                }
                 None => false,
             };
             let mut stored = false;
@@ -668,7 +788,11 @@ impl Table {
             if stored || !seen.insert(encoded) {
                 return match is_pk {
                     true => err(format!("duplicate primary key: {}", show(&keys))),
-                    false => err(format!("duplicate value in unique index {}: {}", index.name, show(&keys))),
+                    false => err(format!(
+                        "duplicate value in unique index {}: {}",
+                        index.name,
+                        show(&keys)
+                    )),
                 };
             }
         }
@@ -698,7 +822,9 @@ impl Table {
         }
         for (i, row) in new_rows.iter().enumerate() {
             let value = &row[column];
-            let kept = old_rows.get(i).is_some_and(|(_, old)| &old[column] == value);
+            let kept = old_rows
+                .get(i)
+                .is_some_and(|(_, old)| &old[column] == value);
             let stored = match &self.storage {
                 Storage::Lsm { tree, .. } if !kept => {
                     let key = tuple::encode_key(value);
@@ -717,14 +843,22 @@ impl Table {
 /// A row's keys in a unique index, if they must be unique: the row is
 /// indexed and none of them is NULL.
 fn unique_keys(index: &Index, row: &[Value]) -> Result<Option<Vec<Value>>> {
-    Ok(index.key_values(row)?.filter(|keys| !keys.iter().any(Value::is_null)))
+    Ok(index
+        .key_values(row)?
+        .filter(|keys| !keys.iter().any(Value::is_null)))
 }
 
 /// Keys as an error message shows them: one as a literal, several in parentheses.
 fn show(keys: &[Value]) -> String {
     match keys {
         [key] => key.to_sql(),
-        keys => format!("({})", keys.iter().map(Value::to_sql).collect::<Vec<_>>().join(", ")),
+        keys => format!(
+            "({})",
+            keys.iter()
+                .map(Value::to_sql)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -732,7 +866,9 @@ impl RowId {
     /// The bytes an index stores for this row.
     fn to_bytes(&self) -> Vec<u8> {
         match self {
-            RowId::Record(rid) => [&rid.page_id.0.to_be_bytes()[..], &rid.slot.to_be_bytes()].concat(),
+            RowId::Record(rid) => {
+                [&rid.page_id.0.to_be_bytes()[..], &rid.slot.to_be_bytes()].concat()
+            }
             RowId::Key(key) => key.clone(),
             RowId::Position(_) => unreachable!("COLUMN tables cannot have indexes"),
         }
@@ -762,7 +898,10 @@ impl RowId {
 
 fn check_heap_size(bytes: &[u8]) -> Result<()> {
     if bytes.len() > MAX_TUPLE_SIZE {
-        return err(format!("row is {} bytes, the maximum is {MAX_TUPLE_SIZE}", bytes.len()));
+        return err(format!(
+            "row is {} bytes, the maximum is {MAX_TUPLE_SIZE}",
+            bytes.len()
+        ));
     }
     Ok(())
 }

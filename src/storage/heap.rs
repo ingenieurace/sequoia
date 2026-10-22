@@ -21,10 +21,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::storage::buffer::pool::BufferPool;
-use crate::storage::io::disk::PageId;
 use super::page::{MAX_TUPLE_SIZE, SlottedPage};
 use crate::error::{Result, err};
+use crate::storage::buffer::pool::BufferPool;
+use crate::storage::io::disk::PageId;
 
 /// Physical location of a tuple.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -48,13 +48,23 @@ impl TableHeap {
         let room = SlottedPage::init(&mut *page).room();
         let id = page.id();
         drop(page);
-        Ok(Self { pool, first_page: id, last_page: id, free_space: Some(BTreeMap::from([(id, room)])) })
+        Ok(Self {
+            pool,
+            first_page: id,
+            last_page: id,
+            free_space: Some(BTreeMap::from([(id, room)])),
+        })
     }
 
     /// Opens an existing heap. `last_page` is a hint: the chain is followed from
     /// there to the real end, in case pages were appended after it was recorded.
     pub fn open(pool: Arc<BufferPool>, first_page: PageId, last_page: PageId) -> Result<Self> {
-        let mut heap = Self { pool, first_page, last_page, free_space: None };
+        let mut heap = Self {
+            pool,
+            first_page,
+            last_page,
+            free_space: None,
+        };
         while let Some(next) = heap.next_page(heap.last_page)? {
             heap.last_page = next;
         }
@@ -73,10 +83,17 @@ impl TableHeap {
     /// Appends a page, changing `last_page`, if none has room.
     pub fn insert(&mut self, tuple: &[u8]) -> Result<RecordId> {
         if tuple.len() > MAX_TUPLE_SIZE {
-            return err(format!("row is {} bytes, the maximum is {MAX_TUPLE_SIZE}", tuple.len()));
+            return err(format!(
+                "row is {} bytes, the maximum is {MAX_TUPLE_SIZE}",
+                tuple.len()
+            ));
         }
 
-        let target = self.free_space()?.iter().find(|&(_, &room)| room >= tuple.len()).map(|(&id, _)| id);
+        let target = self
+            .free_space()?
+            .iter()
+            .find(|&(_, &room)| room >= tuple.len())
+            .map(|(&id, _)| id);
         if let Some(page_id) = target {
             let mut guard = self.pool.fetch_write(page_id)?;
             let mut page = SlottedPage::new(&mut *guard);
@@ -100,7 +117,10 @@ impl TableHeap {
 
         self.last_page = new_id;
         self.set_room(new_id, room);
-        Ok(RecordId { page_id: new_id, slot })
+        Ok(RecordId {
+            page_id: new_id,
+            slot,
+        })
     }
 
     /// Returns the tuple at `rid`, or `None` if it was deleted.
@@ -145,7 +165,12 @@ impl TableHeap {
     /// Like [`TableHeap::scan`], but turns each tuple into a `T` with `f`
     /// where it lies in its page, rather than copying it out first.
     pub fn scan_map<T, F: FnMut(&[u8]) -> Result<T>>(&self, f: F) -> Scan<'_, T, F> {
-        Scan { pool: &self.pool, next_page: Some(self.first_page), pending: Vec::new().into_iter(), f }
+        Scan {
+            pool: &self.pool,
+            next_page: Some(self.first_page),
+            pending: Vec::new().into_iter(),
+            f,
+        }
     }
 
     /// Returns all of the heap's pages to the free list.
@@ -210,7 +235,10 @@ impl<T, F: FnMut(&[u8]) -> Result<T>> Iterator for Scan<'_, T, F> {
             let page = SlottedPage::new(&*guard);
             self.next_page = page.next_page();
             let f = &mut self.f;
-            let tuples: Vec<_> = page.iter().map(|(slot, tuple)| Ok((RecordId { page_id, slot }, f(tuple)?))).collect();
+            let tuples: Vec<_> = page
+                .iter()
+                .map(|(slot, tuple)| Ok((RecordId { page_id, slot }, f(tuple)?)))
+                .collect();
             self.pending = tuples.into_iter();
         }
     }
@@ -244,7 +272,11 @@ mod tests {
         let mut heap = heap();
         let rids: Vec<RecordId> = (0..100).map(|i| heap.insert(&row(i)).unwrap()).collect();
 
-        assert_ne!(heap.first_page(), heap.last_page(), "100 x 200 bytes needs several pages");
+        assert_ne!(
+            heap.first_page(),
+            heap.last_page(),
+            "100 x 200 bytes needs several pages"
+        );
         assert_eq!(rids[0].page_id, heap.first_page());
         assert_eq!(rids[99].page_id, heap.last_page());
 
@@ -356,7 +388,12 @@ mod tests {
 
         let pool = pool(DiskManager::open(&path).unwrap(), 2);
         // A stale last_page hint still finds the real end of the chain.
-        assert_eq!(TableHeap::open(pool.clone(), first, first).unwrap().last_page(), last);
+        assert_eq!(
+            TableHeap::open(pool.clone(), first, first)
+                .unwrap()
+                .last_page(),
+            last
+        );
 
         let heap = TableHeap::open(pool, first, last).unwrap();
         let tuples: Vec<Vec<u8>> = scan_all(&heap).into_iter().map(|(_, t)| t).collect();

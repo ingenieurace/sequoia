@@ -25,10 +25,10 @@ use crate::catalog::Catalog;
 use crate::error::{Error, Result, err};
 use crate::executor::model::Model;
 use crate::executor::{self, Query, Settings};
-use crate::sql::ast::Statement;
-use crate::storage::io::disk::Savepoint;
-use crate::sql::parse;
 use crate::result::QueryResult;
+use crate::sql::ast::Statement;
+use crate::sql::parse;
+use crate::storage::io::disk::Savepoint;
 use crate::storage::{BufferPool, DiskManager, Policy, Stats};
 
 /// Frames in the buffer pool: 256 x 4 KB = 1 MB of cached pages.
@@ -72,7 +72,13 @@ impl Database {
         let mut catalog = Catalog::open(pool.clone())?;
         catalog.save()?; // a new database's empty catalog
         pool.disk().commit()?;
-        Ok(Database { pool, catalog, settings: Settings::default(), transaction: None, broken: false })
+        Ok(Database {
+            pool,
+            catalog,
+            settings: Settings::default(),
+            transaction: None,
+            broken: false,
+        })
     }
 
     /// Parses and runs every statement in `sql`, stopping at the first error.
@@ -109,7 +115,9 @@ impl Database {
                 self.restore(None)?;
                 Ok(message("transaction rolled back"))
             }
-            Statement::Rollback { savepoint: Some(name) } => {
+            Statement::Rollback {
+                savepoint: Some(name),
+            } => {
                 let savepoints = self.savepoints("ROLLBACK TO")?;
                 let i = find(savepoints, &name)?;
                 savepoints.truncate(i + 1);
@@ -119,7 +127,8 @@ impl Database {
             }
             Statement::Savepoint { name } => {
                 let savepoint = self.pool.disk().savepoint();
-                self.savepoints("SAVEPOINT")?.push((name.clone(), savepoint));
+                self.savepoints("SAVEPOINT")?
+                    .push((name.clone(), savepoint));
                 Ok(message(format!("savepoint {name} created")))
             }
             Statement::Release { name } => {
@@ -128,7 +137,9 @@ impl Database {
                 savepoints.truncate(i);
                 Ok(message(format!("savepoint {name} released")))
             }
-            Statement::Checkpoint if self.transaction.is_some() => err("CHECKPOINT cannot run inside a transaction"),
+            Statement::Checkpoint if self.transaction.is_some() => {
+                err("CHECKPOINT cannot run inside a transaction")
+            }
             statement => self.statement(statement),
         }
     }
@@ -137,7 +148,8 @@ impl Database {
     /// it, or inside a transaction saves it, or else undoes it.
     fn statement(&mut self, statement: Statement) -> Result<QueryResult> {
         let modifies = !matches!(statement, Statement::Select(_) | Statement::Explain { .. });
-        let savepoint = (modifies && self.transaction.is_some()).then(|| self.pool.disk().savepoint());
+        let savepoint =
+            (modifies && self.transaction.is_some()).then(|| self.pool.disk().savepoint());
         let result = executor::execute(&mut self.catalog, statement, &self.settings);
         if !modifies {
             return result;
@@ -186,7 +198,9 @@ impl Database {
         }
         let mut statements = parse(sql)?;
         match (statements.pop(), statements.is_empty()) {
-            (Some(Statement::Select(query)), true) => executor::select(&self.catalog, query, &self.settings),
+            (Some(Statement::Select(query)), true) => {
+                executor::select(&self.catalog, query, &self.settings)
+            }
             _ => err("query runs a single SELECT; use execute for other statements"),
         }
     }
@@ -246,7 +260,9 @@ impl Database {
     }
 
     pub fn replacement_policy(&self) -> Policy {
-        self.pool.policy().expect("the database's pool is made with a policy")
+        self.pool
+            .policy()
+            .expect("the database's pool is made with a policy")
     }
 
     /// The buffer pool's hits and misses since its policy was last set, and
@@ -282,12 +298,17 @@ mod tests {
         let mut db = open(sim).unwrap();
         for (table, storage) in [("h", "HEAP"), ("l", "LSM"), ("c", "COLUMN")] {
             let schema = "(id INT PRIMARY KEY, tag TEXT, n INT, body TEXT)";
-            db.execute(&format!("CREATE TABLE {table} {schema} USING {storage}")).unwrap();
+            db.execute(&format!("CREATE TABLE {table} {schema} USING {storage}"))
+                .unwrap();
             if storage != "COLUMN" {
-                db.execute(&format!("CREATE INDEX {table}_tag ON {table} (tag)")).unwrap();
+                db.execute(&format!("CREATE INDEX {table}_tag ON {table} (tag)"))
+                    .unwrap();
             }
-            let rows = values((0..300).map(|i| format!("({i}, 'tag{}', {i}, '{}')", i % 7, "b".repeat(100))));
-            db.execute(&format!("INSERT INTO {table} VALUES {rows}")).unwrap();
+            let rows = values(
+                (0..300).map(|i| format!("({i}, 'tag{}', {i}, '{}')", i % 7, "b".repeat(100))),
+            );
+            db.execute(&format!("INSERT INTO {table} VALUES {rows}"))
+                .unwrap();
         }
         db
     }
@@ -296,11 +317,17 @@ mod tests {
     /// split, rows move, an LSM tree flushes, a column store migrates.
     fn statements() -> Vec<String> {
         let rows = |n: i64, body: usize| {
-            values((1000..1000 + n).map(|i| format!("({i}, 'new{}', {i}, '{}')", i % 5, "n".repeat(body))))
+            values(
+                (1000..1000 + n)
+                    .map(|i| format!("({i}, 'new{}', {i}, '{}')", i % 5, "n".repeat(body))),
+            )
         };
         vec![
             format!("INSERT INTO h VALUES {}", rows(200, 150)),
-            format!("UPDATE h SET body = '{}', tag = 'moved' WHERE id < 100", "z".repeat(300)),
+            format!(
+                "UPDATE h SET body = '{}', tag = 'moved' WHERE id < 100",
+                "z".repeat(300)
+            ),
             "DELETE FROM h WHERE tag = 'tag3' OR id > 250".into(),
             "CREATE INDEX h_n ON h (n)".into(),
             format!("INSERT INTO l VALUES {}", rows(400, 200)),
@@ -333,16 +360,30 @@ mod tests {
                 tags.sort_by(|a, b| a.sort_cmp(b));
                 tags.dedup();
                 for tag in tags {
-                    let found = rows(db, &format!("SELECT * FROM {table} WHERE tag = {}", tag.to_sql())).unwrap();
-                    let expected: Vec<Vec<Value>> = all.iter().filter(|row| row[1] == tag).cloned().collect();
+                    let found = rows(
+                        db,
+                        &format!("SELECT * FROM {table} WHERE tag = {}", tag.to_sql()),
+                    )
+                    .unwrap();
+                    let expected: Vec<Vec<Value>> =
+                        all.iter().filter(|row| row[1] == tag).cloned().collect();
                     assert!(found == expected, "index {table}_tag for {}", tag.to_sql());
                 }
-                let found = rows(db, &format!("SELECT * FROM {table} WHERE n >= 100 AND n < 200")).unwrap();
-                let in_range = |row: &&Vec<Value>| matches!(row[2], Value::Int(n) if (100..200).contains(&n));
+                let found = rows(
+                    db,
+                    &format!("SELECT * FROM {table} WHERE n >= 100 AND n < 200"),
+                )
+                .unwrap();
+                let in_range =
+                    |row: &&Vec<Value>| matches!(row[2], Value::Int(n) if (100..200).contains(&n));
                 let expected: Vec<Vec<Value>> = all.iter().filter(in_range).cloned().collect();
                 assert!(found == expected, "range of n in {table}");
             }
-            let plan = match db.execute(&format!("EXPLAIN SELECT * FROM {table} WHERE n = 5")).unwrap().pop() {
+            let plan = match db
+                .execute(&format!("EXPLAIN SELECT * FROM {table} WHERE n = 5"))
+                .unwrap()
+                .pop()
+            {
                 Some(QueryResult::Message(plan)) => plan,
                 other => panic!("expected a plan, got {other:?}"),
             };
@@ -385,7 +426,9 @@ mod tests {
                 for kept in [0, 1, usize::MAX] {
                     let mut db = open(&sim.crashed(kept)).unwrap();
                     let found = snapshot(&mut db);
-                    let label = format!("statement {i}, crash after {crash} of {ops} ops, {kept} unsynced kept");
+                    let label = format!(
+                        "statement {i}, crash after {crash} of {ops} ops, {kept} unsynced kept"
+                    );
                     match &result {
                         Ok(_) => assert!(found == after, "{label}"),
                         Err(_) => assert!(found == before || found == after, "{label}"),
@@ -411,7 +454,10 @@ mod tests {
                     }
                     Err(e) => {
                         assert_eq!(e.0, "simulated I/O error", "statement {i}");
-                        assert!(snapshot(&mut db) == expected, "statement {i} failing after {fail} ops left nothing");
+                        assert!(
+                            snapshot(&mut db) == expected,
+                            "statement {i} failing after {fail} ops left nothing"
+                        );
                     }
                 }
             }
@@ -468,10 +514,16 @@ mod tests {
         let before = snapshot(&mut db);
         db.execute("BEGIN").unwrap();
         // About 2 MB, twice the buffer pool, so dirty pages are evicted into the log.
-        let big = |from: i64| values((from..from + 3000).map(|i| format!("({i}, 'big', {i}, '{}')", "b".repeat(600))));
-        db.execute(&format!("INSERT INTO h VALUES {}", big(10_000))).unwrap();
+        let big = |from: i64| {
+            values((from..from + 3000).map(|i| format!("({i}, 'big', {i}, '{}')", "b".repeat(600))))
+        };
+        db.execute(&format!("INSERT INTO h VALUES {}", big(10_000)))
+            .unwrap();
         // A statement failing after evictions is undone alone: the last row is a duplicate.
-        let failing = format!("INSERT INTO h VALUES {}, (10000, 'dup', 0, '')", big(20_000));
+        let failing = format!(
+            "INSERT INTO h VALUES {}, (10000, 'dup', 0, '')",
+            big(20_000)
+        );
         assert!(db.execute(&failing).unwrap_err().0.contains("duplicate"));
         let count = rows(&mut db, "SELECT COUNT(*) FROM h WHERE tag = 'big'").unwrap();
         assert_eq!(count, vec![vec![Value::Int(3000)]]);
@@ -503,7 +555,10 @@ mod tests {
                     Err(e) => {
                         assert_eq!(e.0, "simulated I/O error", "statement {i}");
                         assert!(db.in_transaction(), "statement {i}");
-                        assert!(snapshot(&mut db) == expected, "statement {i} failing after {fail} ops left nothing");
+                        assert!(
+                            snapshot(&mut db) == expected,
+                            "statement {i} failing after {fail} ops left nothing"
+                        );
                     }
                 }
             }

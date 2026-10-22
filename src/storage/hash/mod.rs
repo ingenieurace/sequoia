@@ -96,7 +96,12 @@ impl HashFile {
         Ok(match kind {
             EXTENDIBLE => HashFile::Extendible(Extendible::open(pool, root)),
             LINEAR => HashFile::Linear(Linear::open(pool, root)),
-            _ => return err(format!("corrupted hash file: root page {} has kind {kind}", root.0)),
+            _ => {
+                return err(format!(
+                    "corrupted hash file: root page {} has kind {kind}",
+                    root.0
+                ));
+            }
         })
     }
 
@@ -117,7 +122,10 @@ impl HashFile {
     /// Adds an entry whose key hashes to `hash`.
     pub fn insert(&self, hash: u32, entry: &[u8]) -> Result<()> {
         if entry.len() > MAX_ENTRY_SIZE {
-            return err(format!("index entry is {} bytes, the maximum is {MAX_ENTRY_SIZE}", entry.len()));
+            return err(format!(
+                "index entry is {} bytes, the maximum is {MAX_ENTRY_SIZE}",
+                entry.len()
+            ));
         }
         match self {
             HashFile::Extendible(file) => file.insert(hash, entry),
@@ -162,12 +170,16 @@ pub fn hash(key: &[u8]) -> u32 {
     let mut h = (key.len() as u64).wrapping_mul(K);
     let (chunks, rest) = key.as_chunks::<8>();
     for chunk in chunks {
-        h = (h ^ u64::from_le_bytes(*chunk)).wrapping_mul(K).rotate_left(31);
+        h = (h ^ u64::from_le_bytes(*chunk))
+            .wrapping_mul(K)
+            .rotate_left(31);
     }
     if !rest.is_empty() {
         let mut word = [0; 8];
         word[..rest.len()].copy_from_slice(rest);
-        h = (h ^ u64::from_le_bytes(word)).wrapping_mul(K).rotate_left(31);
+        h = (h ^ u64::from_le_bytes(word))
+            .wrapping_mul(K)
+            .rotate_left(31);
     }
     h ^= h >> 33;
     h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
@@ -179,7 +191,11 @@ pub fn hash(key: &[u8]) -> u32 {
 
 /// A mask of the low `bits` bits.
 fn mask(bits: u32) -> u32 {
-    if bits >= 32 { u32::MAX } else { (1 << bits) - 1 }
+    if bits >= 32 {
+        u32::MAX
+    } else {
+        (1 << bits) - 1
+    }
 }
 
 #[cfg(test)]
@@ -221,7 +237,10 @@ mod tests {
     #[test]
     fn hashes_are_fixed_and_spread() {
         // Stored on disk: these must never change.
-        assert_eq!((hash(b"sequoia"), hash(b"a key nine bytes or more")), (149_225_573, 3_947_121_480));
+        assert_eq!(
+            (hash(b"sequoia"), hash(b"a key nine bytes or more")),
+            (149_225_573, 3_947_121_480)
+        );
         assert_eq!(hash(b"a"), hash(b"a"));
         assert_ne!(hash(b"a"), hash(b"a\0"), "the length counts");
         // Consecutive integer keys spread evenly over 64 buckets.
@@ -229,7 +248,10 @@ mod tests {
         for i in 0..64_000u64 {
             buckets[(hash(&i.to_be_bytes()) & 63) as usize] += 1;
         }
-        assert!(buckets.iter().all(|&n| (800..1200).contains(&n)), "{buckets:?}");
+        assert!(
+            buckets.iter().all(|&n| (800..1200).contains(&n)),
+            "{buckets:?}"
+        );
     }
 
     /// Random inserts, deletes and lookups on a file of each scheme, checked
@@ -252,14 +274,24 @@ mod tests {
                             model.entry(k.clone()).or_default().insert(e);
                         }
                     } else {
-                        assert_eq!(file.delete(h, &e).unwrap(), present, "{scheme:?} step {step}");
+                        assert_eq!(
+                            file.delete(h, &e).unwrap(),
+                            present,
+                            "{scheme:?} step {step}"
+                        );
                         if present {
                             model.get_mut(&k).unwrap().remove(&e);
                         }
                     }
                     if step % 7 == 0 {
-                        let want: Vec<Vec<u8>> = model.get(&k).map_or(vec![], |set| set.iter().cloned().collect());
-                        assert_eq!(sorted(file.find(h, &k).unwrap()), want, "{scheme:?} {keys} keys, step {step}");
+                        let want: Vec<Vec<u8>> = model
+                            .get(&k)
+                            .map_or(vec![], |set| set.iter().cloned().collect());
+                        assert_eq!(
+                            sorted(file.find(h, &k).unwrap()),
+                            want,
+                            "{scheme:?} {keys} keys, step {step}"
+                        );
                     }
                 }
                 for (k, set) in &model {
@@ -290,7 +322,10 @@ mod tests {
             }
             let total = (pool.disk().page_count() - empty) as usize;
             let used = total - free_pages(&pool);
-            assert!(used <= start as usize + 2, "{scheme:?}: {used} pages still in use, {start} at the start");
+            assert!(
+                used <= start as usize + 2,
+                "{scheme:?}: {used} pages still in use, {start} at the start"
+            );
             file.destroy().unwrap();
             // Counting free pages adds one to the file, which it frees again.
             let total = (pool.disk().page_count() - empty) as usize;
@@ -325,17 +360,25 @@ mod tests {
             let (h, k, _) = entry(42, 0);
             let others: Vec<_> = (100..400).map(|i| entry(i, 0)).collect();
             for id in 0..3000u32 {
-                file.insert(h, &[k.as_slice(), &id.to_be_bytes()].concat()).unwrap();
+                file.insert(h, &[k.as_slice(), &id.to_be_bytes()].concat())
+                    .unwrap();
             }
             for (h, _, e) in &others {
                 file.insert(*h, e).unwrap();
             }
             assert_eq!(file.find(h, &k).unwrap().len(), 3000);
             for (h, k, e) in &others {
-                assert_eq!(file.find(*h, k).unwrap(), std::slice::from_ref(e), "{scheme:?}");
+                assert_eq!(
+                    file.find(*h, k).unwrap(),
+                    std::slice::from_ref(e),
+                    "{scheme:?}"
+                );
             }
             for id in (0..3000u32).rev() {
-                assert!(file.delete(h, &[k.as_slice(), &id.to_be_bytes()].concat()).unwrap());
+                assert!(
+                    file.delete(h, &[k.as_slice(), &id.to_be_bytes()].concat())
+                        .unwrap()
+                );
             }
             assert!(file.find(h, &k).unwrap().is_empty());
             assert_eq!(file.find(others[7].0, &others[7].1).unwrap().len(), 1);
@@ -378,7 +421,8 @@ mod tests {
                     let file = file.clone();
                     std::thread::spawn(move || {
                         for round in 0..3 {
-                            let mine: Vec<_> = (0..1500).map(|i| entry(i * 8 + 1 + t, round)).collect();
+                            let mine: Vec<_> =
+                                (0..1500).map(|i| entry(i * 8 + 1 + t, round)).collect();
                             for (h, _, e) in &mine {
                                 file.insert(*h, e).unwrap();
                             }

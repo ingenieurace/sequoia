@@ -90,7 +90,10 @@ impl<'a> Join<'a> {
     /// Makes the rows come out in their left rows' order even if a hash
     /// join's right side spills, by sorting them back into it within `budget`.
     pub fn keeping_order(self, budget: usize) -> Self {
-        Join { keep_order: Some(budget), ..self }
+        Join {
+            keep_order: Some(budget),
+            ..self
+        }
     }
 
     /// The next joined row, and the number of the left row in it.
@@ -114,7 +117,8 @@ impl<'a> Join<'a> {
                 if self.keep_order.is_some() {
                     row.pop();
                 }
-                (self.current, self.number, self.next, self.matched) = (Some(row), number, 0, false);
+                (self.current, self.number, self.next, self.matched) =
+                    (Some(row), number, 0, false);
             }
             let left = self.current.as_ref().expect("set above");
             while self.next < self.candidates {
@@ -150,7 +154,9 @@ impl<'a> Join<'a> {
                 None => self.left_done = true,
             }
         }
-        let Some(mut row) = self.right.deferred()? else { return Ok(None) };
+        let Some(mut row) = self.right.deferred()? else {
+            return Ok(None);
+        };
         let number = match self.keep_order {
             Some(_) => match row.pop() {
                 Some(Value::Int(n)) => n as u64,
@@ -206,8 +212,18 @@ impl<'a> Right<'a> {
         right_fields: Vec<Field>,
         budget: usize,
     ) -> Self {
-        let (left_keys, right_keys) = (Key::all(left_keys, left_fields), Key::all(right_keys, &right_fields));
-        Right::Hash(HashSide::new(source, left_keys, right_keys, left_fields.to_vec(), right_fields, budget))
+        let (left_keys, right_keys) = (
+            Key::all(left_keys, left_fields),
+            Key::all(right_keys, &right_fields),
+        );
+        Right::Hash(HashSide::new(
+            source,
+            left_keys,
+            right_keys,
+            left_fields.to_vec(),
+            right_fields,
+            budget,
+        ))
     }
 
     /// Finds the right rows that may match `left`, and returns how many there
@@ -253,14 +269,21 @@ impl Key {
         exprs
             .into_iter()
             .map(|expr| match &expr {
-                Expr::Column(column) => resolve(fields, column).map_or(Key::Expr(expr), Key::Column),
+                Expr::Column(column) => {
+                    resolve(fields, column).map_or(Key::Expr(expr), Key::Column)
+                }
                 _ => Key::Expr(locate(&expr, fields)),
             })
             .collect()
     }
 
     /// Puts the values of `keys` on `row` in `values`.
-    pub(super) fn eval_all(keys: &[Key], fields: &[Field], row: &Row, values: &mut Vec<Value>) -> Result<()> {
+    pub(super) fn eval_all(
+        keys: &[Key],
+        fields: &[Field],
+        row: &Row,
+        values: &mut Vec<Value>,
+    ) -> Result<()> {
         values.clear();
         for key in keys {
             values.push(match key {

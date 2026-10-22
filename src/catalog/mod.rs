@@ -31,8 +31,8 @@ use crate::error::{Error, Result, err};
 use crate::sql::ast::{ColumnRef, CreateIndex, Expr, IndexKind, Statement};
 use crate::sql::parse;
 use crate::storage::{BPlusTree, BufferPool, PageId, RecordId, TableHeap, tuple};
-use table::{Table, primary_key, validate_schema};
 use crate::types::{Column, DataType, StorageKind, Value};
+use table::{Table, primary_key, validate_schema};
 
 /// The second page of an index's catalog row: not a page, but a mark of the
 /// format of its entries.
@@ -80,11 +80,29 @@ impl Catalog {
         for item in heap.scan() {
             let (rid, bytes) = item?;
             match decode_entry(&bytes)? {
-                (Statement::CreateTable { name, columns, storage }, first, last) => {
-                    let table = Table::open(pool.clone(), name.clone(), columns, storage, (first, last))?;
-                    tables.insert(name, Entry { table, rid, saved_last_page: last });
+                (
+                    Statement::CreateTable {
+                        name,
+                        columns,
+                        storage,
+                    },
+                    first,
+                    last,
+                ) => {
+                    let table =
+                        Table::open(pool.clone(), name.clone(), columns, storage, (first, last))?;
+                    tables.insert(
+                        name,
+                        Entry {
+                            table,
+                            rid,
+                            saved_last_page: last,
+                        },
+                    );
                 }
-                (Statement::CreateIndex(definition), root, format) => index_rows.push((rid, definition, root, format)),
+                (Statement::CreateIndex(definition), root, format) => {
+                    index_rows.push((rid, definition, root, format))
+                }
                 (statement, ..) => return err(format!("corrupted catalog row: {statement:?}")),
             }
         }
@@ -94,7 +112,9 @@ impl Catalog {
         for (mut rid, definition, root, format) in index_rows {
             let (name, table) = (definition.name.clone(), definition.table.clone());
             let Some(entry) = tables.get_mut(&table) else {
-                return err(format!("corrupted catalog: index {name} on unknown table {table}"));
+                return err(format!(
+                    "corrupted catalog: index {name} on unknown table {table}"
+                ));
             };
             if format == INDEX_FORMAT {
                 entry.table.open_index(&definition, root)?;
@@ -102,28 +122,49 @@ impl Catalog {
                 // From before entries held NULL keys: built again.
                 BPlusTree::open(pool.clone(), root).destroy()?;
                 entry.table.create_index(&definition)?;
-                let root = entry.table.indexes().last().expect("just created").root_page();
+                let root = entry
+                    .table
+                    .indexes()
+                    .last()
+                    .expect("just created")
+                    .root_page();
                 heap.delete(rid)?;
                 rid = heap.insert(&encode_entry(definition.to_string(), (root, INDEX_FORMAT))?)?;
             }
             indexes.insert(name, IndexEntry { table, rid });
         }
-        Ok(Catalog { pool, heap, tables, indexes })
+        Ok(Catalog {
+            pool,
+            heap,
+            tables,
+            indexes,
+        })
     }
 
     pub fn get(&self, name: &str) -> Result<&Table> {
-        self.tables.get(name).map(|e| &e.table).ok_or_else(|| unknown_table(name))
+        self.tables
+            .get(name)
+            .map(|e| &e.table)
+            .ok_or_else(|| unknown_table(name))
     }
 
     pub fn get_mut(&mut self, name: &str) -> Result<&mut Table> {
-        self.tables.get_mut(name).map(|e| &mut e.table).ok_or_else(|| unknown_table(name))
+        self.tables
+            .get_mut(name)
+            .map(|e| &mut e.table)
+            .ok_or_else(|| unknown_table(name))
     }
 
     pub fn table_names(&self) -> Vec<&str> {
         self.tables.keys().map(String::as_str).collect()
     }
 
-    pub fn create_table(&mut self, name: String, columns: Vec<Column>, storage: StorageKind) -> Result<()> {
+    pub fn create_table(
+        &mut self,
+        name: String,
+        columns: Vec<Column>,
+        storage: StorageKind,
+    ) -> Result<()> {
         if self.tables.contains_key(&name) {
             return err(format!("table already exists: {name}"));
         }
@@ -155,7 +196,14 @@ impl Catalog {
             }
         };
         let saved_last_page = table.root_pages().1;
-        self.tables.insert(name.clone(), Entry { table, rid, saved_last_page });
+        self.tables.insert(
+            name.clone(),
+            Entry {
+                table,
+                rid,
+                saved_last_page,
+            },
+        );
 
         if let Some(index) = pk_index
             && let Err(e) = self.create_index(index)
@@ -167,9 +215,16 @@ impl Catalog {
     }
 
     pub fn drop_table(&mut self, name: &str) -> Result<()> {
-        let entry = self.tables.remove(name).ok_or_else(|| unknown_table(name))?;
-        let indexes: Vec<String> =
-            self.indexes.iter().filter(|(_, index)| index.table == name).map(|(n, _)| n.clone()).collect();
+        let entry = self
+            .tables
+            .remove(name)
+            .ok_or_else(|| unknown_table(name))?;
+        let indexes: Vec<String> = self
+            .indexes
+            .iter()
+            .filter(|(_, index)| index.table == name)
+            .map(|(n, _)| n.clone())
+            .collect();
         for index in indexes {
             let rid = self.indexes.remove(&index).expect("listed above").rid;
             self.heap.delete(rid)?;
@@ -184,11 +239,21 @@ impl Catalog {
         if self.indexes.contains_key(&name) {
             return err(format!("index already exists: {name}"));
         }
-        let entry = self.tables.get_mut(&table).ok_or_else(|| unknown_table(&table))?;
+        let entry = self
+            .tables
+            .get_mut(&table)
+            .ok_or_else(|| unknown_table(&table))?;
         entry.table.create_index(&definition)?;
 
-        let root = entry.table.indexes().last().expect("just created").root_page();
-        match encode_entry(definition.to_string(), (root, INDEX_FORMAT)).and_then(|bytes| self.heap.insert(&bytes)) {
+        let root = entry
+            .table
+            .indexes()
+            .last()
+            .expect("just created")
+            .root_page();
+        match encode_entry(definition.to_string(), (root, INDEX_FORMAT))
+            .and_then(|bytes| self.heap.insert(&bytes))
+        {
             Ok(rid) => {
                 self.indexes.insert(name, IndexEntry { table, rid });
                 Ok(())
@@ -201,13 +266,23 @@ impl Catalog {
     }
 
     pub fn drop_index(&mut self, name: &str) -> Result<()> {
-        let index = self.indexes.get(name).ok_or_else(|| Error(format!("unknown index: {name}")))?;
+        let index = self
+            .indexes
+            .get(name)
+            .ok_or_else(|| Error(format!("unknown index: {name}")))?;
         if name == pk_index_name(&index.table) {
-            return err(format!("cannot drop index {name}: the primary key of {} needs it", index.table));
+            return err(format!(
+                "cannot drop index {name}: the primary key of {} needs it",
+                index.table
+            ));
         }
         let index = self.indexes.remove(name).expect("found above");
         self.heap.delete(index.rid)?;
-        self.tables.get_mut(&index.table).expect("an index's table exists").table.drop_index(name)
+        self.tables
+            .get_mut(&index.table)
+            .expect("an index's table exists")
+            .table
+            .drop_index(name)
     }
 
     /// Copies the committed pages from the write-ahead log into the database file.
@@ -222,7 +297,10 @@ impl Catalog {
             let last_page = entry.table.root_pages().1;
             if last_page != entry.saved_last_page {
                 // Same length as before, so this rewrites one page in place.
-                if !self.heap.update(entry.rid, &encode_table_entry(&entry.table)?)? {
+                if !self
+                    .heap
+                    .update(entry.rid, &encode_table_entry(&entry.table)?)?
+                {
                     return err("cannot update catalog row");
                 }
                 entry.saved_last_page = last_page;
@@ -233,17 +311,32 @@ impl Catalog {
 }
 
 fn catalog_columns() -> Vec<Column> {
-    [("sql", DataType::Text), ("first_page", DataType::Int), ("last_page", DataType::Int)]
-        .map(|(name, data_type)| Column { name: name.into(), data_type, primary_key: false })
-        .into()
+    [
+        ("sql", DataType::Text),
+        ("first_page", DataType::Int),
+        ("last_page", DataType::Int),
+    ]
+    .map(|(name, data_type)| Column {
+        name: name.into(),
+        data_type,
+        primary_key: false,
+    })
+    .into()
 }
 
 fn encode_table_entry(table: &Table) -> Result<Vec<u8>> {
-    encode_entry(create_table_sql(&table.name, &table.columns, table.storage_kind()), table.root_pages())
+    encode_entry(
+        create_table_sql(&table.name, &table.columns, table.storage_kind()),
+        table.root_pages(),
+    )
 }
 
 fn encode_entry(sql: String, (first, last): (PageId, PageId)) -> Result<Vec<u8>> {
-    let row = [Value::Text(sql), Value::Int(first.0.into()), Value::Int(last.0.into())];
+    let row = [
+        Value::Text(sql),
+        Value::Int(first.0.into()),
+        Value::Int(last.0.into()),
+    ];
     tuple::encode(&catalog_columns(), &row)
 }
 
@@ -279,7 +372,9 @@ fn create_table_sql(name: &str, columns: &[Column], storage: StorageKind) -> Str
 }
 
 fn page_id(raw: i64) -> Result<PageId> {
-    u32::try_from(raw).map(PageId).map_err(|_| Error(format!("corrupted catalog: bad page id {raw}")))
+    u32::try_from(raw)
+        .map(PageId)
+        .map_err(|_| Error(format!("corrupted catalog: bad page id {raw}")))
 }
 
 fn unknown_table(name: &str) -> Error {
@@ -292,7 +387,9 @@ mod tests {
     use crate::storage::DiskManager;
 
     fn create_index(catalog: &mut Catalog, sql: &str) {
-        let Some(Statement::CreateIndex(definition)) = parse(sql).unwrap().pop() else { unreachable!() };
+        let Some(Statement::CreateIndex(definition)) = parse(sql).unwrap().pop() else {
+            unreachable!()
+        };
         catalog.create_index(definition).unwrap();
     }
 
@@ -301,32 +398,81 @@ mod tests {
         let pool = Arc::new(BufferPool::new(Arc::new(DiskManager::in_memory()), 64));
         let mut catalog = Catalog::open(pool.clone()).unwrap();
         let columns = vec![
-            Column { name: "id".into(), data_type: DataType::Int, primary_key: true },
-            Column { name: "n".into(), data_type: DataType::Int, primary_key: false },
+            Column {
+                name: "id".into(),
+                data_type: DataType::Int,
+                primary_key: true,
+            },
+            Column {
+                name: "n".into(),
+                data_type: DataType::Int,
+                primary_key: false,
+            },
         ];
-        catalog.create_table("t".into(), columns, StorageKind::Heap).unwrap();
-        let rows = (0..500).map(|i| vec![Value::Int(i), if i % 5 == 0 { Value::Null } else { Value::Int(i % 7) }]);
-        catalog.get_mut("t").unwrap().insert(rows.collect()).unwrap();
+        catalog
+            .create_table("t".into(), columns, StorageKind::Heap)
+            .unwrap();
+        let rows = (0..500).map(|i| {
+            vec![
+                Value::Int(i),
+                if i % 5 == 0 {
+                    Value::Null
+                } else {
+                    Value::Int(i % 7)
+                },
+            ]
+        });
+        catalog
+            .get_mut("t")
+            .unwrap()
+            .insert(rows.collect())
+            .unwrap();
         create_index(&mut catalog, "CREATE INDEX t_n ON t (n)");
 
         // Record it as files from before did, its root page twice.
         let rid = catalog.indexes["t_n"].rid;
         let root = catalog.get("t").unwrap().indexes()[1].root_page();
-        assert!(catalog.heap.update(rid, &encode_entry("CREATE INDEX t_n ON t (n)".into(), (root, root)).unwrap()).unwrap());
+        assert!(
+            catalog
+                .heap
+                .update(
+                    rid,
+                    &encode_entry("CREATE INDEX t_n ON t (n)".into(), (root, root)).unwrap()
+                )
+                .unwrap()
+        );
         catalog.save().unwrap();
         let pages = pool.disk().page_count();
 
         let catalog = Catalog::open(pool.clone()).unwrap();
-        let (sql, _, format) = decode_entry(&catalog.heap.get(catalog.indexes["t_n"].rid).unwrap().unwrap()).unwrap();
+        let (sql, _, format) = decode_entry(
+            &catalog
+                .heap
+                .get(catalog.indexes["t_n"].rid)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(format, INDEX_FORMAT);
         assert!(matches!(sql, Statement::CreateIndex(CreateIndex { name, .. }) if name == "t_n"));
         let index = &catalog.get("t").unwrap().indexes()[1];
-        assert_eq!(index.scan(&[Value::Null], None, None).unwrap().len(), 100, "NULL keys are in it now");
+        assert_eq!(
+            index.scan(&[Value::Null], None, None).unwrap().len(),
+            100,
+            "NULL keys are in it now"
+        );
         assert_eq!(index.scan(&[Value::Int(3)], None, None).unwrap().len(), 57);
-        assert_eq!(pool.disk().page_count(), pages, "the old tree's pages were freed and reused");
+        assert_eq!(
+            pool.disk().page_count(),
+            pages,
+            "the old tree's pages were freed and reused"
+        );
 
         // Once built again, it is opened as it is.
         let reopened = Catalog::open(pool.clone()).unwrap();
-        assert_eq!(reopened.get("t").unwrap().indexes()[1].root_page(), index.root_page());
+        assert_eq!(
+            reopened.get("t").unwrap().indexes()[1].root_page(),
+            index.root_page()
+        );
     }
 }

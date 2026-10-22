@@ -16,7 +16,7 @@ pub mod trie;
 pub mod types;
 
 pub use database::Database;
-pub use executor::Query;
 pub use error::{Error, Result};
+pub use executor::Query;
 pub use result::QueryResult;
 pub use types::Value;

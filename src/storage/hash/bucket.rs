@@ -25,7 +25,9 @@
 
 use crate::error::{Result, err};
 use crate::storage::buffer::pool::BufferPool;
-use crate::storage::io::disk::{PAGE_USABLE, Page, PageId, decode_id, encode_id, read_u32, write_u32};
+use crate::storage::io::disk::{
+    PAGE_USABLE, Page, PageId, decode_id, encode_id, read_u32, write_u32,
+};
 
 pub const HEADER: usize = 13;
 /// The bytes of a page that entries can take.
@@ -101,7 +103,13 @@ fn push(page: &mut Page, hash: u32, entry: &[u8]) {
 
 /// Adds the entries of the bucket whose first page is `head` that start
 /// with `key`, whose hash is `hash`, to `out`.
-pub fn find(pool: &BufferPool, head: &Page, hash: u32, key: &[u8], out: &mut Vec<Vec<u8>>) -> Result<()> {
+pub fn find(
+    pool: &BufferPool,
+    head: &Page,
+    hash: u32,
+    key: &[u8],
+    out: &mut Vec<Vec<u8>>,
+) -> Result<()> {
     let mut collect = |page: &Page| -> Result<Option<PageId>> {
         for (h, entry, _) in entries(page)? {
             if h == hash && entry.starts_with(key) {
@@ -158,7 +166,9 @@ pub fn delete(pool: &BufferPool, head: &mut Page, hash: u32, entry: &[u8]) -> Re
 
 /// Removes an entry from one page, closing the gap. Returns false if it was not there.
 fn remove(page: &mut Page, hash: u32, entry: &[u8]) -> Result<bool> {
-    let Some((at, len)) = entries(page)?.find(|(h, e, _)| *h == hash && *e == entry).map(|(_, e, at)| (at, e.len()))
+    let Some((at, len)) = entries(page)?
+        .find(|(h, e, _)| *h == hash && *e == entry)
+        .map(|(_, e, at)| (at, e.len()))
     else {
         return Ok(false);
     };
@@ -234,7 +244,11 @@ pub fn rewrite(pool: &BufferPool, head: &mut Page, entries: &[(u32, Vec<u8>)]) -
     match hashes.next() {
         None => head[8] = EMPTY,
         Some(first) => {
-            head[8] = if hashes.all(|h| h == first) { UNIFORM } else { MIXED };
+            head[8] = if hashes.all(|h| h == first) {
+                UNIFORM
+            } else {
+                MIXED
+            };
             write_u32(head, 9, first);
         }
     }
@@ -260,7 +274,11 @@ fn entries(page: &Page) -> Result<Entries<'_>> {
     if !(HEADER..=PAGE_USABLE).contains(&end) {
         return err("corrupted hash bucket: bad free space offset");
     }
-    Ok(Entries { page: &page[..end], at: HEADER, left: count(page) })
+    Ok(Entries {
+        page: &page[..end],
+        at: HEADER,
+        left: count(page),
+    })
 }
 
 /// Reads entries one after another, without copying them.

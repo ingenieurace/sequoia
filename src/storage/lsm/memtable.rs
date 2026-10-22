@@ -29,7 +29,12 @@ pub enum MemTableKind {
 }
 
 impl MemTableKind {
-    pub const ALL: [MemTableKind; 4] = [MemTableKind::SkipList, MemTableKind::Trie, MemTableKind::RadixTree, MemTableKind::Art];
+    pub const ALL: [MemTableKind; 4] = [
+        MemTableKind::SkipList,
+        MemTableKind::Trie,
+        MemTableKind::RadixTree,
+        MemTableKind::Art,
+    ];
 }
 
 /// A value, or `None` for a tombstone.

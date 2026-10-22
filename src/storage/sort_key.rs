@@ -90,7 +90,11 @@ pub fn encode(value: &Value, desc: bool, out: &mut Vec<u8>) {
 fn encode_int(n: i64, out: &mut Vec<u8>) {
     let magnitude = n.unsigned_abs();
     let len = 8 - magnitude.leading_zeros() as usize / 8;
-    let (tag, bits) = if n < 0 { (INT - len as u8, !magnitude) } else { (INT + len as u8, magnitude) };
+    let (tag, bits) = if n < 0 {
+        (INT - len as u8, !magnitude)
+    } else {
+        (INT + len as u8, magnitude)
+    };
     out.push(tag);
     out.extend_from_slice(&bits.to_be_bytes()[8 - len..]);
 }
@@ -121,21 +125,23 @@ pub fn decode(bytes: &[u8], pos: &mut usize) -> Result<Value> {
             }
             Value::Text(String::from_utf8(text).map_err(|_| corrupted())?)
         }
-        _ if tag == INT - 9 || tag == INT + 9 => {
-            Value::Real(real_from_ordered(u64::from_be_bytes(take(8)?.try_into().expect("8 bytes"))))
-        }
+        _ if tag == INT - 9 || tag == INT + 9 => Value::Real(real_from_ordered(
+            u64::from_be_bytes(take(8)?.try_into().expect("8 bytes")),
+        )),
         _ if (INT - 8..=INT + 8).contains(&tag) => {
             let len = tag.abs_diff(INT) as usize;
             let raw = take(len)?.iter().fold(0u64, |n, &b| n << 8 | b as u64);
             let n = match tag < INT {
                 // The complement of the magnitude, whose leading bytes, all ones, were left out.
-                true => (!(raw | u64::MAX.checked_shl(8 * len as u32).unwrap_or(0)) as i64).wrapping_neg(),
+                true => (!(raw | u64::MAX.checked_shl(8 * len as u32).unwrap_or(0)) as i64)
+                    .wrapping_neg(),
                 false => raw as i64,
             };
             match take(1)?[0] {
                 WHOLE => Value::Int(n),
                 FRACTION => {
-                    let fraction = f64::from_bits(u64::from_be_bytes(take(8)?.try_into().expect("8 bytes")));
+                    let fraction =
+                        f64::from_bits(u64::from_be_bytes(take(8)?.try_into().expect("8 bytes")));
                     Value::Real(n as f64 + fraction)
                 }
                 _ => return err(corrupted().0),
@@ -187,15 +193,31 @@ mod tests {
     use super::*;
 
     fn values() -> Vec<Value> {
-        let mut values = vec![Value::Null, Value::Bool(false), Value::Bool(true), Value::Real(-1e300)];
+        let mut values = vec![
+            Value::Null,
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Real(-1e300),
+        ];
         for n in [i64::MIN, -70_000, -256, -255, -1] {
             values.push(Value::Int(n));
         }
-        values.extend([Value::Real(-0.5), Value::Int(0), Value::Real(0.25), Value::Int(1), Value::Real(1.5)]);
+        values.extend([
+            Value::Real(-0.5),
+            Value::Int(0),
+            Value::Real(0.25),
+            Value::Int(1),
+            Value::Real(1.5),
+        ]);
         for n in [255, 256, 70_000, i64::MAX] {
             values.push(Value::Int(n));
         }
-        values.extend([Value::Real(1e300), Value::Text("".into()), Value::Text("\0".into()), Value::Text("a".into())]);
+        values.extend([
+            Value::Real(1e300),
+            Value::Text("".into()),
+            Value::Text("\0".into()),
+            Value::Text("a".into()),
+        ]);
         values.push(Value::Text("a\0b".into()));
         values
     }

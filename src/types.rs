@@ -86,7 +86,8 @@ impl Hash for Value {
 /// The INT a REAL equals, if one does.
 pub fn real_as_int(r: f64) -> Option<i64> {
     // -2^63 <= r < 2^63, the range of i64, with no fraction.
-    (r.fract() == 0.0 && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&r)).then_some(r as i64)
+    (r.fract() == 0.0 && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&r))
+        .then_some(r as i64)
 }
 
 /// A REAL's bits, changed so that they compare as unsigned numbers as the
@@ -94,12 +95,20 @@ pub fn real_as_int(r: f64) -> Option<i64> {
 /// others only the sign bit.
 pub fn ordered_real(r: f64) -> u64 {
     let bits = (if r == 0.0 { 0.0 } else { r }).to_bits();
-    if bits >> 63 == 1 { !bits } else { bits | 1 << 63 }
+    if bits >> 63 == 1 {
+        !bits
+    } else {
+        bits | 1 << 63
+    }
 }
 
 /// The REAL whose [`ordered_real`] bits these are.
 pub fn real_from_ordered(bits: u64) -> f64 {
-    f64::from_bits(if bits >> 63 == 1 { bits & !(1 << 63) } else { !bits })
+    f64::from_bits(if bits >> 63 == 1 {
+        bits & !(1 << 63)
+    } else {
+        !bits
+    })
 }
 
 /// Compares an INT with a REAL exactly, without rounding the INT to a REAL.

@@ -210,7 +210,10 @@ pub mod sim {
         }
 
         pub fn file(self: &Arc<Self>, index: usize) -> Box<dyn Medium> {
-            Box::new(SimMedium { sim: self.clone(), index })
+            Box::new(SimMedium {
+                sim: self.clone(),
+                index,
+            })
         }
 
         /// Crashes after `ops` more operations.
@@ -243,11 +246,21 @@ pub mod sim {
                 .iter()
                 .map(|file| {
                     let mut bytes = file.durable.clone();
-                    file.unsynced.iter().take(kept).for_each(|op| apply(&mut bytes, op));
-                    SimFile { current: bytes.clone(), durable: bytes, unsynced: Vec::new() }
+                    file.unsynced
+                        .iter()
+                        .take(kept)
+                        .for_each(|op| apply(&mut bytes, op));
+                    SimFile {
+                        current: bytes.clone(),
+                        durable: bytes,
+                        unsynced: Vec::new(),
+                    }
                 })
                 .collect();
-            Arc::new(Sim(Mutex::new(State { files, ..State::default() })))
+            Arc::new(Sim(Mutex::new(State {
+                files,
+                ..State::default()
+            })))
         }
 
         fn op<T>(&self, index: usize, f: impl FnOnce(&mut SimFile) -> T) -> Result<T> {
@@ -274,7 +287,10 @@ pub mod sim {
     impl Medium for SimMedium {
         fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
             let state = self.sim.0.lock().unwrap();
-            match state.files[self.index].current.get(offset as usize..offset as usize + buf.len()) {
+            match state.files[self.index]
+                .current
+                .get(offset as usize..offset as usize + buf.len())
+            {
                 Some(data) => buf.copy_from_slice(data),
                 None => return err(format!("read past the end at {offset}")),
             }
@@ -282,7 +298,9 @@ pub mod sim {
         }
 
         fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
-            self.sim.op(self.index, |file| file.record(Op::Write(offset, buf.to_vec())))
+            self.sim.op(self.index, |file| {
+                file.record(Op::Write(offset, buf.to_vec()))
+            })
         }
 
         fn size(&self) -> Result<u64> {

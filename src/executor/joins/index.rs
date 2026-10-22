@@ -30,12 +30,24 @@ impl Lookup<'_> {
         }
         let data_type = self.table.columns[self.column].data_type;
         // The column's value that equals this one, if any: as in a hash join, 1 finds 1.0.
-        let Some(value) = &value.coerce(data_type) else { return Ok(Vec::new()) };
-        let predicates = [Predicate { column: self.column, op: Compare::Eq, literal: value.clone() }];
+        let Some(value) = &value.coerce(data_type) else {
+            return Ok(Vec::new());
+        };
+        let predicates = [Predicate {
+            column: self.column,
+            op: Compare::Eq,
+            literal: value.clone(),
+        }];
         let access = match self.key {
             LookupKey::Index(index) => {
                 let covering = self.table.indexes()[index].covers(&self.needed);
-                Access::Index { index, equal: vec![value.clone()], lower: None, upper: None, covering }
+                Access::Index {
+                    index,
+                    equal: vec![value.clone()],
+                    lower: None,
+                    upper: None,
+                    covering,
+                }
             }
             LookupKey::PrimaryKey => Access::Key(value.clone()),
         };

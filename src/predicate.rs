@@ -67,6 +67,8 @@ pub struct Predicate {
 impl Predicate {
     /// Whether a decoded row satisfies the predicate; NULL never does.
     pub fn matches(&self, row: &[Value]) -> bool {
-        row[self.column].compare(&self.literal).is_some_and(|ord| self.op.holds(ord))
+        row[self.column]
+            .compare(&self.literal)
+            .is_some_and(|ord| self.op.holds(ord))
     }
 }

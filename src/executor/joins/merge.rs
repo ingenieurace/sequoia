@@ -65,7 +65,14 @@ impl<'a> MergeJoin<'a> {
         let sort = MergeSort {
             left_keys: locate_all(&sort.left_keys, &left_fields),
             right_keys: locate_all(&sort.right_keys, &right_fields),
-            then: sort.then.iter().map(|o| OrderBy { expr: locate(&o.expr, &left_fields), desc: o.desc }).collect(),
+            then: sort
+                .then
+                .iter()
+                .map(|o| OrderBy {
+                    expr: locate(&o.expr, &left_fields),
+                    desc: o.desc,
+                })
+                .collect(),
             ..sort
         };
         MergeJoin {
@@ -93,7 +100,13 @@ impl<'a> MergeJoin<'a> {
     /// The next left row in order, sorting the left side first if it is not yet.
     fn next_left(&mut self) -> Option<Result<Row>> {
         if let Some(rows) = self.left_input.take() {
-            let MergeSort { left_keys, desc, then, budget, .. } = &self.sort;
+            let MergeSort {
+                left_keys,
+                desc,
+                then,
+                budget,
+                ..
+            } = &self.sort;
             match sort(rows, &self.left_fields, left_keys, desc, then, *budget) {
                 Ok(sorted) => self.left = Some(sorted),
                 Err(e) => return Some(Err(e)),
@@ -110,12 +123,28 @@ impl<'a> MergeJoin<'a> {
         if key.iter().any(Value::is_null) {
             return Ok(0); // nothing is equal to NULL
         }
-        if self.group_key.as_ref().is_some_and(|group| compare(group, &key, &self.sort.desc).is_eq()) {
+        if self
+            .group_key
+            .as_ref()
+            .is_some_and(|group| compare(group, &key, &self.sort.desc).is_eq())
+        {
             return Ok(self.group.len());
         }
         if let Some(rows) = self.right_input.take() {
-            let MergeSort { right_keys, desc, budget, .. } = &self.sort;
-            self.right = Some(sort(rows, &self.right_fields, right_keys, desc, &[], *budget)?);
+            let MergeSort {
+                right_keys,
+                desc,
+                budget,
+                ..
+            } = &self.sort;
+            self.right = Some(sort(
+                rows,
+                &self.right_fields,
+                right_keys,
+                desc,
+                &[],
+                *budget,
+            )?);
         }
         let right = self.right.as_mut().expect("sorted above");
         self.group.clear();
@@ -123,13 +152,16 @@ impl<'a> MergeJoin<'a> {
             if self.lookahead.is_none() {
                 let Some(row) = right.next() else { break };
                 let row = row?;
-                self.lookahead = Some((keys(&self.sort.right_keys, &self.right_fields, &row)?, row));
+                self.lookahead =
+                    Some((keys(&self.sort.right_keys, &self.right_fields, &row)?, row));
             }
             // A right row with a NULL key is never equal, so never joins the group.
             let (right_key, _) = self.lookahead.as_ref().expect("read above");
             match compare(right_key, &key, &self.sort.desc) {
                 Ordering::Less => self.lookahead = None,
-                Ordering::Equal => self.group.push(self.lookahead.take().expect("read above").1),
+                Ordering::Equal => self
+                    .group
+                    .push(self.lookahead.take().expect("read above").1),
                 Ordering::Greater => break,
             }
         }
@@ -180,8 +212,19 @@ impl Iterator for MergeJoin<'_> {
 /// Sorts rows by the values of `keys`, in the order [`compare`] puts them
 /// (which is how the sorter orders values of different types too), then by
 /// `then`, as ORDER BY would.
-fn sort(rows: Rows, fields: &[Field], keys: &[Expr], desc: &[bool], then: &[OrderBy], budget: usize) -> Result<Sorted> {
-    let directions = desc.iter().copied().chain(then.iter().map(|o| o.desc)).collect();
+fn sort(
+    rows: Rows,
+    fields: &[Field],
+    keys: &[Expr],
+    desc: &[bool],
+    then: &[OrderBy],
+    budget: usize,
+) -> Result<Sorted> {
+    let directions = desc
+        .iter()
+        .copied()
+        .chain(then.iter().map(|o| o.desc))
+        .collect();
     let mut sorter = Sorter::new(directions, None, budget);
     let mut sort_keys = Vec::new();
     for row in rows {

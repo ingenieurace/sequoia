@@ -127,7 +127,13 @@ use List::{B1, B2, T1, T2};
 
 impl ArcReplacer {
     pub fn new(capacity: usize) -> Self {
-        Self { capacity, target: 0, lists: Default::default(), entries: HashMap::new(), next_stamp: 0 }
+        Self {
+            capacity,
+            target: 0,
+            lists: Default::default(),
+            entries: HashMap::new(),
+            next_stamp: 0,
+        }
     }
 
     fn len(&self, list: List) -> usize {
@@ -184,9 +190,18 @@ impl Replacer for ArcReplacer {
     }
 
     fn victim(&mut self, evictable: &dyn Fn(PageId) -> bool) -> Option<PageId> {
-        let order = if self.len(T1) > self.target { [T1, T2] } else { [T2, T1] };
+        let order = if self.len(T1) > self.target {
+            [T1, T2]
+        } else {
+            [T2, T1]
+        };
         // If every page in the preferred list is pinned, fall back to the other.
-        order.into_iter().find_map(|list| self.lists[list as usize].values().copied().find(|&p| evictable(p)))
+        order.into_iter().find_map(|list| {
+            self.lists[list as usize]
+                .values()
+                .copied()
+                .find(|&p| evictable(p))
+        })
     }
 
     fn evict(&mut self, page: PageId) {
@@ -245,7 +260,8 @@ impl LruKReplacer {
 
     fn take_ghost(&mut self, page: PageId) -> Option<VecDeque<u64>> {
         let history = self.ghosts.remove(&page)?;
-        self.ghost_order.remove(history.back().expect("histories are never empty"));
+        self.ghost_order
+            .remove(history.back().expect("histories are never empty"));
         Some(history)
     }
 }
@@ -253,7 +269,11 @@ impl LruKReplacer {
 impl Replacer for LruKReplacer {
     fn record_access(&mut self, page: PageId) {
         self.now += 1;
-        let mut history = self.resident.remove(&page).or_else(|| self.take_ghost(page)).unwrap_or_default();
+        let mut history = self
+            .resident
+            .remove(&page)
+            .or_else(|| self.take_ghost(page))
+            .unwrap_or_default();
         history.push_back(self.now);
         if history.len() > self.k {
             history.pop_front();
@@ -268,11 +288,17 @@ impl Replacer for LruKReplacer {
             true => (true, history[0]),
             false => (false, *history.back().unwrap()),
         };
-        self.resident.iter().filter(|&(&page, _)| evictable(page)).min_by_key(|(_, h)| key(h)).map(|(&page, _)| page)
+        self.resident
+            .iter()
+            .filter(|&(&page, _)| evictable(page))
+            .min_by_key(|(_, h)| key(h))
+            .map(|(&page, _)| page)
     }
 
     fn evict(&mut self, page: PageId) {
-        let Some(history) = self.resident.remove(&page) else { return };
+        let Some(history) = self.resident.remove(&page) else {
+            return;
+        };
         self.ghost_order.insert(*history.back().unwrap(), page);
         self.ghosts.insert(page, history);
         if self.ghosts.len() > self.capacity
@@ -304,7 +330,12 @@ pub struct ClockReplacer {
 
 impl ClockReplacer {
     pub fn new(capacity: usize) -> Self {
-        Self { ring: vec![None; capacity], slots: HashMap::new(), free: (0..capacity).rev().collect(), hand: 0 }
+        Self {
+            ring: vec![None; capacity],
+            slots: HashMap::new(),
+            free: (0..capacity).rev().collect(),
+            hand: 0,
+        }
     }
 }
 
@@ -314,7 +345,10 @@ impl Replacer for ClockReplacer {
             self.ring[slot] = Some((page, true));
             return;
         }
-        let slot = self.free.pop().expect("more resident pages than the replacer's capacity");
+        let slot = self
+            .free
+            .pop()
+            .expect("more resident pages than the replacer's capacity");
         self.ring[slot] = Some((page, true));
         self.slots.insert(page, slot);
     }
@@ -325,7 +359,9 @@ impl Replacer for ClockReplacer {
         for _ in 0..2 * n {
             let slot = self.hand;
             self.hand = (self.hand + 1) % n;
-            let Some((page, referenced)) = &mut self.ring[slot] else { continue };
+            let Some((page, referenced)) = &mut self.ring[slot] else {
+                continue;
+            };
             if !evictable(*page) {
                 continue;
             }
@@ -417,7 +453,11 @@ mod tests {
 
         // T1 is above its target of 0, so it is evicted from first.
         assert_eq!(arc.victim(&|_| true), Some(p(2)));
-        assert_eq!(arc.victim(&|page| page != p(2)), Some(p(1)), "falls back to T2");
+        assert_eq!(
+            arc.victim(&|page| page != p(2)),
+            Some(p(1)),
+            "falls back to T2"
+        );
     }
 
     #[test]
@@ -479,7 +519,11 @@ mod tests {
         let mut lru_2 = LruKReplacer::new(3, 2);
         // 1 is the least recently used, but 2 and 3 were used only once.
         simulate(&mut lru_2, 3, &[1, 1, 2, 3]);
-        assert_eq!(lru_2.victim(&|_| true), Some(p(2)), "LRU among infinite distances");
+        assert_eq!(
+            lru_2.victim(&|_| true),
+            Some(p(2)),
+            "LRU among infinite distances"
+        );
         assert_eq!(lru_2.victim(&|page| page == p(1)), Some(p(1)));
     }
 
@@ -497,7 +541,11 @@ mod tests {
         let mut lru_2 = LruKReplacer::new(2, 2);
         // 3 evicts 1, then 1 comes back (evicting 2) with its old access.
         simulate(&mut lru_2, 2, &[1, 2, 3, 1]);
-        assert_eq!(lru_2.resident[&p(1)].len(), 2, "history from before the eviction");
+        assert_eq!(
+            lru_2.resident[&p(1)].len(),
+            2,
+            "history from before the eviction"
+        );
         assert_eq!(lru_2.ghosts.keys().collect::<Vec<_>>(), [&p(2)]);
 
         let mut lru_2 = LruKReplacer::new(2, 2);
@@ -506,11 +554,18 @@ mod tests {
         assert_eq!(lru_2.ghosts.len(), 2, "bounded by capacity");
         assert_eq!(lru_2.ghost_order.len(), 2);
 
-        let tracked: Vec<PageId> = lru_2.resident.keys().chain(lru_2.ghosts.keys()).copied().collect();
+        let tracked: Vec<PageId> = lru_2
+            .resident
+            .keys()
+            .chain(lru_2.ghosts.keys())
+            .copied()
+            .collect();
         for page in tracked {
             lru_2.remove(page);
         }
-        assert!(lru_2.resident.is_empty() && lru_2.ghosts.is_empty() && lru_2.ghost_order.is_empty());
+        assert!(
+            lru_2.resident.is_empty() && lru_2.ghosts.is_empty() && lru_2.ghost_order.is_empty()
+        );
     }
 
     #[test]
@@ -526,7 +581,13 @@ mod tests {
 
     #[test]
     fn policies_are_named() {
-        for policy in [Policy::Arc, Policy::LruK(1), Policy::LruK(2), Policy::LruK(10), Policy::Clock] {
+        for policy in [
+            Policy::Arc,
+            Policy::LruK(1),
+            Policy::LruK(2),
+            Policy::LruK(10),
+            Policy::Clock,
+        ] {
             assert_eq!(Policy::from_name(&policy.to_string()), Some(policy));
         }
         assert_eq!(Policy::from_name("LRU-3"), Some(Policy::LruK(3)));

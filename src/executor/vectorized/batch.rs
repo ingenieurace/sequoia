@@ -43,12 +43,20 @@ impl Vector {
     pub fn from_values(values: Vec<Value>) -> Vector {
         let n = values.len();
         let first = values.iter().find(|v| !v.is_null());
-        let Some(first) = first else { return Vector::Const(Value::Null, n) };
+        let Some(first) = first else {
+            return Vector::Const(Value::Null, n);
+        };
         let same = std::mem::discriminant(first);
-        if values.iter().any(|v| !v.is_null() && std::mem::discriminant(v) != same) {
+        if values
+            .iter()
+            .any(|v| !v.is_null() && std::mem::discriminant(v) != same)
+        {
             return Vector::Mixed(values);
         }
-        let nulls = values.iter().any(Value::is_null).then(|| values.iter().map(Value::is_null).collect());
+        let nulls = values
+            .iter()
+            .any(Value::is_null)
+            .then(|| values.iter().map(Value::is_null).collect());
         macro_rules! typed {
             ($variant:ident, $default:expr) => {
                 Vector::$variant(
@@ -90,9 +98,10 @@ impl Vector {
     /// The nulls of a typed vector.
     fn nulls(&self) -> Option<&[bool]> {
         match self {
-            Vector::Int(_, nulls) | Vector::Real(_, nulls) | Vector::Bool(_, nulls) | Vector::Text(_, nulls) => {
-                nulls.as_deref()
-            }
+            Vector::Int(_, nulls)
+            | Vector::Real(_, nulls)
+            | Vector::Bool(_, nulls)
+            | Vector::Text(_, nulls) => nulls.as_deref(),
             _ => None,
         }
     }
@@ -125,7 +134,10 @@ impl Vector {
         fn pick<T: Clone>(values: &[T], rows: &[u32]) -> Vec<T> {
             rows.iter().map(|&i| values[i as usize].clone()).collect()
         }
-        let nulls = self.nulls().map(|nulls| pick(nulls, rows)).filter(|nulls| nulls.contains(&true));
+        let nulls = self
+            .nulls()
+            .map(|nulls| pick(nulls, rows))
+            .filter(|nulls| nulls.contains(&true));
         match self {
             Vector::Int(v, _) => Vector::Int(pick(v, rows), nulls),
             Vector::Real(v, _) => Vector::Real(pick(v, rows), nulls),
@@ -152,7 +164,11 @@ impl Batch {
     /// A batch of all the rows of these columns.
     pub fn new(columns: Vec<Rc<Vector>>, len: usize) -> Self {
         debug_assert!(columns.iter().all(|c| c.len() == len));
-        Batch { columns, len, selection: None }
+        Batch {
+            columns,
+            len,
+            selection: None,
+        }
     }
 
     /// A batch of these rows, each `width` values long.
@@ -164,7 +180,13 @@ impl Batch {
                 column.push(value);
             }
         }
-        Batch::new(columns.into_iter().map(|values| Rc::new(Vector::from_values(values))).collect(), len)
+        Batch::new(
+            columns
+                .into_iter()
+                .map(|values| Rc::new(Vector::from_values(values)))
+                .collect(),
+            len,
+        )
     }
 
     /// How many rows are in the batch.
@@ -174,7 +196,9 @@ impl Batch {
 
     /// The position of the `i`th row in the columns.
     pub fn position(&self, i: usize) -> usize {
-        self.selection.as_ref().map_or(i, |selection| selection[i] as usize)
+        self.selection
+            .as_ref()
+            .map_or(i, |selection| selection[i] as usize)
     }
 
     /// The `i`th row.
@@ -212,16 +236,26 @@ mod tests {
     #[test]
     fn vectors_are_typed_when_their_values_share_a_type() {
         let ints = Vector::from_values(vec![Value::Int(1), Value::Null, Value::Int(3)]);
-        assert!(matches!(&ints, Vector::Int(v, Some(nulls)) if v == &[1, 0, 3] && nulls == &[false, true, false]));
+        assert!(
+            matches!(&ints, Vector::Int(v, Some(nulls)) if v == &[1, 0, 3] && nulls == &[false, true, false])
+        );
         assert_eq!((ints.get(1), ints.get(2)), (Value::Null, Value::Int(3)));
-        assert!(matches!(Vector::from_values(vec![Value::Null, Value::Null]), Vector::Const(Value::Null, 2)));
+        assert!(matches!(
+            Vector::from_values(vec![Value::Null, Value::Null]),
+            Vector::Const(Value::Null, 2)
+        ));
         // An INT and a REAL are values of two types, though they may be equal.
-        assert!(matches!(Vector::from_values(vec![Value::Int(1), Value::Real(1.0)]), Vector::Mixed(_)));
+        assert!(matches!(
+            Vector::from_values(vec![Value::Int(1), Value::Real(1.0)]),
+            Vector::Mixed(_)
+        ));
     }
 
     #[test]
     fn a_selection_keeps_rows_without_copying_them() {
-        let rows = (0..5).map(|i| vec![Value::Int(i), Value::Text(format!("r{i}"))]).collect();
+        let rows = (0..5)
+            .map(|i| vec![Value::Int(i), Value::Text(format!("r{i}"))])
+            .collect();
         let batch = Batch::from_rows(rows, 2).keep(&[1, 3, 4]).keep(&[0, 2]);
         assert_eq!(batch.selection, Some(vec![1, 4]));
         assert_eq!(batch.rows(), 2);

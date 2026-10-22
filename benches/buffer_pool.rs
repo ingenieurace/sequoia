@@ -26,18 +26,38 @@ const READS: usize = 200_000;
 
 fn main() {
     let patterns: Vec<(&str, &str, Vec<usize>)> = vec![
-        ("sequential", "every page in order, again and again", (0..READS).map(|i| i % PAGES).collect()),
+        (
+            "sequential",
+            "every page in order, again and again",
+            (0..READS).map(|i| i % PAGES).collect(),
+        ),
         // A little more than the pool: LRU evicts each page just before it is read again.
-        ("loop", "300 pages in order, again and again", (0..READS).map(|i| i % 300).collect()),
-        ("uniform", "pages at random", random(READS).map(|r| r % PAGES).collect()),
+        (
+            "loop",
+            "300 pages in order, again and again",
+            (0..READS).map(|i| i % 300).collect(),
+        ),
+        (
+            "uniform",
+            "pages at random",
+            random(READS).map(|r| r % PAGES).collect(),
+        ),
         ("skewed", "90% of reads to 200 pages", skewed()),
         ("scans", "128 hot pages, between scans", scans()),
     ];
-    let policies = [("ARC", Policy::Arc), ("LRU", Policy::LruK(1)), ("LRU-2", Policy::LruK(2)), ("CLOCK", Policy::Clock)];
+    let policies = [
+        ("ARC", Policy::Arc),
+        ("LRU", Policy::LruK(1)),
+        ("LRU-2", Policy::LruK(2)),
+        ("CLOCK", Policy::Clock),
+    ];
 
     let disk = Arc::new(DiskManager::in_memory());
     let pages = make_pages(&disk);
-    print!("{:<52}", format!("{READS} reads of {PAGES} pages, {FRAMES} frames"));
+    print!(
+        "{:<52}",
+        format!("{READS} reads of {PAGES} pages, {FRAMES} frames")
+    );
     for (name, _) in &policies {
         print!("{name:>18}");
     }
@@ -49,7 +69,10 @@ fn main() {
         print!("  {:<50}", format!("{pattern}: {about}"));
         for (_, policy) in &policies {
             let misses = Arc::new(AtomicUsize::new(0));
-            let replacer = Counting { inner: policy.replacer(FRAMES), misses: misses.clone() };
+            let replacer = Counting {
+                inner: policy.replacer(FRAMES),
+                misses: misses.clone(),
+            };
             let pool = BufferPool::with_replacer(disk.clone(), FRAMES, Box::new(replacer));
             read(&pool, &pages, reads);
             let (time, misses) = common::fastest(|| {
@@ -58,7 +81,10 @@ fn main() {
                 misses.load(Ordering::Relaxed)
             });
             let hits = 100.0 * (1.0 - misses as f64 / reads.len() as f64);
-            print!("{:>18}", format!("{hits:5.1}% {}", common::shown(time).trim()));
+            print!(
+                "{:>18}",
+                format!("{hits:5.1}% {}", common::shown(time).trim())
+            );
         }
         println!();
     }

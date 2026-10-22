@@ -117,7 +117,8 @@ use crate::error::{Result, err};
 use crate::plan::{access, filter};
 use crate::predicate::{Compare, Predicate};
 use crate::sql::ast::{
-    Aggregate, BinaryOp, ColumnRef, Expr, From, JoinKind, OrderBy, Projection, Select, SelectItem, TableRef, TableSource,
+    Aggregate, BinaryOp, ColumnRef, Expr, From, JoinKind, OrderBy, Projection, Select, SelectItem,
+    TableRef, TableSource,
 };
 use crate::sql::eval::{Field, resolve};
 use crate::types::{StorageKind, Value};
@@ -133,29 +134,70 @@ pub struct Plan<'a> {
 pub enum Node<'a> {
     /// Reads a table's rows the way `access` says. `qualifier` is what the
     /// query calls the table: its alias, or else its name.
-    Scan { table: &'a Table, qualifier: String, needed: Vec<bool>, predicates: Vec<Predicate>, access: Access },
+    Scan {
+        table: &'a Table,
+        qualifier: String,
+        needed: Vec<bool>,
+        predicates: Vec<Predicate>,
+        access: Access,
+    },
     /// Reads the rows of a table whose `column` equals a value an index join
     /// gives, through an index or the primary key. Only an index join's right side.
-    Lookup { table: &'a Table, qualifier: String, needed: Vec<bool>, column: usize, key: LookupKey, left_key: Expr },
+    Lookup {
+        table: &'a Table,
+        qualifier: String,
+        needed: Vec<bool>,
+        column: usize,
+        key: LookupKey,
+        left_key: Expr,
+    },
     /// Keeps the rows `predicate` is true for.
-    Filter { input: Box<Node<'a>>, predicate: Expr },
+    Filter {
+        input: Box<Node<'a>>,
+        predicate: Expr,
+    },
     /// Pairs each left row with the right rows `condition` holds for, as `method` finds them.
-    Join { left: Box<Node<'a>>, right: Box<Node<'a>>, kind: JoinKind, method: JoinMethod, condition: Option<Expr> },
+    Join {
+        left: Box<Node<'a>>,
+        right: Box<Node<'a>>,
+        kind: JoinKind,
+        method: JoinMethod,
+        condition: Option<Expr>,
+    },
     /// Folds rows into one row per group: the keys, then the aggregates.
-    Aggregate { input: Box<Node<'a>>, group_by: Vec<Expr>, aggregates: Vec<AggregateCall> },
+    Aggregate {
+        input: Box<Node<'a>>,
+        group_by: Vec<Expr>,
+        aggregates: Vec<AggregateCall>,
+    },
     /// Orders the rows, keeping the first `limit` if given.
-    Sort { input: Box<Node<'a>>, keys: Vec<OrderBy>, limit: Option<usize> },
+    Sort {
+        input: Box<Node<'a>>,
+        keys: Vec<OrderBy>,
+        limit: Option<usize>,
+    },
     /// The rows of each input in turn, as `UNION ALL` returns them; with a
     /// distinct step above, as `UNION` does.
     Union { inputs: Vec<Node<'a>> },
     /// Drops each row equal to one already returned, NULLs included.
     Distinct { input: Box<Node<'a>> },
     /// Keeps the first `count` rows.
-    Limit { input: Box<Node<'a>>, count: Option<usize>, offset: usize },
+    Limit {
+        input: Box<Node<'a>>,
+        count: Option<usize>,
+        offset: usize,
+    },
     /// Evaluates the select list on each row.
-    Project { input: Box<Node<'a>>, exprs: Vec<Expr> },
+    Project {
+        input: Box<Node<'a>>,
+        exprs: Vec<Expr>,
+    },
     /// A derived table: its query's rows, with columns `names` qualified by `qualifier`.
-    Derived { input: Box<Node<'a>>, qualifier: String, names: Vec<String> },
+    Derived {
+        input: Box<Node<'a>>,
+        qualifier: String,
+        names: Vec<String>,
+    },
 }
 
 /// How a join finds the right rows that may match a left row.
@@ -166,14 +208,23 @@ pub enum JoinMethod {
     /// Those whose `right_keys` equal the left row's `left_keys`, from a hash
     /// table. `keep_order` if the rows must come out in the left side's
     /// order (after a merge join), even if the table spills.
-    Hash { left_keys: Vec<Expr>, right_keys: Vec<Expr>, keep_order: bool },
+    Hash {
+        left_keys: Vec<Expr>,
+        right_keys: Vec<Expr>,
+        keep_order: bool,
+    },
     /// Those the right side, a `Lookup` (maybe under filters), finds for the left row.
     Index,
     /// Those whose `right_keys` equal the left row's `left_keys`, found by
     /// sorting both sides by their keys, each in its direction in `desc`, the
     /// left side then by `then`, and merging them. Its rows come out in the
     /// left side's order.
-    Merge { left_keys: Vec<Expr>, right_keys: Vec<Expr>, desc: Vec<bool>, then: Vec<OrderBy> },
+    Merge {
+        left_keys: Vec<Expr>,
+        right_keys: Vec<Expr>,
+        desc: Vec<bool>,
+        then: Vec<OrderBy>,
+    },
 }
 
 /// What a `Lookup` reads the table through.
@@ -205,11 +256,21 @@ enum SourceKind<'a> {
 impl<'a> Source<'a> {
     fn table(table: &'a Table, qualifier: &str) -> Self {
         let names = table.columns.iter().map(|c| c.name.clone()).collect();
-        Source { kind: SourceKind::Table(table), qualifier: qualifier.into(), names }
+        Source {
+            kind: SourceKind::Table(table),
+            qualifier: qualifier.into(),
+            names,
+        }
     }
 
     fn fields(&self) -> Vec<Field> {
-        self.names.iter().map(|name| Field { table: Some(self.qualifier.clone()), name: name.clone() }).collect()
+        self.names
+            .iter()
+            .map(|name| Field {
+                table: Some(self.qualifier.clone()),
+                name: name.clone(),
+            })
+            .collect()
     }
 
     /// Plans reading the rows `filter` matches; `needed` marks the columns read above.
@@ -218,9 +279,16 @@ impl<'a> Source<'a> {
             SourceKind::Table(table) => scan(table, &self.qualifier, &filter, needed),
             SourceKind::Derived(plan) => {
                 let input = Box::new(plan.take().expect("read once"));
-                let node = Node::Derived { input, qualifier: self.qualifier.clone(), names: self.names.clone() };
+                let node = Node::Derived {
+                    input,
+                    qualifier: self.qualifier.clone(),
+                    names: self.names.clone(),
+                };
                 match filter {
-                    Some(predicate) => Node::Filter { input: Box::new(node), predicate },
+                    Some(predicate) => Node::Filter {
+                        input: Box::new(node),
+                        predicate,
+                    },
                     None => node,
                 }
             }
@@ -236,7 +304,9 @@ pub fn output_names(catalog: &Catalog, query: &Select) -> Result<Vec<String>> {
             let mut names = Vec::new();
             for table in query.from.tables() {
                 match &table.source {
-                    TableSource::Table(name) => names.extend(catalog.get(name)?.columns.iter().map(|c| c.name.clone())),
+                    TableSource::Table(name) => {
+                        names.extend(catalog.get(name)?.columns.iter().map(|c| c.name.clone()))
+                    }
                     TableSource::Subquery(query) => names.extend(output_names(catalog, query)?),
                 }
             }
@@ -250,7 +320,18 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
     if !query.compound.is_empty() {
         return union(catalog, query);
     }
-    let Select { distinct, from, projection, filter, group_by, having, mut order_by, limit, offset, .. } = query;
+    let Select {
+        distinct,
+        from,
+        projection,
+        filter,
+        group_by,
+        having,
+        mut order_by,
+        limit,
+        offset,
+        ..
+    } = query;
     let offset = offset.unwrap_or(0);
     let mut sources = from
         .tables()
@@ -259,18 +340,31 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
             TableSource::Subquery(query) => {
                 let plan = select(catalog, (**query).clone())?;
                 let kind = SourceKind::Derived(Some(plan.root));
-                Ok(Source { kind, qualifier: r.qualifier().into(), names: plan.columns })
+                Ok(Source {
+                    kind,
+                    qualifier: r.qualifier().into(),
+                    names: plan.columns,
+                })
             }
         })
         .collect::<Result<Vec<_>>>()?;
     for (i, source) in sources.iter().enumerate() {
         if sources[..i].iter().any(|s| s.qualifier == source.qualifier) {
-            return err(format!("table name {} appears more than once in FROM", source.qualifier));
+            return err(format!(
+                "table name {} appears more than once in FROM",
+                source.qualifier
+            ));
         }
     }
     forbid(&filter, "WHERE")?;
-    forbid(from.joins.iter().filter_map(|j| j.on.as_ref()), "JOIN ... ON")?;
-    forbid_subqueries(from.joins.iter().filter_map(|j| j.on.as_ref()), "JOIN ... ON")?;
+    forbid(
+        from.joins.iter().filter_map(|j| j.on.as_ref()),
+        "JOIN ... ON",
+    )?;
+    forbid_subqueries(
+        from.joins.iter().filter_map(|j| j.on.as_ref()),
+        "JOIN ... ON",
+    )?;
     forbid_subqueries(&group_by, "GROUP BY")?;
 
     // ORDER BY may name a column of the select list by its AS name.
@@ -293,12 +387,21 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
         Projection::Exprs(items) => Projection::Exprs(
             items
                 .into_iter()
-                .map(|item| Ok(SelectItem { expr: bind(&item.expr)?, alias: item.alias }))
+                .map(|item| {
+                    Ok(SelectItem {
+                        expr: bind(&item.expr)?,
+                        alias: item.alias,
+                    })
+                })
                 .collect::<Result<_>>()?,
         ),
     };
     let filter = filter.as_ref().map(bind).transpose()?;
-    let ons = from.joins.iter().map(|j| j.on.as_ref().map(bind).transpose()).collect::<Result<Vec<_>>>()?;
+    let ons = from
+        .joins
+        .iter()
+        .map(|j| j.on.as_ref().map(bind).transpose())
+        .collect::<Result<Vec<_>>>()?;
     // A repeated GROUP BY expression groups by nothing more, and would make its column ambiguous.
     let mut distinct_group_by: Vec<Expr> = Vec::new();
     for expr in bind_all(&group_by)? {
@@ -310,28 +413,47 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
     let having = having.as_ref().map(bind).transpose()?;
     let order_by = order_by
         .iter()
-        .map(|o| Ok(OrderBy { expr: bind(&o.expr)?, desc: o.desc }))
+        .map(|o| {
+            Ok(OrderBy {
+                expr: bind(&o.expr)?,
+                desc: o.desc,
+            })
+        })
         .collect::<Result<Vec<_>>>()?;
     for (i, on) in ons.iter().enumerate() {
-        if let Some(later) = on.iter().flat_map(|on| binder.tables(on)).find(|&t| t > i + 1) {
+        if let Some(later) = on
+            .iter()
+            .flat_map(|on| binder.tables(on))
+            .find(|&t| t > i + 1)
+        {
             let (this, later) = (&sources[i + 1].qualifier, &sources[later].qualifier);
-            return err(format!("the ON of {this} refers to {later}, which is joined after it"));
+            return err(format!(
+                "the ON of {this} refers to {later}, which is joined after it"
+            ));
         }
     }
 
     let grouped = is_grouped(&projection, &group_by, &having, &order_by);
     let (exprs, columns) = match projection {
-        Projection::All if grouped => return err("SELECT * cannot be used with GROUP BY or aggregate functions"),
+        Projection::All if grouped => {
+            return err("SELECT * cannot be used with GROUP BY or aggregate functions");
+        }
         Projection::All => (None, sources.iter().flat_map(|s| s.names.clone()).collect()),
         Projection::Exprs(items) => {
             let names = items.iter().map(item_name).collect();
-            (Some(items.into_iter().map(|item| item.expr).collect::<Vec<_>>()), names)
+            (
+                Some(items.into_iter().map(|item| item.expr).collect::<Vec<_>>()),
+                names,
+            )
         }
     };
     if let (true, Some(exprs)) = (distinct, &exprs)
         && let Some(key) = order_by.iter().find(|o| !exprs.contains(&o.expr))
     {
-        return err(format!("for SELECT DISTINCT, ORDER BY {} must appear in the select list", key.expr));
+        return err(format!(
+            "for SELECT DISTINCT, ORDER BY {} must appear in the select list",
+            key.expr
+        ));
     }
 
     // The columns each table must read: those any expression uses.
@@ -347,7 +469,9 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
     let needed: Vec<Vec<bool>> = sources
         .iter()
         .map(|s| match (&s.kind, &exprs) {
-            (SourceKind::Table(table), Some(_)) => filter::needed_columns(table, &s.qualifier, used.iter().copied()),
+            (SourceKind::Table(table), Some(_)) => {
+                filter::needed_columns(table, &s.qualifier, used.iter().copied())
+            }
             _ => vec![true; s.names.len()],
         })
         .collect();
@@ -365,16 +489,28 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
         let having = having.as_ref().map(&mut rewrite).transpose()?;
         let order_by = order_by
             .iter()
-            .map(|o| Ok(OrderBy { expr: rewrite(&o.expr)?, desc: o.desc }))
+            .map(|o| {
+                Ok(OrderBy {
+                    expr: rewrite(&o.expr)?,
+                    desc: o.desc,
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
-        node = Node::Aggregate { input: Box::new(node), group_by, aggregates };
+        node = Node::Aggregate {
+            input: Box::new(node),
+            group_by,
+            aggregates,
+        };
         (Some(exprs), having, order_by)
     } else {
         (exprs, None, order_by)
     };
 
     if let Some(predicate) = having {
-        node = Node::Filter { input: Box::new(node), predicate };
+        node = Node::Filter {
+            input: Box::new(node),
+            predicate,
+        };
     }
     // A sort keeps the rows the limit and offset take, and is all the limit
     // there is without an offset. Under DISTINCT, they wait until rows equal
@@ -382,22 +518,44 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
     let sorted = !order_by.is_empty() && !ordered;
     let limited = limit.is_some() || offset > 0;
     if sorted {
-        let top = limit.map(|n| n.saturating_add(offset)).filter(|_| !distinct);
-        node = Node::Sort { input: Box::new(node), keys: order_by, limit: top };
+        let top = limit
+            .map(|n| n.saturating_add(offset))
+            .filter(|_| !distinct);
+        node = Node::Sort {
+            input: Box::new(node),
+            keys: order_by,
+            limit: top,
+        };
     }
     if limited && !distinct && !(sorted && offset == 0) {
-        node = Node::Limit { input: Box::new(node), count: limit, offset };
+        node = Node::Limit {
+            input: Box::new(node),
+            count: limit,
+            offset,
+        };
     }
     if let Some(exprs) = exprs {
-        node = Node::Project { input: Box::new(node), exprs };
+        node = Node::Project {
+            input: Box::new(node),
+            exprs,
+        };
     }
     if distinct {
-        node = Node::Distinct { input: Box::new(node) };
+        node = Node::Distinct {
+            input: Box::new(node),
+        };
         if limited {
-            node = Node::Limit { input: Box::new(node), count: limit, offset };
+            node = Node::Limit {
+                input: Box::new(node),
+                count: limit,
+                offset,
+            };
         }
     }
-    Ok(Plan { root: node, columns })
+    Ok(Plan {
+        root: node,
+        columns,
+    })
 }
 
 /// Plans queries joined by `UNION [ALL]`: the rows of each in turn, left to
@@ -407,12 +565,33 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select) -> Result<Plan<'a>> {
 /// columns as it would a table's.
 fn union<'a>(catalog: &'a Catalog, mut query: Select) -> Result<Plan<'a>> {
     if !query.order_by.is_empty() || query.limit.is_some() || query.offset.is_some() {
-        let (order_by, limit, offset) = (std::mem::take(&mut query.order_by), query.limit.take(), query.offset.take());
-        let table = TableRef { source: TableSource::Subquery(Box::new(query)), alias: Some("union".into()) };
+        let (order_by, limit, offset) = (
+            std::mem::take(&mut query.order_by),
+            query.limit.take(),
+            query.offset.take(),
+        );
+        let table = TableRef {
+            source: TableSource::Subquery(Box::new(query)),
+            alias: Some("union".into()),
+        };
         let projection = Projection::All;
         let (filter, group_by, having, compound) = (None, Vec::new(), None, Vec::new());
-        let from = From { table, joins: Vec::new() };
-        let outer = Select { distinct: false, from, projection, filter, group_by, having, order_by, limit, offset, compound };
+        let from = From {
+            table,
+            joins: Vec::new(),
+        };
+        let outer = Select {
+            distinct: false,
+            from,
+            projection,
+            filter,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
+            compound,
+        };
         return select(catalog, outer);
     }
     let parts = std::mem::take(&mut query.compound);
@@ -433,13 +612,20 @@ fn union<'a>(catalog: &'a Catalog, mut query: Select) -> Result<Plan<'a>> {
                 inputs.push(part.root);
                 Node::Union { inputs }
             }
-            node => Node::Union { inputs: vec![node, part.root] },
+            node => Node::Union {
+                inputs: vec![node, part.root],
+            },
         };
         if !all {
-            node = Node::Distinct { input: Box::new(node) };
+            node = Node::Distinct {
+                input: Box::new(node),
+            };
         }
     }
-    Ok(Plan { root: node, columns })
+    Ok(Plan {
+        root: node,
+        columns,
+    })
 }
 
 /// Plans the scans and joins of FROM, with WHERE and the ONs placed as the
@@ -455,7 +641,9 @@ fn joins<'a>(
     order_by: &[OrderBy],
 ) -> (Node<'a>, bool) {
     let n = sources.len();
-    let kinds: Vec<JoinKind> = std::iter::once(JoinKind::Inner).chain(from.joins.iter().map(|j| j.kind)).collect();
+    let kinds: Vec<JoinKind> = std::iter::once(JoinKind::Inner)
+        .chain(from.joins.iter().map(|j| j.kind))
+        .collect();
     // For each table: conditions pushed down to its scan, conditions of the
     // join that brings it in, and conditions checked just after that join.
     let mut pushed: Vec<Vec<Expr>> = vec![Vec::new(); n];
@@ -476,7 +664,12 @@ fn joins<'a>(
                     for part in parts {
                         let tables = binder.tables(&part);
                         let right_only = tables.len() == 1 && tables.contains(&(i + 1));
-                        if right_only { &mut pushed[i + 1] } else { &mut conditions[i + 1] }.push(part);
+                        if right_only {
+                            &mut pushed[i + 1]
+                        } else {
+                            &mut conditions[i + 1]
+                        }
+                        .push(part);
                     }
                 }
                 (_, None) => {}
@@ -493,7 +686,9 @@ fn joins<'a>(
             }
             match tables.last() {
                 None => pushed[0].push(part), // constant: filters all rows or none
-                Some(&last) if tables.len() == 1 && kinds[last] == JoinKind::Inner => pushed[last].push(part),
+                Some(&last) if tables.len() == 1 && kinds[last] == JoinKind::Inner => {
+                    pushed[last].push(part)
+                }
                 Some(&last) if kinds[last] == JoinKind::Inner => conditions[last].push(part),
                 Some(&last) => after[last].push(part),
             }
@@ -530,46 +725,76 @@ fn joins<'a>(
         let index = keys
             .iter()
             .find_map(|(at, left, right)| {
-                let (Expr::Column(column), SourceKind::Table(table)) = (right, &source.kind) else { return None };
+                let (Expr::Column(column), SourceKind::Table(table)) = (right, &source.kind) else {
+                    return None;
+                };
                 let column = table.column_index(&column.name).ok()?;
-                Some((*at, left.clone(), column, *table, lookup_key(table, column)?))
+                Some((
+                    *at,
+                    left.clone(),
+                    column,
+                    *table,
+                    lookup_key(table, column)?,
+                ))
             })
             .filter(|(.., table, key)| lookups_win(estimate(&node), table, *key));
-        let (method, right) = if let Some((_, (order, desc, then))) = merge.take_if(|(at, _)| *at == i) {
-            for (at, ..) in keys.iter().rev() {
-                residual.remove(*at);
-            }
-            let (left_keys, right_keys) = order.iter().map(|&k| (keys[k].1.clone(), keys[k].2.clone())).unzip();
-            (JoinMethod::Merge { left_keys, right_keys, desc, then }, source.read(right_filter, needed[i].clone()))
-        } else if let Some((at, left_key, column, table, key)) = index {
-            residual.remove(at);
-            needed[i][column] = true;
-            let lookup = Node::Lookup {
-                table,
-                qualifier: source.qualifier.clone(),
-                needed: needed[i].clone(), // includes the filter's columns: it is part of the query
-                column,
-                key,
-                left_key,
-            };
-            let right = match right_filter {
-                Some(predicate) => Node::Filter { input: Box::new(lookup), predicate },
-                None => lookup,
-            };
-            (JoinMethod::Index, right)
-        } else {
-            let right = source.read(right_filter, needed[i].clone());
-            if keys.is_empty() {
-                (JoinMethod::Block, right)
-            } else {
+        let (method, right) =
+            if let Some((_, (order, desc, then))) = merge.take_if(|(at, _)| *at == i) {
                 for (at, ..) in keys.iter().rev() {
                     residual.remove(*at);
                 }
-                let (left_keys, right_keys) = keys.into_iter().map(|(_, l, r)| (l, r)).unzip();
-                let keep_order = merge_at.is_some_and(|at| i > at);
-                (JoinMethod::Hash { left_keys, right_keys, keep_order }, right)
-            }
-        };
+                let (left_keys, right_keys) = order
+                    .iter()
+                    .map(|&k| (keys[k].1.clone(), keys[k].2.clone()))
+                    .unzip();
+                (
+                    JoinMethod::Merge {
+                        left_keys,
+                        right_keys,
+                        desc,
+                        then,
+                    },
+                    source.read(right_filter, needed[i].clone()),
+                )
+            } else if let Some((at, left_key, column, table, key)) = index {
+                residual.remove(at);
+                needed[i][column] = true;
+                let lookup = Node::Lookup {
+                    table,
+                    qualifier: source.qualifier.clone(),
+                    needed: needed[i].clone(), // includes the filter's columns: it is part of the query
+                    column,
+                    key,
+                    left_key,
+                };
+                let right = match right_filter {
+                    Some(predicate) => Node::Filter {
+                        input: Box::new(lookup),
+                        predicate,
+                    },
+                    None => lookup,
+                };
+                (JoinMethod::Index, right)
+            } else {
+                let right = source.read(right_filter, needed[i].clone());
+                if keys.is_empty() {
+                    (JoinMethod::Block, right)
+                } else {
+                    for (at, ..) in keys.iter().rev() {
+                        residual.remove(*at);
+                    }
+                    let (left_keys, right_keys) = keys.into_iter().map(|(_, l, r)| (l, r)).unzip();
+                    let keep_order = merge_at.is_some_and(|at| i > at);
+                    (
+                        JoinMethod::Hash {
+                            left_keys,
+                            right_keys,
+                            keep_order,
+                        },
+                        right,
+                    )
+                }
+            };
         node = Node::Join {
             left: Box::new(node),
             right: Box::new(right),
@@ -578,7 +803,10 @@ fn joins<'a>(
             condition: and(residual),
         };
         if let Some(predicate) = and(std::mem::take(&mut after[i])) {
-            node = Node::Filter { input: Box::new(node), predicate };
+            node = Node::Filter {
+                input: Box::new(node),
+                predicate,
+            };
         }
     }
     (node, ordered)
@@ -591,7 +819,9 @@ fn equalities(parts: &[Expr], i: usize, binder: &Binder) -> Vec<(usize, Expr, Ex
         .iter()
         .enumerate()
         .filter_map(|(at, part)| {
-            let Expr::Binary(a, BinaryOp::Eq, b) = part else { return None };
+            let Expr::Binary(a, BinaryOp::Eq, b) = part else {
+                return None;
+            };
             let side = |e: &Expr| {
                 let tables = binder.tables(e);
                 match tables.last() {
@@ -628,7 +858,9 @@ fn merge_order(
     let (mut order, mut desc) = (Vec::new(), Vec::new());
     let mut rest: &[OrderBy] = &[];
     for (at, o) in order_by.iter().enumerate() {
-        let Some(k) = keys.iter().position(|(_, l, r)| *l == o.expr || (kind == JoinKind::Inner && *r == o.expr))
+        let Some(k) = keys
+            .iter()
+            .position(|(_, l, r)| *l == o.expr || (kind == JoinKind::Inner && *r == o.expr))
         else {
             rest = &order_by[at..];
             break;
@@ -638,8 +870,11 @@ fn merge_order(
             desc.push(o.desc);
         }
     }
-    let left_only = |o: &OrderBy| !o.expr.has_subquery() && binder.tables(&o.expr).iter().all(|&t| t < i);
-    if order.is_empty() || (!rest.is_empty() && (order.len() < keys.len() || !rest.iter().all(left_only))) {
+    let left_only =
+        |o: &OrderBy| !o.expr.has_subquery() && binder.tables(&o.expr).iter().all(|&t| t < i);
+    if order.is_empty()
+        || (!rest.is_empty() && (order.len() < keys.len() || !rest.iter().all(left_only)))
+    {
         return None;
     }
     for k in 0..keys.len() {
@@ -688,10 +923,16 @@ fn lookups_win(left: f64, table: &Table, key: LookupKey) -> bool {
 /// side matched one of the other), and one without, a third of every pair.
 pub fn estimate(node: &Node) -> f64 {
     match node {
-        Node::Scan { table, predicates, .. } => {
+        Node::Scan {
+            table, predicates, ..
+        } => {
             let rows = table.row_count().map_or(1000.0, |rows| rows as f64);
             let unique = |column| {
-                table.primary_key() == Some(column) || table.indexes().iter().any(|i| i.unique && i.is_on_column(column))
+                table.primary_key() == Some(column)
+                    || table
+                        .indexes()
+                        .iter()
+                        .any(|i| i.unique && i.is_on_column(column))
             };
             predicates.iter().fold(rows, |rows, p| match p.op {
                 Compare::Eq if unique(p.column) => rows.min(1.0),
@@ -706,25 +947,45 @@ pub fn estimate(node: &Node) -> f64 {
             Node::Scan { predicates, .. } if !predicates.is_empty() => estimate(input),
             _ => estimate(input) * OTHER_KEEPS,
         },
-        Node::Join { left, right, method, kind, .. } => {
+        Node::Join {
+            left,
+            right,
+            method,
+            kind,
+            ..
+        } => {
             let (left, right) = (estimate(left), estimate(right));
             let rows = match method {
                 JoinMethod::Block => left * right * OTHER_KEEPS,
                 _ => left.max(right),
             };
-            if *kind == JoinKind::Left { rows.max(left) } else { rows }
+            if *kind == JoinKind::Left {
+                rows.max(left)
+            } else {
+                rows
+            }
         }
-        Node::Aggregate { input, group_by, .. } => match group_by.is_empty() {
+        Node::Aggregate {
+            input, group_by, ..
+        } => match group_by.is_empty() {
             true => 1.0,
             false => (estimate(input) * OTHER_KEEPS).max(1.0),
         },
-        Node::Sort { input, limit, .. } => limit.map_or(estimate(input), |n| estimate(input).min(n as f64)),
-        Node::Limit { input, count, offset } => {
+        Node::Sort { input, limit, .. } => {
+            limit.map_or(estimate(input), |n| estimate(input).min(n as f64))
+        }
+        Node::Limit {
+            input,
+            count,
+            offset,
+        } => {
             let rows = (estimate(input) - *offset as f64).max(0.0);
             count.map_or(rows, |n| rows.min(n as f64))
         }
         Node::Union { inputs } => inputs.iter().map(estimate).sum(),
-        Node::Distinct { input } | Node::Project { input, .. } | Node::Derived { input, .. } => estimate(input),
+        Node::Distinct { input } | Node::Project { input, .. } | Node::Derived { input, .. } => {
+            estimate(input)
+        }
     }
 }
 
@@ -733,27 +994,53 @@ pub fn estimate(node: &Node) -> f64 {
 /// only if it is the only key (and before a B+ tree), or the primary key of
 /// an LSM table.
 fn lookup_key(table: &Table, column: usize) -> Option<LookupKey> {
-    let first = |index: &Index| index.keys.first() == Some(&Key::Column(column)) && index.predicate.is_none();
+    let first = |index: &Index| {
+        index.keys.first() == Some(&Key::Column(column)) && index.predicate.is_none()
+    };
     let hash = |index: &Index| index.is_hash() && first(index) && index.keys.len() == 1;
     let tree = |index: &Index| !index.is_hash() && first(index);
-    if let Some(i) = table.indexes().iter().position(hash).or_else(|| table.indexes().iter().position(tree)) {
+    if let Some(i) = table
+        .indexes()
+        .iter()
+        .position(hash)
+        .or_else(|| table.indexes().iter().position(tree))
+    {
         return Some(LookupKey::Index(i));
     }
-    (table.storage_kind() == StorageKind::Lsm && table.primary_key() == Some(column)).then_some(LookupKey::PrimaryKey)
+    (table.storage_kind() == StorageKind::Lsm && table.primary_key() == Some(column))
+        .then_some(LookupKey::PrimaryKey)
 }
 
 /// Plans reading the rows of `table`, which the query calls `qualifier`, that
 /// `filter` matches: a scan, and a filter if there is one. `needed` marks the
 /// columns read above the filter.
-pub fn scan<'a>(table: &'a Table, qualifier: &str, filter: &Option<Expr>, needed: Vec<bool>) -> Node<'a> {
+pub fn scan<'a>(
+    table: &'a Table,
+    qualifier: &str,
+    filter: &Option<Expr>,
+    needed: Vec<bool>,
+) -> Node<'a> {
     let needed_by_filter = filter::needed_columns(table, qualifier, filter);
-    let needed: Vec<bool> = needed.iter().zip(needed_by_filter).map(|(a, b)| *a || b).collect();
+    let needed: Vec<bool> = needed
+        .iter()
+        .zip(needed_by_filter)
+        .map(|(a, b)| *a || b)
+        .collect();
     let conditions = filter::conditions(table, qualifier, filter);
     let predicates = filter::predicates(table, &conditions);
     let access = access::choose(table, qualifier, filter, &conditions, &needed);
-    let scan = Node::Scan { table, qualifier: qualifier.into(), needed, predicates, access };
+    let scan = Node::Scan {
+        table,
+        qualifier: qualifier.into(),
+        needed,
+        predicates,
+        access,
+    };
     match filter {
-        Some(predicate) => Node::Filter { input: Box::new(scan), predicate: predicate.clone() },
+        Some(predicate) => Node::Filter {
+            input: Box::new(scan),
+            predicate: predicate.clone(),
+        },
         None => scan,
     }
 }
@@ -762,7 +1049,10 @@ pub fn scan<'a>(table: &'a Table, qualifier: &str, filter: &Option<Expr>, needed
 /// as a SELECT's are bound: its columns are checked and its subqueries'
 /// outer references marked.
 pub fn bind(catalog: &Catalog, table: Option<&Table>, expr: &Expr) -> Result<Expr> {
-    let sources: Vec<Source> = table.into_iter().map(|table| Source::table(table, &table.name)).collect();
+    let sources: Vec<Source> = table
+        .into_iter()
+        .map(|table| Source::table(table, &table.name))
+        .collect();
     Binder::new(catalog, &sources).bind(expr)
 }
 
@@ -784,7 +1074,12 @@ impl<'c> Binder<'c> {
             owners.extend(std::iter::repeat_n(i, own.len()));
             fields.extend(own);
         }
-        Binder { catalog, fields, owners, single: sources.len() == 1 }
+        Binder {
+            catalog,
+            fields,
+            owners,
+            single: sources.len() == 1,
+        }
     }
 
     /// The expression with each column qualified by its table (left as it is
@@ -797,7 +1092,10 @@ impl<'c> Binder<'c> {
                 let field = &self.fields[resolve(&self.fields, column)?];
                 match self.single {
                     true => Expr::Column(ColumnRef::bare(&field.name)),
-                    false => Expr::Column(ColumnRef { table: field.table.clone(), name: field.name.clone() }),
+                    false => Expr::Column(ColumnRef {
+                        table: field.table.clone(),
+                        name: field.name.clone(),
+                    }),
                 }
             }
             Expr::Unary(op, inner) => Expr::Unary(*op, bind(inner)?),
@@ -809,9 +1107,11 @@ impl<'c> Binder<'c> {
                 }
                 Expr::Aggregate(*function, arg.as_deref().map(bind).transpose()?, *distinct)
             }
-            Expr::InList(left, items, negated) => {
-                Expr::InList(bind(left)?, items.iter().map(|e| self.bind(e)).collect::<Result<_>>()?, *negated)
-            }
+            Expr::InList(left, items, negated) => Expr::InList(
+                bind(left)?,
+                items.iter().map(|e| self.bind(e)).collect::<Result<_>>()?,
+                *negated,
+            ),
             Expr::Subquery(query) => Expr::Subquery(Box::new(self.subquery(query, true)?)),
             Expr::Exists(query) => Expr::Exists(Box::new(self.subquery(query, false)?)),
             Expr::InSubquery(left, query, negated) => {
@@ -844,13 +1144,22 @@ impl<'c> Binder<'c> {
         let mut own = Vec::new();
         for table in query.from.tables_mut() {
             let names = match &mut table.source {
-                TableSource::Table(name) => self.catalog.get(name)?.columns.iter().map(|c| c.name.clone()).collect(),
+                TableSource::Table(name) => self
+                    .catalog
+                    .get(name)?
+                    .columns
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect(),
                 TableSource::Subquery(sub) => {
                     **sub = self.correlate(sub, scopes)?;
                     output_names(self.catalog, sub)?
                 }
             };
-            own.extend(names.into_iter().map(|name| Field { table: Some(table.qualifier().into()), name }));
+            own.extend(names.into_iter().map(|name| Field {
+                table: Some(table.qualifier().into()),
+                name,
+            }));
         }
         scopes.push(own);
         let query = query.try_map_own(&mut |e| self.correlate_expr(e, scopes));
@@ -867,14 +1176,27 @@ impl<'c> Binder<'c> {
                 // Qualified even with a single table, so that it never reads as the subquery's own.
                 Some(resolve(&self.fields, column).map(|i| {
                     let field = &self.fields[i];
-                    Expr::Outer(ColumnRef { table: field.table.clone(), name: field.name.clone() })
+                    Expr::Outer(ColumnRef {
+                        table: field.table.clone(),
+                        name: field.name.clone(),
+                    })
                 }))
             }
-            Expr::Subquery(query) => Some(self.correlate(query, scopes).map(|q| Expr::Subquery(Box::new(q)))),
-            Expr::Exists(query) => Some(self.correlate(query, scopes).map(|q| Expr::Exists(Box::new(q)))),
+            Expr::Subquery(query) => Some(
+                self.correlate(query, scopes)
+                    .map(|q| Expr::Subquery(Box::new(q))),
+            ),
+            Expr::Exists(query) => Some(
+                self.correlate(query, scopes)
+                    .map(|q| Expr::Exists(Box::new(q))),
+            ),
             Expr::InSubquery(left, query, negated) => Some((|| {
                 let left = self.correlate_expr(left, scopes)?;
-                Ok(Expr::InSubquery(Box::new(left), Box::new(self.correlate(query, scopes)?), *negated))
+                Ok(Expr::InSubquery(
+                    Box::new(left),
+                    Box::new(self.correlate(query, scopes)?),
+                    *negated,
+                ))
             })()),
             _ => None,
         })
@@ -893,7 +1215,10 @@ impl<'c> Binder<'c> {
 }
 
 /// The subquery with each outer reference replaced by the value `value` gives it.
-pub fn substitute(query: &Select, value: &mut dyn FnMut(&ColumnRef) -> Result<Value>) -> Result<Select> {
+pub fn substitute(
+    query: &Select,
+    value: &mut dyn FnMut(&ColumnRef) -> Result<Value>,
+) -> Result<Select> {
     query.try_map(&mut |e| {
         e.replace(&mut |e| match e {
             Expr::Outer(column) => Some(value(column).map(Expr::Literal)),
@@ -915,7 +1240,9 @@ fn conjuncts(expr: &Expr, out: &mut Vec<Expr>) {
 
 /// The conditions joined by AND, if there are any.
 fn and(parts: Vec<Expr>) -> Option<Expr> {
-    parts.into_iter().reduce(|a, b| Expr::Binary(Box::new(a), BinaryOp::And, Box::new(b)))
+    parts
+        .into_iter()
+        .reduce(|a, b| Expr::Binary(Box::new(a), BinaryOp::And, Box::new(b)))
 }
 
 impl Node<'_> {
@@ -923,26 +1250,45 @@ impl Node<'_> {
     /// to them by name, and by table if they come from one.
     pub fn columns(&self) -> Vec<Field> {
         match self {
-            Node::Scan { table, qualifier, .. } | Node::Lookup { table, qualifier, .. } => {
-                Field::of_table(qualifier, &table.columns)
+            Node::Scan {
+                table, qualifier, ..
             }
+            | Node::Lookup {
+                table, qualifier, ..
+            } => Field::of_table(qualifier, &table.columns),
             Node::Filter { input, .. }
             | Node::Sort { input, .. }
             | Node::Distinct { input }
             | Node::Limit { input, .. } => input.columns(),
             Node::Join { left, right, .. } => [left.columns(), right.columns()].concat(),
             // Named by the first query's columns, which ORDER BY above refers to.
-            Node::Union { inputs } => inputs[0].columns().into_iter().map(|f| Field::named(f.name)).collect(),
-            Node::Aggregate { group_by, aggregates, .. } => group_by
+            Node::Union { inputs } => inputs[0]
+                .columns()
+                .into_iter()
+                .map(|f| Field::named(f.name))
+                .collect(),
+            Node::Aggregate {
+                group_by,
+                aggregates,
+                ..
+            } => group_by
                 .iter()
                 .map(Expr::to_string)
                 .chain(aggregates.iter().map(aggregate_name))
                 .map(Field::named)
                 .collect(),
-            Node::Project { exprs, .. } => exprs.iter().map(output_name).map(Field::named).collect(),
-            Node::Derived { qualifier, names, .. } => {
-                names.iter().map(|name| Field { table: Some(qualifier.clone()), name: name.clone() }).collect()
+            Node::Project { exprs, .. } => {
+                exprs.iter().map(output_name).map(Field::named).collect()
             }
+            Node::Derived {
+                qualifier, names, ..
+            } => names
+                .iter()
+                .map(|name| Field {
+                    table: Some(qualifier.clone()),
+                    name: name.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -962,7 +1308,11 @@ impl Node<'_> {
 
     /// How many steps the tree has, this one included: the lines it explains to.
     pub fn steps(&self) -> usize {
-        1 + self.inputs().iter().map(|input| input.steps()).sum::<usize>()
+        1 + self
+            .inputs()
+            .iter()
+            .map(|input| input.steps())
+            .sum::<usize>()
     }
 
     /// The steps this one reads from, in the order EXPLAIN lists them.
@@ -984,36 +1334,94 @@ impl Node<'_> {
     fn explain_into(&self, depth: usize, lines: &mut Vec<String>) {
         let list = |exprs: &mut dyn Iterator<Item = String>| exprs.collect::<Vec<_>>().join(", ");
         let line = match self {
-            Node::Scan { table, qualifier, predicates, access, .. } => {
-                access::describe(table, &label(table, qualifier), predicates, access)
-            }
-            Node::Lookup { table, qualifier, column, key, left_key, .. } => {
+            Node::Scan {
+                table,
+                qualifier,
+                predicates,
+                access,
+                ..
+            } => access::describe(table, &label(table, qualifier), predicates, access),
+            Node::Lookup {
+                table,
+                qualifier,
+                column,
+                key,
+                left_key,
+                ..
+            } => {
                 let through = match key {
                     LookupKey::Index(i) => {
                         let index = &table.indexes()[*i];
-                        format!("{}INDEX {}", if index.is_hash() { "HASH " } else { "" }, index.name)
+                        format!(
+                            "{}INDEX {}",
+                            if index.is_hash() { "HASH " } else { "" },
+                            index.name
+                        )
                     }
                     LookupKey::PrimaryKey => "PRIMARY KEY".into(),
                 };
-                let column = ColumnRef { table: Some(qualifier.clone()), name: table.columns[*column].name.clone() };
-                format!("LOOKUP {} USING {through} ({column} = {left_key})", label(table, qualifier))
+                let column = ColumnRef {
+                    table: Some(qualifier.clone()),
+                    name: table.columns[*column].name.clone(),
+                };
+                format!(
+                    "LOOKUP {} USING {through} ({column} = {left_key})",
+                    label(table, qualifier)
+                )
             }
             Node::Filter { predicate, .. } => format!("FILTER {predicate}"),
-            Node::Join { kind, method, condition, .. } => {
+            Node::Join {
+                kind,
+                method,
+                condition,
+                ..
+            } => {
                 let kind = if *kind == JoinKind::Left { "LEFT " } else { "" };
                 let (name, mut on) = match method {
                     JoinMethod::Block => ("BLOCK NESTED LOOP", Vec::new()),
                     JoinMethod::Index => ("INDEX", Vec::new()),
-                    JoinMethod::Hash { left_keys, right_keys, .. } | JoinMethod::Merge { left_keys, right_keys, .. } => {
-                        let name = if matches!(method, JoinMethod::Hash { .. }) { "HASH" } else { "MERGE" };
-                        (name, left_keys.iter().zip(right_keys).map(|(l, r)| format!("{l} = {r}")).collect())
+                    JoinMethod::Hash {
+                        left_keys,
+                        right_keys,
+                        ..
+                    }
+                    | JoinMethod::Merge {
+                        left_keys,
+                        right_keys,
+                        ..
+                    } => {
+                        let name = if matches!(method, JoinMethod::Hash { .. }) {
+                            "HASH"
+                        } else {
+                            "MERGE"
+                        };
+                        (
+                            name,
+                            left_keys
+                                .iter()
+                                .zip(right_keys)
+                                .map(|(l, r)| format!("{l} = {r}"))
+                                .collect(),
+                        )
                     }
                 };
                 on.extend(condition.iter().map(Expr::to_string));
-                let on = if on.is_empty() { String::new() } else { format!(" ON {}", on.join(" AND ")) };
+                let on = if on.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ON {}", on.join(" AND "))
+                };
                 let by = match method {
-                    JoinMethod::Merge { left_keys, desc, then, .. } => {
-                        let keys = left_keys.iter().zip(desc).map(|(e, &desc)| sort_key(e, desc));
+                    JoinMethod::Merge {
+                        left_keys,
+                        desc,
+                        then,
+                        ..
+                    } => {
+                        let keys = left_keys
+                            .iter()
+                            .zip(desc)
+                            .map(|(e, &desc)| sort_key(e, desc));
                         let then = then.iter().map(|o| sort_key(&o.expr, o.desc));
                         format!(" (SORTED BY {})", list(&mut keys.chain(then)))
                     }
@@ -1021,8 +1429,15 @@ impl Node<'_> {
                 };
                 format!("{kind}{name} JOIN{on}{by}")
             }
-            Node::Aggregate { group_by, aggregates, .. } => {
-                let mut line = format!("AGGREGATE {}", list(&mut aggregates.iter().map(aggregate_name)));
+            Node::Aggregate {
+                group_by,
+                aggregates,
+                ..
+            } => {
+                let mut line = format!(
+                    "AGGREGATE {}",
+                    list(&mut aggregates.iter().map(aggregate_name))
+                );
                 if !group_by.is_empty() {
                     line += &format!(" BY {}", list(&mut group_by.iter().map(Expr::to_string)));
                 }
@@ -1040,7 +1455,9 @@ impl Node<'_> {
                 (None, offset) => format!("OFFSET {offset}"),
             },
             Node::Union { .. } => "UNION ALL".into(),
-            Node::Project { exprs, .. } => format!("PROJECT {}", list(&mut exprs.iter().map(Expr::to_string))),
+            Node::Project { exprs, .. } => {
+                format!("PROJECT {}", list(&mut exprs.iter().map(Expr::to_string)))
+            }
             Node::Derived { qualifier, .. } => format!("SUBQUERY {qualifier}"),
         };
         lines.push(format!("{}{line}", "  ".repeat(depth)));
@@ -1064,19 +1481,30 @@ fn label(table: &Table, qualifier: &str) -> String {
 }
 
 /// Whether a SELECT groups its rows: it has `GROUP BY` or `HAVING`, or uses an aggregate.
-fn is_grouped(projection: &Projection, group_by: &[Expr], having: &Option<Expr>, order_by: &[OrderBy]) -> bool {
+fn is_grouped(
+    projection: &Projection,
+    group_by: &[Expr],
+    having: &Option<Expr>,
+    order_by: &[OrderBy],
+) -> bool {
     let items = match projection {
         Projection::All => &[][..],
         Projection::Exprs(items) => items,
     };
     !group_by.is_empty()
         || having.is_some()
-        || items.iter().map(|item| &item.expr).chain(order_by.iter().map(|o| &o.expr)).any(contains_aggregate)
+        || items
+            .iter()
+            .map(|item| &item.expr)
+            .chain(order_by.iter().map(|o| &o.expr))
+            .any(contains_aggregate)
 }
 
 /// The name of a select list item's column: its AS name, or else its expression's.
 pub fn item_name(item: &SelectItem) -> String {
-    item.alias.clone().unwrap_or_else(|| output_name(&item.expr))
+    item.alias
+        .clone()
+        .unwrap_or_else(|| output_name(&item.expr))
 }
 
 /// The name of a result column: a column's name, an aggregate's function, or `?column?`.
@@ -1104,22 +1532,31 @@ fn rewrite(expr: &Expr, group_by: &[Expr], aggregates: &mut Vec<AggregateCall>) 
     Ok(match expr {
         Expr::Literal(_) => expr.clone(),
         Expr::Column(column) | Expr::Slot(_, column) => {
-            return err(format!("column {column} must appear in GROUP BY or be used in an aggregate function"));
+            return err(format!(
+                "column {column} must appear in GROUP BY or be used in an aggregate function"
+            ));
         }
         Expr::Unary(op, inner) => Expr::Unary(*op, rewrite(inner)?),
         Expr::Binary(left, op, right) => Expr::Binary(rewrite(left)?, *op, rewrite(right)?),
         Expr::IsNull(inner, negated) => Expr::IsNull(rewrite(inner)?, *negated),
         Expr::InList(left, items, negated) => {
-            let items = items.iter().map(|e| rewrite(e).map(|e| *e)).collect::<Result<_>>()?;
+            let items = items
+                .iter()
+                .map(|e| rewrite(e).map(|e| *e))
+                .collect::<Result<_>>()?;
             Expr::InList(rewrite(left)?, items, *negated)
         }
         Expr::Subquery(query) => Expr::Subquery(Box::new(regroup(query, group_by)?)),
         Expr::Exists(query) => Expr::Exists(Box::new(regroup(query, group_by)?)),
-        Expr::InSubquery(left, query, negated) => {
-            Expr::InSubquery(rewrite(left)?, Box::new(regroup(query, group_by)?), *negated)
-        }
+        Expr::InSubquery(left, query, negated) => Expr::InSubquery(
+            rewrite(left)?,
+            Box::new(regroup(query, group_by)?),
+            *negated,
+        ),
         Expr::Outer(_) => unreachable!("outer references are inside subqueries"),
-        Expr::Case { .. } | Expr::Function(..) => expr.try_map_parts(&mut |e| rewrite(e).map(|e| *e))?,
+        Expr::Case { .. } | Expr::Function(..) => {
+            expr.try_map_parts(&mut |e| rewrite(e).map(|e| *e))?
+        }
         Expr::Aggregate(function, arg, distinct) => {
             if arg.as_deref().is_some_and(contains_aggregate) {
                 return err("aggregate functions cannot be nested");
@@ -1176,8 +1613,15 @@ pub fn forbid<'a>(exprs: impl IntoIterator<Item = &'a Expr>, clause: &str) -> Re
 fn contains_aggregate(expr: &Expr) -> bool {
     match expr {
         Expr::Aggregate(..) => true,
-        Expr::Literal(_) | Expr::Column(_) | Expr::Outer(_) | Expr::Slot(..) | Expr::Subquery(_) | Expr::Exists(_) => false,
-        Expr::InList(left, items, _) => contains_aggregate(left) || items.iter().any(contains_aggregate),
+        Expr::Literal(_)
+        | Expr::Column(_)
+        | Expr::Outer(_)
+        | Expr::Slot(..)
+        | Expr::Subquery(_)
+        | Expr::Exists(_) => false,
+        Expr::InList(left, items, _) => {
+            contains_aggregate(left) || items.iter().any(contains_aggregate)
+        }
         Expr::InSubquery(left, ..) => contains_aggregate(left),
         Expr::Unary(_, inner) | Expr::IsNull(inner, _) => contains_aggregate(inner),
         Expr::Binary(left, _, right) => contains_aggregate(left) || contains_aggregate(right),

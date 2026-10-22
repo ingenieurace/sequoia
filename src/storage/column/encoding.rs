@@ -86,7 +86,9 @@ impl Encoding {
         [Plain, BitPack, Patched, Rle, Delta, Dictionary, Bitmap]
             .get(tag as usize)
             .copied()
-            .ok_or_else(|| crate::error::Error(format!("corrupted column chunk: unknown encoding {tag}")))
+            .ok_or_else(|| {
+                crate::error::Error(format!("corrupted column chunk: unknown encoding {tag}"))
+            })
     }
 }
 
@@ -96,7 +98,12 @@ pub fn bit(bitmap: &[u8], i: usize) -> bool {
 }
 
 /// Encodings for numbers inside Delta and Dictionary.
-const INNER: [Encoding; 4] = [Encoding::Rle, Encoding::BitPack, Encoding::Patched, Encoding::Plain];
+const INNER: [Encoding; 4] = [
+    Encoding::Rle,
+    Encoding::BitPack,
+    Encoding::Patched,
+    Encoding::Plain,
+];
 /// Every integer encoding, the cheapest to decode first so that it wins ties.
 const ALL_INTS: [Encoding; 7] = [
     Encoding::Rle,
@@ -157,14 +164,26 @@ pub fn decode(data_type: DataType, bytes: &[u8], n: usize) -> Result<Vec<Value>>
 /// Decodes only the rows whose bit is set in `selected`, in row order. The
 /// others are never turned into [`Value`]s: text is copied out of the chunk
 /// only for the selected rows.
-pub fn decode_selected(data_type: DataType, bytes: &[u8], n: usize, selected: &[u8]) -> Result<Vec<Value>> {
+pub fn decode_selected(
+    data_type: DataType,
+    bytes: &[u8],
+    n: usize,
+    selected: &[u8],
+) -> Result<Vec<Value>> {
     let mut reader = Reader { bytes, pos: 0 };
     let nulls = read_nulls(&mut reader, n)?;
     let rows = (0..n).filter(|&i| bit(selected, i));
     let values = match data_type {
         DataType::Int => {
             let ints = decode_ints(&mut reader, n)?;
-            rows.map(|i| if nulls.is_some_and(|b| bit(b, i)) { Value::Null } else { Value::Int(ints[i]) }).collect()
+            rows.map(|i| {
+                if nulls.is_some_and(|b| bit(b, i)) {
+                    Value::Null
+                } else {
+                    Value::Int(ints[i])
+                }
+            })
+            .collect()
         }
         DataType::Real => {
             let ints = decode_ints(&mut reader, n)?;
@@ -186,8 +205,14 @@ pub fn decode_selected(data_type: DataType, bytes: &[u8], n: usize, selected: &[
         }
         DataType::Text => {
             let texts = decode_texts(&mut reader, n)?;
-            rows.map(|i| if nulls.is_some_and(|b| bit(b, i)) { Value::Null } else { Value::Text(texts[i].to_owned()) })
-                .collect()
+            rows.map(|i| {
+                if nulls.is_some_and(|b| bit(b, i)) {
+                    Value::Null
+                } else {
+                    Value::Text(texts[i].to_owned())
+                }
+            })
+            .collect()
         }
     };
     reader.finish()?;
@@ -198,7 +223,13 @@ pub fn decode_selected(data_type: DataType, bytes: &[u8], n: usize, selected: &[
 /// satisfies `v op literal`; a NULL row never does. The literal must be a
 /// non-NULL value of the chunk's type. The values are compared while still
 /// encoded where the encoding allows it (see the module docs).
-pub fn filter(data_type: DataType, bytes: &[u8], n: usize, op: Compare, literal: &Value) -> Result<Vec<u8>> {
+pub fn filter(
+    data_type: DataType,
+    bytes: &[u8],
+    n: usize,
+    op: Compare,
+    literal: &Value,
+) -> Result<Vec<u8>> {
     let mut reader = Reader { bytes, pos: 0 };
     let nulls = read_nulls(&mut reader, n)?;
     let mut matching = match (data_type, literal) {
@@ -206,11 +237,19 @@ pub fn filter(data_type: DataType, bytes: &[u8], n: usize, op: Compare, literal:
         (DataType::Bool, Value::Bool(b)) => filter_ints(&mut reader, n, op, *b as i64)?,
         (DataType::Real, Value::Real(r)) => filter_ints(&mut reader, n, op, real_to_int(*r))?,
         (DataType::Text, Value::Text(s)) => filter_texts(&mut reader, n, op, s)?,
-        (_, literal) => return err(format!("cannot compare a {data_type} column with {}", literal.to_sql())),
+        (_, literal) => {
+            return err(format!(
+                "cannot compare a {data_type} column with {}",
+                literal.to_sql()
+            ));
+        }
     };
     reader.finish()?;
     if let Some(nulls) = nulls {
-        matching.iter_mut().zip(nulls).for_each(|(m, null)| *m &= !null);
+        matching
+            .iter_mut()
+            .zip(nulls)
+            .for_each(|(m, null)| *m &= !null);
     }
     Ok(matching)
 }
@@ -288,10 +327,15 @@ fn encode_ints(values: &[i64], candidates: &[Encoding]) -> Vec<u8> {
 /// state, if the encoding does not apply to them.
 fn encode_ints_with(encoding: Encoding, values: &[i64], out: &mut Vec<u8>) -> bool {
     match encoding {
-        Encoding::Plain => values.iter().for_each(|v| out.extend_from_slice(&v.to_le_bytes())),
+        Encoding::Plain => values
+            .iter()
+            .for_each(|v| out.extend_from_slice(&v.to_le_bytes())),
         Encoding::BitPack => {
             let base = values.iter().copied().min().unwrap_or(0);
-            let offsets: Vec<u64> = values.iter().map(|&v| v.wrapping_sub(base) as u64).collect();
+            let offsets: Vec<u64> = values
+                .iter()
+                .map(|&v| v.wrapping_sub(base) as u64)
+                .collect();
             let width = offsets.iter().map(|&o| bit_width(o)).max().unwrap_or(0);
             out.extend_from_slice(&base.to_le_bytes());
             out.push(width);
@@ -299,11 +343,16 @@ fn encode_ints_with(encoding: Encoding, values: &[i64], out: &mut Vec<u8>) -> bo
         }
         Encoding::Patched => {
             let base = values.iter().copied().min().unwrap_or(0);
-            let offsets: Vec<u64> = values.iter().map(|&v| v.wrapping_sub(base) as u64).collect();
+            let offsets: Vec<u64> = values
+                .iter()
+                .map(|&v| v.wrapping_sub(base) as u64)
+                .collect();
             let mut sorted = offsets.clone();
             sorted.sort_unstable();
             // Wide enough for most values, with the marker above all of them.
-            let Some(&p) = sorted.get(values.len() * PATCHED_PERCENTILE / 100) else { return false };
+            let Some(&p) = sorted.get(values.len() * PATCHED_PERCENTILE / 100) else {
+                return false;
+            };
             let width = bit_width(p.saturating_add(1));
             if width >= 64 {
                 return false;
@@ -326,7 +375,9 @@ fn encode_ints_with(encoding: Encoding, values: &[i64], out: &mut Vec<u8>) -> bo
             out.push(width);
             pack(&packed, width, out);
             out.extend_from_slice(&(exceptions.len() as u32).to_le_bytes());
-            exceptions.iter().for_each(|v| out.extend_from_slice(&v.to_le_bytes()));
+            exceptions
+                .iter()
+                .for_each(|v| out.extend_from_slice(&v.to_le_bytes()));
         }
         Encoding::Rle => {
             let mut runs: Vec<(i64, u32, u32)> = Vec::new();
@@ -344,16 +395,28 @@ fn encode_ints_with(encoding: Encoding, values: &[i64], out: &mut Vec<u8>) -> bo
             }
         }
         Encoding::Delta => {
-            let Some(&first) = values.first() else { return false };
+            let Some(&first) = values.first() else {
+                return false;
+            };
             let deltas: Vec<i64> = values.windows(2).map(|w| w[1].wrapping_sub(w[0])).collect();
             out.extend_from_slice(&first.to_le_bytes());
             out.extend(encode_ints(&deltas, &INNER));
         }
         Encoding::Dictionary => {
-            let dictionary: Vec<i64> = values.iter().copied().collect::<BTreeSet<_>>().into_iter().collect();
-            let codes: Vec<i64> = values.iter().map(|v| dictionary.binary_search(v).unwrap() as i64).collect();
+            let dictionary: Vec<i64> = values
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let codes: Vec<i64> = values
+                .iter()
+                .map(|v| dictionary.binary_search(v).unwrap() as i64)
+                .collect();
             out.extend_from_slice(&(dictionary.len() as u32).to_le_bytes());
-            dictionary.iter().for_each(|v| out.extend_from_slice(&v.to_le_bytes()));
+            dictionary
+                .iter()
+                .for_each(|v| out.extend_from_slice(&v.to_le_bytes()));
             out.extend(encode_ints(&codes, &INNER));
         }
         Encoding::Bitmap => {
@@ -382,7 +445,10 @@ fn decode_ints(reader: &mut Reader, n: usize) -> Result<Vec<i64>> {
             let base = reader.i64()?;
             let width = reader.width()?;
             let offsets = unpack(reader, width, n)?;
-            Ok(offsets.into_iter().map(|o| base.wrapping_add(o as i64)).collect())
+            Ok(offsets
+                .into_iter()
+                .map(|o| base.wrapping_add(o as i64))
+                .collect())
         }
         Encoding::Patched => {
             let base = reader.i64()?;
@@ -392,13 +458,18 @@ fn decode_ints(reader: &mut Reader, n: usize) -> Result<Vec<i64>> {
             }
             let packed = unpack(reader, width, n)?;
             let count = reader.u32()? as usize;
-            let mut exceptions = (0..count).map(|_| reader.i64()).collect::<Result<Vec<_>>>()?.into_iter();
+            let mut exceptions = (0..count)
+                .map(|_| reader.i64())
+                .collect::<Result<Vec<_>>>()?
+                .into_iter();
             let marker = (1u64 << width) - 1;
             let values = packed
                 .into_iter()
                 .map(|p| {
                     if p == marker {
-                        exceptions.next().ok_or_else(|| corrupted("missing exception"))
+                        exceptions
+                            .next()
+                            .ok_or_else(|| corrupted("missing exception"))
                     } else {
                         Ok(base.wrapping_add(p as i64))
                     }
@@ -412,7 +483,11 @@ fn decode_ints(reader: &mut Reader, n: usize) -> Result<Vec<i64>> {
         Encoding::Rle => {
             let mut values = Vec::with_capacity(n);
             for _ in 0..reader.u32()? {
-                let (value, start, len) = (reader.i64()?, reader.u32()? as usize, reader.u32()? as usize);
+                let (value, start, len) = (
+                    reader.i64()?,
+                    reader.u32()? as usize,
+                    reader.u32()? as usize,
+                );
                 if start != values.len() || start + len > n {
                     return err("corrupted column chunk: bad run");
                 }
@@ -432,7 +507,9 @@ fn decode_ints(reader: &mut Reader, n: usize) -> Result<Vec<i64>> {
             Ok(values)
         }
         Encoding::Dictionary => {
-            let dictionary = (0..reader.u32()?).map(|_| reader.i64()).collect::<Result<Vec<_>>>()?;
+            let dictionary = (0..reader.u32()?)
+                .map(|_| reader.i64())
+                .collect::<Result<Vec<_>>>()?;
             decode_codes(reader, n, &dictionary)
         }
         Encoding::Bitmap => {
@@ -446,7 +523,10 @@ fn decode_ints(reader: &mut Reader, n: usize) -> Result<Vec<i64>> {
                     }
                 }
             }
-            values.into_iter().map(|v| v.ok_or_else(|| corrupted("row in no bitmap"))).collect()
+            values
+                .into_iter()
+                .map(|v| v.ok_or_else(|| corrupted("row in no bitmap")))
+                .collect()
         }
     }
 }
@@ -459,7 +539,11 @@ fn filter_ints(reader: &mut Reader, n: usize, op: Compare, literal: i64) -> Resu
         Encoding::Rle => {
             let mut next = 0;
             for _ in 0..reader.u32()? {
-                let (value, start, len) = (reader.i64()?, reader.u32()? as usize, reader.u32()? as usize);
+                let (value, start, len) = (
+                    reader.i64()?,
+                    reader.u32()? as usize,
+                    reader.u32()? as usize,
+                );
                 if start != next || start + len > n {
                     return err("corrupted column chunk: bad run");
                 }
@@ -482,7 +566,9 @@ fn filter_ints(reader: &mut Reader, n: usize, op: Compare, literal: i64) -> Resu
             }
         }
         Encoding::Dictionary => {
-            let dictionary = (0..reader.u32()?).map(|_| reader.i64()).collect::<Result<Vec<_>>>()?;
+            let dictionary = (0..reader.u32()?)
+                .map(|_| reader.i64())
+                .collect::<Result<Vec<_>>>()?;
             let lo = dictionary.partition_point(|&v| v < literal);
             let hi = dictionary.partition_point(|&v| v <= literal);
             let (op, code) = code_test(op, lo, hi);
@@ -505,7 +591,11 @@ fn decode_codes<T: Clone>(reader: &mut Reader, n: usize, dictionary: &[T]) -> Re
     decode_ints(reader, n)?
         .into_iter()
         .map(|code| {
-            usize::try_from(code).ok().and_then(|i| dictionary.get(i)).cloned().ok_or_else(|| corrupted("bad code"))
+            usize::try_from(code)
+                .ok()
+                .and_then(|i| dictionary.get(i))
+                .cloned()
+                .ok_or_else(|| corrupted("bad code"))
         })
         .collect()
 }
@@ -519,15 +609,27 @@ fn encode_texts(values: &[&str]) -> Vec<u8> {
         bytes
     };
     let dictionary = {
-        let dictionary: Vec<&str> = values.iter().copied().collect::<BTreeSet<_>>().into_iter().collect();
-        let codes: Vec<i64> = values.iter().map(|v| dictionary.binary_search(v).unwrap() as i64).collect();
+        let dictionary: Vec<&str> = values
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let codes: Vec<i64> = values
+            .iter()
+            .map(|v| dictionary.binary_search(v).unwrap() as i64)
+            .collect();
         let mut bytes = vec![Encoding::Dictionary.tag()];
         bytes.extend_from_slice(&(dictionary.len() as u32).to_le_bytes());
         dictionary.iter().for_each(|s| put_str(&mut bytes, s));
         bytes.extend(encode_ints(&codes, &INNER));
         bytes
     };
-    if dictionary.len() < plain.len() { dictionary } else { plain }
+    if dictionary.len() < plain.len() {
+        dictionary
+    } else {
+        plain
+    }
 }
 
 /// Returns each row's string, borrowed from the chunk.
@@ -535,10 +637,14 @@ fn decode_texts<'a>(reader: &mut Reader<'a>, n: usize) -> Result<Vec<&'a str>> {
     match Encoding::from_tag(reader.u8()?)? {
         Encoding::Plain => (0..n).map(|_| reader.str()).collect(),
         Encoding::Dictionary => {
-            let dictionary = (0..reader.u32()?).map(|_| reader.str()).collect::<Result<Vec<_>>>()?;
+            let dictionary = (0..reader.u32()?)
+                .map(|_| reader.str())
+                .collect::<Result<Vec<_>>>()?;
             decode_codes(reader, n, &dictionary)
         }
-        encoding => err(format!("corrupted column chunk: {encoding:?} is not a text encoding")),
+        encoding => err(format!(
+            "corrupted column chunk: {encoding:?} is not a text encoding"
+        )),
     }
 }
 
@@ -546,7 +652,9 @@ fn decode_texts<'a>(reader: &mut Reader<'a>, n: usize) -> Result<Vec<&'a str>> {
 fn filter_texts(reader: &mut Reader, n: usize, op: Compare, literal: &str) -> Result<Vec<u8>> {
     match Encoding::from_tag(reader.u8()?)? {
         Encoding::Dictionary => {
-            let dictionary = (0..reader.u32()?).map(|_| reader.str()).collect::<Result<Vec<_>>>()?;
+            let dictionary = (0..reader.u32()?)
+                .map(|_| reader.str())
+                .collect::<Result<Vec<_>>>()?;
             let lo = dictionary.partition_point(|&s| s < literal);
             let hi = dictionary.partition_point(|&s| s <= literal);
             let (op, code) = code_test(op, lo, hi);
@@ -686,8 +794,15 @@ mod tests {
     fn size_with(encoding: Encoding, values: &[i64]) -> usize {
         let mut bytes = vec![encoding.tag()];
         assert!(encode_ints_with(encoding, values, &mut bytes));
-        let mut reader = Reader { bytes: &bytes, pos: 0 };
-        assert_eq!(decode_ints(&mut reader, values.len()).unwrap(), values, "{encoding:?}");
+        let mut reader = Reader {
+            bytes: &bytes,
+            pos: 0,
+        };
+        assert_eq!(
+            decode_ints(&mut reader, values.len()).unwrap(),
+            values,
+            "{encoding:?}"
+        );
         reader.finish().unwrap();
         bytes.len()
     }
@@ -700,7 +815,9 @@ mod tests {
             vec![i64::MIN, i64::MAX, 0, -1, 1],
             (0..1000).collect(),
             (0..1000).map(|i| i % 3).collect(),
-            (0..1000).map(|i| if i % 50 == 0 { 1 << 40 } else { i % 16 }).collect(),
+            (0..1000)
+                .map(|i| if i % 50 == 0 { 1 << 40 } else { i % 16 })
+                .collect(),
             (0..1000).map(|i| -i * 1_000_003).collect(),
         ];
         for values in &samples {
@@ -736,12 +853,17 @@ mod tests {
         // Few distinct values that are far apart and mixed.
         let sparse = ints((0..1000).map(|i| [i64::MIN, 0, i64::MAX][noise(i) as usize % 3]));
         let (encoding, _) = round_trip(DataType::Int, &sparse);
-        assert!(matches!(encoding, Encoding::Dictionary | Encoding::Bitmap), "{encoding:?}");
+        assert!(
+            matches!(encoding, Encoding::Dictionary | Encoding::Bitmap),
+            "{encoding:?}"
+        );
     }
 
     #[test]
     fn patched_beats_bit_packing_with_outliers() {
-        let values: Vec<i64> = (0..1000).map(|i| if i % 100 == 0 { 1 << 50 } else { i % 8 }).collect();
+        let values: Vec<i64> = (0..1000)
+            .map(|i| if i % 100 == 0 { 1 << 50 } else { i % 8 })
+            .collect();
         assert!(size_with(Encoding::Patched, &values) * 5 < size_with(Encoding::BitPack, &values));
     }
 
@@ -756,15 +878,22 @@ mod tests {
     #[test]
     fn text_uses_an_order_preserving_dictionary() {
         let cities = ["paris", "tokyo", "lima", "oslo"];
-        let values: Vec<Value> = (0..500).map(|i| Value::Text(cities[i % 4].into())).collect();
+        let values: Vec<Value> = (0..500)
+            .map(|i| Value::Text(cities[i % 4].into()))
+            .collect();
         let (encoding, size) = round_trip(DataType::Text, &values);
         assert_eq!(encoding, Encoding::Dictionary);
         assert!(size < 300, "{size}");
 
         // Codes follow the sorted order of the strings.
         let bytes = encode(DataType::Text, &values).unwrap();
-        let mut reader = Reader { bytes: &bytes[2..], pos: 0 };
-        let dictionary: Vec<&str> = (0..reader.u32().unwrap()).map(|_| reader.str().unwrap()).collect();
+        let mut reader = Reader {
+            bytes: &bytes[2..],
+            pos: 0,
+        };
+        let dictionary: Vec<&str> = (0..reader.u32().unwrap())
+            .map(|_| reader.str().unwrap())
+            .collect();
         assert_eq!(dictionary, ["lima", "oslo", "paris", "tokyo"]);
 
         let unique: Vec<Value> = (0..100).map(|i| Value::Text(format!("row {i}"))).collect();
@@ -775,20 +904,40 @@ mod tests {
     fn nulls_and_bools_round_trip() {
         let values = vec![Value::Int(5), Value::Null, Value::Int(-5), Value::Null];
         round_trip(DataType::Int, &values);
-        let flags: Vec<Value> =
-            (0..100).map(|i| if i % 7 == 0 { Value::Null } else { Value::Bool(i % 3 == 0) }).collect();
+        let flags: Vec<Value> = (0..100)
+            .map(|i| {
+                if i % 7 == 0 {
+                    Value::Null
+                } else {
+                    Value::Bool(i % 3 == 0)
+                }
+            })
+            .collect();
         round_trip(DataType::Bool, &flags);
-        let texts = vec![Value::Null, Value::Text("".into()), Value::Text("ünïcode".into())];
+        let texts = vec![
+            Value::Null,
+            Value::Text("".into()),
+            Value::Text("ünïcode".into()),
+        ];
         round_trip(DataType::Text, &texts);
         round_trip(DataType::Int, &[]);
     }
 
-    const OPS: [Compare; 6] = [Compare::Eq, Compare::NotEq, Compare::Lt, Compare::LtEq, Compare::Gt, Compare::GtEq];
+    const OPS: [Compare; 6] = [
+        Compare::Eq,
+        Compare::NotEq,
+        Compare::Lt,
+        Compare::LtEq,
+        Compare::Gt,
+        Compare::GtEq,
+    ];
 
     /// The rows of `values` for which `value op literal` holds, as a filter
     /// that decodes everything would find them.
     fn expected(values: &[Value], op: Compare, literal: &Value) -> Vec<usize> {
-        (0..values.len()).filter(|&i| values[i].compare(literal).is_some_and(|ord| op.holds(ord))).collect()
+        (0..values.len())
+            .filter(|&i| values[i].compare(literal).is_some_and(|ord| op.holds(ord)))
+            .collect()
     }
 
     fn rows_of(bitmap: &[u8], n: usize) -> Vec<usize> {
@@ -804,8 +953,12 @@ mod tests {
             vec![i64::MIN, i64::MAX, 0, -1, 1],
             (0..300).collect(),
             (0..300).map(|i| i / 100 * 10).collect(),
-            (0..300).map(|i| [-20, 0, 50][noise(i) as usize % 3]).collect(),
-            (0..300).map(|i| if i % 50 == 0 { 1 << 40 } else { i % 16 }).collect(),
+            (0..300)
+                .map(|i| [-20, 0, 50][noise(i) as usize % 3])
+                .collect(),
+            (0..300)
+                .map(|i| if i % 50 == 0 { 1 << 40 } else { i % 16 })
+                .collect(),
         ];
         for values in &samples {
             let literals: BTreeSet<i64> = values
@@ -822,7 +975,8 @@ mod tests {
                 for &literal in &literals {
                     for op in OPS {
                         let literal = Value::Int(literal);
-                        let matching = filter(DataType::Int, &chunk, values.len(), op, &literal).unwrap();
+                        let matching =
+                            filter(DataType::Int, &chunk, values.len(), op, &literal).unwrap();
                         assert_eq!(
                             rows_of(&matching, values.len()),
                             expected(&decoded, op, &literal),
@@ -838,11 +992,25 @@ mod tests {
     fn dictionary_codes_are_compared_in_place_of_strings() {
         let cities = ["lima", "oslo", "paris", "tokyo"];
         let dictionary: Vec<Value> = (0..500)
-            .map(|i| if i % 9 == 0 { Value::Null } else { Value::Text(cities[noise(i) as usize % 4].into()) })
+            .map(|i| {
+                if i % 9 == 0 {
+                    Value::Null
+                } else {
+                    Value::Text(cities[noise(i) as usize % 4].into())
+                }
+            })
             .collect();
-        let runs: Vec<Value> = (0..500).map(|i| Value::Text(cities[i / 125].into())).collect();
-        let plain: Vec<Value> = (0..100).map(|i| Value::Text(format!("row {i:03}"))).collect();
-        let cases = [(&dictionary, Encoding::Dictionary), (&runs, Encoding::Dictionary), (&plain, Encoding::Plain)];
+        let runs: Vec<Value> = (0..500)
+            .map(|i| Value::Text(cities[i / 125].into()))
+            .collect();
+        let plain: Vec<Value> = (0..100)
+            .map(|i| Value::Text(format!("row {i:03}")))
+            .collect();
+        let cases = [
+            (&dictionary, Encoding::Dictionary),
+            (&runs, Encoding::Dictionary),
+            (&plain, Encoding::Plain),
+        ];
         for (values, encoding) in cases {
             let chunk = encode(DataType::Text, values).unwrap();
             assert_eq!(encoding_of(&chunk, values.len()).unwrap(), encoding);
@@ -850,8 +1018,13 @@ mod tests {
             for literal in ["lima", "oslo", "m", "a", "zz", "row 050", "row 05"] {
                 for op in OPS {
                     let literal = Value::Text(literal.into());
-                    let matching = filter(DataType::Text, &chunk, values.len(), op, &literal).unwrap();
-                    assert_eq!(rows_of(&matching, values.len()), expected(values, op, &literal), "{op:?} {literal:?}");
+                    let matching =
+                        filter(DataType::Text, &chunk, values.len(), op, &literal).unwrap();
+                    assert_eq!(
+                        rows_of(&matching, values.len()),
+                        expected(values, op, &literal),
+                        "{op:?} {literal:?}"
+                    );
                 }
             }
         }
@@ -859,13 +1032,31 @@ mod tests {
 
     #[test]
     fn null_rows_never_match() {
-        let values: Vec<Value> = (0..100).map(|i| if i % 3 == 0 { Value::Null } else { Value::Int(i % 2) }).collect();
+        let values: Vec<Value> = (0..100)
+            .map(|i| {
+                if i % 3 == 0 {
+                    Value::Null
+                } else {
+                    Value::Int(i % 2)
+                }
+            })
+            .collect();
         let chunk = encode(DataType::Int, &values).unwrap();
         let matching = filter(DataType::Int, &chunk, 100, Compare::NotEq, &Value::Int(7)).unwrap();
-        assert_eq!(rows_of(&matching, 100), (0..100).filter(|i| i % 3 != 0).collect::<Vec<_>>());
+        assert_eq!(
+            rows_of(&matching, 100),
+            (0..100).filter(|i| i % 3 != 0).collect::<Vec<_>>()
+        );
 
-        let flags: Vec<Value> =
-            (0..100).map(|i| if i % 4 == 0 { Value::Null } else { Value::Bool(i % 3 == 0) }).collect();
+        let flags: Vec<Value> = (0..100)
+            .map(|i| {
+                if i % 4 == 0 {
+                    Value::Null
+                } else {
+                    Value::Bool(i % 3 == 0)
+                }
+            })
+            .collect();
         let chunk = encode(DataType::Bool, &flags).unwrap();
         for op in OPS {
             for literal in [Value::Bool(false), Value::Bool(true)] {
@@ -874,17 +1065,36 @@ mod tests {
             }
         }
         assert!(filter(DataType::Bool, &chunk, 100, Compare::Eq, &Value::Int(1)).is_err());
-        assert!(filter(DataType::Int, &encode(DataType::Int, &[]).unwrap(), 0, Compare::Eq, &Value::Null).is_err());
+        assert!(
+            filter(
+                DataType::Int,
+                &encode(DataType::Int, &[]).unwrap(),
+                0,
+                Compare::Eq,
+                &Value::Null
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn selected_rows_are_decoded_alone() {
-        let values: Vec<Value> =
-            (0..20).map(|i| if i % 5 == 0 { Value::Null } else { Value::Text(format!("v{}", i % 3)) }).collect();
+        let values: Vec<Value> = (0..20)
+            .map(|i| {
+                if i % 5 == 0 {
+                    Value::Null
+                } else {
+                    Value::Text(format!("v{}", i % 3))
+                }
+            })
+            .collect();
         let chunk = encode(DataType::Text, &values).unwrap();
         let selected = [0b0010_0001, 0b0000_0100, 0b1000];
         let rows: Vec<Value> = [0, 5, 10, 19].iter().map(|&i| values[i].clone()).collect();
-        assert_eq!(decode_selected(DataType::Text, &chunk, 20, &selected).unwrap(), rows);
+        assert_eq!(
+            decode_selected(DataType::Text, &chunk, 20, &selected).unwrap(),
+            rows
+        );
     }
 
     #[test]
@@ -893,6 +1103,13 @@ mod tests {
         let bytes = encode(DataType::Int, &ints(0..100)).unwrap();
         assert!(decode(DataType::Int, &bytes[..bytes.len() - 1], 100).is_err());
         assert!(decode(DataType::Int, &[bytes.clone(), vec![0]].concat(), 100).is_err());
-        assert!(decode(DataType::Bool, &encode(DataType::Int, &ints([2])).unwrap(), 1).is_err());
+        assert!(
+            decode(
+                DataType::Bool,
+                &encode(DataType::Int, &ints([2])).unwrap(),
+                1
+            )
+            .is_err()
+        );
     }
 }

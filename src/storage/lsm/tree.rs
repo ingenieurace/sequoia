@@ -58,13 +58,13 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::storage::buffer::pool::BufferPool;
-use crate::storage::io::disk::{PAGE_USABLE, PageId, decode_id, encode_id, read_u32, write_u32};
-use crate::storage::heap::TableHeap;
-use crate::storage::page::MAX_TUPLE_SIZE;
 use super::memtable::{self, MEMTABLE, MemTable, MemTableKind};
 use super::sstable::{self, Entry, SsTable};
 use crate::error::{Result, err};
+use crate::storage::buffer::pool::BufferPool;
+use crate::storage::heap::TableHeap;
+use crate::storage::io::disk::{PAGE_USABLE, PageId, decode_id, encode_id, read_u32, write_u32};
+use crate::storage::page::MAX_TUPLE_SIZE;
 
 /// The compaction strategy of `LsmConfig::default`, used by every LSM table.
 /// Edit this line to switch, like `REPLACEMENT_POLICY` in `storage/buffer/pool.rs`:
@@ -182,7 +182,10 @@ impl LsmTree {
             log: TableHeap::open(pool.clone(), log_page, log_page)?,
             log_bytes: 0,
             next_seq: 0,
-            level0: level0.into_iter().map(|id| SsTable::open(pool.clone(), id)).collect::<Result<_>>()?,
+            level0: level0
+                .into_iter()
+                .map(|id| SsTable::open(pool.clone(), id))
+                .collect::<Result<_>>()?,
             levels: levels
                 .into_iter()
                 .map(|id| id.map(|id| SsTable::open(pool.clone(), id)).transpose())
@@ -198,7 +201,11 @@ impl LsmTree {
                 return err("corrupted LSM log record");
             };
             let (key, value) = sstable::decode_entry(entry)?;
-            records.push((u64::from_le_bytes(*seq), key.to_vec(), value.map(<[u8]>::to_vec)));
+            records.push((
+                u64::from_le_bytes(*seq),
+                key.to_vec(),
+                value.map(<[u8]>::to_vec),
+            ));
             tree.log_bytes += record.len();
         }
         records.sort_by_key(|(seq, _, _)| *seq);
@@ -222,7 +229,9 @@ impl LsmTree {
         let max = MAX_TUPLE_SIZE - SEQ_SIZE;
         let len = sstable::entry_len(key, value);
         if len > max {
-            return err(format!("row is {len} bytes with its key, the maximum is {max}"));
+            return err(format!(
+                "row is {len} bytes with its key, the maximum is {max}"
+            ));
         }
         Ok(())
     }
@@ -264,20 +273,41 @@ impl LsmTree {
     /// SSTable page, rather than copying them out first. Each source starts
     /// where `start` would be, and reads its pages only as the merge reaches
     /// them, so a caller that stops early reads little more than it took.
-    pub fn scan_map<T, F: FnMut(&[u8], &[u8]) -> Result<T>>(&self, start: &[u8], f: F) -> ScanMap<'_, T, F> {
-        ScanMap { tree: self, start: Some(start.to_vec()), cursors: Vec::new(), key: Vec::new(), f, done: false, made: PhantomData }
+    pub fn scan_map<T, F: FnMut(&[u8], &[u8]) -> Result<T>>(
+        &self,
+        start: &[u8],
+        f: F,
+    ) -> ScanMap<'_, T, F> {
+        ScanMap {
+            tree: self,
+            start: Some(start.to_vec()),
+            cursors: Vec::new(),
+            key: Vec::new(),
+            f,
+            done: false,
+            made: PhantomData,
+        }
     }
 
     /// The largest key ever written that may still be stored, deleted or not.
     pub fn max_key(&self) -> Option<Vec<u8>> {
         let stored = self.tables().map(SsTable::max_key);
-        self.memtable.last_key().into_iter().chain(stored).max().map(<[u8]>::to_vec)
+        self.memtable
+            .last_key()
+            .into_iter()
+            .chain(stored)
+            .max()
+            .map(<[u8]>::to_vec)
     }
 
     /// Frees every page of the tree.
     pub fn destroy(self) -> Result<()> {
         self.log.destroy()?;
-        for table in self.level0.into_iter().chain(self.levels.into_iter().flatten()) {
+        for table in self
+            .level0
+            .into_iter()
+            .chain(self.levels.into_iter().flatten())
+        {
             table.destroy()?;
         }
         self.pool.delete_page(self.manifest)
@@ -305,7 +335,10 @@ impl LsmTree {
 
     /// Writes the MemTable out as a new level-0 SSTable and starts a new log.
     fn flush(&mut self) -> Result<()> {
-        let entries = self.memtable.iter().map(|(k, v)| Ok((k.to_vec(), v.clone())));
+        let entries = self
+            .memtable
+            .iter()
+            .map(|(k, v)| Ok((k.to_vec(), v.clone())));
         let table = SsTable::write(self.pool.clone(), entries)?;
         self.pages_written += table.as_ref().map_or(0, SsTable::page_count);
         let new_log = TableHeap::create(self.pool.clone())?;
@@ -354,11 +387,15 @@ impl LsmTree {
         let mut i = 0;
         while i < self.levels.len() {
             let limit = self.config.level1_pages * self.config.fanout.pow(i as u32);
-            if self.levels[i].as_ref().is_some_and(|table| table.page_count() > limit) {
+            if self.levels[i]
+                .as_ref()
+                .is_some_and(|table| table.page_count() > limit)
+            {
                 if i + 1 == self.levels.len() {
                     self.levels.push(None);
                 }
-                let inputs: Vec<&SsTable> = self.levels[i].iter().chain(&self.levels[i + 1]).collect();
+                let inputs: Vec<&SsTable> =
+                    self.levels[i].iter().chain(&self.levels[i + 1]).collect();
                 let merged = self.merge(&inputs, self.is_bottom(i + 1))?;
                 self.pages_written += merged.as_ref().map_or(0, SsTable::page_count);
                 garbage.extend(self.levels[i].take());
@@ -415,8 +452,12 @@ impl LsmTree {
     /// Sort-merges SSTables (newest first) into a new one, keeping the newest
     /// entry for each key. Tombstones are dropped if nothing lies below.
     fn merge(&self, inputs: &[&SsTable], drop_tombstones: bool) -> Result<Option<SsTable>> {
-        let sources = inputs.iter().map(|table| Box::new(table.iter()) as Source).collect();
-        let entries = Merge::new(sources).filter(|item| !(drop_tombstones && matches!(item, Ok((_, None)))));
+        let sources = inputs
+            .iter()
+            .map(|table| Box::new(table.iter()) as Source)
+            .collect();
+        let entries =
+            Merge::new(sources).filter(|item| !(drop_tombstones && matches!(item, Ok((_, None)))));
         SsTable::write(self.pool.clone(), entries)
     }
 
@@ -425,8 +466,15 @@ impl LsmTree {
         let mut ids = vec![self.log.first_page().0, self.level0.len() as u32];
         ids.extend(self.level0.iter().map(|table| table.first_page().0));
         ids.push(self.levels.len() as u32);
-        ids.extend(self.levels.iter().map(|table| encode_id(table.as_ref().map(SsTable::first_page))));
-        assert!(ids.len() * 4 <= PAGE_USABLE, "manifest does not fit in a page");
+        ids.extend(
+            self.levels
+                .iter()
+                .map(|table| encode_id(table.as_ref().map(SsTable::first_page))),
+        );
+        assert!(
+            ids.len() * 4 <= PAGE_USABLE,
+            "manifest does not fit in a page"
+        );
 
         let mut page = self.pool.fetch_write(self.manifest)?;
         for (i, &id) in ids.iter().enumerate() {
@@ -506,7 +554,9 @@ impl<T, F: FnMut(&[u8], &[u8]) -> Result<T>> ScanMap<'_, T, F> {
                     newest = Some(i);
                 }
             }
-            let Some(newest) = newest else { return Ok(None) };
+            let Some(newest) = newest else {
+                return Ok(None);
+            };
             let (key, value) = self.cursors[newest].entry().expect("has an entry");
             let made = value.map(|value| (self.f)(key, value)).transpose()?;
             self.key.clear();
@@ -514,7 +564,10 @@ impl<T, F: FnMut(&[u8], &[u8]) -> Result<T>> ScanMap<'_, T, F> {
 
             // Move every source holding the key past it: older versions are hidden.
             for cursor in &mut self.cursors {
-                if cursor.entry().is_some_and(|(key, _)| key == self.key.as_slice()) {
+                if cursor
+                    .entry()
+                    .is_some_and(|(key, _)| key == self.key.as_slice())
+                {
                     cursor.advance()?;
                 }
             }
@@ -553,7 +606,11 @@ struct Merge<'a> {
 impl<'a> Merge<'a> {
     fn new(sources: Vec<Source<'a>>) -> Self {
         let heads = sources.iter().map(|_| None).collect();
-        Merge { sources, heads, started: false }
+        Merge {
+            sources,
+            heads,
+            started: false,
+        }
     }
 
     fn advance(&mut self, i: usize) -> Result<()> {
@@ -576,12 +633,21 @@ impl Iterator for Merge<'_> {
         // The smallest key; on a tie `min_by` picks the first, i.e. the newest source.
         let newest = (0..self.heads.len())
             .filter(|&i| self.heads[i].is_some())
-            .min_by(|&a, &b| self.heads[a].as_ref().unwrap().0.cmp(&self.heads[b].as_ref().unwrap().0))?;
+            .min_by(|&a, &b| {
+                self.heads[a]
+                    .as_ref()
+                    .unwrap()
+                    .0
+                    .cmp(&self.heads[b].as_ref().unwrap().0)
+            })?;
         let entry = self.heads[newest].take().unwrap();
 
         // Skip older versions of the same key, then move every source used past it.
         for i in 0..self.heads.len() {
-            let used = i == newest || self.heads[i].as_ref().is_some_and(|(key, _)| *key == entry.0);
+            let used = i == newest
+                || self.heads[i]
+                    .as_ref()
+                    .is_some_and(|(key, _)| *key == entry.0);
             if used && let Err(e) = self.advance(i) {
                 return Some(Err(e));
             }
@@ -614,7 +680,10 @@ mod tests {
     }
 
     fn small_universal() -> LsmConfig {
-        LsmConfig { compaction: Compaction::Universal, ..small() }
+        LsmConfig {
+            compaction: Compaction::Universal,
+            ..small()
+        }
     }
 
     fn key(i: u32) -> Vec<u8> {
@@ -646,7 +715,10 @@ mod tests {
     #[test]
     fn newest_version_wins_with_level_compaction() {
         for memtable in MemTableKind::ALL {
-            let tree = check_newest_version_wins(LsmConfig { memtable, ..small() });
+            let tree = check_newest_version_wins(LsmConfig {
+                memtable,
+                ..small()
+            });
             assert!(tree.levels.len() >= 2, "compacted down at least two levels");
         }
     }
@@ -654,7 +726,10 @@ mod tests {
     #[test]
     fn newest_version_wins_with_universal_compaction() {
         for memtable in MemTableKind::ALL {
-            let tree = check_newest_version_wins(LsmConfig { memtable, ..small_universal() });
+            let tree = check_newest_version_wins(LsmConfig {
+                memtable,
+                ..small_universal()
+            });
             assert!(tree.levels.is_empty() && tree.level0.len() < 4);
         }
     }
@@ -685,7 +760,10 @@ mod tests {
             .collect();
         assert_eq!(scan(&tree), expected);
         for i in 0..600 {
-            let want = expected.iter().find(|(k, _)| *k == key(i)).map(|(_, v)| v.clone());
+            let want = expected
+                .iter()
+                .find(|(k, _)| *k == key(i))
+                .map(|(_, v)| v.clone());
             assert_eq!(tree.get(&key(i)).unwrap(), want, "key {i}");
         }
         tree
@@ -694,7 +772,9 @@ mod tests {
     #[test]
     fn scan_from_starts_at_any_key_in_every_source() {
         let configs = [small(), small_universal()].into_iter();
-        for config in configs.flat_map(|c| MemTableKind::ALL.map(|memtable| LsmConfig { memtable, ..c })) {
+        for config in
+            configs.flat_map(|c| MemTableKind::ALL.map(|memtable| LsmConfig { memtable, ..c }))
+        {
             let mut tree = check_newest_version_wins(config);
             // Recent writes, still in the MemTable, over keys in the SSTables.
             for i in (1..600).step_by(50) {
@@ -705,7 +785,17 @@ mod tests {
             let all = scan(&tree);
             let mut between = key(300);
             between.push(0); // after key 300, before key 301
-            for start in [Vec::new(), key(0), key(1), key(2), key(299), between, key(599), key(600), vec![0xFF; 8]] {
+            for start in [
+                Vec::new(),
+                key(0),
+                key(1),
+                key(2),
+                key(299),
+                between,
+                key(599),
+                key(600),
+                vec![0xFF; 8],
+            ] {
                 let from: Vec<_> = tree.scan_from(&start).collect::<Result<_>>().unwrap();
                 let want: Vec<_> = all.iter().filter(|(k, _)| *k >= start).cloned().collect();
                 assert_eq!(from, want, "from {start:?}");
@@ -718,11 +808,18 @@ mod tests {
         let mut tree = LsmTree::create(pool(), small()).unwrap();
         for i in 0..2000 {
             tree.put(key(i), value(i, 1)).unwrap();
-            assert!(tree.level0.len() < 3, "level 0 is merged as soon as it has 3 tables");
+            assert!(
+                tree.level0.len() < 3,
+                "level 0 is merged as soon as it has 3 tables"
+            );
         }
         for (i, level) in tree.levels.iter().enumerate().take(tree.levels.len() - 1) {
             let limit = 4 * 2usize.pow(i as u32);
-            assert!(level.as_ref().is_none_or(|t| t.page_count() <= limit), "level {} is too big", i + 1);
+            assert!(
+                level.as_ref().is_none_or(|t| t.page_count() <= limit),
+                "level {} is too big",
+                i + 1
+            );
         }
         assert_eq!(scan(&tree).len(), 2000);
     }
@@ -730,8 +827,17 @@ mod tests {
     #[test]
     fn universal_keeps_runs_below_the_limit_and_rewrites_less() {
         // Default ratios (4 level-0 tables, fanout 10, 8 runs) on a small scale.
-        let level = LsmConfig { log_bytes: 2000, compaction: Compaction::Level, level1_pages: 16, ..Default::default() };
-        let universal = LsmConfig { log_bytes: 2000, compaction: Compaction::Universal, ..Default::default() };
+        let level = LsmConfig {
+            log_bytes: 2000,
+            compaction: Compaction::Level,
+            level1_pages: 16,
+            ..Default::default()
+        };
+        let universal = LsmConfig {
+            log_bytes: 2000,
+            compaction: Compaction::Universal,
+            ..Default::default()
+        };
         let mut level = LsmTree::create(pool(), level).unwrap();
         let mut universal = LsmTree::create(pool(), universal).unwrap();
         for i in 0..3000u32 {
@@ -739,7 +845,10 @@ mod tests {
             let k = i.wrapping_mul(2_654_435_761).to_be_bytes().to_vec();
             level.put(k.clone(), value(i, 1)).unwrap();
             universal.put(k, value(i, 1)).unwrap();
-            assert!(universal.level0.len() < 8, "universal merges as soon as there are 8 runs");
+            assert!(
+                universal.level0.len() < 8,
+                "universal merges as soon as there are 8 runs"
+            );
             assert!(universal.levels.is_empty());
         }
         assert_eq!(scan(&universal), scan(&level));
@@ -765,7 +874,10 @@ mod tests {
         }
         let stored: usize = tree.tables().map(|t| t.iter().count()).sum();
         assert_eq!(scan(&tree).len(), 400);
-        assert!(stored < 500, "most of the 100 tombstones are gone: {stored} entries stored");
+        assert!(
+            stored < 500,
+            "most of the 100 tombstones are gone: {stored} entries stored"
+        );
     }
 
     #[test]
@@ -810,13 +922,19 @@ mod tests {
         let stored: usize = tree.tables().map(|t| t.iter().count()).sum();
         let live = scan(&tree).len();
         assert_eq!(live, 400);
-        assert!(stored < live + 100, "most of the 100 tombstones are gone: {stored} entries stored");
+        assert!(
+            stored < live + 100,
+            "most of the 100 tombstones are gone: {stored} entries stored"
+        );
     }
 
     #[test]
     fn reopening_replays_the_log_and_finds_the_sstables() {
         for memtable in MemTableKind::ALL {
-            reopen(LsmConfig { memtable, ..small() });
+            reopen(LsmConfig {
+                memtable,
+                ..small()
+            });
         }
     }
 
@@ -866,4 +984,3 @@ mod tests {
         tree.put(key(1), vec![0; max]).unwrap();
     }
 }
-
