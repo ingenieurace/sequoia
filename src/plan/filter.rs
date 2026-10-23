@@ -5,7 +5,8 @@ use crate::catalog::table::Table;
 use crate::predicate::{Compare, Predicate};
 use crate::sql::ast::{BinaryOp, ColumnRef, Expr, Select};
 use crate::sql::eval::eval;
-use crate::types::Value;
+use crate::storage::sort_key;
+use crate::types::{DataType, Value};
 
 /// Marks the columns of `table`, which goes by `qualifier`, that the
 /// expressions use, so that a scan may skip the others.
@@ -125,12 +126,29 @@ pub fn own_conjuncts(table: &Table, qualifier: &str, filter: &Option<Expr>) -> V
 /// never evaluated on the skipped rows, so an error it would raise only
 /// there (`1 / 0`) is not raised; nor is the error of comparing an
 /// expression an index has with a value of another type.
+///
+/// Besides the comparisons, `x IN (v)` of one value is the condition
+/// `x = v` (see [`in_lists`] for more values), and a comparison of an INT
+/// column plus or minus an INT constant gives one on the column itself:
+/// `x + 1 > 5` gives `x > 4`, and `10 - x <= 3` gives `x >= 7`, which an
+/// index on `x`, or its chunks, can serve. (The comparison itself stays: it
+/// may still serve an index on `x + 1`.)
 pub fn conditions(table: &Table, qualifier: &str, filter: &Option<Expr>) -> Vec<Condition> {
     let Some(filter) = filter else {
         return Vec::new();
     };
     let mut conditions = Vec::new();
     for part in conjuncts(filter) {
+        if let Some(list) = in_list(table, qualifier, part)
+            && let [value] = list.values.as_slice()
+        {
+            conditions.push(Condition {
+                expr: list.expr,
+                op: Compare::Eq,
+                literal: value.clone(),
+            });
+            continue;
+        }
         let Expr::Binary(left, op, right) = part else {
             continue;
         };
@@ -152,6 +170,7 @@ pub fn conditions(table: &Table, qualifier: &str, filter: &Option<Expr>) -> Vec<
         let Some(expr) = own_expr(table, qualifier, expr) else {
             continue;
         };
+        conditions.extend(arithmetic(table, &expr, op, &literal));
         // As a value of the column's type, which an index or a chunk holds:
         // `price > 10` on a REAL column compares with 10.0.
         let literal = match &expr {
@@ -166,6 +185,100 @@ pub fn conditions(table: &Table, qualifier: &str, filter: &Option<Expr>) -> Vec<
         }
     }
     conditions
+}
+
+/// The condition on an INT column that `expr op literal` gives, when
+/// `expr` is the column plus or minus an INT constant, or that constant
+/// minus the column, and moving the constant over cannot overflow.
+fn arithmetic(table: &Table, expr: &Expr, op: Compare, literal: &Value) -> Option<Condition> {
+    let Expr::Binary(left, arith @ (BinaryOp::Add | BinaryOp::Sub), right) = expr else {
+        return None;
+    };
+    let Value::Int(v) = literal.coerce(DataType::Int)? else {
+        return None;
+    };
+    let (column, op, value) = match (&**left, arith, &**right) {
+        // x + k op v, k + x op v: x op v - k
+        (Expr::Column(c), BinaryOp::Add, Expr::Literal(Value::Int(k)))
+        | (Expr::Literal(Value::Int(k)), BinaryOp::Add, Expr::Column(c)) => {
+            (c, op, v.checked_sub(*k)?)
+        }
+        // x - k op v: x op v + k
+        (Expr::Column(c), BinaryOp::Sub, Expr::Literal(Value::Int(k))) => {
+            (c, op, v.checked_add(*k)?)
+        }
+        // k - x op v: x (op turned around) k - v
+        (Expr::Literal(Value::Int(k)), BinaryOp::Sub, Expr::Column(c)) => {
+            (c, op.flip(), k.checked_sub(v)?)
+        }
+        _ => return None,
+    };
+    let at = table.column_index(&column.name).ok()?;
+    (table.columns[at].data_type == DataType::Int).then(|| Condition {
+        expr: Expr::Column(column.clone()),
+        op,
+        literal: Value::Int(value),
+    })
+}
+
+/// A conjunct `expr IN (constants)` of a WHERE clause on `table`, whose
+/// expression reads only `table`'s columns, written as [`Condition`]s are.
+/// Its values are those of the list but NULL, which matches nothing; as
+/// values of the column's type if `expr` is a column; each once, in the
+/// order of their keys.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InList {
+    pub expr: Expr,
+    pub values: Vec<Value>,
+}
+
+/// The conjuncts `expr IN (constants)` of a WHERE clause on `table`, which
+/// goes by `qualifier`, of more than one value, for an index to find each
+/// value's rows (see [`conditions`] for one value). A list with a value
+/// that a column's type has no value equal to is left out, as a comparison
+/// would be: the whole clause, evaluated, reports the error.
+pub fn in_lists(table: &Table, qualifier: &str, filter: &Option<Expr>) -> Vec<InList> {
+    let Some(filter) = filter else {
+        return Vec::new();
+    };
+    conjuncts(filter)
+        .into_iter()
+        .filter_map(|part| in_list(table, qualifier, part))
+        .filter(|list| list.values.len() > 1)
+        .collect()
+}
+
+fn in_list(table: &Table, qualifier: &str, part: &Expr) -> Option<InList> {
+    let Expr::InList(left, items, false) = part else {
+        return None;
+    };
+    let expr = own_expr(table, qualifier, left)?;
+    let data_type = match &expr {
+        Expr::Column(column) => {
+            Some(table.columns[table.column_index(&column.name).ok()?].data_type)
+        }
+        _ => None,
+    };
+    let mut keyed: Vec<(Vec<u8>, Value)> = Vec::new();
+    for item in items {
+        let value = constant(item)?;
+        if value.is_null() {
+            continue;
+        }
+        let value = match data_type {
+            Some(data_type) => value.coerce(data_type)?,
+            None => value,
+        };
+        let mut key = Vec::new();
+        sort_key::encode(&value, false, &mut key);
+        keyed.push((key, value));
+    }
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    keyed.dedup_by(|a, b| a.0 == b.0);
+    (!keyed.is_empty()).then(|| InList {
+        expr,
+        values: keyed.into_iter().map(|(_, v)| v).collect(),
+    })
 }
 
 /// The conditions `column op literal` among a WHERE clause's (see

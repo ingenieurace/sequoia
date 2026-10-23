@@ -351,6 +351,19 @@ fn open_node<'a>(
                     .collect()
             }))
         }
+        Node::Extend { input, exprs, .. } => {
+            let columns = input.columns();
+            let exprs = locate_all(&exprs, &columns);
+            let mut subqueries = Runner::new(catalog, settings);
+            Box::new(open(*input, below(step, 0)).map(move |item| {
+                let mut row = item?;
+                for e in &exprs {
+                    let value = eval_with(e, &columns, &row, &mut subqueries)?;
+                    row.push(value);
+                }
+                Ok(row)
+            }))
+        }
         Node::Sort { input, keys, limit } => {
             let columns = input.columns();
             let input = open(*input, below(step, 0));

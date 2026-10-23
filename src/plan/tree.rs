@@ -109,9 +109,12 @@ fn step<'n, 'a>(node: &'n Node<'a>) -> (Label, Vec<&'n Node<'a>>) {
                     " [compressed chunks filtered]".to_string()
                 }
                 Access::Scan => String::new(),
-                Access::Key(_) => " [primary key]".into(),
+                Access::Key(_) | Access::Keys(_) => " [primary key]".into(),
                 Access::KeyRange { .. } => " [primary key range]".into(),
                 Access::Index {
+                    index, covering, ..
+                }
+                | Access::IndexPoints {
                     index, covering, ..
                 } => {
                     let index = &table.indexes()[*index];
@@ -150,6 +153,17 @@ fn step<'n, 'a>(node: &'n Node<'a>) -> (Label, Vec<&'n Node<'a>>) {
         Node::Project { input, exprs } => {
             let exprs = list(&mut exprs.iter().map(Expr::to_string));
             (Label::op(format!("π {exprs}")), vec![input])
+        }
+        Node::Extend {
+            input,
+            exprs,
+            names,
+        } => {
+            let columns = names.iter().zip(exprs).map(|(n, e)| format!("{n} = {e}"));
+            (
+                Label::op(format!("extend {}", list(&mut columns.into_iter()))),
+                vec![input],
+            )
         }
         Node::Join {
             left,

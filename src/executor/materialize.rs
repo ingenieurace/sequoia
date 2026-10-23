@@ -194,6 +194,32 @@ fn run_node<'a>(
             }
             Output::ended(rows, input.error, wanted)
         }
+        Node::Extend { input, exprs, .. } => {
+            let fields = input.columns();
+            let exprs = locate_all(&exprs, &fields);
+            let input = run(*input, below(step, 0), wanted);
+            let mut subqueries = Runner::new(catalog, settings);
+            let mut rows = Vec::with_capacity(input.rows.len());
+            for mut row in input.rows {
+                let values: Result<Vec<_>> = exprs
+                    .iter()
+                    .map(|e| eval_with(e, &fields, &row, &mut subqueries))
+                    .collect();
+                match values {
+                    Ok(values) => {
+                        row.extend(values);
+                        rows.push(row);
+                    }
+                    Err(e) => {
+                        return Output {
+                            rows,
+                            error: Some(e),
+                        };
+                    }
+                }
+            }
+            Output::ended(rows, input.error, wanted)
+        }
         Node::Limit {
             input,
             count,

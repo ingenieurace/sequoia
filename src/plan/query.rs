@@ -58,6 +58,15 @@
 //! A RIGHT or FULL JOIN is never an index join: the right rows that match
 //! nothing are found by joining the other way round (see `operator.rs`).
 //!
+//! **Rewriting.** Before that, once bound, every expression is simplified
+//! (see `rewrite.rs`): a WHERE or inner ON that is never true leaves a
+//! `LIMIT 0` that reads nothing, and the select list's repeated
+//! subexpressions are computed once, by an `EXTEND` below it. Then, among
+//! the conditions every row must meet, a constant an equality ties a column
+//! to is carried to the columns joins make equal to it (`carry_constants`),
+//! and a single-equality `EXISTS` is bound as an uncorrelated `IN`
+//! (`Binder::decorrelate`).
+//!
 //! **Joins.** Each join picks how to find the right rows that may match a
 //! left row from its equalities `left expression = right column`:
 //!
@@ -175,6 +184,7 @@ use crate::catalog::Catalog;
 use crate::catalog::index::{Index, Key};
 use crate::catalog::table::{Access, Row, Table};
 use crate::error::{Result, err};
+use crate::plan::rewrite::{Clause, common, simplify, simplify_clause};
 use crate::plan::selectivity::{self, EQUAL_KEEPS, OTHER_KEEPS, Scope, table_rows};
 use crate::plan::{access, filter, order};
 use crate::predicate::{Compare, Predicate};
@@ -184,7 +194,7 @@ use crate::sql::ast::{
     derived_name,
 };
 use crate::sql::eval::{Field, resolve};
-use crate::types::{StorageKind, Value};
+use crate::types::{DataType, StorageKind, Value};
 
 /// A SELECT's plan: the tree, and the names of the columns it returns.
 pub struct Plan<'a> {
@@ -257,6 +267,14 @@ pub enum Node<'a> {
     Project {
         input: Box<Node<'a>>,
         exprs: Vec<Expr>,
+    },
+    /// Adds to each row the values of `exprs`, as columns named `names`
+    /// (`#1`, `#2`, ...): what the projection above reads more than once,
+    /// computed once (see `rewrite::common`).
+    Extend {
+        input: Box<Node<'a>>,
+        exprs: Vec<Expr>,
+        names: Vec<String>,
     },
     /// A derived table: its query's rows, with columns `names` qualified by `qualifier`.
     Derived {
@@ -946,27 +964,55 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Resu
                 .collect::<Result<_>>()?,
         ),
     };
-    let filter = filter.as_ref().map(bind).transpose()?;
+    // Each expression rewritten once bound (see `rewrite.rs`). A WHERE, or
+    // the ON of an inner join, that no row can meet leaves the query
+    // without rows: `never`.
+    let mut never = false;
+    let filter = match filter.as_ref().map(bind).transpose()? {
+        Some(filter) => match simplify_clause(&filter) {
+            Clause::Never => {
+                never = true;
+                None
+            }
+            clause => clause.condition(),
+        },
+        None => None,
+    };
     let ons = from
         .joins
         .iter()
         .zip(&using_ons)
-        .map(|(j, using)| j.on.as_ref().or(using.as_ref()).map(bind).transpose())
+        .map(|(j, using)| {
+            let Some(on) = j.on.as_ref().or(using.as_ref()).map(bind).transpose()? else {
+                return Ok(None);
+            };
+            Ok(match (simplify_clause(&on), j.kind) {
+                (Clause::Never, JoinKind::Inner) => {
+                    never = true;
+                    None
+                }
+                (clause, _) => clause.condition(),
+            })
+        })
         .collect::<Result<Vec<_>>>()?;
     // A repeated GROUP BY expression groups by nothing more, and would make its column ambiguous.
     let mut distinct_group_by: Vec<Expr> = Vec::new();
-    for expr in bind_all(&group_by)? {
+    for expr in bind_all(&group_by)?.iter().map(simplify) {
         if !distinct_group_by.contains(&expr) {
             distinct_group_by.push(expr);
         }
     }
     let group_by = distinct_group_by;
-    let having = having.as_ref().map(bind).transpose()?;
+    let having = having
+        .as_ref()
+        .map(bind)
+        .transpose()?
+        .and_then(|having| simplify_clause(&having).condition());
     let order_by = order_by
         .iter()
         .map(|o| {
             Ok(OrderBy {
-                expr: bind(&o.expr)?,
+                expr: simplify(&bind(&o.expr)?),
                 desc: o.desc,
             })
         })
@@ -991,11 +1037,10 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Resu
         }
         Projection::All => (None, sources.iter().flat_map(|s| s.names.clone()).collect()),
         Projection::Exprs(items) => {
+            // Named as written: `SELECT ABS(-1)` is still `abs`.
             let names = items.iter().map(item_name).collect();
-            (
-                Some(items.into_iter().map(|item| item.expr).collect::<Vec<_>>()),
-                names,
-            )
+            let exprs = items.iter().map(|item| simplify(&item.expr));
+            (Some(exprs.collect::<Vec<_>>()), names)
         }
     };
     if let (true, Some(exprs)) = (distinct, &exprs)
@@ -1122,6 +1167,14 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Resu
         (Some(_), None) => all_columns,
         (_, exprs) => exprs,
     };
+    if never {
+        // No row is read: a limit of none asks its input for nothing.
+        node = Node::Limit {
+            input: Box::new(node),
+            count: Some(0),
+            offset: 0,
+        };
+    }
 
     let (exprs, having, order_by) = if grouped {
         forbid(&group_by, "GROUP BY")?;
@@ -1188,6 +1241,16 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Resu
         };
     }
     if let Some(exprs) = exprs {
+        // What the select list computes more than once, computed once below it.
+        let (shared, exprs) = common(exprs);
+        if !shared.is_empty() {
+            let (names, shared) = shared.into_iter().unzip();
+            node = Node::Extend {
+                input: Box::new(node),
+                exprs: shared,
+                names,
+            };
+        }
         node = Node::Project {
             input: Box::new(node),
             exprs,
@@ -1458,6 +1521,15 @@ fn gathered(node: Node<'_>, workers: usize) -> Node<'_> {
             input: inner(*input, workers),
             exprs,
         },
+        Node::Extend {
+            input,
+            exprs,
+            names,
+        } => Node::Extend {
+            input: inner(*input, workers),
+            exprs,
+            names,
+        },
         Node::Derived {
             input,
             qualifier,
@@ -1712,6 +1784,7 @@ fn joins<'a>(
                 JoinKind::Right | JoinKind::Full => conditions[i + 1].append(&mut parts),
             }
         }
+        carry_constants(&mut pool, sources, binder, &kinds);
         for (part, by) in pool {
             let tables = binder.tables(&part);
             let last = tables.last().copied();
@@ -2139,6 +2212,103 @@ fn permute<T>(items: Vec<T>, order: &[usize]) -> Vec<T> {
         .collect()
 }
 
+/// Carries constants across equalities: to the conditions every row must
+/// meet (`pool`, the conjuncts of WHERE and of the inner joins' ONs), adds
+/// `c = v` for each column `c` that they make equal to a column made equal
+/// to `v` (`a.x = b.x AND b.x = 5` adds `a.x = 5`), so that it is pushed
+/// down to `c`'s table, and may pick an index there.
+///
+/// Only columns of the database's tables are carried, of the tables of
+/// inner joins, and only a constant that is a value of both columns'
+/// types: comparing the column with it can then fail on no row. A carried
+/// condition is checked by the last join any it comes from is checked by.
+fn carry_constants(
+    pool: &mut Vec<(Expr, usize)>,
+    sources: &[Source],
+    binder: &Binder,
+    kinds: &[JoinKind],
+) {
+    // The table a column is of, in FROM, and its type, if it is a table's.
+    let column = |column: &ColumnRef| {
+        let i = resolve(&binder.fields, column).ok()?;
+        let SourceKind::Table(table) = &sources[binder.owners[i]].kind else {
+            return None;
+        };
+        let at = table.column_index(&column.name).ok()?;
+        Some((binder.owners[i], table.columns[at].data_type))
+    };
+    // Columns made equal, in classes; and columns made equal to constants;
+    // each with the last join that checks a condition it comes from.
+    let mut classes: Vec<(Vec<ColumnRef>, usize)> = Vec::new();
+    let mut constants: Vec<(ColumnRef, Value, usize)> = Vec::new();
+    for &(ref part, by) in pool.iter() {
+        let Expr::Binary(a, BinaryOp::Eq, b) = part else {
+            continue;
+        };
+        match (&**a, &**b) {
+            (Expr::Column(x), Expr::Column(y)) => {
+                let find = |c: &ColumnRef, classes: &[(Vec<ColumnRef>, usize)]| {
+                    classes.iter().position(|(class, _)| class.contains(c))
+                };
+                let class = match (find(x, &classes), find(y, &classes)) {
+                    (Some(i), Some(j)) if i != j => {
+                        let (other, other_by) = classes.remove(i.max(j));
+                        let i = i.min(j);
+                        classes[i].0.extend(other);
+                        classes[i].1 = classes[i].1.max(other_by);
+                        i
+                    }
+                    (Some(i), Some(_)) => i,
+                    (Some(i), None) => {
+                        classes[i].0.push(y.clone());
+                        i
+                    }
+                    (None, Some(j)) => {
+                        classes[j].0.push(x.clone());
+                        j
+                    }
+                    (None, None) => {
+                        classes.push((vec![x.clone(), y.clone()], by));
+                        classes.len() - 1
+                    }
+                };
+                classes[class].1 = classes[class].1.max(by);
+            }
+            (Expr::Column(c), Expr::Literal(v)) | (Expr::Literal(v), Expr::Column(c))
+                if !v.is_null() =>
+            {
+                constants.push((c.clone(), v.clone(), by))
+            }
+            _ => {}
+        }
+    }
+    for (from, value, value_by) in constants {
+        let Some((_, from_type)) = column(&from) else {
+            continue;
+        };
+        let Some((class, class_by)) = classes.iter().find(|(class, _)| class.contains(&from))
+        else {
+            continue;
+        };
+        for to in class.iter().filter(|&c| *c != from) {
+            let Some((table, to_type)) = column(to) else {
+                continue;
+            };
+            let Some(value) = value.coerce(from_type).and_then(|v| v.coerce(to_type)) else {
+                continue;
+            };
+            let carried = Expr::Binary(
+                Box::new(Expr::Column(to.clone())),
+                BinaryOp::Eq,
+                Box::new(Expr::Literal(value)),
+            );
+            if kinds[table] == JoinKind::Inner && !pool.iter().any(|(part, _)| *part == carried) {
+                pool.push((carried, value_by.max(*class_by)));
+            }
+        }
+    }
+}
+
 /// The error of a join of `table` that cannot use the method forced on it.
 fn cannot<T>(force: ForceJoin, table: &str, why: &str) -> Result<T> {
     err(format!(
@@ -2275,12 +2445,12 @@ fn lookups_win(left: f64, table: &Table, key: LookupKey) -> bool {
 pub fn estimate(node: &Node) -> f64 {
     match node {
         Node::Scan {
-            table, predicates, ..
+            table,
+            predicates,
+            access,
+            ..
         } => {
-            let rows = table_rows(table);
-            if let Some(stats) = table.stats() {
-                return rows * selectivity::predicates(stats, predicates, rows);
-            }
+            let total = table_rows(table);
             let unique = |column| {
                 table.primary_key() == Some(column)
                     || table
@@ -2288,12 +2458,28 @@ pub fn estimate(node: &Node) -> f64 {
                         .iter()
                         .any(|i| i.unique && i.is_on_column(column))
             };
-            predicates.iter().fold(rows, |rows, p| match p.op {
-                Compare::Eq if unique(p.column) => rows.min(1.0),
-                Compare::Eq => rows * EQUAL_KEEPS,
-                Compare::NotEq => rows * (1.0 - EQUAL_KEEPS),
-                _ => rows * OTHER_KEEPS,
-            })
+            let rows = match table.stats() {
+                Some(stats) => total * selectivity::predicates(stats, predicates, total),
+                None => predicates.iter().fold(total, |rows, p| match p.op {
+                    Compare::Eq if unique(p.column) => rows.min(1.0),
+                    Compare::Eq => rows * EQUAL_KEEPS,
+                    Compare::NotEq => rows * (1.0 - EQUAL_KEEPS),
+                    _ => rows * OTHER_KEEPS,
+                }),
+            };
+            // An IN list: a key's rows, or an equality's share, per value.
+            match access {
+                Access::Keys(keys) => rows.min(keys.len() as f64),
+                Access::IndexPoints { index, points, .. } => {
+                    let index = &table.indexes()[*index];
+                    let each = match index.unique && points[0].len() == index.keys.len() {
+                        true => 1.0,
+                        false => (total * EQUAL_KEEPS).max(1.0),
+                    };
+                    rows.min(points.len() as f64 * each)
+                }
+                _ => rows,
+            }
         }
         Node::Lookup { table, column, .. } => match table.stats() {
             Some(stats) => {
@@ -2312,7 +2498,12 @@ pub fn estimate(node: &Node) -> f64 {
                 return rows * keeps;
             }
             match &**input {
-                // A filter above a scan checks again what its predicates did.
+                // A filter above a scan checks again what its predicates,
+                // or the IN list it reads by, did.
+                Node::Scan {
+                    access: Access::Keys(_) | Access::IndexPoints { .. },
+                    ..
+                } => estimate(input),
                 Node::Scan { predicates, .. } if !predicates.is_empty() => estimate(input),
                 _ => estimate(input) * OTHER_KEEPS,
             }
@@ -2368,6 +2559,7 @@ pub fn estimate(node: &Node) -> f64 {
         Node::Union { inputs } => inputs.iter().map(estimate).sum(),
         Node::Distinct { input }
         | Node::Project { input, .. }
+        | Node::Extend { input, .. }
         | Node::Derived { input, .. }
         | Node::Gather { input, .. } => estimate(input),
     }
@@ -2485,7 +2677,8 @@ pub fn scan<'a>(
         .collect();
     let conditions = filter::conditions(table, qualifier, filter);
     let predicates = filter::predicates(table, &conditions);
-    let access = access::choose(table, qualifier, filter, &conditions, &needed);
+    let lists = filter::in_lists(table, qualifier, filter);
+    let access = access::choose(table, qualifier, filter, &conditions, &lists, &needed);
     let scan = Node::Scan {
         table,
         qualifier: qualifier.into(),
@@ -2510,7 +2703,16 @@ pub fn bind(catalog: &Catalog, table: Option<&Table>, expr: &Expr) -> Result<Exp
         .into_iter()
         .map(|table| Source::table(table, &table.name))
         .collect();
-    Binder::new(catalog, &sources).bind(expr)
+    Ok(simplify(&Binder::new(catalog, &sources).bind(expr)?))
+}
+
+/// The WHERE clause of an UPDATE or DELETE on `table`, bound and simplified
+/// as a SELECT's is: None if every row meets it, `FALSE` if none can.
+pub fn bind_where(catalog: &Catalog, table: &Table, filter: &Option<Expr>) -> Result<Option<Expr>> {
+    match filter {
+        Some(filter) => Ok(simplify_clause(&bind(catalog, Some(table), filter)?).condition()),
+        None => Ok(None),
+    }
 }
 
 /// Resolves column references against the tables of FROM.
@@ -2519,6 +2721,8 @@ struct Binder<'c> {
     fields: Vec<Field>,
     /// The position in FROM of the table of each field.
     owners: Vec<usize>,
+    /// The type of each field, if it is a table's column, not a subquery's.
+    types: Vec<Option<DataType>>,
     single: bool,
     /// The columns USING and NATURAL joins merged, which an unqualified
     /// reference to their names reads (see `using_joins`).
@@ -2529,15 +2733,23 @@ impl<'c> Binder<'c> {
     fn new(catalog: &'c Catalog, sources: &[Source]) -> Self {
         let mut fields = Vec::new();
         let mut owners = Vec::new();
+        let mut types = Vec::new();
         for (i, source) in sources.iter().enumerate() {
             let own = source.fields();
             owners.extend(std::iter::repeat_n(i, own.len()));
+            match &source.kind {
+                SourceKind::Table(table) => {
+                    types.extend(table.columns.iter().map(|c| Some(c.data_type)))
+                }
+                _ => types.extend(std::iter::repeat_n(None, own.len())),
+            }
             fields.extend(own);
         }
         Binder {
             catalog,
             fields,
             owners,
+            types,
             single: sources.len() == 1,
             merged: Vec::new(),
         }
@@ -2584,7 +2796,13 @@ impl<'c> Binder<'c> {
                 *negated,
             ),
             Expr::Subquery(query) => Expr::Subquery(Box::new(self.subquery(query, true)?)),
-            Expr::Exists(query) => Expr::Exists(Box::new(self.subquery(query, false)?)),
+            Expr::Exists(query) => {
+                let query = self.subquery(query, false)?;
+                match self.decorrelate(&query) {
+                    Some(semi) => semi,
+                    None => Expr::Exists(Box::new(query)),
+                }
+            }
             Expr::InSubquery(left, query, negated) => {
                 Expr::InSubquery(bind(left)?, Box::new(self.subquery(query, true)?), *negated)
             }
@@ -2593,6 +2811,98 @@ impl<'c> Binder<'c> {
                 expr.try_map_parts(&mut |e| self.bind(e))?
             }
         })
+    }
+
+    /// An `EXISTS` subquery (`query`, its outer references marked) that one
+    /// equality ties to the query around it, rewritten so that it is not
+    /// tied to it, if it can be:
+    ///
+    /// ```text
+    /// EXISTS (SELECT ... FROM t WHERE t.c = o.c AND rest)
+    ///   o.c IS NOT NULL AND o.c IN (SELECT t.c FROM t WHERE rest AND t.c IS NOT NULL)
+    /// ```
+    ///
+    /// Run once per distinct `o.c` before, the subquery now runs once, and
+    /// each row looks its `o.c` up among the values it returned: a semi-join
+    /// through a hash set. `NOT EXISTS` becomes its negation, an anti-join.
+    ///
+    /// The two have the same value for every row, NULL never among them:
+    /// the subquery returns no NULL for `IN` to make NULL of, and a NULL
+    /// `o.c`, which equals nothing, is FALSE as `EXISTS` finds no row. So
+    /// that `t.c = o.c` could fail on no row, which `IN` would not, they
+    /// must be columns of tables, both numbers or of one type. The subquery
+    /// must return a row for each row its WHERE keeps (no aggregate, GROUP
+    /// BY, HAVING, LIMIT or OFFSET), and `rest` must not read the query
+    /// around it.
+    fn decorrelate(&self, query: &Select) -> Option<Expr> {
+        let grouped = is_grouped(
+            &query.projection,
+            &query.group_by,
+            &query.having,
+            &query.order_by,
+        );
+        if grouped || query.limit.is_some() || query.offset.is_some() || !query.compound.is_empty()
+        {
+            return None;
+        }
+        let mut parts = Vec::new();
+        conjuncts(query.filter.as_ref()?, &mut parts);
+        // The equality `inner = outer`, an inner column with an outer one.
+        let tie = |part: &Expr| {
+            let Expr::Binary(a, BinaryOp::Eq, b) = part else {
+                return None;
+            };
+            match (&**a, &**b) {
+                (Expr::Outer(outer), Expr::Column(inner))
+                | (Expr::Column(inner), Expr::Outer(outer)) => Some((outer.clone(), inner.clone())),
+                _ => None,
+            }
+        };
+        let at = parts.iter().position(|part| tie(part).is_some())?;
+        let (outer, inner) = tie(&parts.remove(at))?;
+
+        // Both columns' types: the outer one's among this query's tables,
+        // the inner one's among the subquery's.
+        let outer_type = self.types[resolve(&self.fields, &outer).ok()?]?;
+        let mut fields = Vec::new();
+        let mut types = Vec::new();
+        for table in query.from.tables() {
+            let TableSource::Table(name) = &table.source else {
+                return None;
+            };
+            let table_columns = &self.catalog.get(name).ok()?.columns;
+            fields.extend(Field::of_table(table.qualifier(), table_columns));
+            types.extend(table_columns.iter().map(|c| c.data_type));
+        }
+        let inner_type = types[resolve(&fields, &inner).ok()?];
+        let number = |t: DataType| matches!(t, DataType::Int | DataType::Real);
+        if outer_type != inner_type && !(number(outer_type) && number(inner_type)) {
+            return None;
+        }
+
+        let inner = Expr::Column(inner);
+        parts.push(Expr::IsNull(Box::new(inner.clone()), true));
+        let semi = Select {
+            distinct: false,
+            projection: Projection::Exprs(vec![SelectItem {
+                expr: inner,
+                alias: None,
+            }]),
+            filter: and(parts),
+            order_by: Vec::new(),
+            ..query.clone()
+        };
+        let mut tied = false;
+        filter::visit_outer(&semi, &mut |_| tied = true);
+        if tied || select(self.catalog, semi.clone(), Choices::default()).is_err() {
+            return None;
+        }
+        let outer = self.bind(&Expr::Column(outer)).ok()?;
+        Some(Expr::Binary(
+            Box::new(Expr::IsNull(Box::new(outer.clone()), true)),
+            BinaryOp::And,
+            Box::new(Expr::InSubquery(Box::new(outer), Box::new(semi), false)),
+        ))
     }
 
     /// A subquery with its outer references marked, after checking that it
@@ -2800,6 +3110,12 @@ impl Node<'_> {
             Node::Project { exprs, .. } => {
                 exprs.iter().map(output_name).map(Field::named).collect()
             }
+            // The input's columns, qualified as they were, then the new ones.
+            Node::Extend { input, names, .. } => {
+                let mut columns = input.columns();
+                columns.extend(names.iter().map(Field::named));
+                columns
+            }
             Node::Derived {
                 qualifier, names, ..
             }
@@ -2871,6 +3187,7 @@ impl Node<'_> {
             | Node::Distinct { input }
             | Node::Limit { input, .. }
             | Node::Project { input, .. }
+            | Node::Extend { input, .. }
             | Node::Derived { input, .. }
             | Node::Gather { input, .. } => vec![input],
         }
@@ -3013,6 +3330,10 @@ impl Node<'_> {
             Node::Project { exprs, .. } => {
                 format!("PROJECT {}", list(&mut exprs.iter().map(Expr::to_string)))
             }
+            Node::Extend { exprs, names, .. } => format!(
+                "EXTEND {}",
+                list(&mut names.iter().zip(exprs).map(|(n, e)| format!("{n} = {e}")))
+            ),
             Node::Derived { qualifier, .. } => format!("SUBQUERY {qualifier}"),
             Node::Gather { workers, .. } => format!("GATHER ({workers} WORKERS)"),
             Node::Values { rows, .. } => match rows.len() {

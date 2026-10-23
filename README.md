@@ -114,7 +114,7 @@ through an index or key shows it in brackets: `takes t [index takes_key]`.
 | Queries | subqueries anywhere a value goes; `UNION`, `INTERSECT`, `EXCEPT`; common table expressions, recursive too; window functions over partitions and frames |
 | Parallelism | parallel heap scans, parallel grace hash join, gathered hash and index joins, two-phase (partial and final) aggregation |
 | Sort and aggregation | external merge sort with a tournament tree, top-N heap for `LIMIT`; hash aggregation that spills partitions |
-| Planner | access path choice, predicate pushdown, cost-based choice between index and hash joins, merge join to save a sort, join reordering by dynamic programming |
+| Planner | expression rewriting (constant folding, NOT pushdown, transitive equalities, IN lists, EXISTS decorrelation, common subexpressions), access path choice, predicate pushdown, cost-based choice between index and hash joins, merge join to save a sort, join reordering by dynamic programming |
 | Statistics | `ANALYZE`: reservoir sample, null share, distinct count (Haas-Stokes), most common values, equi-depth histograms; kept in the catalog |
 | Concurrency | multiversion concurrency control: snapshot isolation, row versions with xmin and xmax in every storage engine, a commit log, first updater wins, waits for row conflicts with deadlock detection, `VACUUM` and autovacuum; a thread per connection in the server |
 
@@ -450,6 +450,7 @@ src/
     query.rs         SELECT -> tree of plan steps: binding, pushdown, joins, costs, gathers, EXPLAIN
     selectivity.rs   the share of rows a condition or a join keeps, from statistics or guessed
     order.rs         the cheapest order to join tables in: dynamic programming over sets, or greedy
+    rewrite.rs       expression rewriting: folding, NOT pushdown, IN lists, common subexpressions
     tree.rs          PLANTREE: the plan drawn as a tree of relational algebra
 
   catalog/
@@ -622,14 +623,41 @@ reads the rows of the last round. Window functions are computed above the
 joins, the grouping and `HAVING`, by a `WINDOW` step for each distinct
 `PARTITION BY` and `ORDER BY`, which the expressions above read as columns.
 
+**Expression rewriting** (`plan/rewrite.rs`) happens once columns are bound,
+before conditions are pushed down, so pushdown and index choice work on the
+result, and `EXPLAIN` shows it:
+
+| Rewrite | Example |
+|---|---|
+| constant folding | `price > 2 * 50` becomes `price > 100` |
+| boolean identities | `TRUE AND x > 1` becomes `x > 1`; `FALSE AND x` becomes `FALSE` |
+| NOT pushed down | `NOT (a = 1 OR b < 2)` becomes `a != 1 AND b >= 2` |
+| redundant conjuncts | `x > 5 AND x > 3 AND 1 = 1` becomes `x > 5` |
+| a WHERE never true | `WHERE x > 1 AND 1 = 0` reads no row (`LIMIT 0`) |
+| equalities to IN | `x = 1 OR x = 2` becomes `x IN (1, 2)` |
+| constants carried across joins | `a.x = b.x AND b.x = 5` adds `a.x = 5`, pushed down to `a` |
+| arithmetic on a column | `x + 1 > 5` lets an index on `x` read `x > 4` |
+| EXISTS decorrelated | `EXISTS (SELECT … WHERE t.c = o.c)` becomes `o.c IN (SELECT t.c …)`, run once |
+| common subexpressions | `SELECT a * b, a * b + 1` computes `a * b` once (`EXTEND`) |
+
+Each keeps every row's value, NULL included. A constant is folded only if
+evaluating it succeeds, so `1 / 0` still fails on the rows it is evaluated
+on; `TRUE AND x` becomes `x` only where `x` is a BOOL wherever it does not
+fail; a constant is carried, and an `EXISTS` decorrelated, only between
+columns whose types make the comparison unable to fail. What may change is
+only which error a failing row reports, or whether it reports one, when a
+rewrite leaves a conjunct unevaluated, as reordering conjuncts does in any
+database.
+
 **Access paths.** Conditions of the form `expr op literal` choose how a table
 is read: an LSM primary key lookup or key range, or the index that narrows
 the rows most (equalities on its first keys, then a range on the next key).
-A partial index is used only when the `WHERE` implies its condition. An index
-that holds every column the query reads is used without reading the table
-(`COVERING INDEX`). Otherwise the table is scanned. On an analyzed table,
-an index that would find more than a quarter of the rows is left for a scan,
-unless it is covering or partial.
+An `IN` list of constants on a key is read a value at a time, through the
+index or the LSM primary key. A partial index is used only when the `WHERE`
+implies its condition. An index that holds every column the query reads is
+used without reading the table (`COVERING INDEX`). Otherwise the table is
+scanned. On an analyzed table, an index that would find more than a quarter
+of the rows is left for a scan, unless it is covering or partial.
 
 **Statistics.** `ANALYZE` reads every row of a table and keeps a sample of
 30000 (reservoir sampling, with a fixed seed). For each column it records the
@@ -699,8 +727,9 @@ Temporary files are deleted as soon as they are created.
 
 Subqueries are planned and run like any query, after their outer references
 are replaced by the current row's values. Answers are remembered per
-distinct set of outer values, so an uncorrelated subquery runs once. A
-`LATERAL` subquery is planned and run alike for each left row (`LATERAL
+distinct set of outer values, so an uncorrelated subquery runs once, and an
+`EXISTS` tied to its outer query by a single equality, which the planner
+turns into an uncorrelated `IN`, runs once too. A `LATERAL` subquery is planned and run alike for each left row (`LATERAL
 JOIN`), reusing its rows while the values it reads stay the same.
 
 A `RIGHT JOIN` is an inner join, and a `FULL JOIN` a `LEFT JOIN`, of its two

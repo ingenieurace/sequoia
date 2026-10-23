@@ -3,11 +3,11 @@
 
 use crate::catalog::index::{Bound, Index, Key};
 use crate::catalog::table::{Access, Table};
-use crate::plan::filter::{self, Condition, conjuncts};
+use crate::plan::filter::{self, Condition, InList, conjuncts};
 use crate::plan::selectivity;
 use crate::predicate::{Compare, Predicate};
 use crate::sql::ast::{ColumnRef, Expr};
-use crate::types::StorageKind;
+use crate::types::{StorageKind, Value};
 
 /// Picks how to read the rows of `table`, which goes by `qualifier`, that
 /// `filter` may match, given the columns marked in `needed` are read: by
@@ -29,6 +29,11 @@ use crate::types::StorageKind;
 /// its conditions (`x > 5` implies `x > 0`, `x = 1` implies `x != 2`), or
 /// is `e IS NOT NULL` for an `e` the WHERE compares with a value.
 ///
+/// An `IN` list of values (`lists`) on an index's next key counts 2: the
+/// index is searched once for each value (each with the equalities before
+/// it, and those of the keys after it, if any). On an LSM table's primary
+/// key, its rows are looked up by each key; that wins over a key range.
+///
 /// An analyzed table is read in full instead when its statistics say the
 /// index would find more than a quarter of its rows ([`RANDOM_ROW_COST`]),
 /// unless the index holds every column needed, or is partial.
@@ -37,6 +42,7 @@ pub fn choose(
     qualifier: &str,
     filter: &Option<Expr>,
     conditions: &[Condition],
+    lists: &[InList],
     needed: &[bool],
 ) -> Access {
     let mut own = None; // the WHERE's conjuncts, once a partial index needs them
@@ -57,6 +63,9 @@ pub fn choose(
                 if score > 0 {
                     best = Some(((score, true, true), Access::KeyRange { lower, upper }));
                 }
+                if let Some(list) = lists.iter().find(|l| l.expr == key) {
+                    best = Some(((2, true, true), Access::Keys(list.values.clone())));
+                }
             }
         }
         StorageKind::Heap => {}
@@ -75,6 +84,8 @@ pub fn choose(
             continue;
         }
         let (mut score, mut equal, mut lower, mut upper) = (0, Vec::new(), None, None);
+        // The key with an IN list, if one has: its position, and the values.
+        let mut list: Option<(usize, &[Value])> = None;
         for key in index.key_exprs() {
             match range(conditions, key) {
                 (true, Some(l), Some(u)) if l == u => {
@@ -82,8 +93,20 @@ pub fn choose(
                     equal.push(l.value);
                 }
                 (fixed, l, u) => {
-                    score += fixed as usize + l.is_some() as usize + u.is_some() as usize;
-                    (lower, upper) = (l, u);
+                    if list.is_none()
+                        && let Some(found) = lists.iter().find(|list| list.expr == *key)
+                    {
+                        score += 2;
+                        list = Some((equal.len(), &found.values));
+                        equal.push(Value::Null); // each value's place
+                        continue;
+                    }
+                    // A range only after equalities: each point of a list
+                    // would need one of its own.
+                    if list.is_none() {
+                        score += fixed as usize + l.is_some() as usize + u.is_some() as usize;
+                        (lower, upper) = (l, u);
+                    }
                     break;
                 }
             }
@@ -94,16 +117,29 @@ pub fn choose(
         score += 3 * index.predicate.is_some() as usize;
         let rank = (score, index.covers(needed), index.is_hash());
         if score > 0 && best.as_ref().is_none_or(|(best, _)| rank > *best) {
-            best = Some((
-                rank,
-                Access::Index {
+            let access = match list {
+                // Values in key order, after the same equalities: points in key order.
+                Some((at, values)) => Access::IndexPoints {
+                    index: i,
+                    points: values
+                        .iter()
+                        .map(|value| {
+                            let mut point = equal.clone();
+                            point[at] = value.clone();
+                            point
+                        })
+                        .collect(),
+                    covering: rank.1,
+                },
+                None => Access::Index {
                     index: i,
                     equal,
                     lower,
                     upper,
                     covering: rank.1,
                 },
-            ));
+            };
+            best = Some((rank, access));
         }
     }
     match best {
@@ -207,7 +243,7 @@ fn implied(
 }
 
 /// Whether every value that condition `a` holds for is one `b` holds for.
-fn implies(a: &Condition, b: &Condition) -> bool {
+pub(crate) fn implies(a: &Condition, b: &Condition) -> bool {
     use Compare::*;
     let Some(ord) = (a.expr == b.expr)
         .then(|| a.literal.compare(&b.literal))
@@ -267,6 +303,52 @@ pub fn describe(table: &Table, name: &str, predicates: &[Predicate], access: &Ac
             format!(
                 "SEARCH {name} USING PRIMARY KEY ({})",
                 describe_range(&table.columns[pk].name, lower, upper)
+            )
+        }
+        Access::Keys(values) => {
+            let pk = table.primary_key().expect("keys need a primary key");
+            format!(
+                "SEARCH {name} USING PRIMARY KEY ({} IN ({}))",
+                table.columns[pk].name,
+                values
+                    .iter()
+                    .map(Value::to_sql)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+        Access::IndexPoints {
+            index,
+            points,
+            covering,
+        } => {
+            let index = &table.indexes()[index];
+            let kind = match (covering, index.is_hash()) {
+                (false, false) => "INDEX",
+                (true, false) => "COVERING INDEX",
+                (false, true) => "HASH INDEX",
+                (true, true) => "COVERING HASH INDEX",
+            };
+            // Each key: `key = v` if every point has one value for it, else its values.
+            let parts: Vec<String> = (0..points[0].len())
+                .map(|k| {
+                    let mut values: Vec<String> = Vec::new();
+                    for point in &points {
+                        let value = point[k].to_sql();
+                        if !values.contains(&value) {
+                            values.push(value);
+                        }
+                    }
+                    match values.as_slice() {
+                        [value] => format!("{} = {value}", key_name(index, k)),
+                        values => format!("{} IN ({})", key_name(index, k), values.join(", ")),
+                    }
+                })
+                .collect();
+            format!(
+                "SEARCH {name} USING {kind} {} ({})",
+                index.name,
+                parts.join(" AND ")
             )
         }
         Access::Index {

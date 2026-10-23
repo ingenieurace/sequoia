@@ -77,7 +77,7 @@ impl<'a> Scope<'a> {
 
     /// The tables a plan step reads rows of, as its expressions name them:
     /// those of its scans and lookups, through filters, joins and the steps
-    /// that keep their input's columns, but not through a projection, an
+    /// that keep their input's columns (an `EXTEND` adds to them), but not through a projection, an
     /// aggregate or a derived table, which name their columns anew.
     pub fn of(node: &Node<'a>) -> Self {
         fn collect<'a>(node: &Node<'a>, out: &mut Vec<(String, &'a Table)>) {
@@ -94,6 +94,7 @@ impl<'a> Scope<'a> {
                 | Node::Distinct { input }
                 | Node::Gather { input, .. }
                 | Node::Window { input, .. }
+                | Node::Extend { input, .. }
                 | Node::Lateral { left: input, .. } => collect(input, out),
                 Node::Join { left, right, .. } => {
                     collect(left, out);

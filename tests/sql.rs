@@ -4009,12 +4009,21 @@ fn nested_correlated_and_grouped_subqueries() {
         ),
         [vec![text("ann")]]
     );
+    // An EXISTS tied to the outer query by one equality runs once, as an IN.
     assert_eq!(
         explain(
             &mut db,
             "SELECT name FROM users u WHERE EXISTS (SELECT * FROM orders o WHERE o.user_id = u.id)"
         ),
-        "PROJECT name\n  FILTER EXISTS (SELECT * FROM orders o WHERE o.user_id = u.id)\n    SCAN users u"
+        "PROJECT name\n  FILTER (id IS NOT NULL) AND (id IN (SELECT o.user_id FROM orders o WHERE o.user_id IS NOT NULL))\n    SCAN users u"
+    );
+    // One that reads the outer query elsewhere too runs for each row, as written.
+    assert_eq!(
+        explain(
+            &mut db,
+            "SELECT name FROM users u WHERE EXISTS (SELECT * FROM orders o WHERE o.user_id = u.id AND o.total > u.id)"
+        ),
+        "PROJECT name\n  FILTER EXISTS (SELECT * FROM orders o WHERE (o.user_id = u.id) AND (o.total > u.id))\n    SCAN users u"
     );
 }
 
@@ -8733,4 +8742,174 @@ fn plantree_draws_the_plan_as_a_tree_of_relational_algebra() {
     // A name, not a keyword.
     db.execute("CREATE TABLE plantree (plantree INT)").unwrap();
     assert!(plan_tree(&mut db, "SELECT plantree FROM plantree").ends_with("plantree"));
+}
+
+#[test]
+fn expressions_are_rewritten_before_they_are_planned() {
+    let mut db = in_memory();
+    db.execute(
+        "CREATE TABLE a (id INT PRIMARY KEY, x INT, name TEXT);
+         CREATE TABLE b (id INT PRIMARY KEY, x INT);
+         CREATE TABLE l (id INT PRIMARY KEY, v TEXT) USING LSM;
+         CREATE INDEX a_x ON a (x);
+         INSERT INTO a VALUES (1, 10, 'p'), (2, 20, 'q'), (3, 30, 'r'), (4, NULL, 's');
+         INSERT INTO b VALUES (10, 10), (20, 20), (30, 99);
+         INSERT INTO l VALUES (1, 'u'), (2, 'v'), (3, 'w');",
+    )
+    .unwrap();
+    // Constants folded, NOT pushed down, implied and true conjuncts dropped.
+    assert_eq!(
+        explain(
+            &mut db,
+            "SELECT id FROM a WHERE NOT (x < 2 * 5 OR name = 'p') AND x > 5 AND 1 = 1"
+        ),
+        "PROJECT id\n  FILTER (x >= 10) AND (name != 'p')\n    SEARCH a USING INDEX a_x (x >= 10)"
+    );
+    // A WHERE never true reads nothing.
+    assert_eq!(
+        explain(&mut db, "SELECT id FROM a WHERE x > 1 AND 1 = 0"),
+        "PROJECT id\n  LIMIT 0\n    SCAN a"
+    );
+    assert!(query(&mut db, "SELECT id FROM a WHERE x > 1 AND 1 = 0").is_empty());
+    assert_eq!(
+        query(&mut db, "SELECT COUNT(*) FROM a WHERE NULL"),
+        [vec![int(0)]]
+    );
+    // Equalities on one expression become IN, which an index or primary
+    // key serves, a value at a time.
+    assert_eq!(
+        plan(
+            &mut db,
+            "SELECT * FROM a WHERE x = 30 OR x = 10 OR x = 10.0"
+        ),
+        "SEARCH a USING INDEX a_x (x IN (10, 30))"
+    );
+    assert_eq!(
+        query(
+            &mut db,
+            "SELECT id FROM a WHERE x = 30 OR x = 10 OR x = 10.0"
+        ),
+        [vec![int(1)], vec![int(3)]]
+    );
+    assert_eq!(
+        plan(&mut db, "SELECT * FROM l WHERE id IN (3, 1, 9)"),
+        "SEARCH l USING PRIMARY KEY (id IN (1, 3, 9))"
+    );
+    assert_eq!(
+        query(&mut db, "SELECT v FROM l WHERE id IN (3, 1, 9)"),
+        [vec![text("u")], vec![text("w")]]
+    );
+    // A value of another type is compared, and fails, as written.
+    assert!(db.execute("SELECT * FROM a WHERE id IN (1, 'z')").is_err());
+    // Arithmetic on a column gives a condition on it.
+    assert_eq!(
+        plan(&mut db, "SELECT * FROM a WHERE x + 5 > 20"),
+        "SEARCH a USING INDEX a_x (x > 15)"
+    );
+    assert_eq!(
+        query(&mut db, "SELECT id FROM a WHERE 40 - x <= 15 ORDER BY id"),
+        [vec![int(3)]]
+    );
+    // A constant carried across a join's equality, to the other table: as
+    // its first, read through its index.
+    let sql = "SELECT a.id FROM b JOIN a ON a.x = b.x WHERE b.x = 20";
+    assert!(
+        explain(&mut db, sql).contains("FILTER a.x = 20"),
+        "{}",
+        explain(&mut db, sql)
+    );
+    assert_eq!(query(&mut db, sql), [vec![int(2)]]);
+    // Written the other way round, the joins may be reordered; either way
+    // the constant reaches a, which is read through its index.
+    let sql = "SELECT a.id FROM a JOIN b ON a.x = b.x WHERE b.x = 20";
+    let plan_text = explain(&mut db, sql);
+    assert!(
+        plan_text.contains("SEARCH a USING INDEX a_x (x = 20)")
+            || (plan_text.contains("a.x = 20") && plan_text.contains("a USING INDEX a_x")),
+        "{plan_text}"
+    );
+    assert_eq!(query(&mut db, sql), [vec![int(2)]]);
+    // Common subexpressions computed once, in every model.
+    let sql = "SELECT x * 2 + 1, x * 2 + 1 > 30, id FROM a ORDER BY id";
+    assert_eq!(
+        explain(&mut db, sql),
+        "PROJECT \"#1\", \"#1\" > 30, id\n  EXTEND #1 = (x * 2) + 1\n    SORT BY id\n      SCAN a"
+    );
+    for model in Model::ALL {
+        db.set_execution_model(Some(model));
+        assert_eq!(
+            query(&mut db, sql),
+            [
+                vec![int(21), Value::Bool(false), int(1)],
+                vec![int(41), Value::Bool(true), int(2)],
+                vec![int(61), Value::Bool(true), int(3)],
+                vec![Value::Null, Value::Null, int(4)],
+            ],
+            "{model}"
+        );
+        // The result's columns are named as written.
+        let Some(QueryResult::Rows { columns, .. }) = db
+            .execute("SELECT ABS(-1), x + 1 AS y, x + 1 FROM a")
+            .unwrap()
+            .pop()
+        else {
+            panic!()
+        };
+        assert_eq!(columns, ["abs", "y", "?column?"]);
+    }
+    db.set_execution_model(model());
+    // UPDATE and DELETE read their rows as a SELECT does.
+    assert_eq!(
+        explain(&mut db, "DELETE FROM a WHERE id = 1 OR id = 2"),
+        "FILTER id IN (1, 2)\n  SEARCH a USING INDEX a_pkey (id IN (1, 2))"
+    );
+    db.execute("UPDATE a SET name = 'z' WHERE NOT (id <> 2)")
+        .unwrap();
+    assert_eq!(
+        query(&mut db, "SELECT id FROM a WHERE name = 'z'"),
+        [vec![int(2)]]
+    );
+}
+
+#[test]
+fn in_lists_read_the_versions_a_snapshot_sees() {
+    for storage in ["LSM", "HEAP"] {
+        let mut db = in_memory();
+        db.execute(&format!(
+            "CREATE TABLE t (id INT PRIMARY KEY, x INT, v TEXT) USING {storage};
+             CREATE INDEX t_x ON t (x);
+             INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c');"
+        ))
+        .unwrap();
+        // Rows changed and deleted leave old versions behind.
+        db.execute(
+            "UPDATE t SET v = 'B' WHERE id = 2;
+             UPDATE t SET v = 'BB' WHERE id = 2;
+             DELETE FROM t WHERE id = 3;",
+        )
+        .unwrap();
+        for sql in [
+            "SELECT id, v FROM t WHERE id IN (1, 2, 3) ORDER BY id",
+            "SELECT id, v FROM t WHERE x IN (10, 20, 30) ORDER BY id",
+        ] {
+            assert_eq!(
+                query(&mut db, sql),
+                [vec![int(1), text("a")], vec![int(2), text("BB")]],
+                "{storage}: {sql}\n{}",
+                explain(&mut db, sql)
+            );
+        }
+        // Inside a transaction, its own changes are seen; after a rollback, not.
+        db.execute("BEGIN; UPDATE t SET v = 'z' WHERE id = 1")
+            .unwrap();
+        assert_eq!(
+            query(&mut db, "SELECT v FROM t WHERE id IN (1, 2) ORDER BY id"),
+            [vec![text("z")], vec![text("BB")]]
+        );
+        db.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            query(&mut db, "SELECT v FROM t WHERE x IN (10, 20) ORDER BY id"),
+            [vec![text("a")], vec![text("BB")]]
+        );
+    }
 }

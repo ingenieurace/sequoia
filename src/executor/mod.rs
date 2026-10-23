@@ -307,9 +307,7 @@ fn plan<'a>(catalog: &'a Catalog, statement: Statement, settings: &Settings) -> 
         Statement::Select(query) => query::select(catalog, *query, settings.choices())?.root,
         Statement::Update { table, filter, .. } | Statement::Delete { table, filter, .. } => {
             let table = catalog.get(&table)?;
-            let filter = filter
-                .map(|f| query::bind(catalog, Some(table), &f))
-                .transpose()?;
+            let filter = query::bind_where(catalog, table, &filter)?;
             query::scan(table, &table.name, &filter, vec![true; table.columns.len()])
         }
         _ => return err("EXPLAIN and PLANTREE support only SELECT, UPDATE and DELETE"),
@@ -531,9 +529,7 @@ fn update(
         let catalog: &Catalog = catalog;
         let table = catalog.get(table)?;
         let returning = Returning::bind(catalog, table, returning)?;
-        let filter = filter
-            .map(|f| query::bind(catalog, Some(table), &f))
-            .transpose()?;
+        let filter = query::bind_where(catalog, table, &filter)?;
         // `SET column = DEFAULT` sets the default, the same for every row.
         let defaults = match assignments.iter().any(|(_, e)| e.is_none()) {
             true => table.defaults(now)?,
@@ -613,9 +609,7 @@ fn delete(
         let catalog: &Catalog = catalog;
         let table = catalog.get(table)?;
         let returning = Returning::bind(catalog, table, returning)?;
-        let filter = filter
-            .map(|f| query::bind(catalog, Some(table), &f))
-            .transpose()?;
+        let filter = query::bind_where(catalog, table, &filter)?;
         let fields = Field::of_table(&table.name, &table.columns);
         let mut subqueries = Runner::new(catalog, settings);
         // The filter's columns, and the indexed ones, whose entries the delete
@@ -729,7 +723,8 @@ fn scan<'a>(
 ) -> Box<dyn Iterator<Item = Result<(RowId, Row)>> + 'a> {
     let conditions = filter::conditions(table, &table.name, filter);
     let predicates = filter::predicates(table, &conditions);
-    let access = access::choose(table, &table.name, filter, &conditions, needed);
+    let lists = filter::in_lists(table, &table.name, filter);
+    let access = access::choose(table, &table.name, filter, &conditions, &lists, needed);
     table.scan_filtered(snapshot, needed, &predicates, &access)
 }
 

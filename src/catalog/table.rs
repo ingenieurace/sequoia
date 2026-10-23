@@ -346,6 +346,17 @@ pub enum Access {
         upper: Option<Bound>,
         covering: bool,
     },
+    /// Look each of these primary keys up in an LSM tree, in key order: an
+    /// `IN` list on the key.
+    Keys(Vec<Value>),
+    /// Read the rows of an index whose first keys equal one of `points`,
+    /// each searched for in turn, in index order: an `IN` list on one of
+    /// the keys. The points differ, so no row is read twice.
+    IndexPoints {
+        index: usize,
+        points: Vec<Vec<Value>>,
+        covering: bool,
+    },
 }
 
 /// The versions a scan reads, with their headers.
@@ -785,8 +796,22 @@ impl Table {
                     Ok(step(RowId::Key(key.to_vec()), seen(bytes)?))
                 }))
             }
-            (Access::Key(_) | Access::KeyRange { .. }, Storage::Heap(_)) => {
+            (Access::Key(_) | Access::KeyRange { .. } | Access::Keys(_), Storage::Heap(_)) => {
                 unreachable!("only an LSM tree has primary key lookups")
+            }
+            // Each key's versions in turn, as for `Access::Key`.
+            (Access::Keys(values), Storage::Lsm { tree, .. }) => {
+                steps(values.into_iter().flat_map(move |value| {
+                    let prefix = encode_keys(std::slice::from_ref(&value));
+                    let seen = seen.clone();
+                    tree.scan_map(&prefix.clone(), move |key, bytes| {
+                        if primary_part(key) != prefix.as_slice() {
+                            return Ok(Step::Stop);
+                        }
+                        Ok(step(RowId::Key(key.to_vec()), seen(bytes)?))
+                    })
+                    .take_while(|step| !matches!(step, Ok(Step::Stop)))
+                }))
             }
             (
                 Access::Index {
@@ -803,23 +828,55 @@ impl Table {
                     Ok(entries) => entries,
                     Err(e) => return Box::new(std::iter::once(Err(e))),
                 };
-                let needed = needed.to_vec();
-                steps(entries.into_iter().map(move |entry| {
-                    let id = self.row_id(index.row_id(&entry)?.to_vec())?;
-                    let Some((header, bytes)) = self.version(&id)? else {
-                        return err(format!("index points to a missing row: {id:?}"));
-                    };
-                    if !vis.visible(header)? {
-                        return Ok(Step::Skip);
+                self.index_rows(index, entries, needed, covering, vis)
+            }
+            (
+                Access::IndexPoints {
+                    index,
+                    points,
+                    covering,
+                },
+                _,
+            ) => {
+                let index = &self.indexes[index];
+                let mut entries = Vec::new();
+                for point in &points {
+                    match index.scan(point, None, None) {
+                        Ok(found) => entries.extend(found),
+                        Err(e) => return Box::new(std::iter::once(Err(e))),
                     }
-                    let row = match covering {
-                        true => index.row(&entry, &needed)?,
-                        false => tuple::decode_columns(&self.columns, &bytes[HEADER..], &needed)?,
-                    };
-                    Ok(Step::Row(id, header, row))
-                }))
+                }
+                self.index_rows(index, entries, needed, covering, vis)
             }
         }
+    }
+
+    /// The versions `vis` sees of the rows an index's entries point to, with
+    /// their ids: from the entries alone if the index is `covering` the
+    /// columns `needed`.
+    fn index_rows<'a, V: Visibility + 'a>(
+        &'a self,
+        index: &'a Index,
+        entries: Vec<Vec<u8>>,
+        needed: &[bool],
+        covering: bool,
+        vis: V,
+    ) -> Versions<'a> {
+        let needed = needed.to_vec();
+        steps(entries.into_iter().map(move |entry| {
+            let id = self.row_id(index.row_id(&entry)?.to_vec())?;
+            let Some((header, bytes)) = self.version(&id)? else {
+                return err(format!("index points to a missing row: {id:?}"));
+            };
+            if !vis.visible(header)? {
+                return Ok(Step::Skip);
+            }
+            let row = match covering {
+                true => index.row(&entry, &needed)?,
+                false => tuple::decode_columns(&self.columns, &bytes[HEADER..], &needed)?,
+            };
+            Ok(Step::Row(id, header, row))
+        }))
     }
 
     /// The rows [`Table::scan_filtered`] reads, left in their columns, if the

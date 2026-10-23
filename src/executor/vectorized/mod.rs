@@ -169,6 +169,37 @@ fn open_node<'a>(
                 (Batch::from_rows(rows, exprs.len()), None)
             })
         }
+        Node::Extend { input, exprs, .. } => {
+            let fields = input.columns();
+            let exprs = locate_all(&exprs, &fields);
+            let mut subqueries = Runner::new(catalog, settings);
+            each_batch(open(*input, below(step, 0)), move |batch| {
+                let added = exprs
+                    .iter()
+                    .map(|e| expr::eval(e, &fields, &batch, &mut subqueries));
+                if let Ok(added) = added.collect::<Result<Vec<_>>>() {
+                    let mut columns: Vec<_> = (0..fields.len()).map(|c| batch.column(c)).collect();
+                    columns.extend(added);
+                    return (Batch::new(columns, batch.rows()), None);
+                }
+                let mut rows = Vec::new();
+                for i in 0..batch.rows() {
+                    let mut row = batch.row(i);
+                    let values: Result<Vec<_>> = exprs
+                        .iter()
+                        .map(|e| eval_with(e, &fields, &row, &mut subqueries))
+                        .collect();
+                    match values {
+                        Ok(values) => {
+                            row.extend(values);
+                            rows.push(row);
+                        }
+                        Err(e) => return (Batch::from_rows(rows, width), Some(e)),
+                    }
+                }
+                (Batch::from_rows(rows, width), None)
+            })
+        }
         Node::Limit {
             input,
             count,
