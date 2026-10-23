@@ -9,9 +9,13 @@
 //! An address is `host:port`, a port alone (on 127.0.0.1), or with `=` a
 //! host alone (`--serve=0.0.0.0`, on port [`PORT`]); left out, it is
 //! 127.0.0.1 on that port.
+//!
+//! On a terminal, both shells edit lines as `editor.rs` describes: the up
+//! and down arrows bring back the lines typed before.
 
-use std::io::{self, BufRead, Write};
+mod editor;
 
+use editor::{Input, Line};
 use sequoia::executor::model::Model;
 use sequoia::server::{Client, MAX_CONNECTIONS, PORT, Server};
 use sequoia::sql::parse;
@@ -184,9 +188,10 @@ trait Backend {
 }
 
 /// Reads statements and commands until `.exit` or the end of the input.
+/// Ctrl-C drops the line being typed and the statement it is part of.
 fn shell(backend: &mut impl Backend) {
     let mut buffer = String::new();
-    let mut lines = io::stdin().lock().lines();
+    let mut input = Input::new();
     loop {
         // The prompt shows a transaction in progress with a `*`, as psql does.
         let prompt = match (buffer.is_empty(), backend.in_transaction()) {
@@ -194,9 +199,14 @@ fn shell(backend: &mut impl Backend) {
             (true, true) => "sequoia*> ",
             (false, _) => "    ...> ",
         };
-        print!("{prompt}");
-        io::stdout().flush().ok();
-        let Some(Ok(line)) = lines.next() else { break };
+        let line = match input.read_line(prompt) {
+            Line::Text(line) => line,
+            Line::Interrupt => {
+                buffer.clear();
+                continue;
+            }
+            Line::Eof => break,
+        };
         let trimmed = line.trim();
 
         if buffer.is_empty() && trimmed.starts_with('.') {

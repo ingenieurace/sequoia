@@ -96,7 +96,16 @@ sequoia [FILE] [--replacer arc|lru|lru-K|clock]
 ```
 
 Statements end with `;` and may span lines. The prompt is `sequoia*>` while a
-transaction is open. Commands start with `.`:
+transaction is open.
+
+On a terminal (on Unix), lines can be edited: Up and Down bring back the
+lines typed before, Left, Right, Home, End, Backspace and Delete edit the
+line, Ctrl-U and Ctrl-K delete before or after the cursor, Ctrl-C drops the
+statement being typed, and Ctrl-D on an empty line leaves the shell. The
+history lasts until the shell exits. Input from a pipe, and the shell on
+Windows, read whole lines without editing.
+
+Commands start with `.`:
 
 | Command | Effect |
 |---|---|
@@ -217,6 +226,7 @@ sql -> executor -> plan -> catalog -> storage        (types, predicate, error: s
 ```
 src/
   main.rs            shell, server and client command line
+  editor.rs          the shell's line editing and history (arrow keys)
   lib.rs             module list and public exports
   database.rs        Database: one session on one core; atomic statements, transactions, savepoints
   shared.rs          SharedDatabase and Session: many threads, many readers or one writer
