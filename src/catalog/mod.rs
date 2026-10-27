@@ -14,9 +14,12 @@
 //! stored: for a heap the two pages are its first and last page, for an LSM
 //! tree or a column store both are its manifest page. For an index the first
 //! is the root page of its B+ tree or hash file, which never moves, and the second is
-//! [`INDEX_FORMAT`]. In files from before indexes had several keys, included
-//! columns and NULL keys, the second was the root page again: such an index
-//! is built again, in the format of today, when the catalog is opened.
+//! [`INDEX_FORMAT`]. An index of an older format is built again, in the
+//! format of today, when the catalog is opened: in files from before indexes
+//! had several keys, included columns and NULL keys, the second page was the
+//! root page again; in files from before DECIMAL, it was
+//! [`PREVIOUS_INDEX_FORMAT`], and a REAL key's fraction had no 00 after it
+//! (see `storage/sort_key.rs`).
 //!
 //! A heap table with a primary key gets a unique index on it, `<table>_pkey`,
 //! when it is created; it is dropped with the table and not on its own.
@@ -42,7 +45,11 @@ use table::{Table, primary_key, validate_schema};
 
 /// The second page of an index's catalog row: not a page, but a mark of the
 /// format of its entries.
-const INDEX_FORMAT: PageId = PageId(u32::MAX);
+const INDEX_FORMAT: PageId = PageId(u32::MAX - 2);
+
+/// The mark of the format before, whose keys a REAL with a fraction ended
+/// without a 00.
+const PREVIOUS_INDEX_FORMAT: PageId = PageId(u32::MAX);
 
 /// The second page of a table's statistics row: not a page either.
 const STATS_FORMAT: PageId = PageId(u32::MAX - 1);
@@ -137,8 +144,13 @@ impl Catalog {
             if format == INDEX_FORMAT {
                 entry.table.open_index(&definition, root)?;
             } else {
-                // From before entries held NULL keys: built again.
-                BPlusTree::open(pool.clone(), root).destroy()?;
+                // Of an older format: built again.
+                if format == PREVIOUS_INDEX_FORMAT {
+                    entry.table.open_index(&definition, root)?;
+                    entry.table.drop_index(&name)?;
+                } else {
+                    BPlusTree::open(pool.clone(), root).destroy()?;
+                }
                 entry.table.create_index(&definition)?;
                 let root = entry
                     .table
@@ -555,5 +567,55 @@ mod tests {
             reopened.get("t").unwrap().indexes()[1].root_page(),
             index.root_page()
         );
+    }
+
+    #[test]
+    fn indexes_from_before_decimal_are_built_again_when_opened() {
+        let pool = Arc::new(BufferPool::new(Arc::new(DiskManager::in_memory()), 64));
+        let mut catalog = Catalog::open(pool.clone()).unwrap();
+        let column = |name: &str, data_type| Column {
+            name: name.into(),
+            data_type,
+            primary_key: name == "id",
+        };
+        let columns = vec![column("id", DataType::Int), column("x", DataType::Real)];
+        catalog
+            .create_table("t".into(), columns, StorageKind::Heap)
+            .unwrap();
+        let rows = (0..300).map(|i| vec![Value::Int(i), Value::Real(i as f64 / 4.0)]);
+        catalog
+            .get_mut("t")
+            .unwrap()
+            .insert(rows.collect())
+            .unwrap();
+        for sql in [
+            "CREATE INDEX t_x ON t (x)",
+            "CREATE INDEX t_h ON t USING HASH (x)",
+        ] {
+            create_index(&mut catalog, sql);
+            // Record it as files from before DECIMAL did.
+            let name = if sql.contains("HASH") { "t_h" } else { "t_x" };
+            let rid = catalog.indexes[name].rid;
+            let index = catalog.get("t").unwrap().indexes().last().unwrap();
+            let row = encode_entry(sql.into(), (index.root_page(), PREVIOUS_INDEX_FORMAT)).unwrap();
+            assert!(catalog.heap.update(rid, &row).unwrap());
+        }
+        catalog.save().unwrap();
+        let pages = pool.disk().page_count();
+
+        let catalog = Catalog::open(pool.clone()).unwrap();
+        for name in ["t_x", "t_h"] {
+            let row = catalog
+                .heap
+                .get(catalog.indexes[name].rid)
+                .unwrap()
+                .unwrap();
+            assert_eq!(decode_row(&row).unwrap().2, INDEX_FORMAT, "{name}");
+        }
+        for index in &catalog.get("t").unwrap().indexes()[1..] {
+            let found = index.scan(&[Value::Real(12.25)], None, None).unwrap();
+            assert_eq!(found.len(), 1, "{}", index.name);
+        }
+        assert_eq!(pool.disk().page_count(), pages, "the old pages were reused");
     }
 }

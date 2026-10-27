@@ -179,6 +179,29 @@ workers, and a join method to force on every join (see
 NaN or infinite), `TEXT` (UTF-8), `BOOL` (or `BOOLEAN`), and `NULL`. INTs and
 REALs compare, group and join by value (`1 = 1.0`). Values are type-checked,
 with no implicit conversion between other types: `LENGTH(5)` is an error.
+Also:
+
+| Type | Literal | Holds |
+|---|---|---|
+| `DATE` | `DATE '2024-02-29'` | a day from year 1 to 9999 |
+| `TIME` | `TIME '13:45:07.25'` | a time of day, to the microsecond |
+| `TIMESTAMP` | `TIMESTAMP '2024-02-29 13:45:07'` | both, with no time zone |
+| `BLOB` | `X'CAFE00'` | bytes, compared byte by byte |
+| `DECIMAL(p, s)` (or `NUMERIC`) | `DECIMAL '19.99'` | exact numbers of up to `p` ≤ 38 digits, `s` after the point |
+
+A DECIMAL column rounds what is stored in it to its `s` places (halves away
+from zero) and refuses a value with more than `p - s` digits before the
+point; a plain `DECIMAL` keeps any value of up to 38 digits, without the
+zeros at the end of its fraction. An INT or a REAL stored in one is
+converted, a REAL by the digits it prints with (`19.99`, not the binary
+fraction near it); literals like `1.5` are REALs, so `price + 0.5` is a
+REAL, and `price + DECIMAL '0.5'` a DECIMAL. DECIMALs add, subtract and
+multiply exactly, and divide to six more places than their operands have;
+with a REAL they become REALs. They compare, group and join with INTs and
+REALs by value, and `SUM` and `AVG` of them are DECIMALs, exact, in
+parallel too. A date plus or minus an INT is a date that many days on, two
+dates' difference an INT, and a date plus a time a timestamp. The type
+names are not keywords, so they stay free as names of columns.
 
 **Constraints**: `PRIMARY KEY` on one column (unique, not NULL), and unique
 indexes (rows with a NULL key may repeat; a partial unique index checks only
@@ -206,7 +229,17 @@ decide, so `x <> 0 AND 10 / x > 1` never divides by zero. Integer overflow and
 division by zero are errors.
 
 **Functions**: `COALESCE`, `NULLIF`, `LENGTH`, `UPPER`, `LOWER`, `SUBSTR(text, start[, length])`,
-`ABS`, `ROUND(number[, digits])`. They behave as in SQLite, without SQLite's type conversions.
+`ABS`, `ROUND(number[, digits])`. They behave as in SQLite, without SQLite's
+type conversions; `LENGTH` of a BLOB counts its bytes, and `ABS` and `ROUND`
+of a DECIMAL are exact. Also:
+
+- `CAST(x AS type)`: between numbers (a REAL or DECIMAL to an INT rounds,
+  halves away from zero), any value to `TEXT` as a result shows it, a `TEXT`
+  to any type it spells (`CAST('2024-01-05' AS DATE)`), a `TIMESTAMP` to its
+  `DATE` or `TIME` and a `DATE` to a `TIMESTAMP`, a `TEXT` to its UTF-8 bytes
+  as a `BLOB` and back, an `INT` to a `BOOL` and back
+- `EXTRACT(field FROM x)`: `YEAR`, `MONTH` or `DAY` of a date or timestamp,
+  `HOUR`, `MINUTE` or `SECOND` (whole seconds) of a time or timestamp, as an INT
 
 **Transactions**: every statement is atomic, and outside a transaction it is
 durable once it returns. A transaction is durable once `COMMIT` returns; a
@@ -217,7 +250,8 @@ inside a transaction is undone alone, and the transaction goes on.
 `FULL` joins, `LATERAL`, subqueries in `ON` or `GROUP BY`, CTEs (`WITH`),
 window functions, `ALTER TABLE`, `NOT NULL`, `DEFAULT`, `CHECK`, foreign
 keys, composite primary keys, the `%` operator, quoted identifiers, `/* */`
-comments, and date, time and blob types.
+comments, time zones, `INTERVAL`, `CURRENT_DATE` and the like, and text
+stored in a DATE, TIME or TIMESTAMP column without a cast or a typed literal.
 
 ## Source layout
 
@@ -235,7 +269,9 @@ src/
   database.rs        Database: one session on one core; atomic statements, transactions, savepoints
   shared.rs          SharedDatabase and Session: many threads, many readers or one writer
   server.rs          TCP server (a thread per connection) and client
-  types.rs           values, data types, columns
+  types.rs           values, data types, columns; how values compare, convert and print
+  decimal.rs         DECIMAL: exact decimal numbers of up to 38 digits, and their arithmetic
+  datetime.rs        DATE, TIME and TIMESTAMP: the calendar, parsing and printing
   predicate.rs       `column op literal` conditions, shared by the planner and storage
   result.rs          query results and table printing
   error.rs           the error type
@@ -368,6 +404,14 @@ bucket that cannot be split continues in overflow pages.
 A heap table with a primary key gets a unique index `<table>_pkey`. Column
 tables cannot have indexes, because moving rows into a row group changes
 their ids. Every write updates every index of its table.
+
+Keys are encoded in `storage/sort_key.rs`. INTs, REALs and DECIMALs share
+one ordering by value, so `1`, `1.0` and `DECIMAL '1.00'` have the same key.
+A DECIMAL that is not a whole number is encoded like the REAL nearest it,
+followed by its exact digits, so that two DECIMALs which round to the same
+REAL still sort apart. When an index was written by a version from before
+DECIMAL, whose REAL keys ended differently, it is rebuilt once when the
+database is opened.
 
 ### Planning
 

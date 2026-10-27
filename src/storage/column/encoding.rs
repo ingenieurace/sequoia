@@ -57,6 +57,7 @@ use std::collections::BTreeSet;
 
 use crate::error::{Result, err};
 use crate::predicate::Compare;
+use crate::storage::sort_key;
 use crate::types::{DataType, Value, ordered_real, real_from_ordered};
 
 /// Most distinct values for which Bitmap encoding is tried.
@@ -127,33 +128,101 @@ pub fn encode(data_type: DataType, values: &[Value]) -> Result<Vec<u8>> {
             }
         }
     }
+    let expected = |value: &Value| {
+        crate::error::Error(format!("expected {data_type}, got {}", value.to_sql()))
+    };
     match data_type {
-        DataType::Int | DataType::Bool | DataType::Real => {
-            let ints = values
-                .iter()
-                .map(|value| match (value, data_type) {
-                    (Value::Null, _) => Ok(0),
-                    (Value::Int(n), DataType::Int) => Ok(*n),
-                    (Value::Bool(b), DataType::Bool) => Ok(*b as i64),
-                    (Value::Real(r), DataType::Real) => Ok(real_to_int(*r)),
-                    (value, _) => err(format!("expected {data_type}, got {}", value.to_sql())),
-                })
-                .collect::<Result<Vec<i64>>>()?;
-            bytes.extend(encode_ints(&ints, &ALL_INTS));
-        }
         DataType::Text => {
             let texts = values
                 .iter()
                 .map(|value| match value {
                     Value::Null => Ok(""),
                     Value::Text(s) => Ok(s.as_str()),
-                    value => err(format!("expected TEXT, got {}", value.to_sql())),
+                    value => Err(expected(value)),
                 })
                 .collect::<Result<Vec<&str>>>()?;
             bytes.extend(encode_texts(&texts));
         }
+        DataType::Blob | DataType::Decimal(_) => {
+            let texts = values
+                .iter()
+                .map(|value| match value {
+                    Value::Null => Ok(String::new()),
+                    value if value.fits(data_type) => Ok(keyed(value)),
+                    value => Err(expected(value)),
+                })
+                .collect::<Result<Vec<String>>>()?;
+            let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+            bytes.extend(encode_texts(&texts));
+        }
+        _ => {
+            let ints = values
+                .iter()
+                .map(|value| match value {
+                    Value::Null => Ok(0),
+                    value => stored_int(value, data_type).ok_or_else(|| expected(value)),
+                })
+                .collect::<Result<Vec<i64>>>()?;
+            bytes.extend(encode_ints(&ints, &ALL_INTS));
+        }
     }
     Ok(bytes)
+}
+
+/// The integer a chunk stores a value of a type stored as integers as: a
+/// BOOL as 0 or 1, a REAL as its ordered bits, a date or time as its count.
+fn stored_int(value: &Value, data_type: DataType) -> Option<i64> {
+    match (value, data_type) {
+        (Value::Int(n), DataType::Int) => Some(*n),
+        (Value::Bool(b), DataType::Bool) => Some(*b as i64),
+        (Value::Real(r), DataType::Real) => Some(real_to_int(*r)),
+        (Value::Date(d), DataType::Date) => Some(*d as i64),
+        (Value::Time(t), DataType::Time) | (Value::Timestamp(t), DataType::Timestamp) => Some(*t),
+        _ => None,
+    }
+}
+
+/// The value of a type stored as integers that a chunk stores as `n`.
+fn from_stored_int(n: i64, data_type: DataType) -> Result<Value> {
+    Ok(match data_type {
+        DataType::Int => Value::Int(n),
+        DataType::Real => Value::Real(int_to_real(n)),
+        DataType::Bool => match n {
+            0 => Value::Bool(false),
+            1 => Value::Bool(true),
+            v => return err(format!("corrupted column chunk: invalid BOOL {v}")),
+        },
+        DataType::Date => match i32::try_from(n) {
+            Ok(d) => Value::Date(d),
+            Err(_) => return err(format!("corrupted column chunk: invalid DATE {n}")),
+        },
+        DataType::Time => Value::Time(n),
+        DataType::Timestamp => Value::Timestamp(n),
+        other => unreachable!("{other} is not stored as integers"),
+    })
+}
+
+/// A BLOB or DECIMAL as the text a chunk stores it as: its sort key's bytes
+/// in hexadecimal, which compare as the values do, so that a chunk of them
+/// is encoded and filtered as one of TEXTs.
+fn keyed(value: &Value) -> String {
+    let mut key = Vec::new();
+    sort_key::encode(value, false, &mut key);
+    crate::types::hex(&key)
+}
+
+/// The BLOB or DECIMAL [`keyed`] made a text of.
+fn from_keyed(text: &str, data_type: DataType) -> Result<Value> {
+    let corrupted = || err(format!("corrupted column chunk: invalid {data_type}"));
+    let bytes: Option<Vec<u8>> = (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
+        .collect();
+    let Some(bytes) = bytes else {
+        return corrupted();
+    };
+    let value = sort_key::decode(&bytes, &mut 0)?;
+    value.coerce(data_type).map_or_else(corrupted, Ok)
 }
 
 /// Decodes a chunk of `n` values written by [`encode`].
@@ -185,21 +254,19 @@ pub fn decode_selected(
             })
             .collect()
         }
-        DataType::Real => {
+        DataType::Blob | DataType::Decimal(_) => {
+            let texts = decode_texts(&mut reader, n)?;
+            rows.map(|i| match nulls.is_some_and(|b| bit(b, i)) {
+                true => Ok(Value::Null),
+                false => from_keyed(texts[i], data_type),
+            })
+            .collect::<Result<_>>()?
+        }
+        DataType::Real | DataType::Bool | DataType::Date | DataType::Time | DataType::Timestamp => {
             let ints = decode_ints(&mut reader, n)?;
             rows.map(|i| match nulls.is_some_and(|b| bit(b, i)) {
-                true => Value::Null,
-                false => Value::Real(int_to_real(ints[i])),
-            })
-            .collect()
-        }
-        DataType::Bool => {
-            let ints = decode_ints(&mut reader, n)?;
-            rows.map(|i| match ints[i] {
-                _ if nulls.is_some_and(|b| bit(b, i)) => Ok(Value::Null),
-                0 => Ok(Value::Bool(false)),
-                1 => Ok(Value::Bool(true)),
-                v => err(format!("corrupted column chunk: invalid BOOL {v}")),
+                true => Ok(Value::Null),
+                false => from_stored_int(ints[i], data_type),
             })
             .collect::<Result<_>>()?
         }
@@ -233,10 +300,14 @@ pub fn filter(
     let mut reader = Reader { bytes, pos: 0 };
     let nulls = read_nulls(&mut reader, n)?;
     let mut matching = match (data_type, literal) {
-        (DataType::Int, Value::Int(v)) => filter_ints(&mut reader, n, op, *v)?,
-        (DataType::Bool, Value::Bool(b)) => filter_ints(&mut reader, n, op, *b as i64)?,
-        (DataType::Real, Value::Real(r)) => filter_ints(&mut reader, n, op, real_to_int(*r))?,
         (DataType::Text, Value::Text(s)) => filter_texts(&mut reader, n, op, s)?,
+        (DataType::Blob | DataType::Decimal(_), literal) if literal.fits(data_type) => {
+            filter_texts(&mut reader, n, op, &keyed(literal))?
+        }
+        (_, literal) if stored_int(literal, data_type).is_some() => {
+            let v = stored_int(literal, data_type).expect("checked");
+            filter_ints(&mut reader, n, op, v)?
+        }
         (_, literal) => {
             return err(format!(
                 "cannot compare a {data_type} column with {}",

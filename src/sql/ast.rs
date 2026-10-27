@@ -1,5 +1,6 @@
+use crate::datetime;
 use crate::error::Result;
-use crate::types::{Column, StorageKind, Value};
+use crate::types::{Column, DataType, StorageKind, Value};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -401,8 +402,14 @@ pub enum Function {
     /// The absolute value of a number.
     Abs,
     /// `ROUND(number[, digits])`: a REAL rounded to `digits` decimal places
-    /// (none by default), halves away from zero, as SQLite does.
+    /// (none by default), halves away from zero, as SQLite does; a DECIMAL
+    /// likewise, exactly, to a DECIMAL with that many places.
     Round,
+    /// `CAST(value AS type)`: the value as one of the type (see `eval.rs`).
+    Cast(DataType),
+    /// `EXTRACT(field FROM value)`: a part of a date, a time or a timestamp,
+    /// as an INT.
+    Extract(datetime::Field),
 }
 
 impl Function {
@@ -432,6 +439,8 @@ impl Function {
             Function::Substr => "substr",
             Function::Abs => "abs",
             Function::Round => "round",
+            Function::Cast(_) => "cast",
+            Function::Extract(_) => "extract",
         }
     }
 
@@ -442,7 +451,12 @@ impl Function {
             Function::Nullif => (2, 2),
             Function::Substr => (2, 3),
             Function::Round => (1, 2),
-            Function::Length | Function::Upper | Function::Lower | Function::Abs => (1, 1),
+            Function::Length
+            | Function::Upper
+            | Function::Lower
+            | Function::Abs
+            | Function::Cast(_)
+            | Function::Extract(_) => (1, 1),
         }
     }
 }
@@ -735,6 +749,12 @@ impl std::fmt::Display for Expr {
                     write!(f, " ELSE {otherwise}")?;
                 }
                 f.write_str(" END")
+            }
+            Expr::Function(Function::Cast(data_type), args) => {
+                write!(f, "CAST({} AS {data_type})", args[0])
+            }
+            Expr::Function(Function::Extract(field), args) => {
+                write!(f, "EXTRACT({} FROM {})", field.name(), args[0])
             }
             Expr::Function(function, args) => {
                 let args = args

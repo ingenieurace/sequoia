@@ -15,9 +15,11 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 
+use crate::datetime;
+use crate::decimal::Decimal;
 use crate::error::{Error, Result, err};
 use crate::sql::ast::{BinaryOp, ColumnRef, Expr, Function, UnaryOp};
-use crate::types::{Column, Value};
+use crate::types::{Column, DataType, Value};
 
 /// A column of the rows an expression is evaluated on: its name, and the
 /// table it comes from, if any, which `table.name` refers to it by.
@@ -302,6 +304,14 @@ pub(crate) fn apply(function: Function, values: &[Value]) -> Result<Value> {
             },
         ),
         (_, values) if values.iter().any(Value::is_null) => Ok(Null),
+        (Function::Cast(data_type), [value]) => cast(value, data_type),
+        (Function::Extract(field), [value]) => extract(field, value),
+        (Function::Length, [Value::Blob(b)]) => Ok(Int(b.len() as i64)),
+        (Function::Abs, [Value::Decimal(d)]) => Ok(Value::Decimal(d.abs())),
+        (Function::Round, [Value::Decimal(d)]) => Ok(Value::Decimal(d.round(0)?)),
+        (Function::Round, [Value::Decimal(d), Int(places)]) => {
+            Ok(Value::Decimal(d.round(*places)?))
+        }
         (Function::Length, [Text(s)]) => Ok(Int(s.chars().count() as i64)),
         (Function::Upper, [Text(s)]) => Ok(Text(s.to_ascii_uppercase())),
         (Function::Lower, [Text(s)]) => Ok(Text(s.to_ascii_lowercase())),
@@ -315,7 +325,8 @@ pub(crate) fn apply(function: Function, values: &[Value]) -> Result<Value> {
         (Function::Round, [x, Int(digits)]) if x.as_real().is_some() => {
             Ok(Real(round(x.as_real().unwrap(), *digits)))
         }
-        (Function::Length | Function::Upper | Function::Lower | Function::Substr, [value, ..])
+        (Function::Length, [value]) => wrong(value, "TEXT or BLOB"),
+        (Function::Upper | Function::Lower | Function::Substr, [value, ..])
             if !matches!(value, Text(_)) =>
         {
             wrong(value, "TEXT")
@@ -331,6 +342,103 @@ pub(crate) fn apply(function: Function, values: &[Value]) -> Result<Value> {
         (Function::Round, [_, digits]) => wrong(digits, "INT"),
         _ => unreachable!("the parser checks how many arguments a function has"),
     }
+}
+
+/// `CAST(value AS data_type)`. A value of the type stays as it is (a
+/// DECIMAL rounded to the type's places); otherwise:
+///
+/// ```text
+/// to INT        a REAL or DECIMAL rounded, halves away from zero; a BOOL as
+///               0 or 1; a TEXT's digits
+/// to REAL       an INT or DECIMAL, the REAL nearest it; a TEXT's number
+/// to DECIMAL    an INT, a REAL (by its shortest digits) or a TEXT's digits,
+///               rounded to the type's places
+/// to TEXT       how a result shows it; a BOOL as 'true' or 'false'; a
+///               BLOB's bytes, if they are UTF-8
+/// to BOOL       an INT, true unless 0; a TEXT 'true', 't', 'yes', 'y',
+///               'on', '1' or their opposites, in any case
+/// to DATE       a TEXT 'YYYY-MM-DD'; a TIMESTAMP's date
+/// to TIME       a TEXT 'HH:MM:SS'; a TIMESTAMP's time
+/// to TIMESTAMP  a TEXT 'YYYY-MM-DD HH:MM:SS'; a DATE at midnight
+/// to BLOB       a TEXT's UTF-8 bytes
+/// ```
+///
+/// Anything else, or a TEXT that is not one, is an error.
+pub(crate) fn cast(value: &Value, to: DataType) -> Result<Value> {
+    use Value::{Blob, Bool, Date, Int, Null, Real, Text, Time, Timestamp};
+    let fail = || err(format!("cannot cast {} to {to}", value.to_sql()));
+    let invalid = |text: &str| err(format!("invalid {to}: '{text}'"));
+    Ok(match (value, to) {
+        (Null, _) => Null,
+        (value, to) if value.fits(to) => value.clone(),
+        (Value::Decimal(_) | Int(_) | Real(_), DataType::Decimal(_)) => value.assign(to)?,
+        (Text(s), DataType::Decimal(_)) => match Decimal::parse(s) {
+            Ok(d) => Value::Decimal(d).assign(to)?,
+            Err(_) => return invalid(s),
+        },
+        (Real(r), DataType::Int) => {
+            let rounded = r.round();
+            match rounded >= -9_223_372_036_854_775_808.0 && rounded < 9_223_372_036_854_775_808.0 {
+                true => Int(rounded as i64),
+                false => return Err(overflow()),
+            }
+        }
+        (Value::Decimal(d), DataType::Int) => Int(d.round_to_int()?),
+        (Bool(b), DataType::Int) => Int(*b as i64),
+        (Text(s), DataType::Int) => match s.trim().parse() {
+            Ok(n) => Int(n),
+            Err(_) => return invalid(s),
+        },
+        (Int(n), DataType::Real) => Real(*n as f64),
+        (Value::Decimal(d), DataType::Real) => Real(d.to_real()),
+        (Text(s), DataType::Real) => match s.trim().parse::<f64>() {
+            Ok(r) if r.is_finite() => Real(r),
+            _ => return invalid(s),
+        },
+        (Bool(b), DataType::Text) => Text(if *b { "true" } else { "false" }.into()),
+        (Blob(b), DataType::Text) => match String::from_utf8(b.clone()) {
+            Ok(s) => Text(s),
+            Err(_) => return err(format!("cannot cast {} to TEXT: not UTF-8", value.to_sql())),
+        },
+        (value, DataType::Text) => Text(value.to_string()),
+        (Int(n), DataType::Bool) => Bool(*n != 0),
+        (Text(s), DataType::Bool) => match s.trim().to_lowercase().as_str() {
+            "true" | "t" | "yes" | "y" | "on" | "1" => Bool(true),
+            "false" | "f" | "no" | "n" | "off" | "0" => Bool(false),
+            _ => return invalid(s),
+        },
+        (Text(s), DataType::Date) => Date(datetime::parse_date(s)?),
+        (Timestamp(t), DataType::Date) => Date(datetime::split_timestamp(*t).0),
+        (Text(s), DataType::Time) => Time(datetime::parse_time(s)?),
+        (Timestamp(t), DataType::Time) => Time(datetime::split_timestamp(*t).1),
+        (Text(s), DataType::Timestamp) => Timestamp(datetime::parse_timestamp(s)?),
+        (Date(d), DataType::Timestamp) => Timestamp(*d as i64 * datetime::MICROS_PER_DAY),
+        (Text(s), DataType::Blob) => Blob(s.as_bytes().to_vec()),
+        _ => return fail(),
+    })
+}
+
+/// `EXTRACT(field FROM value)`: a part of a DATE, a TIME or a TIMESTAMP.
+fn extract(field: datetime::Field, value: &Value) -> Result<Value> {
+    let part = match value {
+        Value::Date(d) if field.of_date() => datetime::date_field(*d, field),
+        Value::Time(t) if !field.of_date() => datetime::time_field(*t, field),
+        Value::Timestamp(t) => {
+            let (day, time) = datetime::split_timestamp(*t);
+            match field.of_date() {
+                true => datetime::date_field(day, field),
+                false => datetime::time_field(time, field),
+            }
+        }
+        _ => {
+            return err(format!(
+                "cannot extract {} from {}",
+                field.name(),
+                value.to_sql()
+            ));
+        }
+    };
+    Ok(Value::Int(part))
 }
 
 /// `SUBSTR`, as SQLite computes it: `start` counts characters from 1, or
@@ -445,6 +553,7 @@ pub(crate) fn unary(op: UnaryOp, value: Value) -> Result<Value> {
         (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
         (UnaryOp::Neg, Value::Int(n)) => n.checked_neg().map(Value::Int).ok_or_else(overflow),
         (UnaryOp::Neg, Value::Real(r)) => Ok(Value::Real(-r)),
+        (UnaryOp::Neg, Value::Decimal(d)) => Ok(Value::Decimal(d.neg())),
         (op, value) => err(format!("cannot apply {op:?} to {}", value.to_sql())),
     }
 }
@@ -503,8 +612,39 @@ pub(crate) fn binary(left: Value, op: BinaryOp, right: Value) -> Result<Value> {
                 };
                 result.map(Int).ok_or_else(overflow)
             }
+            // With a DECIMAL and no REAL, exactly.
+            (Value::Decimal(_), Int(_) | Value::Decimal(_)) | (Int(_), Value::Decimal(_)) => {
+                let as_decimal = |v: &Value| match v {
+                    Value::Decimal(d) => *d,
+                    Int(n) => Decimal::from_int(*n),
+                    _ => unreachable!("matched above"),
+                };
+                let (a, b) = (as_decimal(&left), as_decimal(&right));
+                Ok(Value::Decimal(match op {
+                    Add => a.add(b)?,
+                    Sub => a.sub(b)?,
+                    Mul => a.mul(b)?,
+                    _ => a.div(b)?,
+                }))
+            }
+            // Days added to or taken from a date, or between two.
+            (Value::Date(d), Int(n)) | (Int(n), Value::Date(d))
+                if op == Add || (op == Sub && matches!(left, Value::Date(_))) =>
+            {
+                let days = match op {
+                    Add => *d as i64 + n,
+                    _ => *d as i64 - n,
+                };
+                Ok(Value::Date(datetime::date(days)?))
+            }
+            (Value::Date(a), Value::Date(b)) if op == Sub => Ok(Int(*a as i64 - *b as i64)),
+            // A date at a time of day.
+            (Value::Date(d), Value::Time(t)) | (Value::Time(t), Value::Date(d)) if op == Add => {
+                let micros = *d as i64 * datetime::MICROS_PER_DAY + t;
+                Ok(Value::Timestamp(datetime::timestamp(micros)?))
+            }
             // With a REAL, both as REALs.
-            (a, b) => match (a.as_real(), b.as_real()) {
+            (a, b) => match (a.to_f64(), b.to_f64()) {
                 (Some(_), Some(0.0)) if op == Div => err("division by zero"),
                 (Some(a), Some(b)) => real(match op {
                     Add => a + b,
@@ -523,6 +663,7 @@ pub(crate) fn binary(left: Value, op: BinaryOp, right: Value) -> Result<Value> {
         Concat => match (&left, &right) {
             (Null, _) | (_, Null) => Ok(Null),
             (Text(a), Text(b)) => Ok(Text(format!("{a}{b}"))),
+            (Value::Blob(a), Value::Blob(b)) => Ok(Value::Blob([a.as_slice(), b].concat())),
             _ => type_error(&left, &right),
         },
     }

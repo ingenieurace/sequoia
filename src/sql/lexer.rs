@@ -80,6 +80,8 @@ pub enum Token {
     Number(i64),
     Real(f64),
     Str(String),
+    /// `X'0A1B'`: bytes, two hexadecimal digits for each.
+    Blob(Vec<u8>),
     Symbol(&'static str),
 }
 
@@ -134,6 +136,26 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     Err(_) => return err(format!("integer out of range: {text}")),
                 },
             }
+        } else if matches!(c, 'x' | 'X') && next == Some('\'') {
+            // A blob literal: hexadecimal digits in quotes.
+            let start = i + 2;
+            let Some(len) = chars[start..].iter().position(|&ch| ch == '\'') else {
+                return err("unterminated blob literal");
+            };
+            let digits: String = chars[start..start + len].iter().collect();
+            let bytes: Option<Vec<u8>> = (digits.len() % 2 == 0)
+                .then(|| {
+                    (0..digits.len())
+                        .step_by(2)
+                        .map(|at| u8::from_str_radix(digits.get(at..at + 2)?, 16).ok())
+                        .collect()
+                })
+                .flatten();
+            match bytes {
+                Some(bytes) if digits.is_ascii() => tokens.push(Token::Blob(bytes)),
+                _ => return err(format!("invalid blob literal: X'{digits}'")),
+            }
+            i = start + len + 1;
         } else if c.is_alphabetic() || c == '_' {
             let start = i;
             while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
@@ -202,6 +224,7 @@ impl fmt::Display for Token {
             Token::Number(n) => write!(f, "{n}"),
             Token::Real(r) => write!(f, "{r:?}"),
             Token::Str(s) => write!(f, "'{s}'"),
+            Token::Blob(b) => write!(f, "X'{}'", crate::types::hex(b)),
             Token::Symbol(s) => write!(f, "{s}"),
         }
     }

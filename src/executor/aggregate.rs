@@ -56,10 +56,11 @@ use super::sort::value_size;
 use super::spill::{FANOUT, MAX_LEVEL, RowFile, partition};
 use super::vectorized::batch::Vector;
 use crate::catalog::table::Row;
+use crate::decimal::Decimal;
 use crate::error::{Error, Result, err};
 use crate::plan::query::AggregateCall;
-use crate::sql::ast::{Aggregate, Expr};
-use crate::sql::eval::{Field, eval};
+use crate::sql::ast::{Aggregate, BinaryOp, Expr};
+use crate::sql::eval::{Field, binary, eval};
 use crate::types::Value;
 
 /// Reads every row of `input` (whose columns are `columns`) and returns one
@@ -524,15 +525,18 @@ impl State {
 #[derive(Clone)]
 enum Accumulator {
     Count(i64),
-    /// An INT while every value added is, a REAL once one is.
+    /// An INT while every value added is, a DECIMAL once one is (exactly),
+    /// a REAL once one is.
     Sum(Option<Value>),
     Min(Option<Value>),
     Max(Option<Value>),
     /// INTs summed wider than INT, so that only the average must fit in one;
-    /// REALs summed apart.
+    /// REALs summed apart, and DECIMALs too, while there is no REAL (then
+    /// they are added to the REALs).
     Avg {
         ints: i128,
-        reals: f64,
+        reals: Option<f64>,
+        decimals: Option<Decimal>,
         count: i64,
     },
 }
@@ -546,7 +550,8 @@ impl Accumulator {
             Aggregate::Max => Accumulator::Max(None),
             Aggregate::Avg => Accumulator::Avg {
                 ints: 0,
-                reals: 0.0,
+                reals: None,
+                decimals: None,
                 count: 0,
             },
         }
@@ -574,19 +579,20 @@ impl Accumulator {
                         a.checked_add(b)
                             .ok_or_else(|| Error("integer overflow".into()))?,
                     ),
-                    (Some(a), b) => {
-                        let total = a.as_real().expect("a number") + b.as_real().expect("a number");
-                        if !total.is_finite() {
-                            return err("REAL overflow");
-                        }
-                        Value::Real(total)
-                    }
+                    // A DECIMAL exactly, with any REAL as REALs.
+                    (Some(a), b) => binary(a, BinaryOp::Add, b)?,
                 });
             }
-            Accumulator::Avg { ints, reals, count } => {
+            Accumulator::Avg {
+                ints,
+                reals,
+                decimals,
+                count,
+            } => {
                 match number(&value, "AVG")? {
                     Value::Int(n) => *ints += *n as i128,
-                    other => *reals += other.as_real().expect("a number"),
+                    Value::Decimal(d) => add_decimal(reals, decimals, *d)?,
+                    other => add_real(reals, decimals, other.as_real().expect("a number")),
                 }
                 *count += 1;
             }
@@ -669,7 +675,12 @@ impl Accumulator {
                         }
                         break;
                     }
-                    Some(_) => unreachable!("a sum is a number"),
+                    Some(total) => {
+                        for n in present.by_ref() {
+                            *total = binary(total.clone(), BinaryOp::Add, Value::Int(n))?;
+                        }
+                        break;
+                    }
                 }
             },
             Accumulator::Avg { ints, count, .. } => {
@@ -719,7 +730,7 @@ impl Accumulator {
                     return Ok(());
                 };
                 let mut total = match sum {
-                    Some(total) => finite(total.as_real().expect("a sum is a number") + first)?,
+                    Some(total) => finite(total.to_f64().expect("a sum is a number") + first)?,
                     None => first,
                 };
                 for r in present {
@@ -727,9 +738,14 @@ impl Accumulator {
                 }
                 *sum = Some(Value::Real(total));
             }
-            Accumulator::Avg { reals, count, .. } => {
+            Accumulator::Avg {
+                reals,
+                decimals,
+                count,
+                ..
+            } => {
                 for r in present {
-                    *reals += r;
+                    add_real(reals, decimals, r);
                     *count += 1;
                 }
             }
@@ -754,11 +770,21 @@ impl Accumulator {
             Accumulator::Sum(value) | Accumulator::Min(value) | Accumulator::Max(value) => {
                 out.push(value.clone().unwrap_or(Value::Null))
             }
-            // The sum of INTs, an i128, as its high and low 64 bits.
-            Accumulator::Avg { ints, reals, count } => out.extend([
+            // The sum of INTs, an i128, as its high and low 64 bits; then the
+            // sum of the REALs, or else of the DECIMALs, or NULL.
+            Accumulator::Avg {
+                ints,
+                reals,
+                decimals,
+                count,
+            } => out.extend([
                 Value::Int((*ints >> 64) as i64),
                 Value::Int(*ints as i64),
-                Value::Real(*reals),
+                match (reals, decimals) {
+                    (Some(r), _) => Value::Real(*r),
+                    (None, Some(d)) => Value::Decimal(*d),
+                    (None, None) => Value::Null,
+                },
                 Value::Int(*count),
             ]),
         }
@@ -782,10 +808,17 @@ impl Accumulator {
             Aggregate::Min => Accumulator::Min(present(next()?)),
             Aggregate::Max => Accumulator::Max(present(next()?)),
             Aggregate::Avg => match (next()?, next()?, next()?, next()?) {
-                (Value::Int(high), Value::Int(low), Value::Real(reals), Value::Int(count)) => {
+                (Value::Int(high), Value::Int(low), sum, Value::Int(count)) => {
+                    let (reals, decimals) = match sum {
+                        Value::Real(r) => (Some(r), None),
+                        Value::Decimal(d) => (None, Some(d)),
+                        Value::Null => (None, None),
+                        other => return err(format!("not an average's sum: {other:?}")),
+                    };
                     Accumulator::Avg {
                         ints: ((high as i128) << 64) | (low as u64 as i128),
                         reals,
+                        decimals,
                         count,
                     }
                 }
@@ -812,15 +845,26 @@ impl Accumulator {
                 keep(best, value, Ordering::Greater)?
             }
             (
-                Accumulator::Avg { ints, reals, count },
+                Accumulator::Avg {
+                    ints,
+                    reals,
+                    decimals,
+                    count,
+                },
                 Accumulator::Avg {
                     ints: i,
                     reals: r,
+                    decimals: d,
                     count: c,
                 },
             ) => {
                 *ints += i;
-                *reals += r;
+                if let Some(d) = d {
+                    add_decimal(reals, decimals, d)?;
+                }
+                if let Some(r) = r {
+                    add_real(reals, decimals, r);
+                }
                 *count += c;
             }
             // A sum, minimum or maximum of no values adds nothing.
@@ -838,11 +882,52 @@ impl Accumulator {
             Accumulator::Sum(sum) => sum.clone().unwrap_or(Value::Null),
             Accumulator::Min(best) | Accumulator::Max(best) => best.clone().unwrap_or(Value::Null),
             Accumulator::Avg { count: 0, .. } => Value::Null,
-            Accumulator::Avg { ints, reals, count } => {
-                Value::Real((*ints as f64 + reals) / *count as f64)
+            // Of DECIMALs and INTs, a DECIMAL, unless their sum is too big to
+            // be one.
+            Accumulator::Avg {
+                ints,
+                reals: None,
+                decimals: Some(d),
+                count,
+            } if let Some(avg) = (|| {
+                let ints = Decimal::new(*ints, 0).ok()?;
+                d.add(ints).ok()?.div(Decimal::from_int(*count)).ok()
+            })() =>
+            {
+                Value::Decimal(avg)
+            }
+            Accumulator::Avg {
+                ints,
+                reals,
+                decimals,
+                count,
+            } => {
+                let others = reals.unwrap_or(0.0) + decimals.map_or(0.0, |d| d.to_real());
+                Value::Real((*ints as f64 + others) / *count as f64)
             }
         }
     }
+}
+
+/// Adds a REAL to an average's sums: to the REALs, with the DECIMALs added
+/// to them if there are any.
+fn add_real(reals: &mut Option<f64>, decimals: &mut Option<Decimal>, r: f64) {
+    let decimals = decimals.take().map_or(0.0, |d| d.to_real());
+    *reals = Some(reals.unwrap_or(0.0) + decimals + r);
+}
+
+/// Adds a DECIMAL to an average's sums: exactly, unless there are REALs.
+fn add_decimal(reals: &mut Option<f64>, decimals: &mut Option<Decimal>, d: Decimal) -> Result<()> {
+    match reals {
+        Some(r) => *r += d.to_real(),
+        None => {
+            *decimals = Some(match decimals.take() {
+                Some(total) => total.add(d)?,
+                None => d,
+            })
+        }
+    }
+    Ok(())
 }
 
 /// How many of `n` values are not NULL, counting the flags with no branch.
@@ -930,7 +1015,7 @@ fn keep(best: &mut Option<Value>, value: Value, wanted: Ordering) -> Result<()> 
 
 fn number<'v>(value: &'v Value, function: &str) -> Result<&'v Value> {
     match value {
-        Value::Int(_) | Value::Real(_) => Ok(value),
+        Value::Int(_) | Value::Real(_) | Value::Decimal(_) => Ok(value),
         other => err(format!(
             "{function} expects a number, got {}",
             other.to_sql()

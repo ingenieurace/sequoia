@@ -4811,7 +4811,7 @@ fn case_coalesce_and_scalar_functions() {
         ),
         (
             "SELECT LENGTH(age) FROM users",
-            "LENGTH expects TEXT, got 30",
+            "LENGTH expects TEXT or BLOB, got 30",
         ),
         ("SELECT name || age FROM users", "cannot apply Concat"),
         (
@@ -6202,4 +6202,430 @@ fn explain_analyze_estimates_each_lookup_of_an_index_join() {
         (did.as_str(), estimate.as_str()),
         ("40 rows", "estimated 40")
     );
+}
+
+// ---- dates and times, blobs, decimals ----
+
+/// The rows of a query as the result shows them, their values joined by ` | `.
+fn shown(db: &mut Database, sql: &str) -> Vec<String> {
+    query(db, sql)
+        .into_iter()
+        .map(|row| {
+            row.iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .collect()
+}
+
+fn error(db: &mut Database, sql: &str) -> String {
+    db.execute(sql).unwrap_err().to_string()
+}
+
+/// A table of every new type, stored as `storage`, with a few rows.
+fn setup_types(db: &mut Database, storage: &str) {
+    db.execute(&format!(
+        "CREATE TABLE ev (id INT PRIMARY KEY, day DATE, at TIME, ts TIMESTAMP,
+                          price DECIMAL(10, 2), raw BLOB, n NUMERIC) USING {storage}"
+    ))
+    .unwrap();
+    db.execute(
+        "INSERT INTO ev VALUES
+           (1, DATE '2024-02-29', TIME '13:45:07.25', TIMESTAMP '2024-02-29 13:45:07',
+            19.999, X'CAFE00', DECIMAL '1.50'),
+           (2, DATE '2023-12-31', TIME '00:00', TIMESTAMP '1999-12-31 23:59:59.5', 5, X'', 2),
+           (3, NULL, NULL, NULL, DECIMAL '0.005', NULL, 0.1),
+           (4, DATE '0001-01-01', TIME '23:59:59.999999', TIMESTAMP '9999-12-31 23:59:59',
+            -12345678.9, X'00FF', DECIMAL '-1e-30')",
+    )
+    .unwrap();
+}
+
+const ALL_TYPES: &str = "SELECT id, day, at, ts, price, raw, n FROM ev ORDER BY id";
+
+/// The rows of [`setup_types`], as they show.
+fn all_types() -> Vec<String> {
+    [
+        "1 | 2024-02-29 | 13:45:07.25 | 2024-02-29 13:45:07 | 20.00 | X'CAFE00' | 1.5",
+        "2 | 2023-12-31 | 00:00:00 | 1999-12-31 23:59:59.5 | 5.00 | X'' | 2",
+        "3 | NULL | NULL | NULL | 0.01 | NULL | 0.1",
+        "4 | 0001-01-01 | 23:59:59.999999 | 9999-12-31 23:59:59 | -12345678.90 | X'00FF' | -0.000000000000000000000000000001",
+    ]
+    .map(String::from)
+    .into()
+}
+
+#[test]
+fn new_types_are_stored_by_every_storage_and_read_back_from_disk() {
+    let path = TempDb::new("types");
+    {
+        let mut db = open(&path.0).unwrap();
+        for storage in ["HEAP", "LSM", "COLUMN"] {
+            setup_types(&mut db, storage);
+            assert_eq!(shown(&mut db, ALL_TYPES), all_types(), "{storage}");
+            db.execute("DROP TABLE ev").unwrap();
+        }
+        setup_types(&mut db, "HEAP");
+        // Indexes on each, one of them holding every column read.
+        db.execute(
+            "CREATE INDEX ev_day ON ev (day);
+             CREATE INDEX ev_price ON ev (price) INCLUDE (raw, n);
+             CREATE INDEX ev_raw ON ev USING HASH (raw);
+             CREATE INDEX ev_ts ON ev (ts, at)",
+        )
+        .unwrap();
+    }
+    let mut db = open(&path.0).unwrap();
+    assert_eq!(shown(&mut db, ALL_TYPES), all_types());
+    // Through each index; the covering one decodes its keys back exactly.
+    let through = |db: &mut Database, sql: &str, index: &str| {
+        let plan = plan(db, sql);
+        assert!(plan.contains(index), "{sql}: {plan}");
+        shown(db, sql)
+    };
+    assert_eq!(
+        through(
+            &mut db,
+            "SELECT id FROM ev WHERE day >= DATE '2023-12-31'",
+            "ev_day"
+        ),
+        ["2", "1"]
+    );
+    assert_eq!(
+        through(
+            &mut db,
+            "SELECT price, raw, n FROM ev WHERE price < 6",
+            "COVERING INDEX ev_price"
+        ),
+        [
+            "-12345678.90 | X'00FF' | -0.000000000000000000000000000001",
+            "0.01 | NULL | 0.1",
+            "5.00 | X'' | 2"
+        ]
+    );
+    assert_eq!(
+        through(&mut db, "SELECT id FROM ev WHERE raw = X'00FF'", "ev_raw"),
+        ["4"]
+    );
+    assert_eq!(
+        through(
+            &mut db,
+            "SELECT id FROM ev WHERE ts > TIMESTAMP '2000-01-01 00:00'",
+            "ev_ts"
+        ),
+        ["1", "4"]
+    );
+    // An INT or REAL compared with a DECIMAL column finds it through its index.
+    assert_eq!(
+        through(&mut db, "SELECT id FROM ev WHERE price = 20", "ev_price"),
+        ["1"]
+    );
+    assert_eq!(
+        through(&mut db, "SELECT id FROM ev WHERE price = 5.0", "ev_price"),
+        ["2"]
+    );
+    // A value the column cannot hold exactly is compared row by row, and matches none.
+    assert!(shown(&mut db, "SELECT id FROM ev WHERE price = 19.999").is_empty());
+}
+
+#[test]
+fn new_types_agree_in_every_execution_model() {
+    for storage in ["HEAP", "COLUMN"] {
+        let mut db = Database::in_memory();
+        setup_types(&mut db, storage);
+        let queries = [
+            ALL_TYPES,
+            "SELECT id, day + 30, DATE '2024-03-01' - day, day + at FROM ev ORDER BY id",
+            "SELECT id, EXTRACT(YEAR FROM day), EXTRACT(HOUR FROM ts), EXTRACT(SECOND FROM at)
+             FROM ev ORDER BY id",
+            "SELECT id, price * 2, price / 3, -price, ABS(price), ROUND(price), price + n
+             FROM ev ORDER BY id",
+            "SELECT id, raw || X'01', LENGTH(raw) FROM ev ORDER BY id",
+            "SELECT SUM(price), AVG(price), MIN(day), MAX(ts), MIN(raw), MAX(n) FROM ev",
+            "SELECT day > DATE '2000-01-01', COUNT(*) FROM ev
+             GROUP BY day > DATE '2000-01-01' ORDER BY day > DATE '2000-01-01'",
+            "SELECT id FROM ev WHERE price BETWEEN 0 AND 100 AND raw IS NOT NULL
+             ORDER BY price DESC",
+            "SELECT id FROM ev WHERE day < DATE '2024-01-01' ORDER BY day",
+            "SELECT CAST(price AS TEXT), CAST(day AS TIMESTAMP), CAST(ts AS TIME)
+             FROM ev ORDER BY id",
+        ];
+        let mut first = None;
+        for model in Model::ALL {
+            db.set_execution_model(Some(model));
+            let results: Vec<Vec<String>> = queries.iter().map(|sql| shown(&mut db, sql)).collect();
+            match &first {
+                None => first = Some(results),
+                Some(expected) => assert_eq!(&results, expected, "{storage}, {model}"),
+            }
+        }
+        let results = first.unwrap();
+        assert_eq!(results[0], all_types());
+        assert_eq!(
+            results[1],
+            [
+                "1 | 2024-03-30 | 1 | 2024-02-29 13:45:07.25",
+                "2 | 2024-01-30 | 61 | 2023-12-31 00:00:00",
+                "3 | NULL | NULL | NULL",
+                "4 | 0001-01-31 | 738945 | 0001-01-01 23:59:59.999999",
+            ]
+        );
+        assert_eq!(results[2][0], "1 | 2024 | 13 | 7");
+        assert_eq!(
+            results[3][0],
+            "1 | 40.00 | 6.66666667 | -20.00 | 20.00 | 20 | 21.50"
+        );
+        assert_eq!(
+            results[4],
+            [
+                "1 | X'CAFE0001' | 3",
+                "2 | X'01' | 0",
+                "3 | NULL | NULL",
+                "4 | X'00FF01' | 2"
+            ]
+        );
+        assert_eq!(
+            results[5],
+            ["-12345653.89 | -3086413.47250000 | 0001-01-01 | 9999-12-31 23:59:59 | X'' | 2"]
+        );
+        assert_eq!(results[6], ["NULL | 1", "FALSE | 1", "TRUE | 2"]);
+        assert_eq!(results[7], ["1", "2"]);
+        assert_eq!(results[8], ["4", "2"]);
+        assert_eq!(results[9][1], "5.00 | 2023-12-31 00:00:00 | 23:59:59.5");
+    }
+}
+
+#[test]
+fn dates_and_times_check_their_values() {
+    let mut db = in_memory();
+    for (sql, message) in [
+        (
+            "SELECT DATE '2023-02-29' FROM t",
+            "invalid DATE: '2023-02-29'",
+        ),
+        ("SELECT TIME '24:00' FROM t", "invalid TIME: '24:00'"),
+        (
+            "SELECT TIMESTAMP '2024-01-01 1:00' FROM t",
+            "invalid TIMESTAMP: '2024-01-01 1:00'",
+        ),
+        ("SELECT X'ABC' FROM t", "invalid blob literal: X'ABC'"),
+        ("SELECT DECIMAL '1.2.3' FROM t", "invalid DECIMAL: '1.2.3'"),
+    ] {
+        assert_eq!(error(&mut db, sql), message, "{sql}");
+    }
+    db.execute("CREATE TABLE t (d DATE, s TEXT, n INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (DATE '9999-12-31', '2024-01-05', 3)")
+        .unwrap();
+    for (sql, message) in [
+        ("SELECT d + 1 FROM t", "DATE out of range: years 1 to 9999"),
+        (
+            "SELECT d = s FROM t",
+            "cannot apply Eq to DATE '9999-12-31' and '2024-01-05'",
+        ),
+        (
+            "SELECT d + d FROM t",
+            "cannot apply Add to DATE '9999-12-31' and DATE '9999-12-31'",
+        ),
+        (
+            "SELECT EXTRACT(HOUR FROM d) FROM t",
+            "cannot extract HOUR from DATE '9999-12-31'",
+        ),
+        ("SELECT CAST(n AS DATE) FROM t", "cannot cast 3 to DATE"),
+        ("SELECT CAST(s AS INT) FROM t", "invalid INT: '2024-01-05'"),
+        (
+            "INSERT INTO t VALUES ('2024-01-05', 'x', 1)",
+            "column d expects DATE, got '2024-01-05'",
+        ),
+    ] {
+        assert_eq!(error(&mut db, sql), message, "{sql}");
+    }
+    assert!(error(&mut db, "SELECT EXTRACT(WEEK FROM d) FROM t").contains("YEAR, MONTH, DAY"));
+    // A text is a date once cast, and a date a text.
+    assert_eq!(
+        shown(
+            &mut db,
+            "SELECT CAST(s AS DATE) - DATE '2024-01-01', CAST(d AS TEXT) || '!' FROM t"
+        ),
+        ["4 | 9999-12-31!"]
+    );
+    // Names of types stay free as names of columns.
+    db.execute(
+        "CREATE TABLE names (date DATE, time TIME, timestamp TIMESTAMP, blob BLOB, decimal DECIMAL)",
+    )
+    .unwrap();
+    db.execute("INSERT INTO names VALUES (DATE '2024-01-01', NULL, NULL, X'01', DECIMAL '2.50')")
+        .unwrap();
+    assert_eq!(
+        shown(
+            &mut db,
+            "SELECT date, blob, decimal FROM names WHERE date = DATE '2024-01-01'"
+        ),
+        ["2024-01-01 | X'01' | 2.5"]
+    );
+}
+
+#[test]
+fn decimals_are_exact_and_rounded_to_their_column() {
+    let mut db = in_memory();
+    db.execute("CREATE TABLE m (id INT PRIMARY KEY, amount DECIMAL(8, 2), any NUMERIC)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO m VALUES (1, 0.1, 0.1), (2, 0.2, DECIMAL '0.20'), (3, 2.675, 1e-3),
+                              (4, -0.005, 100)",
+    )
+    .unwrap();
+    // Rounded half away from zero to two places, by the digits written;
+    // NUMERIC keeps its digits but not its trailing zeros.
+    assert_eq!(
+        shown(&mut db, "SELECT amount, any FROM m ORDER BY id"),
+        ["0.10 | 0.1", "0.20 | 0.2", "2.68 | 0.001", "-0.01 | 100"]
+    );
+    // Sums are exact, where REALs' are not.
+    assert_eq!(
+        shown(&mut db, "SELECT SUM(amount), SUM(any) FROM m WHERE id < 3"),
+        ["0.30 | 0.3"]
+    );
+    assert_eq!(
+        shown(&mut db, "SELECT 0.1 + 0.2 = 0.3 FROM m WHERE id = 1"),
+        ["FALSE"]
+    );
+    assert_eq!(
+        shown(
+            &mut db,
+            "SELECT DECIMAL '0.1' + DECIMAL '0.2' = DECIMAL '0.3' FROM m WHERE id = 1"
+        ),
+        ["TRUE"]
+    );
+    // Equal values group and join together whatever their scale, and with INTs.
+    db.execute("INSERT INTO m VALUES (5, 100, 100.00)").unwrap();
+    assert_eq!(
+        shown(
+            &mut db,
+            "SELECT any, COUNT(*) FROM m GROUP BY any HAVING COUNT(*) > 1"
+        ),
+        ["100 | 2"]
+    );
+    assert_eq!(
+        shown(
+            &mut db,
+            "SELECT COUNT(*) FROM m a JOIN m b ON a.any = b.amount"
+        ),
+        ["4"]
+    );
+    assert_eq!(
+        shown(&mut db, "SELECT COUNT(*) FROM m WHERE any IN (100, 0.1)"),
+        ["3"]
+    );
+    // Too many digits before the point, out of range, or by zero: errors.
+    assert_eq!(
+        error(&mut db, "INSERT INTO m VALUES (6, 1000000, 0)"),
+        "column amount: 1000000 does not fit in DECIMAL(8, 2)"
+    );
+    assert_eq!(
+        error(&mut db, "SELECT amount / 0 FROM m"),
+        "division by zero"
+    );
+    assert_eq!(
+        error(
+            &mut db,
+            &format!("SELECT DECIMAL '{}' * 10 FROM m", "9".repeat(38))
+        ),
+        "DECIMAL out of range: more than 38 digits"
+    );
+    assert!(
+        error(&mut db, "CREATE TABLE w (d DECIMAL(39, 2))").contains("precision must be 1 to 38")
+    );
+    assert!(error(&mut db, "CREATE TABLE w (d DECIMAL(5, 6))").contains("scale at most"));
+    // With a REAL, a REAL.
+    assert_eq!(
+        shown(&mut db, "SELECT amount * 0.5 FROM m WHERE id = 2"),
+        ["0.1"]
+    );
+    assert_eq!(
+        shown(&mut db, "SELECT amount > 0.15 FROM m WHERE id = 2"),
+        ["TRUE"]
+    );
+    // Parallel workers sum and average exactly, as one does.
+    db.execute("DELETE FROM m").unwrap();
+    let rows: Vec<String> = (10..3000)
+        .map(|i| format!("({i}, {i}.01, {i}.5)"))
+        .collect();
+    db.execute(&format!("INSERT INTO m VALUES {}", rows.join(", ")))
+        .unwrap();
+    let sql = "SELECT SUM(amount), AVG(amount), SUM(any), AVG(any), COUNT(*) FROM m";
+    let one = shown(&mut db, sql);
+    assert_eq!(
+        one,
+        ["4498484.90 | 1504.51000000 | 4499950.0 | 1505.0000000 | 2990"]
+    );
+    db.set_scan_workers(4);
+    assert!(explain(&mut db, sql).contains("PARTIAL AGGREGATE"));
+    assert_eq!(shown(&mut db, sql), one);
+}
+
+#[test]
+fn blobs_compare_and_group_as_bytes() {
+    let mut db = in_memory();
+    db.execute("CREATE TABLE b (id INT PRIMARY KEY, data BLOB); CREATE INDEX b_data ON b (data)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO b VALUES (1, X'01'), (2, X'00'), (3, X'0100'), (4, X''), (5, X'FF'), (6, x'ff')",
+    )
+    .unwrap();
+    assert_eq!(
+        shown(&mut db, "SELECT id FROM b ORDER BY data, id"),
+        ["4", "2", "1", "3", "5", "6"]
+    );
+    assert!(plan(&mut db, "SELECT id FROM b WHERE data > X'01'").contains("b_data"));
+    assert_eq!(
+        shown(&mut db, "SELECT id FROM b WHERE data > X'01' ORDER BY id"),
+        ["3", "5", "6"]
+    );
+    assert_eq!(
+        shown(
+            &mut db,
+            "SELECT data, COUNT(*) FROM b GROUP BY data HAVING COUNT(*) > 1"
+        ),
+        ["X'FF' | 2"]
+    );
+    assert_eq!(
+        shown(
+            &mut db,
+            "SELECT CAST(CAST('héllo' AS BLOB) AS TEXT), LENGTH(CAST('héllo' AS BLOB)) FROM b WHERE id = 1"
+        ),
+        ["héllo | 6"]
+    );
+    assert_eq!(
+        error(&mut db, "SELECT data || 'x' FROM b WHERE id = 1"),
+        "cannot apply Concat to X'01' and 'x'"
+    );
+}
+
+#[test]
+fn statistics_of_dates_and_decimals_estimate_what_conditions_keep() {
+    let mut db = in_memory();
+    db.execute("CREATE TABLE d (id INT PRIMARY KEY, day DATE, cost DECIMAL(6, 2))")
+        .unwrap();
+    // A day a row, for a year, and ten costs.
+    let rows: Vec<String> = (0..366)
+        .map(|i| format!("({i}, DATE '2024-01-01' + {i}, {}.25)", i % 10))
+        .collect();
+    db.execute(&format!(
+        "INSERT INTO d VALUES {}; ANALYZE d",
+        rows.join(", ")
+    ))
+    .unwrap();
+    let (rows, estimate) = rows_and_estimate(
+        &mut db,
+        "SELECT * FROM d WHERE day >= DATE '2024-03-01' AND day < DATE '2024-04-01'",
+        "FILTER",
+    );
+    assert_eq!(rows, 31.0);
+    assert!((estimate - rows).abs() <= 5.0, "estimated {estimate}");
+    let (rows, estimate) =
+        rows_and_estimate(&mut db, "SELECT * FROM d WHERE cost = 3.25", "FILTER");
+    assert_eq!(rows, 37.0);
+    assert!((estimate - rows).abs() <= 5.0, "estimated {estimate}");
 }

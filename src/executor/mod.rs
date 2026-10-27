@@ -389,7 +389,9 @@ fn insert(
             }
             new_rows.push(row);
         }
-        let returned = returning.map(|returning| (returning, table.coerce_all(new_rows.clone())));
+        let returned = returning
+            .map(|returning| -> Result<_> { Ok((returning, table.coerce_all(new_rows.clone())?)) })
+            .transpose()?;
         (new_rows, returned)
     };
 
@@ -455,10 +457,12 @@ fn update(
             }
             changes.push((rid, old, row));
         }
-        let returned = returning.map(|returning| {
-            let new_rows = changes.iter().map(|(_, _, new)| new.clone()).collect();
-            (returning, table.coerce_all(new_rows))
-        });
+        let returned = returning
+            .map(|returning| -> Result<_> {
+                let new_rows = changes.iter().map(|(_, _, new)| new.clone()).collect();
+                Ok((returning, table.coerce_all(new_rows)?))
+            })
+            .transpose()?;
         (changes, returned)
     };
 

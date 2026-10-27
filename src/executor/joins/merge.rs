@@ -261,8 +261,12 @@ fn rank(value: &Value) -> i64 {
     match value {
         Value::Null => 0,
         Value::Bool(_) => 1,
-        Value::Int(_) | Value::Real(_) => 2,
+        Value::Int(_) | Value::Real(_) | Value::Decimal(_) => 2,
         Value::Text(_) => 3,
+        Value::Blob(_) => 4,
+        Value::Date(_) => 5,
+        Value::Time(_) => 6,
+        Value::Timestamp(_) => 7,
     }
 }
 

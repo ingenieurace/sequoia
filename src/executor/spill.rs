@@ -68,9 +68,33 @@ pub fn temp_file() -> Result<Arc<dyn Medium>> {
 ///
 /// ```text
 /// 0 = NULL | 1, i64 | 2, bool byte | 3, u32 length, UTF-8 bytes | 4, f64
+///   | 5, i32 days | 6, i64 time | 7, i64 timestamp | 8, u32 length, bytes
+///   | 9, i128 mantissa, scale byte
 /// ```
 pub fn encode_value(value: &Value, out: &mut Vec<u8>) {
     match value {
+        Value::Date(d) => {
+            out.push(5);
+            out.extend_from_slice(&d.to_le_bytes());
+        }
+        Value::Time(t) | Value::Timestamp(t) => {
+            out.push(if matches!(value, Value::Time(_)) {
+                6
+            } else {
+                7
+            });
+            out.extend_from_slice(&t.to_le_bytes());
+        }
+        Value::Blob(b) => {
+            out.push(8);
+            out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            out.extend_from_slice(b);
+        }
+        Value::Decimal(d) => {
+            out.push(9);
+            out.extend_from_slice(&d.mantissa().to_le_bytes());
+            out.push(d.scale());
+        }
         Value::Null => out.push(0),
         Value::Int(n) => {
             out.push(1);
@@ -103,6 +127,21 @@ pub fn decode_value(bytes: &[u8], pos: &mut usize) -> Result<Value> {
         1 => Value::Int(i64::from_le_bytes(take(8)?.try_into().unwrap())),
         2 => Value::Bool(take(1)?[0] != 0),
         4 => Value::Real(f64::from_le_bytes(take(8)?.try_into().unwrap())),
+        5 => Value::Date(i32::from_le_bytes(take(4)?.try_into().unwrap())),
+        6 => Value::Time(i64::from_le_bytes(take(8)?.try_into().unwrap())),
+        7 => Value::Timestamp(i64::from_le_bytes(take(8)?.try_into().unwrap())),
+        8 => {
+            let len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
+            Value::Blob(take(len)?.to_vec())
+        }
+        9 => {
+            let mantissa = i128::from_le_bytes(take(16)?.try_into().unwrap());
+            let scale = take(1)?[0];
+            match crate::decimal::Decimal::new(mantissa, scale) {
+                Ok(d) => Value::Decimal(d),
+                Err(_) => return err("corrupted temporary file: invalid DECIMAL"),
+            }
+        }
         3 => {
             let len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
             match String::from_utf8(take(len)?.to_vec()) {

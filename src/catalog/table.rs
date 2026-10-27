@@ -535,7 +535,7 @@ impl Table {
     }
 
     pub fn insert(&mut self, rows: Vec<Row>) -> Result<()> {
-        let rows = self.coerce_all(rows);
+        let rows = self.coerce_all(rows)?;
         let encoded = self.encode_all(&rows)?;
         self.check_unique(&HashSet::new(), &rows, &[])?;
         let pk = primary_key(&self.columns);
@@ -599,7 +599,7 @@ impl Table {
             .into_iter()
             .map(|(id, old, new)| ((id, old), new))
             .unzip();
-        let rows = self.coerce_all(rows);
+        let rows = self.coerce_all(rows)?;
         let ids: Vec<RowId> = old_rows.iter().map(|(id, _)| id.clone()).collect();
         let encoded = self.encode_all(&rows)?;
         self.check_unique(&ids.iter().cloned().collect(), &rows, &old_rows)?;
@@ -814,20 +814,21 @@ impl Table {
         }
     }
 
-    /// Rows with each value made one of its column's type where it equals
-    /// one (an INT stored in a REAL column, 2.0 in an INT one); others are
-    /// left for encoding to reject. These are the values a row is stored with.
-    pub fn coerce_all(&self, mut rows: Vec<Row>) -> Vec<Row> {
+    /// Rows with each value made one of its column's type as it is stored
+    /// (see [`Value::assign`]): an INT stored in a REAL column, 2.0 in an INT
+    /// one, a number rounded to a DECIMAL column's places (an error if it has
+    /// too many digits). Others are left for encoding to reject.
+    pub fn coerce_all(&self, mut rows: Vec<Row>) -> Result<Vec<Row>> {
         for row in &mut rows {
             for (value, column) in row.iter_mut().zip(&self.columns) {
-                if !value.fits(column.data_type)
-                    && let Some(coerced) = value.coerce(column.data_type)
-                {
-                    *value = coerced;
+                if !value.fits(column.data_type) {
+                    *value = value
+                        .assign(column.data_type)
+                        .map_err(|e| Error(format!("column {}: {}", column.name, e.0)))?;
                 }
             }
         }
-        rows
+        Ok(rows)
     }
 
     /// Encodes rows, which also checks their types.

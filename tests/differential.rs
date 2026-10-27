@@ -1346,6 +1346,8 @@ fn quote(value: &Value) -> String {
         Value::Bool(b) => (*b as i64).to_string(),
         Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
         Value::Real(r) => real_text(*r),
+        // Types the cases never make, as SQLite has none of them.
+        other => other.to_sql(),
     }
 }
 

@@ -9,6 +9,8 @@
 
 pub mod catalog;
 pub mod database;
+pub mod datetime;
+pub mod decimal;
 pub mod error;
 pub mod executor;
 pub mod plan;

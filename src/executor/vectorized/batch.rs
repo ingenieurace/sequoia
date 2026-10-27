@@ -76,6 +76,12 @@ impl Vector {
             Value::Real(_) => typed!(Real, 0.0),
             Value::Bool(_) => typed!(Bool, false),
             Value::Text(_) => typed!(Text, String::new()),
+            // The other types go through the loops a value at a time.
+            Value::Date(_)
+            | Value::Time(_)
+            | Value::Timestamp(_)
+            | Value::Blob(_)
+            | Value::Decimal(_) => Vector::Mixed(values),
             Value::Null => unreachable!("found a value that is not NULL"),
         }
     }

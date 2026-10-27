@@ -11,6 +11,8 @@ use super::ast::{
     OrderBy, Projection, Select, SelectItem, Statement, TableRef, TableSource, UnaryOp,
 };
 use super::lexer::{Token, tokenize};
+use crate::datetime;
+use crate::decimal::Decimal;
 use crate::error::{Error, Result};
 use crate::types::{Column, DataType, StorageKind, Value};
 
@@ -151,17 +153,7 @@ impl Parser {
 
     fn column_def(&mut self) -> Result<Column> {
         let name = self.ident()?;
-        let data_type = if self.eat_keyword("INT") || self.eat_keyword("INTEGER") {
-            DataType::Int
-        } else if self.eat_keyword("TEXT") {
-            DataType::Text
-        } else if self.eat_keyword("BOOL") || self.eat_keyword("BOOLEAN") {
-            DataType::Bool
-        } else if self.eat_keyword("REAL") || self.eat_keyword("FLOAT") {
-            DataType::Real
-        } else {
-            return Err(self.unexpected("a data type"));
-        };
+        let data_type = self.data_type()?;
         let primary_key = self.eat_keyword("PRIMARY");
         if primary_key {
             self.expect_keyword("KEY")?;
@@ -171,6 +163,60 @@ impl Parser {
             data_type,
             primary_key,
         })
+    }
+
+    /// A data type: INT, TEXT, BOOL, REAL, DATE, TIME, TIMESTAMP, BLOB or
+    /// `DECIMAL[(precision[, scale])]` (or NUMERIC). The names that are not
+    /// keywords stay free as names of columns.
+    fn data_type(&mut self) -> Result<DataType> {
+        if self.eat_keyword("INT") || self.eat_keyword("INTEGER") {
+            return Ok(DataType::Int);
+        } else if self.eat_keyword("TEXT") {
+            return Ok(DataType::Text);
+        } else if self.eat_keyword("BOOL") || self.eat_keyword("BOOLEAN") {
+            return Ok(DataType::Bool);
+        } else if self.eat_keyword("REAL") || self.eat_keyword("FLOAT") {
+            return Ok(DataType::Real);
+        }
+        let Some(Token::Ident(name)) = self.peek() else {
+            return Err(self.unexpected("a data type"));
+        };
+        let data_type = match name.to_uppercase().as_str() {
+            "DATE" => DataType::Date,
+            "TIME" => DataType::Time,
+            "TIMESTAMP" => DataType::Timestamp,
+            "BLOB" => DataType::Blob,
+            "DECIMAL" | "NUMERIC" => DataType::Decimal(None),
+            _ => return Err(self.unexpected("a data type")),
+        };
+        self.pos += 1;
+        if data_type != DataType::Decimal(None) || !self.eat_symbol("(") {
+            return Ok(data_type);
+        }
+        let precision = self.small_number()?;
+        let scale = match self.eat_symbol(",") {
+            true => self.small_number()?,
+            false => 0,
+        };
+        self.expect_symbol(")")?;
+        if !(1..=crate::decimal::MAX_PRECISION).contains(&precision) || scale > precision {
+            return Err(Error(format!(
+                "invalid DECIMAL({precision}, {scale}): the precision must be 1 to 38, and the scale at most the precision"
+            )));
+        }
+        Ok(DataType::Decimal(Some((precision, scale))))
+    }
+
+    /// A number that fits a byte, as a DECIMAL's precision or scale.
+    fn small_number(&mut self) -> Result<u8> {
+        match self.peek() {
+            Some(Token::Number(n)) if (0..=255).contains(n) => {
+                let n = *n as u8;
+                self.pos += 1;
+                Ok(n)
+            }
+            _ => Err(self.unexpected("a number from 0 to 255")),
+        }
     }
 
     fn create_index(&mut self) -> Result<Statement> {
@@ -598,10 +644,27 @@ impl Parser {
             self.expect_symbol(")")?;
             return Ok(expr);
         }
+        // `DATE '2024-01-31'` and the like: a literal of a type written as text.
+        if let (Some(Token::Ident(name)), Some(Token::Str(text))) =
+            (self.peek(), self.tokens.get(self.pos + 1))
+        {
+            let value = match name.to_uppercase().as_str() {
+                "DATE" => Some(datetime::parse_date(text).map(Value::Date)),
+                "TIME" => Some(datetime::parse_time(text).map(Value::Time)),
+                "TIMESTAMP" => Some(datetime::parse_timestamp(text).map(Value::Timestamp)),
+                "DECIMAL" | "NUMERIC" => Some(Decimal::parse(text).map(Value::Decimal)),
+                _ => None,
+            };
+            if let Some(value) = value {
+                self.pos += 2;
+                return Ok(Expr::Literal(value?));
+            }
+        }
         let expr = match self.peek() {
             Some(Token::Number(n)) => Expr::Literal(Value::Int(*n)),
             Some(Token::Real(r)) => Expr::Literal(Value::Real(*r)),
             Some(Token::Str(s)) => Expr::Literal(Value::Text(s.clone())),
+            Some(Token::Blob(b)) => Expr::Literal(Value::Blob(b.clone())),
             Some(Token::Ident(name))
                 if self.tokens.get(self.pos + 1) == Some(&Token::Symbol("(")) =>
             {
@@ -658,6 +721,32 @@ impl Parser {
 
     /// The rest of `name(...)` after its opening parenthesis: an aggregate or a scalar function.
     fn aggregate(&mut self, name: &str) -> Result<Expr> {
+        // `CAST(value AS type)` and `EXTRACT(field FROM value)`, which take
+        // more than values.
+        match name.to_uppercase().as_str() {
+            "CAST" => {
+                let value = self.expr()?;
+                self.expect_keyword("AS")?;
+                let data_type = self.data_type()?;
+                self.expect_symbol(")")?;
+                return Ok(Expr::Function(Function::Cast(data_type), vec![value]));
+            }
+            "EXTRACT" => {
+                let field = match self.peek() {
+                    Some(Token::Ident(name)) => datetime::Field::from_name(name),
+                    _ => None,
+                };
+                let Some(field) = field else {
+                    return Err(self.unexpected("YEAR, MONTH, DAY, HOUR, MINUTE or SECOND"));
+                };
+                self.pos += 1;
+                self.expect_keyword("FROM")?;
+                let value = self.expr()?;
+                self.expect_symbol(")")?;
+                return Ok(Expr::Function(Function::Extract(field), vec![value]));
+            }
+            _ => {}
+        }
         let Some(function) = Aggregate::from_name(name) else {
             let Some(function) = Function::from_name(name) else {
                 return Err(Error(format!("unknown function: {name}")));

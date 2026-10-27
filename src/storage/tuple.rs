@@ -8,12 +8,19 @@
 //! BOOL         1 byte, 0 or 1
 //! TEXT         u16 length (little-endian) + UTF-8 bytes
 //! REAL         8 bytes, little-endian
+//! DATE         4 bytes, little-endian days since 1970-01-01
+//! TIME         8 bytes, little-endian microseconds since midnight
+//! TIMESTAMP    8 bytes, little-endian microseconds since 1970-01-01 00:00
+//! BLOB         u16 length (little-endian) + the bytes
+//! DECIMAL      16 bytes, the little-endian mantissa, then its scale in 1 byte
 //! ```
 //!
 //! The schema is not stored with the row: decoding needs the columns used to encode it.
 //! Values are copied out when decoding, so no alignment padding is needed.
 
+use crate::decimal::Decimal;
 use crate::error::{Result, err};
+use crate::storage::sort_key;
 use crate::types::{Column, DataType, Value, ordered_real};
 
 pub fn encode(columns: &[Column], row: &[Value]) -> Result<Vec<u8>> {
@@ -27,28 +34,45 @@ pub fn encode(columns: &[Column], row: &[Value]) -> Result<Vec<u8>> {
 
     let mut bytes = vec![0u8; columns.len().div_ceil(8)];
     for (i, (column, value)) in columns.iter().zip(row).enumerate() {
-        match (value, column.data_type) {
-            (Value::Null, _) => bytes[i / 8] |= 1 << (i % 8),
-            (Value::Int(n), DataType::Int) => bytes.extend_from_slice(&n.to_le_bytes()),
-            (Value::Bool(b), DataType::Bool) => bytes.push(*b as u8),
-            (Value::Real(r), DataType::Real) => bytes.extend_from_slice(&r.to_le_bytes()),
-            (Value::Text(s), DataType::Text) => {
+        let long = |what: &str| {
+            err(format!(
+                "{what} in column {} is longer than {} bytes",
+                column.name,
+                u16::MAX
+            ))
+        };
+        match value {
+            Value::Null => bytes[i / 8] |= 1 << (i % 8),
+            value if !value.fits(column.data_type) => {
+                return err(format!(
+                    "column {} expects {}, got {}",
+                    column.name,
+                    column.data_type,
+                    value.to_sql()
+                ));
+            }
+            Value::Int(n) => bytes.extend_from_slice(&n.to_le_bytes()),
+            Value::Bool(b) => bytes.push(*b as u8),
+            Value::Real(r) => bytes.extend_from_slice(&r.to_le_bytes()),
+            Value::Text(s) => {
                 let Ok(len) = u16::try_from(s.len()) else {
-                    return err(format!(
-                        "text in column {} is longer than {} bytes",
-                        column.name,
-                        u16::MAX
-                    ));
+                    return long("text");
                 };
                 bytes.extend_from_slice(&len.to_le_bytes());
                 bytes.extend_from_slice(s.as_bytes());
             }
-            (value, data_type) => {
-                return err(format!(
-                    "column {} expects {data_type}, got {}",
-                    column.name,
-                    value.to_sql()
-                ));
+            Value::Date(d) => bytes.extend_from_slice(&d.to_le_bytes()),
+            Value::Time(t) | Value::Timestamp(t) => bytes.extend_from_slice(&t.to_le_bytes()),
+            Value::Blob(b) => {
+                let Ok(len) = u16::try_from(b.len()) else {
+                    return long("a blob");
+                };
+                bytes.extend_from_slice(&len.to_le_bytes());
+                bytes.extend_from_slice(b);
+            }
+            Value::Decimal(d) => {
+                bytes.extend_from_slice(&d.mantissa().to_le_bytes());
+                bytes.push(d.scale());
             }
         }
     }
@@ -99,9 +123,13 @@ fn decode_from(
         }
         if !needed(i) {
             match column.data_type {
-                DataType::Int | DataType::Real => reader.take(8)?,
+                DataType::Int | DataType::Real | DataType::Time | DataType::Timestamp => {
+                    reader.take(8)?
+                }
+                DataType::Date => reader.take(4)?,
+                DataType::Decimal(_) => reader.take(17)?,
                 DataType::Bool => reader.take(1)?,
-                DataType::Text => {
+                DataType::Text | DataType::Blob => {
                     let len = u16::from_le_bytes(reader.array()?) as usize;
                     reader.take(len)?
                 }
@@ -124,6 +152,21 @@ fn decode_from(
                     Err(_) => return err("corrupted row: invalid UTF-8"),
                 }
             }
+            DataType::Date => Value::Date(i32::from_le_bytes(reader.array()?)),
+            DataType::Time => Value::Time(i64::from_le_bytes(reader.array()?)),
+            DataType::Timestamp => Value::Timestamp(i64::from_le_bytes(reader.array()?)),
+            DataType::Blob => {
+                let len = u16::from_le_bytes(reader.array()?) as usize;
+                Value::Blob(reader.take(len)?.to_vec())
+            }
+            DataType::Decimal(_) => {
+                let mantissa = i128::from_le_bytes(reader.array()?);
+                let [scale] = reader.array::<1>()?;
+                match Decimal::new(mantissa, scale) {
+                    Ok(d) => Value::Decimal(d),
+                    Err(_) => return err("corrupted row: invalid DECIMAL"),
+                }
+            }
         };
         row.push(value);
     }
@@ -133,8 +176,9 @@ fn decode_from(
 /// Encodes a key value so that comparing the bytes orders keys like the values.
 ///
 /// INT is 8 bytes big-endian with the sign bit flipped, TEXT its UTF-8 bytes,
-/// BOOL one byte, REAL its [`ordered_real`] bits big-endian. All keys of a
-/// table have the same type, so no tag is needed.
+/// BOOL one byte, REAL its [`ordered_real`] bits big-endian, and any other
+/// its sort key (see `sort_key.rs`). All keys of a table have the same type,
+/// so no tag is needed.
 pub fn encode_key(value: &Value) -> Vec<u8> {
     match value {
         Value::Int(n) => ((*n as u64) ^ (1 << 63)).to_be_bytes().to_vec(),
@@ -142,6 +186,11 @@ pub fn encode_key(value: &Value) -> Vec<u8> {
         Value::Bool(b) => vec![*b as u8],
         Value::Real(r) => ordered_real(*r).to_be_bytes().to_vec(),
         Value::Null => panic!("NULL cannot be a key"),
+        other => {
+            let mut key = Vec::new();
+            sort_key::encode(other, false, &mut key);
+            key
+        }
     }
 }
 

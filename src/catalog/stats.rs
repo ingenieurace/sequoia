@@ -274,7 +274,11 @@ impl ColumnStats {
 
         // The common values: all of them if the whole table has few, else
         // those that stand out.
-        let short = |v: &Value| !matches!(v, Value::Text(t) if t.chars().count() > MAX_TEXT);
+        let short = |v: &Value| match v {
+            Value::Text(t) => t.chars().count() <= MAX_TEXT,
+            Value::Blob(b) => b.len() <= MAX_TEXT,
+            _ => true,
+        };
         let mut common: Vec<(Value, usize)> = if whole && counts.len() <= MOST_COMMON {
             counts.iter().filter(|(v, _)| short(v)).cloned().collect()
         } else {
@@ -388,7 +392,7 @@ impl ColumnStats {
         }
         let buckets = (bounds.len() - 1) as f64;
         let (low, high) = (&bounds[count - 1], &bounds[count]);
-        let within = match (low.as_real(), high.as_real(), value.as_real()) {
+        let within = match (position(low), position(high), position(value)) {
             (Some(low), Some(high), Some(v)) if high > low => {
                 ((v - low) / (high - low)).clamp(0.0, 1.0)
             }
@@ -441,8 +445,20 @@ fn cut(value: &Value) -> Value {
         Value::Text(t) if t.chars().count() > MAX_TEXT => {
             Value::Text(t.chars().take(MAX_TEXT).collect())
         }
+        Value::Blob(b) if b.len() > MAX_TEXT => Value::Blob(b[..MAX_TEXT].to_vec()),
         value => value.clone(),
     }
+}
+
+/// Bytes from hexadecimal digits, two for each.
+fn unhex(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
 fn encode_value(value: &Value) -> String {
@@ -451,7 +467,22 @@ fn encode_value(value: &Value) -> String {
         Value::Real(r) => format!("r{r:?}"),
         Value::Bool(b) => format!("b{}", *b as u8),
         Value::Text(t) => format!("t{}:{t}", t.len()),
+        Value::Date(d) => format!("D{d}"),
+        Value::Time(t) => format!("T{t}"),
+        Value::Timestamp(t) => format!("S{t}"),
+        Value::Blob(b) => format!("X{}", crate::types::hex(b)),
+        Value::Decimal(d) => format!("N{d}"),
         Value::Null => unreachable!("statistics hold no NULL"),
+    }
+}
+
+/// Where a value lies on a line, for interpolating within a histogram's
+/// bucket: a number's value, or a date's or time's count.
+fn position(value: &Value) -> Option<f64> {
+    match value {
+        Value::Date(d) => Some(*d as f64),
+        Value::Time(t) | Value::Timestamp(t) => Some(*t as f64),
+        other => other.to_f64(),
     }
 }
 
@@ -516,6 +547,23 @@ impl<'a> Reader<'a> {
             },
             ("b", "0") => Value::Bool(false),
             ("b", "1") => Value::Bool(true),
+            ("D", d) => match d.parse() {
+                Ok(d) => Value::Date(d),
+                Err(_) => return bad(),
+            },
+            ("T" | "S", t) => match t.parse() {
+                Ok(t) if tag == "T" => Value::Time(t),
+                Ok(t) => Value::Timestamp(t),
+                Err(_) => return bad(),
+            },
+            ("X", hex) => match unhex(hex) {
+                Some(bytes) => Value::Blob(bytes),
+                None => return bad(),
+            },
+            ("N", d) => match crate::decimal::Decimal::parse(d) {
+                Ok(d) => Value::Decimal(d),
+                Err(_) => return bad(),
+            },
             _ => return bad(),
         })
     }

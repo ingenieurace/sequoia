@@ -348,6 +348,8 @@ impl<'a> KeyRef<'a> {
 pub fn value_size(value: &Value) -> usize {
     match value {
         Value::Text(s) => 24 + s.len(),
+        Value::Blob(b) => 24 + b.len(),
+        Value::Decimal(_) => 32,
         _ => 16,
     }
 }
@@ -766,8 +768,12 @@ mod tests {
         let rank = |v: &Value| match v {
             Value::Null => 0,
             Value::Bool(_) => 1,
-            Value::Int(_) | Value::Real(_) => 2,
+            Value::Int(_) | Value::Real(_) | Value::Decimal(_) => 2,
             Value::Text(_) => 3,
+            Value::Blob(_) => 4,
+            Value::Date(_) => 5,
+            Value::Time(_) => 6,
+            Value::Timestamp(_) => 7,
         };
         rank(a).cmp(&rank(b)).then_with(|| a.sort_cmp(b))
     }
