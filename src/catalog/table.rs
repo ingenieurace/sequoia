@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 
 use super::index::{Bound, Index, encode_keys};
+use super::stats::TableStats;
 use crate::error::{Error, Result, err};
 use crate::predicate::Predicate;
 use crate::sql::ast::CreateIndex;
@@ -45,6 +46,8 @@ pub struct Table {
     indexes: Vec<Index>,
     /// How many rows the table has, or [`UNCOUNTED`]: see [`Table::row_count`].
     rows: AtomicU64,
+    /// What the last ANALYZE learned, if the table was analyzed.
+    stats: Option<TableStats>,
 }
 
 /// A row count not counted yet.
@@ -179,6 +182,7 @@ impl Table {
             storage,
             indexes: Vec::new(),
             rows: AtomicU64::new(0),
+            stats: None,
         })
     }
 
@@ -215,6 +219,7 @@ impl Table {
             storage,
             indexes: Vec::new(),
             rows: AtomicU64::new(UNCOUNTED),
+            stats: None,
         })
     }
 
@@ -286,6 +291,17 @@ impl Table {
 
     pub fn indexes(&self) -> &[Index] {
         &self.indexes
+    }
+
+    /// What the last ANALYZE learned about the table's values (see
+    /// `stats.rs`), if it had any rows then: an empty table tells nothing
+    /// of the values it will hold.
+    pub fn stats(&self) -> Option<&TableStats> {
+        self.stats.as_ref().filter(|stats| stats.rows > 0)
+    }
+
+    pub fn set_stats(&mut self, stats: Option<TableStats>) {
+        self.stats = stats;
     }
 
     /// Builds an index over the table's rows. Fails, leaving no index behind,

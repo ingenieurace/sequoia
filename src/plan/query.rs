@@ -15,8 +15,12 @@
 //!           LOOKUP orders o USING INDEX o_user (o.user_id = u.id)
 //! ```
 //!
-//! **Tables.** The tables of FROM are joined left to right, each join
-//! reading the rows joined so far on its left and one table on its right.
+//! **Tables.** The tables of FROM are joined one at a time, each join
+//! reading the rows joined so far on its left and one table on its right:
+//! left to right, unless another order of the inner joins before the first
+//! LEFT JOIN costs clearly less (see `join_order` below and `order.rs`).
+//! Then they are planned as if FROM were written in that order, its ONs
+//! joining WHERE, and `SELECT *` is projected back to FROM's order.
 //! A subquery in FROM (a derived table) is planned like any SELECT, and its
 //! columns are named by its select list (an `AS` name, a column's name, an
 //! aggregate's function or `?column?`) and qualified by its alias. It cannot
@@ -57,11 +61,13 @@
 //! of every right row (and a cheap probe per left row), so which is cheaper
 //! depends on how many rows each side has. The planner counts a table's rows
 //! the first time it needs them (the writes keep the count after that) and
-//! guesses, with no statistics, what share of them a condition keeps, the
-//! way PostgreSQL does without them: 1 in 200 for an equality, a third for a
-//! comparison. A join with equalities is guessed to return as many rows as
-//! its larger side. The costs of a lookup, of a hash table row and of a
-//! probe, relative to reading a row, were measured with `benches/joins.rs`.
+//! estimates what share of them a condition keeps from the statistics
+//! ANALYZE gathered (see `selectivity.rs`), or else guesses, the way
+//! PostgreSQL does without them: 1 in 200 for an equality, a third for a
+//! comparison. A join with equalities is estimated from the distinct values
+//! of its columns, or else guessed to return as many rows as its larger
+//! side. The costs of a lookup, of a hash table row and of a probe,
+//! relative to reading a row, were measured with `benches/joins.rs`.
 //!
 //! A merge join, which sorts both sides by the equalities and merges them,
 //! puts its rows in its left side's sorted order. With no statistics to
@@ -140,7 +146,8 @@ use crate::catalog::Catalog;
 use crate::catalog::index::{Index, Key};
 use crate::catalog::table::{Access, Table};
 use crate::error::{Result, err};
-use crate::plan::{access, filter};
+use crate::plan::selectivity::{self, EQUAL_KEEPS, OTHER_KEEPS, Scope, table_rows};
+use crate::plan::{access, filter, order};
 use crate::predicate::{Compare, Predicate};
 use crate::sql::ast::{
     Aggregate, BinaryOp, ColumnRef, Expr, From, JoinKind, OrderBy, Projection, Select, SelectItem,
@@ -377,6 +384,20 @@ impl<'a> Source<'a> {
             .collect()
     }
 
+    /// What [`Source::read`] would plan, for estimates, leaving a derived
+    /// table's plan for it to take.
+    fn peek(&self, filter: Option<Expr>, needed: Vec<bool>) -> Node<'a> {
+        let mut copy = Source {
+            kind: match &self.kind {
+                SourceKind::Table(table) => SourceKind::Table(table),
+                SourceKind::Derived(plan) => SourceKind::Derived(plan.clone()),
+            },
+            qualifier: self.qualifier.clone(),
+            names: self.names.clone(),
+        };
+        copy.read(filter, needed)
+    }
+
     /// Plans reading the rows `filter` matches; `needed` marks the columns read above.
     fn read(&mut self, filter: Option<Expr>, needed: Vec<bool>) -> Node<'a> {
         match &mut self.kind {
@@ -581,17 +602,75 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Resu
         })
         .collect();
 
+    // Join the tables in the order that costs least, if not as written.
+    let mut kinds: Vec<JoinKind> = std::iter::once(JoinKind::Inner)
+        .chain(from.joins.iter().map(|j| j.kind))
+        .collect();
+    let (mut filter, mut ons, mut needed) = (filter, ons, needed);
+    // SELECT * returns the columns in the order of FROM, whatever the order
+    // of the joins: a projection puts them back in it, if they are named
+    // apart (a derived table may have two of a name).
+    let all_columns: Option<Vec<Expr>> = exprs.is_none().then(|| {
+        let fields = sources.iter().flat_map(Source::fields);
+        fields
+            .map(|f| {
+                Expr::Column(ColumnRef {
+                    table: f.table,
+                    name: f.name,
+                })
+            })
+            .collect()
+    });
+    let named_apart = all_columns
+        .as_ref()
+        .is_none_or(|all| all.iter().enumerate().all(|(i, c)| !all[..i].contains(c)));
+    let reordered = named_apart
+        .then(|| {
+            join_order(
+                &sources,
+                &kinds,
+                filter.as_ref(),
+                &ons,
+                &needed,
+                &binder,
+                choices,
+            )
+        })
+        .flatten();
+    let order_binder;
+    let binder = match &reordered {
+        None => &binder,
+        Some(order) => {
+            // The ONs of the inner joins reordered join the WHERE, which they mean the same as.
+            let prefix = (1..sources.len())
+                .find(|&i| kinds[i] == JoinKind::Left)
+                .unwrap_or(sources.len());
+            let mut parts: Vec<Expr> = filter.into_iter().collect();
+            parts.extend(ons[..prefix - 1].iter_mut().filter_map(Option::take));
+            filter = and(parts);
+            sources = permute(sources, order);
+            needed = permute(needed, order);
+            kinds = permute(kinds, order);
+            order_binder = Binder::new(catalog, &sources);
+            &order_binder
+        }
+    };
+
     let order = if grouped { &[][..] } else { &order_by };
     let (mut node, ordered) = joins(
         &mut sources,
-        &from,
+        kinds,
         filter,
         ons,
         needed,
-        &binder,
+        binder,
         order,
         choices,
     )?;
+    let exprs = match (&reordered, exprs) {
+        (Some(_), None) => all_columns,
+        (_, exprs) => exprs,
+    };
 
     let (exprs, having, order_by) = if grouped {
         forbid(&group_by, "GROUP BY")?;
@@ -952,7 +1031,7 @@ fn union<'a>(catalog: &'a Catalog, mut query: Select, choices: Choices) -> Resul
 #[allow(clippy::too_many_arguments)]
 fn joins<'a>(
     sources: &mut [Source<'a>],
-    from: &From,
+    kinds: Vec<JoinKind>,
     filter: Option<Expr>,
     ons: Vec<Option<Expr>>,
     mut needed: Vec<Vec<bool>>,
@@ -962,9 +1041,6 @@ fn joins<'a>(
 ) -> Result<(Node<'a>, bool)> {
     let force = choices.force_join;
     let n = sources.len();
-    let kinds: Vec<JoinKind> = std::iter::once(JoinKind::Inner)
-        .chain(from.joins.iter().map(|j| j.kind))
-        .collect();
     // For each table: conditions pushed down to its scan, conditions of the
     // join that brings it in, and conditions checked just after that join.
     let mut pushed: Vec<Vec<Expr>> = vec![Vec::new(); n];
@@ -1182,6 +1258,182 @@ fn joins<'a>(
     Ok((node, ordered))
 }
 
+/// An order is taken over the one FROM is written in only if it is
+/// estimated to cost less than this share of it: estimates are rough (more
+/// so without statistics), and whoever wrote the query may know better.
+const REORDER_GAIN: f64 = 0.75;
+
+/// The order in which to join the tables of FROM, if not as written: the
+/// cheapest of the orders of its tables up to the first LEFT JOIN (see
+/// `order.rs`), which keep the same rows as any order of inner joins does,
+/// followed by the rest as written. None to keep the order written: when a
+/// join method is forced, when fewer than two tables come before the first
+/// LEFT JOIN, or when no other order costs clearly less.
+fn join_order(
+    sources: &[Source],
+    kinds: &[JoinKind],
+    filter: Option<&Expr>,
+    ons: &[Option<Expr>],
+    needed: &[Vec<bool>],
+    binder: &Binder,
+    choices: Choices,
+) -> Option<Vec<usize>> {
+    let n = sources.len();
+    let prefix = (1..n).find(|&i| kinds[i] == JoinKind::Left).unwrap_or(n);
+    if choices.force_join.is_some() || prefix < 2 || prefix > 63 {
+        return None;
+    }
+    let mask = |tables: Vec<usize>| tables.into_iter().fold(0u64, |m, t| m | 1 << t);
+    let within = (1u64 << prefix) - 1;
+
+    // The conditions on the tables before the first LEFT JOIN: the WHERE's
+    // and their ONs', which mean the same, but not those with a subquery,
+    // checked after the joins in any order.
+    let mut parts = Vec::new();
+    filter.iter().for_each(|f| conjuncts(f, &mut parts));
+    ons[..prefix - 1]
+        .iter()
+        .flatten()
+        .for_each(|on| conjuncts(on, &mut parts));
+    let parts: Vec<(Expr, u64)> = parts
+        .into_iter()
+        .filter(|part| !part.has_subquery())
+        .map(|part| {
+            let tables = mask(binder.tables(&part));
+            (part, tables)
+        })
+        .filter(|(_, tables)| *tables != 0 && *tables & !within == 0)
+        .collect();
+    // Each equality, with the tables of each side.
+    let equalities: Vec<Option<(&Expr, u64, &Expr, u64)>> = parts
+        .iter()
+        .map(|(part, _)| match part {
+            Expr::Binary(a, BinaryOp::Eq, b) => {
+                Some((&**a, mask(binder.tables(a)), &**b, mask(binder.tables(b))))
+            }
+            _ => None,
+        })
+        .collect();
+
+    // Each table read alone, with the conditions on it alone.
+    let tables: Vec<(Node, Scope, f64, f64, f64)> = (0..prefix)
+        .map(|t| {
+            let filter = and(parts
+                .iter()
+                .filter(|(_, tables)| *tables == 1 << t)
+                .map(|(part, _)| part.clone())
+                .collect());
+            let node = sources[t].peek(filter, needed[t].clone());
+            let rows = estimate(&node);
+            let mut scan = &node;
+            while let Node::Filter { input, .. } = scan {
+                scan = input;
+            }
+            // Rows a scan reads, and those a hash join reads into its table.
+            let (read, whole, scope) = match scan {
+                Node::Scan { table, access, .. } => {
+                    let whole = table_rows(table);
+                    let read = match access {
+                        Access::Scan => whole,
+                        _ => (rows * INDEX_LOOKUP_COST).min(whole),
+                    };
+                    (
+                        read,
+                        whole,
+                        Scope::new([(sources[t].qualifier.clone(), *table)]),
+                    )
+                }
+                scan => (estimate(scan), estimate(scan), Scope::default()),
+            };
+            (node, scope, rows, read, whole)
+        })
+        .collect();
+
+    let first = |t: usize| order::Step {
+        rows: tables[t].2,
+        cost: tables[t].3,
+    };
+    let linked = |set: u64, t: usize| {
+        parts
+            .iter()
+            .any(|(_, m)| m & 1 << t != 0 && m & set != 0 && m & !(set | 1 << t) == 0)
+    };
+    let join = |set: u64, left: f64, t: usize| {
+        let (keys, residual): (Vec<_>, Vec<_>) = parts
+            .iter()
+            .zip(&equalities)
+            .filter(|((_, m), _)| m & 1 << t != 0 && m & set != 0 && m & !(set | 1 << t) == 0)
+            .partition(|(_, eq)| match eq {
+                Some((_, a, _, b)) => {
+                    let joined = |m: u64| m != 0 && m & !set == 0;
+                    let new = |m: u64| m == 1 << t;
+                    (joined(*a) && new(*b)) || (new(*a) && joined(*b))
+                }
+                None => false,
+            });
+        // Each key as (expression on the tables joined, column of table t).
+        let keys: Vec<(&Expr, &Expr)> = keys
+            .iter()
+            .map(|(_, eq)| {
+                let (a, _, b, b_tables) = eq.expect("an equality");
+                if b_tables == 1 << t { (a, b) } else { (b, a) }
+            })
+            .collect();
+        let (_, right_scope, right, read, whole) = &tables[t];
+        let left_scope = Scope::new(
+            (0..prefix)
+                .filter(|u| set & 1 << u != 0)
+                .flat_map(|u| tables[u].1.tables().to_vec()),
+        );
+        let conditions = and(residual.iter().map(|((part, _), _)| part.clone()).collect());
+        let residual = conditions
+            .as_ref()
+            .and_then(|c| selectivity::keeps(c, &left_scope.with(right_scope)));
+        let rows = if keys.is_empty() {
+            left * right * residual.unwrap_or(OTHER_KEEPS)
+        } else {
+            let rows = match selectivity::join(&keys, &left_scope, right_scope, left, *right) {
+                Some(share) => left * right * share,
+                None => left.max(*right),
+            };
+            rows * residual.unwrap_or(1.0)
+        };
+        // The method the planner would pick, and its cost.
+        let index = keys.iter().find_map(|(_, key)| {
+            let (Expr::Column(column), SourceKind::Table(table)) = (key, &sources[t].kind) else {
+                return None;
+            };
+            let key = lookup_key(table, table.column_index(&column.name).ok()?)?;
+            lookups_win(left, table, key).then(|| left * lookup_cost(table, key))
+        });
+        let cost = match index {
+            Some(cost) => cost,
+            None if !keys.is_empty() => whole * HASH_BUILD_COST + left * HASH_PROBE_COST,
+            None => read + left * right * PAIR_COST,
+        };
+        order::Step {
+            rows,
+            cost: cost + rows * JOIN_ROW_COST,
+        }
+    };
+
+    let (best, cost) = order::cheapest(prefix, &first, &join, &linked);
+    let written: Vec<usize> = (0..prefix).collect();
+    if best == written || cost >= order::cost_of(&written, &first, &join) * REORDER_GAIN {
+        return None;
+    }
+    Some(best.into_iter().chain(prefix..n).collect())
+}
+
+/// The items in `order`, which gives their positions.
+fn permute<T>(items: Vec<T>, order: &[usize]) -> Vec<T> {
+    let mut items: Vec<Option<T>> = items.into_iter().map(Some).collect();
+    order
+        .iter()
+        .map(|&i| items[i].take().expect("each position once"))
+        .collect()
+}
+
 /// The error of a join of `table` that cannot use the method forced on it.
 fn cannot<T>(force: ForceJoin, table: &str, why: &str) -> Result<T> {
     err(format!(
@@ -1276,35 +1528,50 @@ const KEY_LOOKUP_COST: f64 = 2.0;
 const HASH_BUILD_COST: f64 = 2.0;
 const HASH_PROBE_COST: f64 = 0.4;
 
-/// How many of its rows a condition keeps, guessed with no statistics as
-/// PostgreSQL guesses: an equality 1 in 200 (but at most one row on a
-/// primary key or unique index), `<>` all but that, and a comparison or
-/// anything else 1 in 3.
-const EQUAL_KEEPS: f64 = 0.005;
-const OTHER_KEEPS: f64 = 1.0 / 3.0;
+/// What trying a pair of rows in a nested loop join costs: checking its
+/// condition, a fraction of reading a row. A rough guess, not measured.
+const PAIR_COST: f64 = 0.1;
+
+/// What making a row a join returns costs: copying the values of both of
+/// its sides. Roughly what joins of the analyzed tables of a few hundred
+/// thousand rows in EXPLAIN ANALYZE show; worth measuring with a bench.
+const JOIN_ROW_COST: f64 = 1.0;
+
+/// What a lookup through `key` in `table` costs, in rows read by a scan.
+fn lookup_cost(table: &Table, key: LookupKey) -> f64 {
+    match key {
+        LookupKey::Index(i) if table.indexes()[i].is_hash() => HASH_INDEX_LOOKUP_COST,
+        LookupKey::Index(_) => INDEX_LOOKUP_COST,
+        LookupKey::PrimaryKey => KEY_LOOKUP_COST,
+    }
+}
 
 /// Whether an index join, looking each of `left` rows up in `table` by
 /// `key`, costs less than a hash join reading all of `table` once.
 fn lookups_win(left: f64, table: &Table, key: LookupKey) -> bool {
     let right = table.row_count().map_or(f64::INFINITY, |rows| rows as f64);
-    let lookup = match key {
-        LookupKey::Index(i) if table.indexes()[i].is_hash() => HASH_INDEX_LOOKUP_COST,
-        LookupKey::Index(_) => INDEX_LOOKUP_COST,
-        LookupKey::PrimaryKey => KEY_LOOKUP_COST,
-    };
-    left * lookup <= right * HASH_BUILD_COST + left * HASH_PROBE_COST
+    left * lookup_cost(table, key) <= right * HASH_BUILD_COST + left * HASH_PROBE_COST
 }
 
-/// Roughly how many rows a plan step returns: tables' row counts, cut down
-/// by the guesses above for what conditions keep. A join with equalities
-/// returns about as many rows as its larger side (as if each row of that
-/// side matched one of the other), and one without, a third of every pair.
+/// Roughly how many rows a plan step returns (for a lookup, and the steps
+/// above it on an index join's right side, each time it runs).
+///
+/// A scan returns its table's rows, cut down by the share its conditions
+/// keep (see `selectivity.rs`): estimated from the table's statistics if it
+/// was analyzed, else guessed. A join returns the share of pairs of rows
+/// its equalities keep: with statistics, by their columns' distinct
+/// values; without, as many rows as its larger side (as if each row of that
+/// side matched one of the other), and without equalities, a third of
+/// every pair.
 pub fn estimate(node: &Node) -> f64 {
     match node {
         Node::Scan {
             table, predicates, ..
         } => {
-            let rows = table.row_count().map_or(1000.0, |rows| rows as f64);
+            let rows = table_rows(table);
+            if let Some(stats) = table.stats() {
+                return rows * selectivity::predicates(stats, predicates, rows);
+            }
             let unique = |column| {
                 table.primary_key() == Some(column)
                     || table
@@ -1319,26 +1586,39 @@ pub fn estimate(node: &Node) -> f64 {
                 _ => rows * OTHER_KEEPS,
             })
         }
-        Node::Lookup { .. } => 1.0,
-        // Above a scan, a filter checks again what the scan's predicates did.
-        Node::Filter { input, .. } => match &**input {
-            Node::Scan { predicates, .. } if !predicates.is_empty() => estimate(input),
-            _ => estimate(input) * OTHER_KEEPS,
+        Node::Lookup { table, column, .. } => match table.stats() {
+            Some(stats) => {
+                let rows = table_rows(table);
+                rows * stats.columns[*column].equal_any(rows)
+            }
+            None => 1.0,
         },
+        Node::Filter { input, predicate } => {
+            if let Some(keeps) = selectivity::keeps(predicate, &Scope::of(input)) {
+                // Above a scan, the filter holds the scan's predicates too.
+                let rows = match &**input {
+                    Node::Scan { table, .. } => table_rows(table),
+                    input => estimate(input),
+                };
+                return rows * keeps;
+            }
+            match &**input {
+                // A filter above a scan checks again what its predicates did.
+                Node::Scan { predicates, .. } if !predicates.is_empty() => estimate(input),
+                _ => estimate(input) * OTHER_KEEPS,
+            }
+        }
         Node::Join {
             left,
             right,
             method,
             kind,
-            ..
+            condition,
         } => {
-            let (left, right) = (estimate(left), estimate(right));
-            let rows = match method {
-                JoinMethod::Block | JoinMethod::Naive => left * right * OTHER_KEEPS,
-                _ => left.max(right),
-            };
+            let (l, r) = (estimate(left), estimate(right));
+            let rows = join_estimate(left, right, method, condition.as_ref(), l, r);
             if *kind == JoinKind::Left {
-                rows.max(left)
+                rows.max(l)
             } else {
                 rows
             }
@@ -1365,6 +1645,74 @@ pub fn estimate(node: &Node) -> f64 {
         | Node::Project { input, .. }
         | Node::Derived { input, .. }
         | Node::Gather { input, .. } => estimate(input),
+    }
+}
+
+/// How many rows a join of `l` left rows and `r` right ones returns, before
+/// a LEFT JOIN adds the left rows that match none.
+fn join_estimate(
+    left: &Node,
+    right: &Node,
+    method: &JoinMethod,
+    condition: Option<&Expr>,
+    l: f64,
+    r: f64,
+) -> f64 {
+    let (left_scope, right_scope) = (Scope::of(left), Scope::of(right));
+    let residual = condition.and_then(|c| selectivity::keeps(c, &left_scope.with(&right_scope)));
+    match method {
+        JoinMethod::Block | JoinMethod::Naive => l * r * residual.unwrap_or(OTHER_KEEPS),
+        JoinMethod::Hash {
+            left_keys,
+            right_keys,
+            ..
+        }
+        | JoinMethod::Merge {
+            left_keys,
+            right_keys,
+            ..
+        } => {
+            let keys: Vec<_> = left_keys.iter().zip(right_keys).collect();
+            let rows = match selectivity::join(&keys, &left_scope, &right_scope, l, r) {
+                Some(share) => l * r * share,
+                None => l.max(r),
+            };
+            rows * residual.unwrap_or(1.0)
+        }
+        JoinMethod::Index => {
+            // The right side's estimate is per lookup: what one left row finds.
+            let mut lookup = right;
+            while let Node::Filter { input, .. } = lookup {
+                lookup = input;
+            }
+            let Node::Lookup {
+                table,
+                qualifier,
+                column,
+                left_key,
+                ..
+            } = lookup
+            else {
+                unreachable!("an index join's right side is a lookup")
+            };
+            let Some(stats) = table.stats() else {
+                return l.max(r) * residual.unwrap_or(1.0);
+            };
+            // The rows of the right side as a whole: those a lookup finds,
+            // over the share of the table one finds.
+            let rows = table_rows(table);
+            let whole = r / stats.columns[*column]
+                .equal_any(rows)
+                .max(f64::MIN_POSITIVE);
+            let right_key = Expr::Column(ColumnRef {
+                table: Some(qualifier.clone()),
+                name: table.columns[*column].name.clone(),
+            });
+            let keys = [(left_key, &right_key)];
+            let share = selectivity::join(&keys, &left_scope, &right_scope, l, whole)
+                .expect("the right key has statistics");
+            l * whole * share * residual.unwrap_or(1.0)
+        }
     }
 }
 

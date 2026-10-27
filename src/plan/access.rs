@@ -1,9 +1,10 @@
 //! Access paths: how a statement reads its table, given the conditions its
 //! WHERE clause implies.
 
-use crate::catalog::index::{Bound, Index};
+use crate::catalog::index::{Bound, Index, Key};
 use crate::catalog::table::{Access, Table};
 use crate::plan::filter::{self, Condition, conjuncts};
+use crate::plan::selectivity;
 use crate::predicate::{Compare, Predicate};
 use crate::sql::ast::{ColumnRef, Expr};
 use crate::types::StorageKind;
@@ -27,6 +28,10 @@ use crate::types::StorageKind;
 /// its condition's conjuncts is one of the WHERE's, or is implied by one of
 /// its conditions (`x > 5` implies `x > 0`, `x = 1` implies `x != 2`), or
 /// is `e IS NOT NULL` for an `e` the WHERE compares with a value.
+///
+/// An analyzed table is read in full instead when its statistics say the
+/// index would find more than a quarter of its rows ([`RANDOM_ROW_COST`]),
+/// unless the index holds every column needed, or is partial.
 pub fn choose(
     table: &Table,
     qualifier: &str,
@@ -101,7 +106,54 @@ pub fn choose(
             ));
         }
     }
-    best.map_or(Access::Scan, |(_, access)| access)
+    match best {
+        Some((_, access)) if !worth_it(table, &access, conditions) => Access::Scan,
+        best => best.map_or(Access::Scan, |(_, access)| access),
+    }
+}
+
+/// What reading a row through an index costs, relative to reading it in a
+/// scan, which reads the rows of a page together: PostgreSQL's default
+/// `random_page_cost` over its `seq_page_cost`.
+const RANDOM_ROW_COST: f64 = 4.0;
+
+/// Whether reading a table through an index rather than in full is worth
+/// it: always, unless its statistics say the index's keys would find so
+/// many rows that a scan reading every one costs less. An index that holds
+/// every column needed, or a partial one, is always worth it.
+fn worth_it(table: &Table, access: &Access, conditions: &[Condition]) -> bool {
+    let (
+        Some(stats),
+        Access::Index {
+            index,
+            equal,
+            lower,
+            upper,
+            covering: false,
+        },
+    ) = (table.stats(), access)
+    else {
+        return true;
+    };
+    let index = &table.indexes()[*index];
+    if index.predicate.is_some() {
+        return true;
+    }
+    // The key columns the access narrows down, and the conditions on them.
+    let used = equal.len() + (lower.is_some() || upper.is_some()) as usize;
+    let mut columns = Vec::new();
+    for key in index.keys.iter().take(used) {
+        match key {
+            Key::Column(c) => columns.push(*c),
+            Key::Expr(_) => return true,
+        }
+    }
+    let predicates: Vec<Predicate> = filter::predicates(table, conditions)
+        .into_iter()
+        .filter(|p| columns.contains(&p.column) && p.op != Compare::NotEq)
+        .collect();
+    let rows = selectivity::table_rows(table);
+    selectivity::predicates(stats, &predicates, rows) * RANDOM_ROW_COST <= 1.0
 }
 
 /// The tightest bounds that `conditions` put on an expression, and whether

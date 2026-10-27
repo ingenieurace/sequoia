@@ -1237,12 +1237,22 @@ impl Gen {
             }
         }
         for _ in 0..40 {
-            match g.rng.below(20) {
+            match g.rng.below(21) {
                 0..=9 => out.push(g.select()),
                 10 | 11 => out.push(g.index_select()),
                 12..=13 => out.push(g.union()),
                 14..=17 => g.change(&mut out),
-                _ => g.transaction(&mut out),
+                18 | 19 => g.transaction(&mut out),
+                // Statistics, for the planner to estimate with, pick
+                // access paths and order joins by.
+                _ => {
+                    let table = g.rng.below(g.tables.len() + 1);
+                    let sql = match g.tables.get(table) {
+                        Some(table) => format!("ANALYZE {}", table.name),
+                        None => "ANALYZE".to_string(),
+                    };
+                    out.push(stmt(sql, Kind::Other));
+                }
             }
         }
         out

@@ -4493,10 +4493,20 @@ fn select_list_names_and_order_by_them() {
     );
 }
 
-/// What EXPLAIN ANALYZE says each step did, without its times: each line's
-/// step, and what follows it in parentheses, then the query's rows. The
-/// first line, the execution model, is left out.
+/// What EXPLAIN ANALYZE says each step did, without its times and
+/// estimates: each line's step, and what follows it in parentheses, then
+/// the query's rows. The first line, the execution model, is left out.
 fn analyzed(db: &mut Database, sql: &str) -> Vec<(String, String)> {
+    analyzed_with_estimates(db, sql)
+        .into_iter()
+        .map(|(step, did, _)| (step, did))
+        .collect()
+}
+
+/// [`analyzed`], with what the planner estimated of each step: "estimated
+/// 12", or "estimated 3 a run", or "estimated 1 a lookup"; empty for the
+/// total.
+fn analyzed_with_estimates(db: &mut Database, sql: &str) -> Vec<(String, String, String)> {
     let plan = explain(db, &format!("ANALYZE {sql}"));
     let mut lines: Vec<&str> = plan.lines().skip(1).collect();
     let total = lines.pop().unwrap();
@@ -4504,19 +4514,21 @@ fn analyzed(db: &mut Database, sql: &str) -> Vec<(String, String)> {
         Some((did, time)) if time.ends_with(" ms") => did.to_string(),
         _ => did.to_string(),
     };
-    let mut steps: Vec<(String, String)> = lines
+    let mut steps: Vec<(String, String, String)> = lines
         .into_iter()
         .map(|line| {
             let (step, did) = line.rsplit_once("  (").unwrap();
+            let (did, estimate) = did.strip_suffix(')').unwrap().rsplit_once("; ").unwrap();
             (
                 step.trim().to_string(),
-                without_time(did.strip_suffix(')').unwrap()),
+                without_time(did),
+                estimate.to_string(),
             )
         })
         .collect();
     let (rows, time) = total.split_once(" in ").unwrap();
     assert!(time.ends_with(" ms"), "{total}");
-    steps.push(("total".into(), rows.into()));
+    steps.push(("total".into(), rows.into(), String::new()));
     steps
 }
 
@@ -5869,4 +5881,325 @@ fn and_or_skip_their_right_side_alike_in_every_model() {
             "{storage}"
         );
     }
+}
+
+// ---- statistics and join order ----
+
+/// What EXPLAIN ANALYZE says the first step whose line starts with `step`
+/// returned, and what the planner estimated: (rows, estimate).
+fn rows_and_estimate(db: &mut Database, sql: &str, step: &str) -> (f64, f64) {
+    let steps = analyzed_with_estimates(db, sql);
+    let (_, did, estimate) = steps
+        .iter()
+        .find(|(s, ..)| s.starts_with(step))
+        .unwrap_or_else(|| panic!("no step {step} in {steps:?}"));
+    let number = |text: &str, prefix: &str| -> f64 {
+        let text = text
+            .strip_prefix(prefix)
+            .unwrap_or_else(|| panic!("{text}"));
+        let digits: String = text.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse().unwrap_or_else(|_| panic!("{text}"))
+    };
+    (number(did, ""), number(estimate, "estimated "))
+}
+
+/// A table of 10000 rows: `id` 0 to 9999; `g`, 100 values each in 100 rows;
+/// `s`, 'common' in nine rows of ten and 'rare' in the rest, indexed; and
+/// `x`, NULL in a fifth of the rows.
+fn setup_skewed(db: &mut Database) {
+    db.execute(
+        "CREATE TABLE t (id INT PRIMARY KEY, g INT, s TEXT, x REAL);
+         CREATE INDEX t_s ON t (s);",
+    )
+    .unwrap();
+    for chunk in 0..10 {
+        let rows: Vec<String> = (chunk * 1000..(chunk + 1) * 1000)
+            .map(|i| {
+                let s = if i % 10 == 0 { "rare" } else { "common" };
+                let x = if i % 5 == 0 {
+                    "NULL".to_string()
+                } else {
+                    format!("{i}.5")
+                };
+                format!("({i}, {}, '{s}', {x})", i % 100)
+            })
+            .collect();
+        db.execute(&format!("INSERT INTO t VALUES {}", rows.join(", ")))
+            .unwrap();
+    }
+}
+
+#[test]
+fn analyze_is_a_statement_and_analyze_a_name() {
+    let mut db = in_memory();
+    let message = |db: &mut Database, sql: &str| match db.execute(sql).unwrap().pop() {
+        Some(QueryResult::Message(m)) => m,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(message(&mut db, "ANALYZE"), "0 tables analyzed");
+    db.execute("CREATE TABLE analyze (analyze INT); CREATE TABLE b (id INT)")
+        .unwrap();
+    assert_eq!(
+        message(&mut db, "analyze analyze"),
+        "table analyze analyzed"
+    );
+    assert_eq!(message(&mut db, "ANALYZE;"), "2 tables analyzed");
+    assert_eq!(
+        db.execute("ANALYZE nope").unwrap_err().to_string(),
+        "unknown table: nope"
+    );
+    db.execute("INSERT INTO analyze VALUES (1)").unwrap();
+    assert_eq!(query(&mut db, "SELECT analyze FROM analyze"), [[int(1)]]);
+}
+
+#[test]
+fn statistics_estimate_what_conditions_keep() {
+    let mut db = in_memory();
+    setup_skewed(&mut db);
+    let cases = [
+        // (query, the rows the guesses without statistics expect)
+        ("SELECT * FROM t WHERE s = 'common'", 50.0),
+        ("SELECT * FROM t WHERE g = 7", 50.0),
+        ("SELECT * FROM t WHERE id >= 1000 AND id < 3000", 1111.0),
+        ("SELECT * FROM t WHERE g BETWEEN 10 AND 19", 1111.0),
+        ("SELECT * FROM t WHERE x IS NULL", 3333.0),
+        ("SELECT * FROM t WHERE g IN (1, 2, 3) OR s = 'rare'", 3333.0),
+        ("SELECT * FROM t WHERE NOT (g < 50)", 3333.0),
+    ];
+    for (sql, guess) in cases {
+        let (rows, estimate) = rows_and_estimate(&mut db, sql, "FILTER");
+        assert_eq!(estimate, guess, "{sql}: {rows} rows");
+    }
+    db.execute("ANALYZE t").unwrap();
+    for (sql, _) in cases {
+        let (rows, estimate) = rows_and_estimate(&mut db, sql, "FILTER");
+        // Within a tenth, or ten rows.
+        assert!(
+            (estimate - rows).abs() <= (rows / 10.0).max(10.0),
+            "{sql}: {rows} rows, estimated {estimate}"
+        );
+    }
+    // A join on columns with statistics: each of 10 rows of u finds the 100
+    // rows of t with its g.
+    db.execute("CREATE TABLE u (id INT PRIMARY KEY, g INT)")
+        .unwrap();
+    let rows: Vec<String> = (0..100).map(|i| format!("({i}, {i})")).collect();
+    db.execute(&format!(
+        "INSERT INTO u VALUES {}; ANALYZE u",
+        rows.join(", ")
+    ))
+    .unwrap();
+    let sql = "SELECT * FROM u JOIN t ON t.g = u.g WHERE u.id < 10";
+    let (rows, estimate) = rows_and_estimate(&mut db, sql, "HASH JOIN");
+    assert_eq!(rows, 1000.0);
+    assert!((estimate - rows).abs() <= 100.0, "estimated {estimate}");
+}
+
+#[test]
+fn statistics_survive_reopening_and_go_with_rollbacks_and_drops() {
+    let path = TempDb::new("statistics");
+    // `WHERE g = 7` keeps 100 of 10000 rows; without statistics, 1 in 200 is guessed.
+    let sql = "SELECT * FROM t WHERE g = 7";
+    let estimate = |db: &mut Database| rows_and_estimate(db, sql, "FILTER").1;
+    {
+        let mut db = open(&path.0).unwrap();
+        setup_skewed(&mut db);
+        assert_eq!(estimate(&mut db), 50.0);
+        db.execute("ANALYZE").unwrap();
+        assert_eq!(estimate(&mut db), 100.0);
+    }
+    let mut db = open(&path.0).unwrap();
+    assert_eq!(estimate(&mut db), 100.0);
+
+    // Statistics of a transaction rolled back go with it.
+    db.execute("BEGIN; DELETE FROM t WHERE g > 9; ANALYZE t")
+        .unwrap();
+    assert_eq!(estimate(&mut db), 100.0, "100 of the 1000 rows left");
+    db.execute("ROLLBACK").unwrap();
+    assert_eq!(estimate(&mut db), 100.0);
+    db.execute("BEGIN; DELETE FROM t WHERE g > 9; ANALYZE t; ROLLBACK")
+        .unwrap();
+    db.execute("DELETE FROM t WHERE g > 49").unwrap();
+    // Writes leave the shares as ANALYZE found them, but the row count
+    // follows them: half as many rows, half as many estimated.
+    assert_eq!(estimate(&mut db), 50.0);
+    db.execute("ANALYZE t").unwrap();
+    assert_eq!(estimate(&mut db), 100.0);
+
+    // A table dropped and created again has none.
+    db.execute("DROP TABLE t").unwrap();
+    setup_skewed(&mut db);
+    assert_eq!(estimate(&mut db), 50.0);
+    drop(db);
+    let mut db = open(&path.0).unwrap();
+    assert_eq!(estimate(&mut db), 50.0);
+}
+
+#[test]
+fn an_index_that_would_find_most_rows_is_left_for_a_scan() {
+    let mut db = in_memory();
+    setup_skewed(&mut db);
+    let common = "SELECT id FROM t WHERE s = 'common'";
+    let rare = "SELECT id FROM t WHERE s = 'rare'";
+    // Without statistics, an equality on an indexed column always uses the index.
+    assert_eq!(
+        plan(&mut db, common),
+        "SEARCH t USING INDEX t_s (s = 'common')"
+    );
+    db.execute("ANALYZE").unwrap();
+    // Nine rows in ten: reading every row costs less than looking them up.
+    assert_eq!(plan(&mut db, common), "SCAN t");
+    assert_eq!(plan(&mut db, rare), "SEARCH t USING INDEX t_s (s = 'rare')");
+    assert_eq!(
+        query(&mut db, &format!("SELECT COUNT(*) FROM ({common}) c")),
+        [[int(9000)]]
+    );
+    // An index that holds every column needed is still worth it.
+    db.execute("CREATE INDEX t_s_id ON t (s) INCLUDE (id)")
+        .unwrap();
+    assert!(plan(&mut db, common).contains("USING COVERING INDEX t_s_id"));
+}
+
+/// Users, their orders and the orders' items: 200 users, 4 of them in
+/// oslo; 2000 orders, 10 for each user; 10000 items, 5 for each order.
+fn setup_orders(db: &mut Database) {
+    db.execute(
+        "CREATE TABLE users (id INT PRIMARY KEY, city TEXT);
+         CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, total REAL);
+         CREATE TABLE items (id INT PRIMARY KEY, order_id INT, qty INT);",
+    )
+    .unwrap();
+    let insert = |db: &mut Database, table: &str, rows: Vec<String>| {
+        db.execute(&format!("INSERT INTO {table} VALUES {}", rows.join(", ")))
+            .unwrap();
+    };
+    let city = |i: i64| match i % 50 {
+        0 => "oslo".to_string(),
+        _ => format!("c{}", i % 7),
+    };
+    let users = (0..200).map(|i| format!("({i}, '{}')", city(i)));
+    insert(db, "users", users.collect());
+    let orders = (0..2000).map(|i| format!("({i}, {}, {i}.5)", i % 200));
+    insert(db, "orders", orders.collect());
+    let items = (0..10000).map(|i| format!("({i}, {}, {})", i % 2000, i % 3));
+    insert(db, "items", items.collect());
+}
+
+#[test]
+fn joins_are_reordered_when_statistics_show_a_cheaper_order() {
+    let mut db = in_memory();
+    setup_orders(&mut db);
+    let sql = "SELECT u.city, o.id, i.id FROM orders o, items i, users u
+               WHERE i.order_id = o.id AND o.user_id = u.id AND u.city = 'oslo'";
+    let sorted = |mut rows: Vec<Vec<Value>>| {
+        rows.sort_by_key(|row| format!("{row:?}"));
+        rows
+    };
+    let before = sorted(query(&mut db, sql));
+    assert_eq!(before.len(), 4 * 10 * 5);
+    assert!(explain(&mut db, sql).contains(
+        "    HASH JOIN ON o.id = i.order_id
+      SCAN orders o
+      SCAN items i"
+    ));
+
+    db.execute("ANALYZE").unwrap();
+    // Orders join the four users of oslo first, and only their 40 orders
+    // then probe the items' hash table.
+    assert_eq!(
+        explain(&mut db, sql),
+        "PROJECT u.city, o.id, i.id
+  HASH JOIN ON o.id = i.order_id
+    HASH JOIN ON o.user_id = u.id
+      SCAN orders o
+      FILTER u.city = 'oslo'
+        SCAN users u
+    SCAN items i"
+    );
+    assert_eq!(sorted(query(&mut db, sql)), before);
+
+    // SELECT * keeps the columns in the order of FROM.
+    let star = "SELECT * FROM orders o, items i, users u
+                WHERE i.order_id = o.id AND o.user_id = u.id AND u.city = 'oslo'
+                ORDER BY i.id LIMIT 1";
+    let plan = explain(&mut db, star);
+    assert!(
+        plan.starts_with("PROJECT o.id, o.user_id, o.total, i.id, i.order_id, i.qty, u.id, u.city"),
+        "{plan}"
+    );
+    match db.execute(star).unwrap().pop() {
+        Some(QueryResult::Rows { columns, rows }) => {
+            let names = [
+                "id", "user_id", "total", "id", "order_id", "qty", "id", "city",
+            ];
+            assert_eq!(columns, names);
+            let first = [0, 0].map(int).into_iter().chain([Value::Real(0.5)]);
+            let first: Vec<Value> = first
+                .chain([0, 0, 0, 0].map(int))
+                .chain([text("oslo")])
+                .collect();
+            assert_eq!(rows, [first]);
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // The ONs of inner joins are conditions like WHERE's, in any order.
+    let on = "SELECT COUNT(*) FROM orders o JOIN items i ON i.order_id = o.id
+              JOIN users u ON o.user_id = u.id WHERE u.city = 'oslo'";
+    let plan = explain(&mut db, on);
+    assert!(
+        plan.contains("SCAN orders o\n        FILTER u.city = 'oslo'"),
+        "{plan}"
+    );
+    assert_eq!(query(&mut db, on), [[int(200)]]);
+}
+
+#[test]
+fn joins_after_a_left_join_and_forced_methods_keep_their_order() {
+    use sequoia::plan::query::ForceJoin;
+    let mut db = in_memory();
+    setup_orders(&mut db);
+    db.execute("ANALYZE").unwrap();
+    // Only the inner joins before the LEFT JOIN may be reordered.
+    let sql = "SELECT COUNT(*) FROM orders o JOIN items i ON i.order_id = o.id
+               LEFT JOIN users u ON o.user_id = u.id AND u.city = 'oslo'";
+    let plan = explain(&mut db, sql);
+    assert!(plan.contains("  LEFT"), "{plan}");
+    assert!(plan.trim_end().ends_with("SCAN users u"), "{plan}");
+    assert_eq!(query(&mut db, sql), [[int(10000)]]);
+    // A method forced on every join compares methods, on the order written.
+    let sql = "SELECT COUNT(*) FROM orders o, items i, users u
+               WHERE i.order_id = o.id AND o.user_id = u.id AND u.city = 'oslo'";
+    let written = "HASH JOIN ON o.id = i.order_id\n        SCAN orders o";
+    db.set_force_join(Some(ForceJoin::Hash));
+    let plan = explain(&mut db, sql);
+    assert!(plan.contains(written), "{plan}");
+    assert_eq!(query(&mut db, sql), [[int(200)]]);
+    db.set_force_join(None);
+    assert!(!explain(&mut db, sql).contains(written));
+}
+
+#[test]
+fn explain_analyze_estimates_each_lookup_of_an_index_join() {
+    let mut db = in_memory();
+    setup_orders(&mut db);
+    db.execute("CREATE INDEX orders_user ON orders (user_id); ANALYZE")
+        .unwrap();
+    // Four users, each of whom has 10 orders.
+    let sql = "SELECT o.id FROM users u JOIN orders o ON o.user_id = u.id WHERE u.city = 'oslo'";
+    let steps = analyzed_with_estimates(&mut db, sql);
+    let (_, did, estimate) = steps
+        .iter()
+        .find(|(step, ..)| step.starts_with("LOOKUP"))
+        .unwrap_or_else(|| panic!("{steps:?}"));
+    assert_eq!(did, "counted with the step above");
+    assert_eq!(estimate, "estimated 10 a lookup");
+    let (_, did, estimate) = steps
+        .iter()
+        .find(|(step, ..)| step == "INDEX JOIN")
+        .unwrap();
+    assert_eq!(
+        (did.as_str(), estimate.as_str()),
+        ("40 rows", "estimated 40")
+    );
 }

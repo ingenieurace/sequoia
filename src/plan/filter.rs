@@ -212,7 +212,7 @@ fn own_expr(table: &Table, qualifier: &str, expr: &Expr) -> Option<Expr> {
 }
 
 /// The value of an expression that reads no column, if it has one.
-fn constant(expr: &Expr) -> Option<Value> {
+pub(crate) fn constant(expr: &Expr) -> Option<Value> {
     fn reads_columns(expr: &Expr) -> bool {
         match expr {
             Expr::Literal(_) => false,

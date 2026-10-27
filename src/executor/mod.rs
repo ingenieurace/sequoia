@@ -158,6 +158,22 @@ pub fn execute(
             catalog.checkpoint()?;
             Ok(message("checkpoint done".into()))
         }
+        Statement::Analyze { table: Some(name) } => {
+            catalog.analyze(&name)?;
+            Ok(message(format!("table {name} analyzed")))
+        }
+        Statement::Analyze { table: None } => {
+            let names: Vec<String> = catalog
+                .table_names()
+                .into_iter()
+                .map(String::from)
+                .collect();
+            for name in &names {
+                catalog.analyze(name)?;
+            }
+            let s = if names.len() == 1 { "" } else { "s" };
+            Ok(message(format!("{} table{s} analyzed", names.len())))
+        }
         Statement::Begin
         | Statement::Commit
         | Statement::Rollback { .. }
@@ -233,6 +249,23 @@ fn explain(catalog: &Catalog, statement: Statement, settings: &Settings) -> Resu
 fn explain_analyze(catalog: &Catalog, query: Select, settings: &Settings) -> Result<QueryResult> {
     let root = query::select(catalog, query, settings.choices())?.root;
     let lines = root.explain_lines();
+    // What the planner expected of each step, in the order of the lines,
+    // and whether it is what each lookup of an index join finds.
+    fn estimates(node: &query::Node, lookup: bool, out: &mut Vec<(f64, bool)>) {
+        out.push((query::estimate(node), lookup));
+        let index = matches!(
+            node,
+            query::Node::Join {
+                method: query::JoinMethod::Index,
+                ..
+            }
+        );
+        for (i, input) in node.inputs().into_iter().enumerate() {
+            estimates(input, lookup || (index && i == 1), out);
+        }
+    }
+    let mut expected = Vec::new();
+    estimates(&root, false, &mut expected);
     let (model, why) = model::choose(&root, settings);
     let profile = Rc::new(Profile::new(lines.len()));
     let zones = |catalog: &Catalog| -> Vec<(String, (u64, u64))> {
@@ -255,27 +288,30 @@ fn explain_analyze(catalog: &Catalog, query: Select, settings: &Settings) -> Res
     let after = zones(catalog);
 
     let mut out = vec![format!("MODEL {model}  ({why})")];
-    out.extend(
-        lines
-            .into_iter()
-            .zip(profile.counts())
-            .map(|(line, count)| {
-                let did = match count {
-                    StepCount { inside: true, .. } => "counted with the step above".to_string(),
-                    StepCount { runs: 0, .. } => "never run".to_string(),
-                    StepCount {
-                        runs: 1,
-                        rows,
-                        time,
-                        ..
-                    } => format!("{}, {}", rows_of(rows), ms(time)),
-                    StepCount {
-                        runs, rows, time, ..
-                    } => format!("{} in {runs} runs, {}", rows_of(rows), ms(time)),
-                };
-                format!("{line}  ({did})")
-            }),
-    );
+    out.extend(lines.into_iter().zip(profile.counts()).zip(expected).map(
+        |((line, count), (expected, lookup))| {
+            let each = match (lookup, count.runs > 1) {
+                (true, _) => " a lookup",
+                (false, true) => " a run",
+                (false, false) => "",
+            };
+            let expected = format!("estimated {}{each}", about(expected));
+            let did = match count {
+                StepCount { inside: true, .. } => "counted with the step above".to_string(),
+                StepCount { runs: 0, .. } => "never run".to_string(),
+                StepCount {
+                    runs: 1,
+                    rows,
+                    time,
+                    ..
+                } => format!("{}, {}", rows_of(rows), ms(time)),
+                StepCount {
+                    runs, rows, time, ..
+                } => format!("{} in {runs} runs, {}", rows_of(rows), ms(time)),
+            };
+            format!("{line}  ({did}; {expected})")
+        },
+    ));
     for ((table, (read, skipped)), (_, (read_before, skipped_before))) in
         after.into_iter().zip(before)
     {
@@ -289,6 +325,14 @@ fn explain_analyze(catalog: &Catalog, query: Select, settings: &Settings) -> Res
     }
     out.push(format!("{} in {}", rows_of(returned), ms(time)));
     Ok(message(out.join("\n")))
+}
+
+/// An estimate of rows, whole, or `<1` for less than half of one.
+fn about(rows: f64) -> String {
+    match rows {
+        r if r > 0.0 && r < 0.5 => "<1".into(),
+        r => format!("{r:.0}"),
+    }
 }
 
 fn rows_of(n: u64) -> String {

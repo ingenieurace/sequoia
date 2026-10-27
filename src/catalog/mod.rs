@@ -20,23 +20,32 @@
 //!
 //! A heap table with a primary key gets a unique index on it, `<table>_pkey`,
 //! when it is created; it is dropped with the table and not on its own.
+//!
+//! An analyzed table has one more row, its statistics (see `stats.rs`):
+//! `sql` is the table's name and the statistics as text, the first page is
+//! 0 and the second is [`STATS_FORMAT`]. ANALYZE replaces it.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub mod index;
+pub mod stats;
 pub mod table;
 
 use crate::error::{Error, Result, err};
 use crate::sql::ast::{ColumnRef, CreateIndex, Expr, IndexKind, Statement};
 use crate::sql::parse;
-use crate::storage::{BPlusTree, BufferPool, PageId, RecordId, TableHeap, tuple};
+use crate::storage::{BPlusTree, BufferPool, MAX_TUPLE_SIZE, PageId, RecordId, TableHeap, tuple};
 use crate::types::{Column, DataType, StorageKind, Value};
+use stats::TableStats;
 use table::{Table, primary_key, validate_schema};
 
 /// The second page of an index's catalog row: not a page, but a mark of the
 /// format of its entries.
 const INDEX_FORMAT: PageId = PageId(u32::MAX);
+
+/// The second page of a table's statistics row: not a page either.
+const STATS_FORMAT: PageId = PageId(u32::MAX - 1);
 
 pub struct Catalog {
     pool: Arc<BufferPool>,
@@ -59,6 +68,8 @@ struct Entry {
     rid: RecordId,
     /// The table's last root page as currently recorded in the catalog row.
     saved_last_page: PageId,
+    /// Location of the table's statistics row, once it is analyzed.
+    stats_rid: Option<RecordId>,
 }
 
 impl Catalog {
@@ -77,9 +88,15 @@ impl Catalog {
 
         let mut tables = BTreeMap::new();
         let mut index_rows = Vec::new();
+        let mut stats_rows = Vec::new();
         for item in heap.scan() {
             let (rid, bytes) = item?;
-            match decode_entry(&bytes)? {
+            let (sql, first, last) = decode_row(&bytes)?;
+            if last == STATS_FORMAT {
+                stats_rows.push((rid, sql));
+                continue;
+            }
+            match decode_entry(&sql, first, last)? {
                 (
                     Statement::CreateTable {
                         name,
@@ -97,6 +114,7 @@ impl Catalog {
                             table,
                             rid,
                             saved_last_page: last,
+                            stats_rid: None,
                         },
                     );
                 }
@@ -132,6 +150,22 @@ impl Catalog {
                 rid = heap.insert(&encode_entry(definition.to_string(), (root, INDEX_FORMAT))?)?;
             }
             indexes.insert(name, IndexEntry { table, rid });
+        }
+        for (rid, sql) in stats_rows {
+            let (name, text) = sql.split_once(' ').unwrap_or((&sql, ""));
+            let Some(entry) = tables.get_mut(name) else {
+                return err(format!(
+                    "corrupted catalog: statistics of unknown table {name}"
+                ));
+            };
+            let stats = TableStats::decode(text)?;
+            if stats.columns.len() != entry.table.columns.len() {
+                return err(format!(
+                    "corrupted catalog: statistics of {name} have the wrong columns"
+                ));
+            }
+            entry.table.set_stats(Some(stats));
+            entry.stats_rid = Some(rid);
         }
         Ok(Catalog {
             pool,
@@ -202,6 +236,7 @@ impl Catalog {
                 table,
                 rid,
                 saved_last_page,
+                stats_rid: None,
             },
         );
 
@@ -230,7 +265,47 @@ impl Catalog {
             self.heap.delete(rid)?;
         }
         self.heap.delete(entry.rid)?;
+        if let Some(rid) = entry.stats_rid {
+            self.heap.delete(rid)?;
+        }
         entry.table.destroy()
+    }
+
+    /// Computes the statistics of a table (see `stats.rs`) and records
+    /// them in place of those it had, halving their histograms and lists
+    /// of common values until they fit in a catalog row.
+    pub fn analyze(&mut self, name: &str) -> Result<()> {
+        let entry = self
+            .tables
+            .get_mut(name)
+            .ok_or_else(|| unknown_table(name))?;
+        let mut stats = TableStats::collect(&entry.table)?;
+        let row = loop {
+            let row = encode_entry(
+                format!("{name} {}", stats.encode()),
+                (PageId(0), STATS_FORMAT),
+            )?;
+            if row.len() <= MAX_TUPLE_SIZE {
+                break row;
+            }
+            if !stats.shrink() {
+                return err(format!(
+                    "the statistics of {name} do not fit in a page: it has too many columns"
+                ));
+            }
+        };
+        let rid = match entry.stats_rid {
+            Some(rid) if self.heap.update(rid, &row)? => rid,
+            old => {
+                if let Some(rid) = old {
+                    self.heap.delete(rid)?;
+                }
+                self.heap.insert(&row)?
+            }
+        };
+        entry.stats_rid = Some(rid);
+        entry.table.set_stats(Some(stats));
+        Ok(())
     }
 
     /// Builds an index on a table from its current rows.
@@ -340,16 +415,21 @@ fn encode_entry(sql: String, (first, last): (PageId, PageId)) -> Result<Vec<u8>>
     tuple::encode(&catalog_columns(), &row)
 }
 
-/// Decodes a catalog row into its statement and the two pages it records.
-fn decode_entry(bytes: &[u8]) -> Result<(Statement, PageId, PageId)> {
+/// Decodes a catalog row into its text and the two pages it records.
+fn decode_row(bytes: &[u8]) -> Result<(String, PageId, PageId)> {
     let row = tuple::decode(&catalog_columns(), bytes)?;
     let [Value::Text(sql), Value::Int(first), Value::Int(last)] = row.as_slice() else {
         return err("corrupted catalog row");
     };
+    Ok((sql.clone(), page_id(*first)?, page_id(*last)?))
+}
+
+/// Parses the statement of a table's or an index's catalog row.
+fn decode_entry(sql: &str, first: PageId, last: PageId) -> Result<(Statement, PageId, PageId)> {
     let Some(statement) = parse(sql)?.pop() else {
         return err(format!("corrupted catalog row: {sql}"));
     };
-    Ok((statement, page_id(*first)?, page_id(*last)?))
+    Ok((statement, first, last))
 }
 
 fn pk_index_name(table: &str) -> String {
@@ -445,7 +525,7 @@ mod tests {
         let pages = pool.disk().page_count();
 
         let catalog = Catalog::open(pool.clone()).unwrap();
-        let (sql, _, format) = decode_entry(
+        let (sql, first, format) = decode_row(
             &catalog
                 .heap
                 .get(catalog.indexes["t_n"].rid)
@@ -453,6 +533,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
+        let (sql, _, format) = decode_entry(&sql, first, format).unwrap();
         assert_eq!(format, INDEX_FORMAT);
         assert!(matches!(sql, Statement::CreateIndex(CreateIndex { name, .. }) if name == "t_n"));
         let index = &catalog.get("t").unwrap().indexes()[1];

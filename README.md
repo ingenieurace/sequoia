@@ -67,8 +67,10 @@ PROJECT u.city, COUNT(*), SUM(o.total)
           LOOKUP orders o USING INDEX orders_user (o.user_id = u.id)
 ```
 
-`EXPLAIN ANALYZE` runs the query and adds the rows and time of each step, and
-the execution model the query ran in, with the reason it was chosen.
+`EXPLAIN ANALYZE` runs the query and adds the rows and time of each step, the
+rows the planner estimated it would return, and the execution model the
+query ran in, with the reason it was chosen. `ANALYZE` gathers statistics
+that make those estimates closer, and let the planner reorder joins.
 
 ## What is inside
 
@@ -84,7 +86,8 @@ the execution model the query ran in, with the reason it was chosen.
 | Joins | hash join (hybrid, spills to disk), index join, sort-merge join, block nested loop join, naive nested loop join (for comparison only) |
 | Parallelism | parallel heap scans, parallel grace hash join, gathered hash and index joins, two-phase (partial and final) aggregation |
 | Sort and aggregation | external merge sort with a tournament tree, top-N heap for `LIMIT`; hash aggregation that spills partitions |
-| Planner | access path choice, predicate pushdown, cost-based choice between index and hash joins, merge join to save a sort |
+| Planner | access path choice, predicate pushdown, cost-based choice between index and hash joins, merge join to save a sort, join reordering by dynamic programming |
+| Statistics | `ANALYZE`: reservoir sample, null share, distinct count (Haas-Stokes), most common values, equi-depth histograms; kept in the catalog |
 | Concurrency | many readers or one writer at a time, as in SQLite; a thread per connection in the server |
 
 ## Shell, server and library
@@ -170,6 +173,7 @@ workers, and a join method to force on every join (see
 - `EXPLAIN` before `SELECT`, `UPDATE` or `DELETE`; `EXPLAIN ANALYZE` before `SELECT`
 - `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT name`, `ROLLBACK TO [SAVEPOINT] name`, `RELEASE [SAVEPOINT] name` (each may add `TRANSACTION`)
 - `CHECKPOINT` copies the committed pages from the log into the database file
+- `ANALYZE [table]` computes the statistics of a table, or of every table, for the planner (see [Planning](#planning))
 
 **Types**: `INT` (or `INTEGER`, 64-bit), `REAL` (or `FLOAT`, 64-bit float, never
 NaN or infinite), `TEXT` (UTF-8), `BOOL` (or `BOOLEAN`), and `NULL`. INTs and
@@ -246,11 +250,14 @@ src/
     filter.rs        what a statement needs from a table: columns read, conditions implied by WHERE
     access.rs        full scan, index, or LSM key lookup / key range; EXPLAIN of a scan
     query.rs         SELECT -> tree of plan steps: binding, pushdown, joins, costs, gathers, EXPLAIN
+    selectivity.rs   the share of rows a condition or a join keeps, from statistics or guessed
+    order.rs         the cheapest order to join tables in: dynamic programming over sets, or greedy
 
   catalog/
-    mod.rs           tables and indexes, stored as their CREATE statements in a heap
+    mod.rs           tables, indexes and statistics, stored as their CREATE statements (and text) in a heap
     table.rs         a table: schema, storage engine, indexes, constraint checks, row counts
     index.rs         index entries (keys, included columns, row id) in a B+ tree or hash file
+    stats.rs         ANALYZE: sampling, distinct values, common values, histograms; estimates from them
 
   executor/
     mod.rs           runs statements; INSERT, UPDATE, DELETE, RETURNING, EXPLAIN ANALYZE
@@ -375,10 +382,36 @@ is read: an LSM primary key lookup or key range, or the index that narrows
 the rows most (equalities on its first keys, then a range on the next key).
 A partial index is used only when the `WHERE` implies its condition. An index
 that holds every column the query reads is used without reading the table
-(`COVERING INDEX`). Otherwise the table is scanned.
+(`COVERING INDEX`). Otherwise the table is scanned. On an analyzed table,
+an index that would find more than a quarter of the rows is left for a scan,
+unless it is covering or partial.
 
-**Joins** are planned in the order of `FROM`; the planner does not reorder
-tables. For each join with an equality between the two sides:
+**Statistics.** `ANALYZE` reads every row of a table and keeps a sample of
+30000 (reservoir sampling, with a fixed seed). For each column it records the
+share of NULLs, the number of distinct values (exact for a table sampled
+whole, else estimated with the Haas-Stokes estimator, and kept as a share of
+the rows when it is large), up to 16 most common values with their shares,
+and an equi-depth histogram of up to 32 buckets of the rest. The statistics
+are one catalog row per table, so they survive reopening, go with a
+rollback and are dropped with the table; writes do not change them until the
+next `ANALYZE`, but estimates use the current row count. With them, the share
+of rows a condition keeps is estimated from its values: equalities and `IN`
+from the common values or the distinct count, ranges (the bounds on a column
+in an `AND` together, as for `BETWEEN`) from the histogram, `IS NULL` from
+the null share, and `AND`, `OR` and `NOT` as if independent. A join on
+equalities keeps `1 / max(distinct left, distinct right)` of the pairs. A
+condition on tables never analyzed is guessed as before (below).
+`EXPLAIN ANALYZE` shows each step's estimate next to the rows it returned.
+
+**Join order.** The inner joins up to the first `LEFT JOIN` may be done in
+any order. The planner finds the cheapest left-deep order by dynamic
+programming over the sets of tables (greedily beyond 10 tables), never adding
+a table no condition links to those joined so far while a linked one waits.
+Each join is costed with the method it would use and the rows it would
+make. The order of `FROM` is kept unless another is estimated to cost less
+than three quarters of it, or when a join method is forced; `SELECT *` still
+returns the columns in the order of `FROM`. For each join with an equality
+between the two sides:
 
 - an **index join** if the right table has an index (or LSM primary key) on
   the column and looking up each left row costs less than building a hash
@@ -387,9 +420,12 @@ tables. For each join with an equality between the two sides:
 - a **merge join** only when its output order lets `ORDER BY` skip its sort.
 
 Without an equality, a **block nested loop join** is used. The costs are
-constants measured with `benches/joins.rs`. There are no statistics: table
-row counts are counted on first use, and selectivity is guessed (1/200 for an
-equality, 1/3 for anything else, one row for an equality on a unique key).
+constants measured with `benches/joins.rs` (except for the cost of making a
+joined row, and of trying a pair in a nested loop, which are rough guesses).
+Table row counts are counted on first use. Without statistics, selectivity
+is guessed (1/200 for an equality, 1/3 for anything else, one row for an
+equality on a unique key), and a join on equalities returns as many rows as
+its larger side.
 
 ### Execution
 
@@ -489,8 +525,11 @@ open.
   because the manifest is one page.
 - **One writer at a time**: there is no MVCC and no row locking, so a long
   write transaction blocks every other session.
-- **No statistics**: the planner knows row counts but not value
-  distributions, and does not reorder joins.
+- **Statistics only on request**: they are computed by `ANALYZE` and not
+  kept up to date by writes (there is no autovacuum); estimates treat the
+  conditions on different columns as independent (no multi-column
+  statistics). Joins are reordered into left-deep trees only (no bushy
+  plans), and not across a `LEFT JOIN`.
 - **Small default cache**: the buffer pool is 1 MB unless the constants are changed.
 - **No page checksums** in the database file; only the log is checksummed.
 - **Startup work**: LSM SSTable summaries and Bloom filters are not stored and

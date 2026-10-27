@@ -24,6 +24,11 @@ pub enum Statement {
     },
     /// Copies the committed pages from the write-ahead log into the database file.
     Checkpoint,
+    /// `ANALYZE [table]`: computes the statistics of a table, or of every
+    /// table, for the planner to estimate how many rows conditions keep.
+    Analyze {
+        table: Option<String>,
+    },
     /// `BEGIN [TRANSACTION]`: the statements up to COMMIT or ROLLBACK form one transaction.
     Begin,
     /// `COMMIT [TRANSACTION]`
