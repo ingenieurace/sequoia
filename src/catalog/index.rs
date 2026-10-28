@@ -479,6 +479,9 @@ fn own_expr(expr: &Expr, table: &str, columns: &[Column], what: &str) -> Result<
         Expr::Window(_) => {
             _ = problem.get_or_insert_with(|| format!("{what} cannot use a window function"))
         }
+        Expr::Function(function, _) if function.reads_clock() => {
+            _ = problem.get_or_insert_with(|| format!("{what} cannot use the current time"))
+        }
         Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(..) | Expr::Outer(_) => {
             _ = problem.get_or_insert_with(|| format!("{what} cannot use a subquery"))
         }

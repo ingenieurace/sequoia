@@ -80,6 +80,8 @@ impl Vector {
             Value::Date(_)
             | Value::Time(_)
             | Value::Timestamp(_)
+            | Value::TimestampTz(_)
+            | Value::Interval(_)
             | Value::Blob(_)
             | Value::Decimal(_) => Vector::Mixed(values),
             Value::Null => unreachable!("found a value that is not NULL"),

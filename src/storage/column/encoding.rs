@@ -143,7 +143,7 @@ pub fn encode(data_type: DataType, values: &[Value]) -> Result<Vec<u8>> {
                 .collect::<Result<Vec<&str>>>()?;
             bytes.extend(encode_texts(&texts));
         }
-        DataType::Blob | DataType::Decimal(_) => {
+        DataType::Blob | DataType::Decimal(_) | DataType::Interval => {
             let texts = values
                 .iter()
                 .map(|value| match value {
@@ -177,7 +177,9 @@ fn stored_int(value: &Value, data_type: DataType) -> Option<i64> {
         (Value::Bool(b), DataType::Bool) => Some(*b as i64),
         (Value::Real(r), DataType::Real) => Some(real_to_int(*r)),
         (Value::Date(d), DataType::Date) => Some(*d as i64),
-        (Value::Time(t), DataType::Time) | (Value::Timestamp(t), DataType::Timestamp) => Some(*t),
+        (Value::Time(t), DataType::Time)
+        | (Value::Timestamp(t), DataType::Timestamp)
+        | (Value::TimestampTz(t), DataType::TimestampTz) => Some(*t),
         _ => None,
     }
 }
@@ -198,11 +200,12 @@ fn from_stored_int(n: i64, data_type: DataType) -> Result<Value> {
         },
         DataType::Time => Value::Time(n),
         DataType::Timestamp => Value::Timestamp(n),
+        DataType::TimestampTz => Value::TimestampTz(n),
         other => unreachable!("{other} is not stored as integers"),
     })
 }
 
-/// A BLOB or DECIMAL as the text a chunk stores it as: its sort key's bytes
+/// A BLOB, DECIMAL or INTERVAL as the text a chunk stores it as: its sort key's bytes
 /// in hexadecimal, which compare as the values do, so that a chunk of them
 /// is encoded and filtered as one of TEXTs.
 fn keyed(value: &Value) -> String {
@@ -211,7 +214,7 @@ fn keyed(value: &Value) -> String {
     crate::types::hex(&key)
 }
 
-/// The BLOB or DECIMAL [`keyed`] made a text of.
+/// The BLOB, DECIMAL or INTERVAL [`keyed`] made a text of.
 fn from_keyed(text: &str, data_type: DataType) -> Result<Value> {
     let corrupted = || err(format!("corrupted column chunk: invalid {data_type}"));
     let bytes: Option<Vec<u8>> = (0..text.len())
@@ -254,7 +257,7 @@ pub fn decode_selected(
             })
             .collect()
         }
-        DataType::Blob | DataType::Decimal(_) => {
+        DataType::Blob | DataType::Decimal(_) | DataType::Interval => {
             let texts = decode_texts(&mut reader, n)?;
             rows.map(|i| match nulls.is_some_and(|b| bit(b, i)) {
                 true => Ok(Value::Null),
@@ -262,7 +265,12 @@ pub fn decode_selected(
             })
             .collect::<Result<_>>()?
         }
-        DataType::Real | DataType::Bool | DataType::Date | DataType::Time | DataType::Timestamp => {
+        DataType::Real
+        | DataType::Bool
+        | DataType::Date
+        | DataType::Time
+        | DataType::Timestamp
+        | DataType::TimestampTz => {
             let ints = decode_ints(&mut reader, n)?;
             rows.map(|i| match nulls.is_some_and(|b| bit(b, i)) {
                 true => Ok(Value::Null),
@@ -301,7 +309,9 @@ pub fn filter(
     let nulls = read_nulls(&mut reader, n)?;
     let mut matching = match (data_type, literal) {
         (DataType::Text, Value::Text(s)) => filter_texts(&mut reader, n, op, s)?,
-        (DataType::Blob | DataType::Decimal(_), literal) if literal.fits(data_type) => {
+        (DataType::Blob | DataType::Decimal(_) | DataType::Interval, literal)
+            if literal.fits(data_type) =>
+        {
             filter_texts(&mut reader, n, op, &keyed(literal))?
         }
         (_, literal) if stored_int(literal, data_type).is_some() => {

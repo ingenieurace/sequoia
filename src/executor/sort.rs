@@ -774,6 +774,8 @@ mod tests {
             Value::Date(_) => 5,
             Value::Time(_) => 6,
             Value::Timestamp(_) => 7,
+            Value::TimestampTz(_) => 8,
+            Value::Interval(_) => 9,
         };
         rank(a).cmp(&rank(b)).then_with(|| a.sort_cmp(b))
     }

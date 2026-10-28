@@ -188,6 +188,8 @@ Also:
 | `DATE` | `DATE '2024-02-29'` | a day from year 1 to 9999 |
 | `TIME` | `TIME '13:45:07.25'` | a time of day, to the microsecond |
 | `TIMESTAMP` | `TIMESTAMP '2024-02-29 13:45:07'` | both, with no time zone |
+| `TIMESTAMPTZ` (or `TIMESTAMP WITH TIME ZONE`) | `TIMESTAMPTZ '2024-02-29 13:45:07+02'` | an instant, kept in UTC |
+| `INTERVAL` | `INTERVAL '1 year 2 mons 3 days 04:05:06'`, `INTERVAL '3' DAY` | a span of months, days and microseconds |
 | `BLOB` | `X'CAFE00'` | bytes, compared byte by byte |
 | `DECIMAL(p, s)` (or `NUMERIC`) | `DECIMAL '19.99'` | exact numbers of up to `p` ≤ 38 digits, `s` after the point |
 
@@ -205,6 +207,28 @@ parallel too. A date plus or minus an INT is a date that many days on, two
 dates' difference an INT, and a date plus a time a timestamp. The type
 names are not keywords, so they stay free as names of columns.
 
+An INTERVAL keeps its months, days and microseconds apart, as PostgreSQL
+does, since a month is not always as many days: a timestamp plus `1 mon`
+is the same day of the next month (or its last day), plus `30 days` 30
+days on. Intervals add and subtract part by part, and multiply and divide
+by numbers, a part's fraction passing down (a month as 30 days, a day as 24
+hours); a timestamp, a TIMESTAMPTZ, a date (which makes a timestamp) or a
+time moves by one; two timestamps' or times' difference is one (`2 days
+02:00:00`). They read the way PostgreSQL writes them (`90 minutes`, `1.5
+hours`, `-2 weeks`, `04:05:06`, `2 hours ago`), and print that way. They
+order by their length, a month as 30 days, but are equal only if all three
+parts are (where PostgreSQL has `1 mon` equal `30 days`), which keeps
+equal intervals' index keys equal.
+
+A TIMESTAMPTZ is an instant: a zone written with it (`Z`, `UTC`, `+02`,
+`-05:30`) says how to read it, and is not kept. The session's time zone is
+always UTC, so it prints in UTC (`2024-02-29 11:45:07+00`) and converts to
+and from a TIMESTAMP as UTC. `x AT TIME ZONE zone` gives a TIMESTAMPTZ's
+wall time in another zone, as a TIMESTAMP, and a TIMESTAMP's instant read
+as a wall time there; a zone is UTC, an offset east of it (`'+05:30'`), or
+an INTERVAL of one. There are no zones by name, and so no daylight saving
+time: there is no time zone database.
+
 **Constraints**: `PRIMARY KEY` on one column (unique, not NULL), and unique
 indexes (rows with a NULL key may repeat; a partial unique index checks only
 the rows it holds).
@@ -219,6 +243,15 @@ the rows it holds).
   `LATERAL (SELECT ...) d`, after a comma, `CROSS JOIN`, `JOIN` or `LEFT
   JOIN`, may read the columns of the tables before it, and runs for each of
   their rows.
+- `JOIN ... USING (column, ...)` joins on those columns being equal on both
+  sides, and `NATURAL JOIN` on all the columns the two sides share by name
+  (of any kind of join). Each pair becomes one column: unqualified, its name
+  reads the left side's, the right side's for a `RIGHT JOIN`, and the first
+  that is not NULL for a `FULL JOIN`; `SELECT *` has it once, first, then
+  the rest of each side's columns.
+- `VALUES (expr, ...), ...` is a query of those rows, of columns `column1`,
+  `column2`...: alone, in a set operation, in `IN (...)`, or in `FROM` as
+  `(VALUES ...) t (a, b)`, `LATERAL` too.
 - `WHERE`, `GROUP BY` (expressions), `HAVING`, `ORDER BY expr [ASC | DESC], ...`
   (NULL first, stable; may name a select-list alias), `LIMIT n [OFFSET m]`
 - `UNION`, `INTERSECT` and `EXCEPT`, each also with `ALL`. `INTERSECT` binds
@@ -233,54 +266,74 @@ the rows it holds).
   The step runs on the rows the last round returned until a round returns
   none; with `UNION`, rows returned before are dropped, so a walk of a cycle
   ends, and a `LIMIT` above ends one that would not.
-- Aggregates: `COUNT(*)`, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, each also with `DISTINCT`
+- Aggregates: `COUNT(*)`, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, each also with
+  `DISTINCT`; their argument may have subqueries: `SUM((SELECT ...))`
 - Window functions, in the select list and `ORDER BY`:
-  `function(...) OVER ([PARTITION BY expr, ...] [ORDER BY ...] [frame])`.
-  The functions are `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `PERCENT_RANK`,
-  `CUME_DIST`, `NTILE(n)`, `LAG(x[, offset[, default]])`, `LEAD(...)`,
-  `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE(x, n)`, and the aggregates (without
-  `DISTINCT`). A frame is `ROWS` or `RANGE`, `[BETWEEN] start [AND end]`,
-  each bound `UNBOUNDED PRECEDING`, `n PRECEDING`, `CURRENT ROW`, `n
-  FOLLOWING` or `UNBOUNDED FOLLOWING` (`RANGE` only without `n`). By default
-  it runs from the start of the partition to the current row's last peer.
-  In a grouped query they read the groups: `SUM(COUNT(*)) OVER ()`.
+  `function(...) OVER ([window] [PARTITION BY expr, ...] [ORDER BY ...] [frame])`,
+  or `OVER window`, a window the query names after `HAVING` with `WINDOW
+  name AS (...), ...` (one may add an `ORDER BY` or a frame to another that
+  has none). The functions are `ROW_NUMBER`, `RANK`, `DENSE_RANK`,
+  `PERCENT_RANK`, `CUME_DIST`, `NTILE(n)`, `LAG(x[, offset[, default]])`,
+  `LEAD(...)`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE(x, n)`, and the
+  aggregates (without `DISTINCT`). A frame is `{ROWS | RANGE | GROUPS}
+  [BETWEEN] start [AND end]`, each bound `UNBOUNDED PRECEDING`, `n
+  PRECEDING`, `CURRENT ROW`, `n FOLLOWING` or `UNBOUNDED FOLLOWING`: `n` rows
+  for `ROWS`, groups of peers for `GROUPS`, and for `RANGE`, over its one
+  `ORDER BY` key, keys at most `n` away (a number, or an INTERVAL for dates
+  and times; a NULL key's frame is the other NULLs). By default it runs from
+  the start of the partition to the current row's last peer. In a grouped
+  query they read the groups: `SUM(COUNT(*)) OVER ()`.
 - Subqueries as a value, with `EXISTS` and with `[NOT] IN`, in the select
-  list, `WHERE`, `ON`, `GROUP BY`, `HAVING`, `ORDER BY`, `UPDATE`, `DELETE`
-  and `VALUES`. They may be correlated and nested.
+  list, `WHERE`, `ON`, `GROUP BY`, `HAVING`, `ORDER BY`, aggregates,
+  `UPDATE`, `DELETE` and `VALUES`. They may be correlated and nested.
 
-**Expressions**: `+ - * /` (INT division truncates toward zero), `||`,
+**Names**: a name is a word, as written (`users` and `Users` are two), or in
+double quotes, which may hold any character and be a keyword: `"order"`,
+`"Mixed Case"`, `"it""s"`. Comments are `-- to the end of the line` and
+`/* ... */`, which may hold others.
+
+**Expressions**: `+ - * /` (INT division truncates toward zero), `%` (of
+INTs or DECIMALs, with the sign of the dividend), `||`,
 `= != <> < <= > >=`, `AND OR NOT` with three-valued logic, `IS [NOT] NULL`,
 `[NOT] IN (list)`, `[NOT] BETWEEN`, `[NOT] LIKE` (`%` and `_`; ASCII letters
 match in either case, as in SQLite), `CASE [x] WHEN ... THEN ... [ELSE ...] END`.
 `AND` and `OR` evaluate their right side only where the left side does not
 decide, so `x <> 0 AND 10 / x > 1` never divides by zero. Integer overflow and
-division by zero are errors.
+division by zero are errors. `x AT TIME ZONE zone` (see Types).
 
-**Functions**: `COALESCE`, `NULLIF`, `LENGTH`, `UPPER`, `LOWER`, `SUBSTR(text, start[, length])`,
-`ABS`, `ROUND(number[, digits])`. They behave as in SQLite, without SQLite's
-type conversions; `LENGTH` of a BLOB counts its bytes, and `ABS` and `ROUND`
-of a DECIMAL are exact. Also:
+**Functions**: `COALESCE`, `NULLIF`, `LENGTH` (or `CHAR_LENGTH`), `UPPER`,
+`LOWER`, `SUBSTR(text, start[, length])`, `ABS`, `ROUND(number[, digits])`.
+They behave as in SQLite, without SQLite's type conversions; `LENGTH` of a
+BLOB counts its bytes, and `ABS` and `ROUND` of a DECIMAL are exact. A NULL
+argument makes NULL, but for `COALESCE`, `CONCAT`, `GREATEST` and `LEAST`.
+
+| Kind | Functions |
+|---|---|
+| text | `TRIM(text[, characters])` or `TRIM([BOTH \| LEADING \| TRAILING] [characters] FROM text)`, `LTRIM`, `RTRIM`, `REPLACE(text, from, to)`, `INSTR(text, part)` or `POSITION(part IN text)` (from 1; 0 if nowhere), `LEFT(text, n)` and `RIGHT(text, n)` (a negative `n` leaves out `-n`), `REVERSE`, `REPEAT(text, n)`, `LPAD` and `RPAD(text, length[, fill])`, `CONCAT(value, ...)` (of any values, as TEXT, NULLs left out) |
+| numbers | `CEIL` (or `CEILING`), `FLOOR`, `TRUNC(x[, digits])` (exact for DECIMALs), `SIGN`, `MOD(a, b)`; as REALs: `SQRT`, `POWER` (or `POW`), `EXP`, `LN`, `LOG(x)` (base 10) or `LOG(base, x)`, `LOG10`, `PI()` |
+| any | `GREATEST(value, ...)` and `LEAST`, NULLs left out, as in PostgreSQL |
+| time | `NOW()` or `CURRENT_TIMESTAMP` (a TIMESTAMPTZ), `CURRENT_DATE`, `CURRENT_TIME` (or `LOCALTIME`) and `LOCALTIMESTAMP`, in UTC: when the statement started, the same for all of it (in PostgreSQL, when the transaction did); `DATE_TRUNC(unit, x)`, from `microsecond` to `millennium` (`week` from Monday) |
 
 - `CAST(x AS type)`: between numbers (a REAL or DECIMAL to an INT rounds,
   halves away from zero), any value to `TEXT` as a result shows it, a `TEXT`
-  to any type it spells (`CAST('2024-01-05' AS DATE)`), a `TIMESTAMP` to its
-  `DATE` or `TIME` and a `DATE` to a `TIMESTAMP`, a `TEXT` to its UTF-8 bytes
-  as a `BLOB` and back, an `INT` to a `BOOL` and back
-- `EXTRACT(field FROM x)`: `YEAR`, `MONTH` or `DAY` of a date or timestamp,
-  `HOUR`, `MINUTE` or `SECOND` (whole seconds) of a time or timestamp, as an INT
+  to any type it spells (`CAST('2024-01-05' AS DATE)`), a `TIMESTAMP` or a
+  `TIMESTAMPTZ` to its `DATE` or `TIME` and to the other, a `DATE` to
+  either, a `TIME` to an `INTERVAL` and back, a `TEXT` to its UTF-8 bytes as
+  a `BLOB` and back, an `INT` to a `BOOL` and back
+- `EXTRACT(field FROM x)`: `YEAR`, `QUARTER`, `MONTH`, `DAY`, `DOW` (0 for
+  Sunday) or `DOY` of a date or timestamp, `HOUR`, `MINUTE` or `SECOND`
+  (whole seconds) of a time or timestamp, the parts of an interval, as an
+  INT; `EPOCH` (seconds since 1970, or an interval's) as a REAL
 
 **Transactions**: every statement is atomic, and outside a transaction it is
 durable once it returns. A transaction is durable once `COMMIT` returns; a
 crash, `ROLLBACK` or closing the database undoes it. A statement that fails
 inside a transaction is undone alone, and the transaction goes on.
 
-**Not supported**: `NATURAL` joins and `USING`, `VALUES` as a table in
-`FROM`, subqueries inside aggregates, named windows (`WINDOW w AS ...`),
-`GROUPS` frames, `RANGE` frames with offsets, `ALTER TABLE`, `NOT NULL`,
-`DEFAULT`, `CHECK`, foreign keys, composite primary keys, the `%` operator,
-quoted identifiers, `/* */` comments, time zones, `INTERVAL`, `CURRENT_DATE`
-and the like, and text stored in a DATE, TIME or TIMESTAMP column without a
-cast or a typed literal.
+**Not supported**: `ALTER TABLE`, `NOT NULL`, `DEFAULT`, `CHECK`, foreign
+keys, composite primary keys, time zones by name (only UTC and offsets),
+`SET TIME ZONE`, frame `EXCLUDE` clauses, and text stored in a DATE, TIME,
+TIMESTAMP, TIMESTAMPTZ or INTERVAL column without a cast or a typed literal.
 
 ## Source layout
 
@@ -300,7 +353,8 @@ src/
   server.rs          TCP server (a thread per connection) and client
   types.rs           values, data types, columns; how values compare, convert and print
   decimal.rs         DECIMAL: exact decimal numbers of up to 38 digits, and their arithmetic
-  datetime.rs        DATE, TIME and TIMESTAMP: the calendar, parsing and printing
+  datetime.rs        DATE, TIME, TIMESTAMP, TIMESTAMPTZ and INTERVAL: the calendar, time
+                     zone offsets, interval arithmetic, parsing and printing
   predicate.rs       `column op literal` conditions, shared by the planner and storage
   result.rs          query results and table printing
   error.rs           the error type
@@ -673,6 +727,9 @@ cargo test --release
   ```bash
   SEQUOIA_DIFF_CASES=2000 SEQUOIA_DIFF_SEED=7 cargo test --release --test differential -- --nocapture
   ```
+
+  With `SEQUOIA_DIFF_TRACE=1` (and `--nocapture`) each statement is printed
+  before it runs, to find one that never ends.
 
 - `tests/concurrency.rs` and `tests/server.rs` test sessions and the TCP server.
 

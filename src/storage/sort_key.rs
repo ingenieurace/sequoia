@@ -2,7 +2,7 @@
 //! the values, used by sorts and by index entries.
 //!
 //! NULL comes first, then BOOL, the numbers (INT, REAL and DECIMAL together,
-//! by value), TEXT, BLOB, DATE, TIME and TIMESTAMP (as values of different
+//! by value), TEXT, BLOB, DATE, TIME, TIMESTAMP, TIMESTAMPTZ and INTERVAL (as values of different
 //! types are never equal, those of one type all sort before those of
 //! another). Each value's encoding ends where it can be told to, so a key
 //! of several values compares like its values one after another:
@@ -28,6 +28,10 @@
 //! DATE       22, its day as 4 big-endian bytes with the sign bit flipped
 //! TIME       23, its microseconds as 8 big-endian bytes with the sign bit flipped
 //! TIMESTAMP  24, its microseconds likewise
+//! TIMESTAMPTZ  25, its microseconds likewise
+//! INTERVAL   26, its length (a month as 30 days) as 16 big-endian bytes
+//!            with the sign bit flipped, then its months, days (4 bytes
+//!            each) and microseconds (8) likewise
 //! ```
 //!
 //! A REAL or DECIMAL equal to an INT is encoded as that INT, so equal
@@ -54,6 +58,8 @@ const BLOB: u8 = 0x21;
 const DATE: u8 = 0x22;
 const TIME: u8 = 0x23;
 const TIMESTAMP: u8 = 0x24;
+const TIMESTAMPTZ: u8 = 0x25;
+const INTERVAL: u8 = 0x26;
 /// After an INT, or a number equal to one; and at the end of any other number.
 const WHOLE: u8 = 0x00;
 /// After the INT below a number with a fraction, before the fraction.
@@ -83,13 +89,20 @@ pub fn encode(value: &Value, desc: bool, out: &mut Vec<u8>) {
             out.push(DATE);
             out.extend_from_slice(&((*d as u32) ^ (1 << 31)).to_be_bytes());
         }
-        Value::Time(t) | Value::Timestamp(t) => {
-            out.push(if matches!(value, Value::Time(_)) {
-                TIME
-            } else {
-                TIMESTAMP
+        Value::Time(t) | Value::Timestamp(t) | Value::TimestampTz(t) => {
+            out.push(match value {
+                Value::Time(_) => TIME,
+                Value::Timestamp(_) => TIMESTAMP,
+                _ => TIMESTAMPTZ,
             });
             out.extend_from_slice(&((*t as u64) ^ (1 << 63)).to_be_bytes());
+        }
+        Value::Interval(i) => {
+            out.push(INTERVAL);
+            out.extend_from_slice(&((i.length() as u128) ^ (1 << 127)).to_be_bytes());
+            out.extend_from_slice(&((i.months as u32) ^ (1 << 31)).to_be_bytes());
+            out.extend_from_slice(&((i.days as u32) ^ (1 << 31)).to_be_bytes());
+            out.extend_from_slice(&((i.micros as u64) ^ (1 << 63)).to_be_bytes());
         }
     }
     if desc {
@@ -205,12 +218,21 @@ pub fn decode(bytes: &[u8], pos: &mut usize) -> Result<Value> {
         TEXT => Value::Text(String::from_utf8(unescape(bytes, pos)?).map_err(|_| corrupted())?),
         BLOB => Value::Blob(unescape(bytes, pos)?),
         DATE => Value::Date((u32::from_be_bytes(array(take(4)?)) ^ (1 << 31)) as i32),
-        TIME | TIMESTAMP => {
+        TIME | TIMESTAMP | TIMESTAMPTZ => {
             let t = (u64::from_be_bytes(array(take(8)?)) ^ (1 << 63)) as i64;
             match tag {
                 TIME => Value::Time(t),
-                _ => Value::Timestamp(t),
+                TIMESTAMP => Value::Timestamp(t),
+                _ => Value::TimestampTz(t),
             }
+        }
+        INTERVAL => {
+            take(16)?; // the length, which the parts give
+            Value::Interval(crate::datetime::Interval {
+                months: (u32::from_be_bytes(array(take(4)?)) ^ (1 << 31)) as i32,
+                days: (u32::from_be_bytes(array(take(4)?)) ^ (1 << 31)) as i32,
+                micros: (u64::from_be_bytes(array(take(8)?)) ^ (1 << 63)) as i64,
+            })
         }
         _ if tag == INT - 9 || tag == INT + 9 => {
             let real = real_from_ordered(u64::from_be_bytes(array(take(8)?)));
@@ -319,7 +341,8 @@ pub fn skip(bytes: &[u8], pos: usize) -> Result<usize> {
             }
         }
         DATE => pos + 5,
-        TIME | TIMESTAMP => pos + 9,
+        TIME | TIMESTAMP | TIMESTAMPTZ => pos + 9,
+        INTERVAL => pos + 33,
         _ if tag == INT - 9 || tag == INT + 9 => match bytes.get(pos + 9) {
             Some(&WHOLE) => pos + 10,
             Some(&EXACT) => digits_end(pos + 26)?,

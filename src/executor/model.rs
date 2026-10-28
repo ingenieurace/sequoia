@@ -101,8 +101,15 @@ pub fn choose(root: &Node, settings: &Settings) -> (Model, String) {
             Node::Filter { predicate, .. } => subqueries |= predicate.has_subquery(),
             Node::Project { exprs, .. } => subqueries |= exprs.iter().any(Expr::has_subquery),
             Node::Sort { keys, .. } => subqueries |= keys.iter().any(|key| key.expr.has_subquery()),
-            Node::Aggregate { group_by, .. } => {
+            Node::Aggregate {
+                group_by,
+                aggregates,
+                ..
+            } => {
                 subqueries |= group_by.iter().any(Expr::has_subquery)
+                    || aggregates
+                        .iter()
+                        .any(|(_, arg, _)| arg.as_ref().is_some_and(Expr::has_subquery))
             }
             Node::Window { functions, .. } => {
                 subqueries |= functions

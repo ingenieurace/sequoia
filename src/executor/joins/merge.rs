@@ -274,6 +274,8 @@ fn rank(value: &Value) -> i64 {
         Value::Text(_) => 3,
         Value::Blob(_) => 4,
         Value::Date(_) => 5,
+        Value::TimestampTz(_) => 8,
+        Value::Interval(_) => 9,
         Value::Time(_) => 6,
         Value::Timestamp(_) => 7,
     }

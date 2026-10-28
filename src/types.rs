@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-use crate::datetime;
+use crate::datetime::{self, Interval};
 use crate::decimal::Decimal;
 use crate::error::{Error, Result, err};
 
@@ -20,6 +20,10 @@ pub enum DataType {
     Time,
     /// A date and a time of day, with no time zone.
     Timestamp,
+    /// An instant: `TIMESTAMP WITH TIME ZONE`, or `TIMESTAMPTZ`.
+    TimestampTz,
+    /// A span of time: months, days and microseconds.
+    Interval,
     /// Bytes.
     Blob,
     /// An exact decimal number (see `decimal.rs`): `DECIMAL(p, s)` holds
@@ -77,6 +81,9 @@ pub enum Value {
     Time(i64),
     /// Microseconds since 1970-01-01 00:00:00.
     Timestamp(i64),
+    /// Microseconds since 1970-01-01 00:00:00 UTC.
+    TimestampTz(i64),
+    Interval(Interval),
     Blob(Vec<u8>),
     Decimal(Decimal),
 }
@@ -107,6 +114,8 @@ impl Hash for Value {
             Value::Time(t) => (6u8, t).hash(state),
             Value::Timestamp(t) => (7u8, t).hash(state),
             Value::Blob(b) => (8u8, b).hash(state),
+            Value::TimestampTz(t) => (9u8, t).hash(state),
+            Value::Interval(i) => (10u8, i).hash(state),
             // As the INT it equals, or else the REAL nearest it, which it equals.
             Value::Decimal(d) => match d.to_int() {
                 Some(n) => (1u8, n).hash(state),
@@ -199,6 +208,8 @@ impl Value {
                     | (Value::Date(_), DataType::Date)
                     | (Value::Time(_), DataType::Time)
                     | (Value::Timestamp(_), DataType::Timestamp)
+                    | (Value::TimestampTz(_), DataType::TimestampTz)
+                    | (Value::Interval(_), DataType::Interval)
                     | (Value::Blob(_), DataType::Blob)
             ),
         }
@@ -271,6 +282,8 @@ impl Value {
             (Value::Date(a), Value::Date(b)) => Some(a.cmp(b)),
             (Value::Time(a), Value::Time(b)) => Some(a.cmp(b)),
             (Value::Timestamp(a), Value::Timestamp(b)) => Some(a.cmp(b)),
+            (Value::TimestampTz(a), Value::TimestampTz(b)) => Some(a.cmp(b)),
+            (Value::Interval(a), Value::Interval(b)) => Some(a.compare(*b)),
             (Value::Blob(a), Value::Blob(b)) => Some(a.cmp(b)),
             (Value::Decimal(a), Value::Decimal(b)) => Some(a.compare(*b)),
             (Value::Decimal(a), Value::Int(b)) => Some(a.compare(Decimal::from_int(*b))),
@@ -304,6 +317,10 @@ impl Value {
             Value::Date(d) => format!("DATE '{}'", datetime::format_date(*d)),
             Value::Time(t) => format!("TIME '{}'", datetime::format_time(*t)),
             Value::Timestamp(t) => format!("TIMESTAMP '{}'", datetime::format_timestamp(*t)),
+            Value::TimestampTz(t) => {
+                format!("TIMESTAMPTZ '{}'", datetime::format_timestamptz(*t))
+            }
+            Value::Interval(i) => format!("INTERVAL '{i}'"),
             Value::Blob(b) => format!("X'{}'", hex(b)),
             Value::Decimal(d) => format!("DECIMAL '{d}'"),
         }
@@ -335,6 +352,8 @@ impl fmt::Display for Value {
             Value::Date(d) => f.write_str(&datetime::format_date(*d)),
             Value::Time(t) => f.write_str(&datetime::format_time(*t)),
             Value::Timestamp(t) => f.write_str(&datetime::format_timestamp(*t)),
+            Value::TimestampTz(t) => f.write_str(&datetime::format_timestamptz(*t)),
+            Value::Interval(i) => write!(f, "{i}"),
             Value::Decimal(d) => write!(f, "{d}"),
             other => f.write_str(&other.to_sql()),
         }
@@ -361,6 +380,8 @@ impl fmt::Display for DataType {
             DataType::Date => "DATE",
             DataType::Time => "TIME",
             DataType::Timestamp => "TIMESTAMP",
+            DataType::TimestampTz => "TIMESTAMPTZ",
+            DataType::Interval => "INTERVAL",
             DataType::Blob => "BLOB",
             DataType::Decimal(None) => "DECIMAL",
             DataType::Decimal(Some((p, s))) => return write!(f, "DECIMAL({p}, {s})"),

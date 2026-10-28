@@ -18,7 +18,9 @@ use std::rc::Rc;
 use crate::datetime;
 use crate::decimal::Decimal;
 use crate::error::{Error, Result, err};
-use crate::sql::ast::{BinaryOp, ColumnRef, Expr, Function, UnaryOp};
+use crate::sql::ast::{
+    BinaryOp, ColumnRef, Expr, Function, InsertSource, Projection, SelectItem, Statement, UnaryOp,
+};
 use crate::types::{Column, DataType, Value};
 
 /// A column of the rows an expression is evaluated on: its name, and the
@@ -294,6 +296,9 @@ pub(crate) fn apply(function: Function, values: &[Value]) -> Result<Value> {
             .cloned()
             .unwrap_or(Null));
     }
+    if let Some(result) = apply_more(function, values) {
+        return result;
+    }
     let wrong = |value: &Value, expected: &str| {
         err(format!(
             "{} expects {expected}, got {}",
@@ -348,6 +353,356 @@ pub(crate) fn apply(function: Function, values: &[Value]) -> Result<Value> {
         (Function::Round, [_, digits]) => wrong(digits, "INT"),
         _ => unreachable!("the parser checks how many arguments a function has"),
     }
+}
+
+/// The most characters a function makes a TEXT of, as REPEAT and LPAD can
+/// make very long ones: 2^28, a quarter of PostgreSQL's limit.
+const LONGEST_TEXT: usize = 1 << 28;
+
+/// Applies the functions on texts, numbers and times that `apply` does
+/// not, if `function` is one of them.
+fn apply_more(function: Function, values: &[Value]) -> Option<Result<Value>> {
+    use Value::{Int, Null, Real, Text};
+    let older = matches!(
+        function,
+        Function::Coalesce
+            | Function::Nullif
+            | Function::Length
+            | Function::Upper
+            | Function::Lower
+            | Function::Substr
+            | Function::Abs
+            | Function::Round
+            | Function::Cast(_)
+            | Function::Extract(_)
+    );
+    if older {
+        return None;
+    }
+    let name = || function.name().to_uppercase();
+    let wrong = |value: &Value, expected: &str| {
+        err(format!(
+            "{} expects {expected}, got {}",
+            name(),
+            value.to_sql()
+        ))
+    };
+    let text = |s: String| match s.chars().count() > LONGEST_TEXT {
+        true => err(format!("{} would make a TEXT too long", name())),
+        false => Ok(Text(s)),
+    };
+    // A number as a REAL, for the functions that compute with REALs.
+    let real_of = |value: &Value| {
+        value.to_f64().ok_or_else(|| {
+            crate::error::Error(format!(
+                "{} expects a number, got {}",
+                name(),
+                value.to_sql()
+            ))
+        })
+    };
+    Some((|| match (function, values) {
+        // These take NULLs as their other arguments do not.
+        (Function::Concat, values) => Ok(Text(
+            values
+                .iter()
+                .filter(|v| !v.is_null())
+                .map(|v| cast(v, DataType::Text).map(|t| t.to_string()))
+                .collect::<Result<String>>()?,
+        )),
+        (Function::Greatest | Function::Least, values) => {
+            let mut best: Option<&Value> = None;
+            for value in values.iter().filter(|v| !v.is_null()) {
+                let Some(ord) = best.map(|b| value.compare(b)) else {
+                    best = Some(value);
+                    continue;
+                };
+                let Some(ord) = ord else {
+                    return err(format!(
+                        "{} cannot compare {} and {}",
+                        name(),
+                        value.to_sql(),
+                        best.expect("compared").to_sql()
+                    ));
+                };
+                let better = match function {
+                    Function::Greatest => ord.is_gt(),
+                    _ => ord.is_lt(),
+                };
+                if better {
+                    best = Some(value);
+                }
+            }
+            Ok(best.cloned().unwrap_or(Null))
+        }
+        (Function::Pi, []) => Ok(Real(std::f64::consts::PI)),
+        // When the statement started, if it was not put in already.
+        (Function::Now, []) => Ok(Value::TimestampTz(datetime::now())),
+        (Function::CurrentDate, []) => Ok(Value::Date(datetime::split_timestamp(datetime::now()).0)),
+        (Function::CurrentTime, []) => Ok(Value::Time(datetime::split_timestamp(datetime::now()).1)),
+        (Function::LocalTimestamp, []) => Ok(Value::Timestamp(datetime::now())),
+        (_, values) if values.iter().any(Value::is_null) => Ok(Null),
+        (Function::Trim | Function::Ltrim | Function::Rtrim, [Text(s), rest @ ..]) => {
+            let set: Vec<char> = match rest {
+                [] => vec![' '],
+                [Text(chars)] => chars.chars().collect(),
+                [other] => return wrong(other, "TEXT"),
+                _ => unreachable!("at most two arguments"),
+            };
+            let strip = |c: char| set.contains(&c);
+            Ok(Text(match function {
+                Function::Ltrim => s.trim_start_matches(strip),
+                Function::Rtrim => s.trim_end_matches(strip),
+                _ => s.trim_matches(strip),
+            }
+            .to_string()))
+        }
+        (Function::Replace, [Text(s), Text(from), Text(to)]) => match from.is_empty() {
+            true => Ok(Text(s.clone())),
+            false => text(s.replace(from.as_str(), to)),
+        },
+        (Function::Instr, [Text(s), Text(part)]) => Ok(Int(match s.find(part.as_str()) {
+            Some(at) => s[..at].chars().count() as i64 + 1,
+            None => 0,
+        })),
+        (Function::Instr, [Value::Blob(b), Value::Blob(part)]) => Ok(Int(
+            match part.is_empty() {
+                true => 1,
+                false => b
+                    .windows(part.len())
+                    .position(|w| w == part.as_slice())
+                    .map_or(0, |at| at as i64 + 1),
+            },
+        )),
+        (Function::Left | Function::Right, [Text(s), Int(n)]) => {
+            let chars: Vec<char> = s.chars().collect();
+            let len = chars.len() as i64;
+            // How many to keep: n, or all but -n.
+            let keep = match *n >= 0 {
+                true => (*n).min(len),
+                false => (len + n).max(0),
+            } as usize;
+            Ok(Text(match function {
+                Function::Left => chars[..keep].iter().collect(),
+                _ => chars[chars.len() - keep..].iter().collect(),
+            }))
+        }
+        (Function::Reverse, [Text(s)]) => Ok(Text(s.chars().rev().collect())),
+        (Function::Repeat, [Text(s), Int(n)]) => {
+            let n = (*n).max(0) as usize;
+            match s.chars().count().saturating_mul(n) > LONGEST_TEXT {
+                true => err(format!("{} would make a TEXT too long", name())),
+                false => Ok(Text(s.repeat(n))),
+            }
+        }
+        (Function::Lpad | Function::Rpad, [Text(s), Int(length), rest @ ..]) => {
+            let fill: Vec<char> = match rest {
+                [] => vec![' '],
+                [Text(fill)] => fill.chars().collect(),
+                [other] => return wrong(other, "TEXT"),
+                _ => unreachable!("at most three arguments"),
+            };
+            let length = (*length).max(0) as usize;
+            if length > LONGEST_TEXT {
+                return err(format!("{} would make a TEXT too long", name()));
+            }
+            let chars: Vec<char> = s.chars().collect();
+            if chars.len() >= length || fill.is_empty() {
+                return Ok(Text(chars[..length.min(chars.len())].iter().collect()));
+            }
+            let padding: String = fill.iter().cycle().take(length - chars.len()).collect();
+            Ok(Text(match function {
+                Function::Lpad => format!("{padding}{s}"),
+                _ => format!("{s}{padding}"),
+            }))
+        }
+        (
+            Function::Trim
+            | Function::Ltrim
+            | Function::Rtrim
+            | Function::Replace
+            | Function::Reverse
+            | Function::Left
+            | Function::Right
+            | Function::Repeat
+            | Function::Lpad
+            | Function::Rpad,
+            [first, ..],
+        ) if !matches!(first, Text(_)) => wrong(first, "TEXT"),
+        (Function::Instr, [a, b]) => wrong(if matches!(a, Text(_)) { b } else { a }, "two TEXTs or two BLOBs"),
+        (Function::Left | Function::Right | Function::Repeat | Function::Lpad | Function::Rpad, [_, n, ..]) => {
+            wrong(n, "INT")
+        }
+        (Function::Replace, [_, a, b]) => wrong(if matches!(a, Text(_)) { b } else { a }, "TEXT"),
+        (Function::Ceil | Function::Floor, [value]) => match value {
+            Int(n) => Ok(Int(*n)),
+            Real(r) => Ok(Real(if function == Function::Ceil { r.ceil() } else { r.floor() })),
+            Value::Decimal(d) => Ok(Value::Decimal(d.floor(function == Function::Ceil)?)),
+            other => wrong(other, "a number"),
+        },
+        (Function::Trunc, [value, rest @ ..]) => {
+            let places = match rest {
+                [] => 0,
+                [Int(places)] => *places,
+                [other] => return wrong(other, "INT"),
+                _ => unreachable!("at most two arguments"),
+            };
+            match value {
+                Int(n) => Ok(Int(*n)),
+                Real(r) => {
+                    let factor = 10f64.powi(places.clamp(-30, 30) as i32);
+                    real((r * factor).trunc() / factor)
+                }
+                Value::Decimal(d) => Ok(Value::Decimal(d.trunc(places))),
+                other => wrong(other, "a number"),
+            }
+        }
+        (Function::Sign, [value]) => match value {
+            Int(n) => Ok(Int(n.signum())),
+            Real(r) => Ok(Real(if *r == 0.0 { 0.0 } else { r.signum() })),
+            Value::Decimal(d) => Ok(Int(d.signum())),
+            other => wrong(other, "a number"),
+        },
+        (Function::Sqrt, [value]) => match real_of(value)? {
+            r if r < 0.0 => err("cannot take the square root of a negative number"),
+            r => real(r.sqrt()),
+        },
+        (Function::Exp, [value]) => real(real_of(value)?.exp()),
+        (Function::Ln | Function::Log10, [value]) | (Function::Log, [value]) => {
+            match real_of(value)? {
+                r if r <= 0.0 => err("cannot take the logarithm of zero or a negative number"),
+                r if function == Function::Ln => real(r.ln()),
+                r => real(r.log10()),
+            }
+        }
+        (Function::Log, [base, value]) => match (real_of(base)?, real_of(value)?) {
+            (b, r) if b <= 0.0 || r <= 0.0 => {
+                err("cannot take the logarithm of zero or a negative number")
+            }
+            (1.0, _) => err("division by zero"),
+            (b, r) => real(r.ln() / b.ln()),
+        },
+        (Function::Power, [base, exponent]) => match (real_of(base)?, real_of(exponent)?) {
+            (0.0, e) if e < 0.0 => err("zero raised to a negative power is undefined"),
+            (b, e) if b < 0.0 && e.fract() != 0.0 => {
+                err("a negative number raised to a power that is not whole is not a REAL")
+            }
+            (b, e) => real(b.powf(e)),
+        },
+        (Function::Mod, [a, b]) => binary(a.clone(), BinaryOp::Mod, b.clone()),
+        (Function::DateTrunc, [Text(unit), value]) => match value {
+            Value::Timestamp(t) => Ok(Value::Timestamp(datetime::truncate(*t, unit)?)),
+            Value::TimestampTz(t) => Ok(Value::TimestampTz(datetime::truncate(*t, unit)?)),
+            Value::Date(d) => Ok(Value::Timestamp(datetime::truncate(
+                *d as i64 * datetime::MICROS_PER_DAY,
+                unit,
+            )?)),
+            other => wrong(other, "a DATE or TIMESTAMP"),
+        },
+        (Function::DateTrunc, [unit, _]) => wrong(unit, "a TEXT unit"),
+        (Function::AtTimeZone, [value, zone]) => {
+            let offset = match zone {
+                Text(zone) => datetime::parse_zone(zone)?,
+                Value::Interval(i) if i.months == 0 && i.days == 0 => i.micros,
+                other => return wrong(other, "a TEXT or an INTERVAL of hours and minutes"),
+            };
+            match value {
+                Value::TimestampTz(t) => Ok(Value::Timestamp(datetime::timestamp(t + offset)?)),
+                Value::Timestamp(t) => Ok(Value::TimestampTz(datetime::timestamp(t - offset)?)),
+                other => err(format!(
+                    "AT TIME ZONE expects a TIMESTAMP, with or without time zone, got {}",
+                    other.to_sql()
+                )),
+            }
+        }
+        _ => unreachable!("the parser checks how many arguments a function has"),
+    })())
+}
+
+/// The statement with every function of the current time (`NOW()`,
+/// `CURRENT_DATE` and the like) replaced by its value at `now`, so that a
+/// statement sees one time throughout, as SQLite has it (PostgreSQL's is
+/// the transaction's).
+pub fn at_time(statement: Statement, now: i64) -> Result<Statement> {
+    let fix = |e: &Expr| {
+        e.replace(&mut |e| match e {
+            Expr::Function(function, _) if function.reads_clock() => {
+                let (day, time) = datetime::split_timestamp(now);
+                Some(Ok(Expr::Literal(match function {
+                    Function::Now => Value::TimestampTz(now),
+                    Function::CurrentDate => Value::Date(day),
+                    Function::CurrentTime => Value::Time(time),
+                    _ => Value::Timestamp(now),
+                })))
+            }
+            _ => None,
+        })
+    };
+    let returning = |p: Option<Projection>| -> Result<Option<Projection>> {
+        Ok(match p {
+            Some(Projection::Exprs(items)) => Some(Projection::Exprs(
+                items
+                    .into_iter()
+                    .map(|item| {
+                        Ok(SelectItem {
+                            expr: fix(&item.expr)?,
+                            alias: item.alias,
+                        })
+                    })
+                    .collect::<Result<_>>()?,
+            )),
+            other => other,
+        })
+    };
+    Ok(match statement {
+        Statement::Select(query) => Statement::Select(Box::new(query.try_map(&mut |e| fix(e))?)),
+        Statement::Explain { statement, analyze } => Statement::Explain {
+            statement: Box::new(at_time(*statement, now)?),
+            analyze,
+        },
+        Statement::Insert {
+            table,
+            columns,
+            source,
+            returning: r,
+        } => Statement::Insert {
+            table,
+            columns,
+            source: match source {
+                InsertSource::Values(rows) => InsertSource::Values(
+                    rows.iter()
+                        .map(|row| row.iter().map(fix).collect::<Result<_>>())
+                        .collect::<Result<_>>()?,
+                ),
+                InsertSource::Select(query) => InsertSource::Select(Box::new(query.try_map(&mut |e| fix(e))?)),
+            },
+            returning: returning(r)?,
+        },
+        Statement::Update {
+            table,
+            assignments,
+            filter,
+            returning: r,
+        } => Statement::Update {
+            table,
+            assignments: assignments
+                .into_iter()
+                .map(|(c, e)| Ok((c, fix(&e)?)))
+                .collect::<Result<_>>()?,
+            filter: filter.as_ref().map(fix).transpose()?,
+            returning: returning(r)?,
+        },
+        Statement::Delete {
+            table,
+            filter,
+            returning: r,
+        } => Statement::Delete {
+            table,
+            filter: filter.as_ref().map(fix).transpose()?,
+            returning: returning(r)?,
+        },
+        other => other,
+    })
 }
 
 /// `CAST(value AS data_type)`. A value of the type stays as it is (a
@@ -419,21 +774,65 @@ pub(crate) fn cast(value: &Value, to: DataType) -> Result<Value> {
         (Timestamp(t), DataType::Time) => Time(datetime::split_timestamp(*t).1),
         (Text(s), DataType::Timestamp) => Timestamp(datetime::parse_timestamp(s)?),
         (Date(d), DataType::Timestamp) => Timestamp(*d as i64 * datetime::MICROS_PER_DAY),
+        // The session's time zone is UTC.
+        (Value::TimestampTz(t), DataType::Timestamp) => Timestamp(*t),
+        (Text(s), DataType::TimestampTz) => Value::TimestampTz(datetime::parse_timestamptz(s)?),
+        (Timestamp(t), DataType::TimestampTz) => Value::TimestampTz(*t),
+        (Date(d), DataType::TimestampTz) => {
+            Value::TimestampTz(*d as i64 * datetime::MICROS_PER_DAY)
+        }
+        (Value::TimestampTz(t), DataType::Date) => Date(datetime::split_timestamp(*t).0),
+        (Value::TimestampTz(t), DataType::Time) => Time(datetime::split_timestamp(*t).1),
+        (Text(s), DataType::Interval) => Value::Interval(datetime::Interval::parse(s)?),
+        (Time(t), DataType::Interval) => Value::Interval(datetime::Interval {
+            micros: *t,
+            ..Default::default()
+        }),
+        (Value::Interval(i), DataType::Time) => Time(datetime::add_to_time(0, *i)),
         (Text(s), DataType::Blob) => Blob(s.as_bytes().to_vec()),
         _ => return fail(),
     })
 }
 
-/// `EXTRACT(field FROM value)`: a part of a DATE, a TIME or a TIMESTAMP.
+/// `EXTRACT(field FROM value)`: a part of a DATE, a TIME, a TIMESTAMP (with
+/// time zone too, in UTC) or an INTERVAL, as an INT; EPOCH, as a REAL.
 fn extract(field: datetime::Field, value: &Value) -> Result<Value> {
+    use datetime::{Field, MICROS_PER_SECOND};
+    let seconds = |micros: i64| micros as f64 / MICROS_PER_SECOND as f64;
+    if field == Field::Epoch {
+        return Ok(Value::Real(match value {
+            Value::Date(d) => *d as f64 * 86_400.0,
+            Value::Time(t) | Value::Timestamp(t) | Value::TimestampTz(t) => seconds(*t),
+            // PostgreSQL's year of 365.25 days, and month of 30.
+            Value::Interval(i) => {
+                let (years, months) = (i.months / 12, i.months % 12);
+                years as f64 * 365.25 * 86_400.0
+                    + (months as f64 * 30.0 + i.days as f64) * 86_400.0
+                    + seconds(i.micros)
+            }
+            _ => return err(format!("cannot extract EPOCH from {}", value.to_sql())),
+        }));
+    }
     let part = match value {
-        Value::Date(d) if field.of_date() => datetime::date_field(*d, field),
+        Value::Date(d) if field.of_date() => datetime::calendar_field(*d, field),
         Value::Time(t) if !field.of_date() => datetime::time_field(*t, field),
-        Value::Timestamp(t) => {
+        Value::Timestamp(t) | Value::TimestampTz(t) => {
             let (day, time) = datetime::split_timestamp(*t);
             match field.of_date() {
-                true => datetime::date_field(day, field),
+                true => datetime::calendar_field(day, field),
                 false => datetime::time_field(time, field),
+            }
+        }
+        Value::Interval(i) if !matches!(field, Field::Dow | Field::Doy) => {
+            let time = i.micros;
+            match field {
+                Field::Year => (i.months / 12) as i64,
+                Field::Quarter => (i.months % 12 / 3 + 1) as i64,
+                Field::Month => (i.months % 12) as i64,
+                Field::Day => i.days as i64,
+                Field::Hour => i.micros / (3600 * MICROS_PER_SECOND),
+                Field::Minute => time / (60 * MICROS_PER_SECOND) % 60,
+                _ => time / MICROS_PER_SECOND % 60,
             }
         }
         _ => {
@@ -560,6 +959,7 @@ pub(crate) fn unary(op: UnaryOp, value: Value) -> Result<Value> {
         (UnaryOp::Neg, Value::Int(n)) => n.checked_neg().map(Value::Int).ok_or_else(overflow),
         (UnaryOp::Neg, Value::Real(r)) => Ok(Value::Real(-r)),
         (UnaryOp::Neg, Value::Decimal(d)) => Ok(Value::Decimal(d.neg())),
+        (UnaryOp::Neg, Value::Interval(i)) => Ok(Value::Interval(i.checked_neg()?)),
         (op, value) => err(format!("cannot apply {op:?} to {}", value.to_sql())),
     }
 }
@@ -606,6 +1006,26 @@ pub(crate) fn binary(left: Value, op: BinaryOp, right: Value) -> Result<Value> {
                 _ => ord.is_ge(),
             }))
         }
+        Mod => match (&left, &right) {
+            (Null, _) | (_, Null) => Ok(Null),
+            (Int(_), Int(0)) => err("division by zero"),
+            // The remainder has the sign of the dividend, as in SQLite and PostgreSQL.
+            (Int(a), Int(b)) => Ok(Int(a.checked_rem(*b).unwrap_or(0))),
+            (Value::Decimal(_), Int(_) | Value::Decimal(_)) | (Int(_), Value::Decimal(_)) => {
+                let as_decimal = |v: &Value| match v {
+                    Value::Decimal(d) => *d,
+                    Int(n) => Decimal::from_int(*n),
+                    _ => unreachable!("matched above"),
+                };
+                Ok(Value::Decimal(as_decimal(&left).remainder(as_decimal(&right))?))
+            }
+            _ => err(format!(
+                "% takes INTs or DECIMALs, got {} and {}",
+                left.to_sql(),
+                right.to_sql()
+            )),
+        },
+        Add | Sub | Mul | Div if let Some(result) = time_arithmetic(&left, op, &right) => result,
         Add | Sub | Mul | Div => match (&left, &right) {
             (Null, _) | (_, Null) => Ok(Null),
             (Int(_), Int(0)) if op == Div => err("division by zero"),
@@ -673,6 +1093,78 @@ pub(crate) fn binary(left: Value, op: BinaryOp, right: Value) -> Result<Value> {
             _ => type_error(&left, &right),
         },
     }
+}
+
+/// `+`, `-`, `*` or `/` with an INTERVAL or a TIMESTAMP WITH TIME ZONE, or
+/// of two timestamps or times, if that is what the operands are:
+///
+/// ```text
+/// interval ± interval          an interval, part by part
+/// interval * number            each part times it, its fractions passed down
+/// interval / number            likewise, divided
+/// timestamp ± interval         the timestamp moved: months on the calendar, then the rest
+/// timestamptz ± interval       likewise, in UTC
+/// date ± interval              the date's midnight moved, a timestamp
+/// time ± interval              the time moved by the interval's time, around midnight
+/// timestamp - timestamp        an interval of days and the rest (timestamptz alike)
+/// time - time                  an interval of the time between
+/// ```
+fn time_arithmetic(left: &Value, op: BinaryOp, right: &Value) -> Option<Result<Value>> {
+    use BinaryOp::{Add, Div, Mul, Sub};
+    use Value::{Date, Interval, Time, Timestamp, TimestampTz};
+    let negated = |i: &datetime::Interval| match op {
+        Sub => i.checked_neg(),
+        _ => Ok(*i),
+    };
+    let factor = |v: &Value| match v {
+        Value::Decimal(d) => Some(d.to_real()),
+        v => v.as_real(),
+    };
+    let result = (|| -> Result<Option<Value>> {
+        Ok(Some(match (left, op, right) {
+            (Value::Null, ..) | (_, _, Value::Null)
+                if matches!(left, Interval(_) | TimestampTz(_))
+                    || matches!(right, Interval(_) | TimestampTz(_)) =>
+            {
+                Value::Null
+            }
+            (Interval(a), Add | Sub, Interval(b)) => Interval(a.checked_add(negated(b)?)?),
+            (Interval(i), Mul, n) | (n, Mul, Interval(i)) if factor(n).is_some() => {
+                Interval(i.scale(factor(n).expect("checked"))?)
+            }
+            (Interval(i), Div, n) if factor(n).is_some() => match factor(n).expect("checked") {
+                0.0 => return err("division by zero"),
+                n => Interval(i.scale(1.0 / n)?),
+            },
+            (Timestamp(t), Add | Sub, Interval(i)) => {
+                Timestamp(datetime::add_interval(*t, negated(i)?)?)
+            }
+            (Interval(i), Add, Timestamp(t)) => Timestamp(datetime::add_interval(*t, *i)?),
+            (TimestampTz(t), Add | Sub, Interval(i)) => {
+                TimestampTz(datetime::add_interval(*t, negated(i)?)?)
+            }
+            (Interval(i), Add, TimestampTz(t)) => TimestampTz(datetime::add_interval(*t, *i)?),
+            (Date(d), Add | Sub, Interval(i)) => Timestamp(datetime::add_interval(
+                *d as i64 * datetime::MICROS_PER_DAY,
+                negated(i)?,
+            )?),
+            (Interval(i), Add, Date(d)) => Timestamp(datetime::add_interval(
+                *d as i64 * datetime::MICROS_PER_DAY,
+                *i,
+            )?),
+            (Time(t), Add | Sub, Interval(i)) => Time(datetime::add_to_time(*t, negated(i)?)),
+            (Interval(i), Add, Time(t)) => Time(datetime::add_to_time(*t, *i)),
+            (Timestamp(a), Sub, Timestamp(b)) | (TimestampTz(a), Sub, TimestampTz(b)) => {
+                Interval(datetime::between(*a, *b))
+            }
+            (Time(a), Sub, Time(b)) => Interval(datetime::Interval {
+                micros: a - b,
+                ..Default::default()
+            }),
+            _ => return Ok(None),
+        }))
+    })();
+    result.transpose()
 }
 
 /// A REAL result, or an error if it is too big to be one.

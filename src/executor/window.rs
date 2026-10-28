@@ -34,7 +34,9 @@ use crate::error::{Result, err};
 use crate::sql::ast::{
     Expr, FrameBound, FrameUnits, OrderBy, Window as WindowCall, WindowFunction,
 };
-use crate::sql::eval::{Field, Subqueries, eval_with, locate, locate_all};
+use crate::sql::ast::BinaryOp;
+use crate::sql::eval::{Field, Subqueries, binary, eval_with, locate, locate_all};
+use std::cmp::Ordering;
 use crate::types::Value;
 
 /// Reads all of `input` (whose columns are `fields`), and returns each row
@@ -219,27 +221,64 @@ fn compute(function: &WindowCall, f: usize, partition: &Partition) -> Result<Vec
     let arg = |i: usize, a: usize| partition.args[i][f].get(a).cloned();
     let name = || function.function.name().to_uppercase();
     let frame = function.frame();
-    // The rows of row i's frame, from the first to past the last.
-    let bounds = |i: usize| {
+    // The groups of peers: each row's, and where each starts and ends.
+    let mut group_of = vec![0; n];
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    for (i, group) in group_of.iter_mut().enumerate() {
         let (first, last) = partition.peers[i];
-        let offset = |k: u64| usize::try_from(k).unwrap_or(usize::MAX);
-        let start = match frame.start {
-            FrameBound::UnboundedPreceding => 0,
-            FrameBound::Preceding(k) => i.saturating_sub(offset(k)),
-            FrameBound::CurrentRow if frame.units == FrameUnits::Range => first,
-            FrameBound::CurrentRow => i,
-            FrameBound::Following(k) => i.saturating_add(offset(k)).min(n),
-            FrameBound::UnboundedFollowing => n,
+        if first == i {
+            groups.push((first, last));
+        }
+        *group = groups.len() - 1;
+    }
+    let desc = function.order_by.first().is_some_and(|o| o.desc);
+    // The rows of row i's frame, from the first to past the last.
+    let bounds = |i: usize| -> Result<(usize, usize)> {
+        let (first, last) = partition.peers[i];
+        let g = group_of[i];
+        let count = |k: &Value| match k {
+            Value::Int(k) => usize::try_from(*k).unwrap_or(usize::MAX),
+            _ => unreachable!("the parser checks that ROWS and GROUPS count in INTs"),
         };
-        let end = match frame.end {
-            FrameBound::UnboundedPreceding => 0,
-            FrameBound::Preceding(k) => (i + 1).saturating_sub(offset(k)),
-            FrameBound::CurrentRow if frame.units == FrameUnits::Range => last,
-            FrameBound::CurrentRow => i + 1,
-            FrameBound::Following(k) => i.saturating_add(offset(k)).saturating_add(1).min(n),
-            FrameBound::UnboundedFollowing => n,
+        // Of RANGE: where the rows whose key is past `k` before (or after) this row's start or end.
+        let by_value = |k: &Value, before: bool, end: bool| {
+            range_bound(&partition.order, i, k, before != desc, end, desc)
         };
-        (start, end.max(start))
+        let start = match (frame.units, &frame.start) {
+            (_, FrameBound::UnboundedPreceding) => 0,
+            (_, FrameBound::UnboundedFollowing) => n,
+            (FrameUnits::Rows, FrameBound::CurrentRow) => i,
+            (_, FrameBound::CurrentRow) => first,
+            (FrameUnits::Rows, FrameBound::Preceding(k)) => i.saturating_sub(count(k)),
+            (FrameUnits::Rows, FrameBound::Following(k)) => i.saturating_add(count(k)).min(n),
+            (FrameUnits::Groups, FrameBound::Preceding(k)) => {
+                g.checked_sub(count(k)).map_or(0, |g| groups[g].0)
+            }
+            (FrameUnits::Groups, FrameBound::Following(k)) => {
+                g.checked_add(count(k)).and_then(|g| groups.get(g)).map_or(n, |g| g.0)
+            }
+            (FrameUnits::Range, FrameBound::Preceding(k)) => by_value(k, true, false)?,
+            (FrameUnits::Range, FrameBound::Following(k)) => by_value(k, false, false)?,
+        };
+        let end = match (frame.units, &frame.end) {
+            (_, FrameBound::UnboundedPreceding) => 0,
+            (_, FrameBound::UnboundedFollowing) => n,
+            (FrameUnits::Rows, FrameBound::CurrentRow) => i + 1,
+            (_, FrameBound::CurrentRow) => last,
+            (FrameUnits::Rows, FrameBound::Preceding(k)) => (i + 1).saturating_sub(count(k)),
+            (FrameUnits::Rows, FrameBound::Following(k)) => {
+                i.saturating_add(count(k)).saturating_add(1).min(n)
+            }
+            (FrameUnits::Groups, FrameBound::Preceding(k)) => {
+                g.checked_sub(count(k)).map_or(0, |g| groups[g].1)
+            }
+            (FrameUnits::Groups, FrameBound::Following(k)) => {
+                g.checked_add(count(k)).and_then(|g| groups.get(g)).map_or(n, |g| g.1)
+            }
+            (FrameUnits::Range, FrameBound::Preceding(k)) => by_value(k, true, true)?,
+            (FrameUnits::Range, FrameBound::Following(k)) => by_value(k, false, true)?,
+        };
+        Ok((start, end.max(start)))
     };
     let positive = |value: Option<Value>, what: &str| -> Result<Option<usize>> {
         match value {
@@ -321,7 +360,7 @@ fn compute(function: &WindowCall, f: usize, partition: &Partition) -> Result<Vec
         }
         WindowFunction::FirstValue | WindowFunction::LastValue | WindowFunction::NthValue => {
             for i in 0..n {
-                let (start, end) = bounds(i);
+                let (start, end) = bounds(i)?;
                 let at = match function.function {
                     WindowFunction::FirstValue => Some(start),
                     WindowFunction::LastValue => end.checked_sub(1),
@@ -337,7 +376,7 @@ fn compute(function: &WindowCall, f: usize, partition: &Partition) -> Result<Vec
             // The state of the frame folded last, and its rows.
             let mut running: Option<(Running, usize, usize)> = None;
             for i in 0..n {
-                let (start, end) = bounds(i);
+                let (start, end) = bounds(i)?;
                 let (state, from) = match running.take() {
                     Some((state, s, e)) if s == start && e <= end => (state, e),
                     _ => (Running::new(aggregate), start),
@@ -352,4 +391,70 @@ fn compute(function: &WindowCall, f: usize, partition: &Partition) -> Result<Vec
         }
     }
     Ok(values)
+}
+
+/// Where a RANGE frame of row `i` starts (or with `end`, ends, past its
+/// last row) at an offset `k` from its key, in a partition sorted by its
+/// one key (`order`, NULLs together at one end): the key minus `k`, if
+/// `lower` (PRECEDING in ascending order, FOLLOWING in descending), or else
+/// plus `k`. The frame of a NULL key is its peers, the other NULLs, and
+/// no other's holds them.
+fn range_bound(
+    order: &[Vec<Value>],
+    i: usize,
+    k: &Value,
+    lower: bool,
+    end: bool,
+    desc: bool,
+) -> Result<usize> {
+    let key = &order[i][0];
+    let null = |j: usize| order[j][0].is_null();
+    let n = order.len();
+    // The rows whose key is not NULL.
+    let (from, to) = match (null(0), n > 0 && null(n - 1)) {
+        (true, _) => ((0..n).find(|&j| !null(j)).unwrap_or(n), n),
+        (_, true) => (0, (0..n).rfind(|&j| !null(j)).map_or(0, |j| j + 1)),
+        _ => (0, n),
+    };
+    if key.is_null() {
+        // The NULLs are the rows outside the others.
+        return Ok(match (end, from > 0) {
+            (false, true) => 0,
+            (true, true) => from,
+            (false, false) => to,
+            (true, false) => n,
+        });
+    }
+    let op = if lower { BinaryOp::Sub } else { BinaryOp::Add };
+    let target = binary(key.clone(), op, k.clone())?;
+    let compare = |a: &Value| range_compare(a, &target);
+    if compare(key).is_none() {
+        return err(format!(
+            "a RANGE offset of {} cannot be taken from a key of {}",
+            k.to_sql(),
+            key.to_sql()
+        ));
+    }
+    let keys = &order[from..to];
+    let ordering = |j: &Vec<Value>| compare(&j[0]).unwrap_or(Ordering::Equal);
+    // In ascending order, a start is the first key not below the target,
+    // an end the first above it; in descending, likewise the other way.
+    let at = match (end, desc) {
+        (false, false) => keys.partition_point(|j| ordering(j) == Ordering::Less),
+        (false, true) => keys.partition_point(|j| ordering(j) == Ordering::Greater),
+        (true, false) => keys.partition_point(|j| ordering(j) != Ordering::Greater),
+        (true, true) => keys.partition_point(|j| ordering(j) != Ordering::Less),
+    };
+    Ok(from + at)
+}
+
+/// Compares a key with a RANGE bound, a DATE as its midnight if the bound
+/// is a TIMESTAMP (a DATE plus an INTERVAL is one).
+fn range_compare(key: &Value, bound: &Value) -> Option<Ordering> {
+    match (key, bound) {
+        (Value::Date(d), Value::Timestamp(_)) => {
+            Value::Timestamp(*d as i64 * crate::datetime::MICROS_PER_DAY).compare(bound)
+        }
+        _ => key.compare(bound),
+    }
 }

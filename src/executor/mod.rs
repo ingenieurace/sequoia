@@ -27,7 +27,8 @@ use crate::plan::query::{self, Choices, ForceJoin, forbid};
 use crate::plan::{access, filter};
 use crate::result::QueryResult;
 use crate::sql::ast::{ColumnRef, Expr, InsertSource, Projection, Select, SelectItem, Statement};
-use crate::sql::eval::{Field, eval_with, locate, matches_with};
+use crate::datetime;
+use crate::sql::eval::{Field, at_time, eval_with, locate, matches_with};
 use crate::types::Value;
 use joins::{HASH_MEMORY, JOIN_MEMORY};
 use model::Model;
@@ -100,7 +101,7 @@ pub fn execute_read(
     statement: Statement,
     settings: &Settings,
 ) -> Result<QueryResult> {
-    match statement {
+    match at_time(statement, datetime::now())? {
         Statement::Explain {
             statement,
             analyze: false,
@@ -132,7 +133,8 @@ pub fn execute(
     if reads_only(&statement) {
         return execute_read(catalog, statement, settings);
     }
-    match statement {
+    // The current time, as the statement starts: the same for all of it.
+    match at_time(statement, datetime::now())? {
         Statement::CreateTable {
             name,
             columns,
@@ -216,6 +218,11 @@ impl Iterator for Query<'_> {
 
 /// Plans a SELECT and starts running it; no row is read until asked for.
 pub fn select<'a>(catalog: &'a Catalog, query: Select, settings: &Settings) -> Result<Query<'a>> {
+    let Statement::Select(query) = at_time(Statement::Select(Box::new(query)), datetime::now())?
+    else {
+        unreachable!("a SELECT stays one")
+    };
+    let query = *query;
     let plan = query::select(catalog, query, settings.choices())?;
     Ok(Query {
         columns: plan.columns,

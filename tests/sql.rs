@@ -4099,10 +4099,7 @@ fn subquery_mistakes_are_reported() {
             "SELECT * FROM users WHERE EXISTS (SELECT * FROM missing)",
             "missing",
         ),
-        (
-            "SELECT SUM((SELECT 1 FROM orders LIMIT 1)) FROM users",
-            "not allowed in aggregate functions",
-        ),
+
         (
             "SELECT city, (SELECT COUNT(*) FROM orders WHERE user_id = users.id) FROM users GROUP BY city",
             "column users.id must appear in GROUP BY",
@@ -6433,7 +6430,7 @@ fn dates_and_times_check_their_values() {
     ] {
         assert_eq!(error(&mut db, sql), message, "{sql}");
     }
-    assert!(error(&mut db, "SELECT EXTRACT(WEEK FROM d) FROM t").contains("YEAR, MONTH, DAY"));
+    assert!(error(&mut db, "SELECT EXTRACT(WEEK FROM d) FROM t").contains("YEAR, QUARTER, MONTH, DAY"));
     // A text is a date once cast, and a date a text.
     assert_eq!(
         shown(
@@ -7142,7 +7139,7 @@ fn window_functions_compute_values_over_the_rows_of_each_window() {
         ("SELECT COUNT(*) FROM users GROUP BY ROW_NUMBER() OVER ()", "not allowed in GROUP BY"),
         ("SELECT SUM(ROW_NUMBER() OVER ()) FROM users", "cannot use window functions"),
         ("SELECT ROW_NUMBER() OVER (ORDER BY ROW_NUMBER() OVER ()) FROM users", "cannot be nested"),
-        ("SELECT SUM(id) OVER (RANGE 1 PRECEDING) FROM users", "RANGE frames take only"),
+        ("SELECT SUM(id) OVER (ORDER BY name RANGE 1 PRECEDING) FROM users", "cannot apply Sub"),
         ("SELECT SUM(id) OVER (ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM users", "before it"),
         ("SELECT NTILE(0) OVER () FROM users", "positive INT"),
         ("SELECT COUNT(DISTINCT id) OVER () FROM users", "DISTINCT is not supported"),
@@ -7171,5 +7168,408 @@ fn window_functions_partition_many_rows_within_a_small_sort_budget() {
         assert_eq!(last as usize, members.len());
         let total: i64 = (0..3000i64).filter(|i| i % 7 == g).map(|i| (i * 37) % 101).sum();
         assert!(members.iter().any(|r| r[3] == int(total)), "group {g}");
+    }
+}
+
+// ---- quoted names, comments, %, USING and NATURAL, VALUES, subqueries in
+// aggregates, named windows and frames, INTERVAL, time zones, functions ----
+
+fn real_value(v: f64) -> Value {
+    Value::Real(v)
+}
+
+/// The one value a query returns.
+fn one(db: &mut Database, sql: &str) -> Value {
+    let mut rows = query(db, sql);
+    assert_eq!(rows.len(), 1, "{sql}");
+    assert_eq!(rows[0].len(), 1, "{sql}");
+    rows.remove(0).remove(0)
+}
+
+/// The text of the one value a query returns, as a result shows it.
+fn shown_one(db: &mut Database, sql: &str) -> String {
+    one(db, sql).to_string()
+}
+
+#[test]
+fn quoted_names_may_be_keywords_and_survive_reopening() {
+    let file = TempDb::new("quoted");
+    {
+        let mut db = open(&file.0).unwrap();
+        db.execute(
+            r#"CREATE TABLE "order" ("select" INT PRIMARY KEY, "Mixed Case" TEXT, "it""s" INT);
+               CREATE INDEX "by case" ON "order" ("Mixed Case") INCLUDE ("it""s");
+               INSERT INTO "order" VALUES (1, 'a', 10), (2, 'b', 20) /* a comment /* in one */ */;
+               -- a line comment"#,
+        )
+        .unwrap();
+    }
+    let mut db = open(&file.0).unwrap();
+    assert_eq!(
+        query(&mut db, r#"SELECT o."select", "it""s" FROM "order" o WHERE "Mixed Case" = 'b'"#),
+        vec![vec![int(2), int(20)]]
+    );
+    // A quoted name is never a keyword, nor a word that means something where it stands.
+    assert_eq!(
+        one(&mut db, r#"SELECT "returning" FROM (SELECT 1 AS "returning") "window""#),
+        int(1)
+    );
+    let plan = explain(&mut db, r#"SELECT "it""s" FROM "order" WHERE "Mixed Case" = 'a'"#);
+    assert!(plan.contains("COVERING INDEX by case"), "{plan}");
+    for (sql, problem) in [
+        (r#"SELECT "" FROM "order""#, "cannot be empty"),
+        (r#"SELECT "x FROM "order""#, "unterminated quoted name"),
+        ("SELECT 1 /* never closed", "unterminated /* comment"),
+        (r#"SELECT "Select" FROM "order""#, "unknown column"),
+    ] {
+        let e = db.execute(sql).expect_err(sql);
+        assert!(e.0.contains(problem), "{sql}: {e}");
+    }
+}
+
+#[test]
+fn remainders_have_the_sign_of_the_dividend() {
+    let mut db = in_memory();
+    assert_eq!(
+        query(&mut db, "SELECT 7 % 3, -7 % 3, 7 % -3, MOD(10, 4), 6 * 5 % 4, DECIMAL '7.5' % 2"),
+        vec![vec![
+            int(1),
+            int(-1),
+            int(1),
+            int(2),
+            int(2),
+            Value::Decimal(sequoia::decimal::Decimal::parse("1.5").unwrap())
+        ]]
+    );
+    assert!(one(&mut db, "SELECT NULL % 2").is_null());
+    for (sql, problem) in [("SELECT 1 % 0", "division by zero"), ("SELECT 1.5 % 1", "% takes INTs or DECIMALs")] {
+        let e = db.execute(sql).expect_err(sql);
+        assert!(e.0.contains(problem), "{sql}: {e}");
+    }
+}
+
+#[test]
+fn using_and_natural_joins_merge_their_columns() {
+    let mut db = people();
+    db.execute(
+        "CREATE TABLE visits (user_id INT, city TEXT, day INT);
+         INSERT INTO visits VALUES (1, 'oslo', 1), (2, 'paris', 3), (5, 'rome', 7)",
+    )
+    .unwrap();
+    // SELECT * has the merged column once, first, then the rest of each side.
+    let result = db.execute("SELECT * FROM users JOIN visits USING (city)").unwrap().pop();
+    let Some(QueryResult::Rows { columns, rows }) = result else {
+        panic!("rows");
+    };
+    assert_eq!(columns, ["city", "id", "name", "user_id", "day"]);
+    assert_eq!(rows.len(), 3);
+    let sql = "SELECT city, id, user_id FROM visits FULL JOIN users USING (city) ORDER BY city, id";
+    assert_eq!(
+        every_way(&mut db, sql, true),
+        vec![
+            vec![null(), int(4), null()],
+            vec![text("oslo"), int(1), int(1)],
+            vec![text("oslo"), int(3), int(1)],
+            vec![text("paris"), null(), int(2)],
+            vec![text("rome"), int(2), int(5)],
+        ]
+    );
+    // A merged column is the right side's in a RIGHT JOIN, and either side's
+    // name still reads that side.
+    let sql = "SELECT city, visits.city, users.city FROM visits RIGHT JOIN users USING (city) ORDER BY users.id";
+    assert_eq!(
+        every_way(&mut db, sql, true),
+        vec![
+            vec![text("oslo"), text("oslo"), text("oslo")],
+            vec![text("rome"), text("rome"), text("rome")],
+            vec![text("oslo"), text("oslo"), text("oslo")],
+            vec![null(), null(), null()],
+        ]
+    );
+    // NATURAL joins on the columns of the same names, here id.
+    let sql = "SELECT id, name, user_id FROM users NATURAL JOIN orders ORDER BY id";
+    assert_eq!(every_way(&mut db, sql, true).len(), 4);
+    // Chained, and in a subquery.
+    let sql = "SELECT city, COUNT(*) FROM users NATURAL LEFT JOIN visits GROUP BY city ORDER BY city";
+    assert_eq!(every_way(&mut db, sql, true).len(), 3);
+    let sql = "SELECT name FROM users u WHERE EXISTS (SELECT 1 FROM visits v JOIN users w USING (city) WHERE w.id = u.id AND city = 'oslo') ORDER BY name";
+    assert_eq!(every_way(&mut db, sql, true), vec![vec![text("ann")], vec![text("cy")]]);
+    for (sql, problem) in [
+        ("SELECT * FROM users JOIN visits USING (nope)", "not on the left"),
+        ("SELECT * FROM users JOIN orders ON TRUE JOIN users x USING (id)", "more than once"),
+        ("SELECT * FROM users JOIN visits USING (city, city)", "named more than once"),
+        ("SELECT * FROM users NATURAL CROSS JOIN visits", "expected JOIN"),
+    ] {
+        let e = db.execute(sql).expect_err(sql);
+        assert!(e.0.contains(problem), "{sql}: {e}");
+    }
+}
+
+#[test]
+fn values_are_a_table_and_a_query() {
+    let mut db = people();
+    assert_eq!(
+        every_way(&mut db, "VALUES (1, 'a'), (2, 'b')", true),
+        vec![vec![int(1), text("a")], vec![int(2), text("b")]]
+    );
+    let sql = "SELECT n * 10, s FROM (VALUES (1, 'a'), (1 + 1, 'b'), ((SELECT COUNT(*) FROM users), NULL)) AS t(n, s) ORDER BY n";
+    assert_eq!(
+        every_way(&mut db, sql, true),
+        vec![
+            vec![int(10), text("a")],
+            vec![int(20), text("b")],
+            vec![int(40), null()],
+        ]
+    );
+    assert_eq!(
+        query(&mut db, "SELECT 1 AS x UNION VALUES (2) ORDER BY x"),
+        vec![vec![int(1)], vec![int(2)]]
+    );
+    let sql = "SELECT u.name, x.k FROM users u, LATERAL (VALUES (u.id), (u.id * 100)) x(k) WHERE u.id < 3 ORDER BY u.name, x.k";
+    assert_eq!(every_way(&mut db, sql, true).len(), 4);
+    assert_eq!(one(&mut db, "SELECT COUNT(*) FROM users WHERE id IN (VALUES (1), (3))"), int(2));
+    db.execute("CREATE TABLE pairs (a INT, b TEXT)").unwrap();
+    db.execute("INSERT INTO pairs VALUES (1, 'x')").unwrap();
+    db.execute("INSERT INTO pairs SELECT column1 + 1, column2 FROM (VALUES (1, 'y'), (2, 'z')) v")
+        .unwrap();
+    assert_eq!(one(&mut db, "SELECT COUNT(*) FROM pairs"), int(3));
+    assert!(explain(&mut db, "SELECT * FROM (VALUES (1), (2)) t").contains("VALUES (2 ROWS)"));
+    let e = db.execute("VALUES (1), (1, 2)").unwrap_err();
+    assert!(e.0.contains("as many values"), "{e}");
+}
+
+#[test]
+fn aggregates_take_subqueries() {
+    let mut db = people();
+    let sql = "SELECT name, SUM((SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id)) FROM users u GROUP BY name ORDER BY name";
+    assert_eq!(
+        every_way(&mut db, sql, true),
+        vec![
+            vec![text("ann"), int(2)],
+            vec![text("bob"), int(1)],
+            vec![text("cy"), int(0)],
+            vec![text("dee"), int(0)],
+        ]
+    );
+    let sql = "SELECT COUNT(DISTINCT (SELECT city FROM users x WHERE x.id = o.user_id)), MAX((SELECT 1)) FROM orders o";
+    assert_eq!(every_way(&mut db, sql, true), vec![vec![int(2), int(1)]]);
+}
+
+#[test]
+fn windows_may_be_named_and_framed_by_groups_and_ranges() {
+    let mut db = people();
+    let sql = "SELECT name, ROW_NUMBER() OVER w, RANK() OVER (w ORDER BY name DESC), COUNT(*) OVER w2 FROM users \
+               WINDOW w AS (PARTITION BY city), w2 AS (w ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) ORDER BY name";
+    let rows = every_way(&mut db, sql, true);
+    assert_eq!(
+        rows.iter().map(|r| r[2].clone()).collect::<Vec<_>>(),
+        [int(2), int(1), int(1), int(1)]
+    );
+    assert_eq!(
+        query(&mut db, "SELECT name FROM users WINDOW w AS (ORDER BY id) ORDER BY ROW_NUMBER() OVER w DESC"),
+        vec![vec![text("dee")], vec![text("cy")], vec![text("bob")], vec![text("ann")]]
+    );
+    let sql = "SELECT id, SUM(id) OVER (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES (1), (1), (2), (3), (3), (4)) t(id)";
+    let sums: Vec<Value> = every_way(&mut db, sql, true).into_iter().map(|r| r[1].clone()).collect();
+    assert_eq!(sums, [int(2), int(2), int(4), int(8), int(8), int(10)]);
+    let sql = "SELECT id, SUM(total) OVER (ORDER BY total RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING), \
+               COUNT(*) OVER (ORDER BY total DESC RANGE BETWEEN 10.5 PRECEDING AND CURRENT ROW) FROM orders ORDER BY id";
+    assert_eq!(
+        every_way(&mut db, sql, true),
+        vec![
+            vec![int(1), real_value(14.75), int(2)],
+            vec![int(2), real_value(20.0), int(1)],
+            vec![int(3), real_value(15.75), int(2)],
+            vec![int(4), real_value(6.25), int(3)],
+        ]
+    );
+    let sql = "SELECT d, COUNT(*) OVER (ORDER BY d RANGE BETWEEN INTERVAL '3 days' PRECEDING AND CURRENT ROW) \
+               FROM (VALUES (DATE '2024-01-01'), (DATE '2024-01-03'), (DATE '2024-01-07')) t(d) ORDER BY d";
+    let counts: Vec<Value> = every_way(&mut db, sql, true).into_iter().map(|r| r[1].clone()).collect();
+    assert_eq!(counts, [int(1), int(2), int(1)]);
+    // NULL keys are each other's peers, and in no other row's frame.
+    let sql = "SELECT x, COUNT(*) OVER (ORDER BY x RANGE 1 PRECEDING) FROM (VALUES (NULL), (1), (2), (NULL), (3)) t(x) ORDER BY x";
+    let counts: Vec<Value> = every_way(&mut db, sql, true).into_iter().map(|r| r[1].clone()).collect();
+    assert_eq!(counts, [int(2), int(2), int(1), int(2), int(2)]);
+    for (sql, problem) in [
+        ("SELECT RANK() OVER nope FROM users", "window nope does not exist"),
+        ("SELECT SUM(id) OVER (RANGE 1 PRECEDING) FROM users", "exactly one ORDER BY key"),
+        ("SELECT SUM(id) OVER (GROUPS 1 PRECEDING) FROM users", "needs an ORDER BY"),
+        ("SELECT SUM(id) OVER (ORDER BY id ROWS 1.5 PRECEDING) FROM users", "must be an INT"),
+        ("SELECT SUM(id) OVER (ORDER BY id ROWS -1 PRECEDING) FROM users", "expected an expression"),
+        ("SELECT COUNT(*) OVER (w ORDER BY id) FROM users WINDOW w AS (ORDER BY name)", "which has one"),
+        ("SELECT COUNT(*) OVER (w ORDER BY id) FROM users WINDOW w AS (ROWS 1 PRECEDING)", "which has a frame"),
+        ("SELECT 1 FROM users WINDOW w AS (), w AS ()", "defined more than once"),
+    ] {
+        let e = db.execute(sql).expect_err(sql);
+        assert!(e.0.contains(problem), "{sql}: {e}");
+    }
+}
+
+#[test]
+fn intervals_measure_and_move_times() {
+    let mut db = in_memory();
+    for (sql, expected) in [
+        ("SELECT INTERVAL '1 year 2 months 3 days 04:05:06.5'", "1 year 2 mons 3 days 04:05:06.5"),
+        ("SELECT INTERVAL '3' DAY", "3 days"),
+        ("SELECT INTERVAL '90 minutes'", "01:30:00"),
+        ("SELECT INTERVAL '-2 weeks'", "-14 days"),
+        ("SELECT INTERVAL '2 hours ago'", "-02:00:00"),
+        ("SELECT INTERVAL '1.5 months'", "1 mon 15 days"),
+        ("SELECT INTERVAL '1.5 hours' * 2", "03:00:00"),
+        ("SELECT INTERVAL '1 day' / 4", "06:00:00"),
+        ("SELECT -INTERVAL '1 mon'", "-1 mon"),
+        ("SELECT INTERVAL '1 mon' + INTERVAL '30 days'", "1 mon 30 days"),
+        ("SELECT TIMESTAMP '2024-01-31 12:00' + INTERVAL '1 month'", "2024-02-29 12:00:00"),
+        ("SELECT DATE '2024-02-29' + INTERVAL '1 year'", "2025-02-28 00:00:00"),
+        ("SELECT TIME '23:00' + INTERVAL '2 hours'", "01:00:00"),
+        ("SELECT TIMESTAMP '2024-03-01' - TIMESTAMP '2024-02-27 22:00'", "2 days 02:00:00"),
+        ("SELECT TIME '10:00' - TIME '08:30'", "01:30:00"),
+        ("SELECT CAST('2 days 01:00' AS INTERVAL)", "2 days 01:00:00"),
+        ("SELECT CAST(INTERVAL '25 hours' AS TEXT)", "25:00:00"),
+        ("SELECT INTERVAL '0 seconds'", "00:00:00"),
+    ] {
+        assert_eq!(shown_one(&mut db, sql), expected, "{sql}");
+    }
+    assert_eq!(one(&mut db, "SELECT EXTRACT(EPOCH FROM INTERVAL '1 day')"), real_value(86400.0));
+    assert_eq!(one(&mut db, "SELECT EXTRACT(HOUR FROM INTERVAL '30 hours')"), int(30));
+    // Ordered by length, but equal only part by part.
+    db.execute(
+        "CREATE TABLE spans (id INT PRIMARY KEY, span INTERVAL);
+         CREATE INDEX spans_span ON spans (span);
+         INSERT INTO spans VALUES (1, INTERVAL '1 mon'), (2, INTERVAL '30 days'), (3, INTERVAL '29 days'), (4, NULL)",
+    )
+    .unwrap();
+    let ids: Vec<Value> = every_way(&mut db, "SELECT id FROM spans ORDER BY span", true)
+        .into_iter()
+        .map(|mut r| r.remove(0))
+        .collect();
+    assert_eq!(ids, [int(4), int(3), int(2), int(1)]);
+    assert_eq!(one(&mut db, "SELECT id FROM spans WHERE span = INTERVAL '30 days'"), int(2));
+    assert_eq!(one(&mut db, "SELECT COUNT(*) FROM spans WHERE span > INTERVAL '29 days 23:00'"), int(2));
+    let e = db.execute("SELECT INTERVAL 'nonsense'").unwrap_err();
+    assert!(e.0.contains("invalid INTERVAL"), "{e}");
+}
+
+#[test]
+fn timestamps_with_time_zones_are_instants_in_utc() {
+    let file = TempDb::new("zones");
+    let mut db = open(&file.0).unwrap();
+    db.execute(
+        "CREATE TABLE events (id INT PRIMARY KEY, at TIMESTAMP WITH TIME ZONE, took INTERVAL) USING COLUMN;
+         INSERT INTO events VALUES (1, TIMESTAMPTZ '2024-01-01 10:00:00+02:00', INTERVAL '1 hour'),
+                                   (2, '2024-06-30 23:30:00Z', INTERVAL '2 days'),
+                                   (3, NULL, NULL)",
+    )
+    .unwrap_err(); // text is not stored in a TIMESTAMPTZ column without a cast
+    db.execute(
+        "INSERT INTO events VALUES (1, TIMESTAMPTZ '2024-01-01 10:00:00+02:00', INTERVAL '1 hour'),
+                                   (2, CAST('2024-06-30 23:30:00Z' AS TIMESTAMPTZ), INTERVAL '2 days'),
+                                   (3, NULL, NULL)",
+    )
+    .unwrap();
+    drop(db);
+    let mut db = open(&file.0).unwrap();
+    assert_eq!(
+        shown_one(&mut db, "SELECT at FROM events WHERE id = 1"),
+        "2024-01-01 08:00:00+00"
+    );
+    assert_eq!(
+        shown_one(&mut db, "SELECT at + took FROM events WHERE id = 2"),
+        "2024-07-02 23:30:00+00"
+    );
+    assert_eq!(
+        one(&mut db, "SELECT COUNT(*) FROM events WHERE at > TIMESTAMPTZ '2024-01-01 10:00+02'"),
+        int(1)
+    );
+    for (sql, expected) in [
+        ("SELECT TIMESTAMPTZ '2024-01-01 10:00:00+02' AT TIME ZONE '+05:30'", "2024-01-01 13:30:00"),
+        ("SELECT TIMESTAMP '2024-01-01 10:00' AT TIME ZONE '-03'", "2024-01-01 13:00:00+00"),
+        ("SELECT TIMESTAMP '2024-01-01 10:00' AT TIME ZONE INTERVAL '2 hours'", "2024-01-01 08:00:00+00"),
+        ("SELECT TIMESTAMPTZ '2024-01-01 00:00 UTC' AT TIME ZONE 'UTC'", "2024-01-01 00:00:00"),
+        ("SELECT CAST(TIMESTAMPTZ '2024-01-01 00:00+01' AS TIMESTAMP)", "2023-12-31 23:00:00"),
+        ("SELECT DATE_TRUNC('hour', TIMESTAMPTZ '2024-05-17 13:14:15+00')", "2024-05-17 13:00:00+00"),
+    ] {
+        assert_eq!(shown_one(&mut db, sql), expected, "{sql}");
+    }
+    let e = db.execute("SELECT NOW() AT TIME ZONE 'Europe/Oslo'").unwrap_err();
+    assert!(e.0.contains("unknown time zone"), "{e}");
+}
+
+#[test]
+fn the_current_time_is_the_same_throughout_a_statement() {
+    let mut db = in_memory();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+    let rows: Vec<String> = (0..3000).map(|i| format!("({i})")).collect();
+    db.execute(&format!("INSERT INTO t VALUES {}", rows.join(", "))).unwrap();
+    for sql in [
+        "SELECT COUNT(DISTINCT NOW()) FROM t",
+        "SELECT COUNT(DISTINCT LOCALTIMESTAMP) FROM t",
+        "SELECT COUNT(DISTINCT (SELECT CURRENT_TIME)) FROM t",
+    ] {
+        assert_eq!(one(&mut db, sql), int(1), "{sql}");
+    }
+    assert_eq!(
+        query(
+            &mut db,
+            "SELECT CURRENT_DATE = CAST(NOW() AS DATE), NOW() = CURRENT_TIMESTAMP, LOCALTIMESTAMP = CAST(NOW() AS TIMESTAMP)"
+        ),
+        vec![vec![Value::Bool(true), Value::Bool(true), Value::Bool(true)]]
+    );
+    let e = db.execute("CREATE INDEX t_now ON t ((id + EXTRACT(DAY FROM CURRENT_DATE)))").unwrap_err();
+    assert!(e.0.contains("current time"), "{e}");
+}
+
+#[test]
+fn text_and_math_functions() {
+    let mut db = in_memory();
+    for (sql, expected) in [
+        ("SELECT TRIM('  hi  ')", text("hi")),
+        ("SELECT TRIM('xxhixx', 'x')", text("hi")),
+        ("SELECT TRIM(BOTH 'x' FROM 'xxhixx')", text("hi")),
+        ("SELECT TRIM(LEADING 'x' FROM 'xxhixx')", text("hixx")),
+        ("SELECT TRIM(TRAILING FROM '  hi  ')", text("  hi")),
+        ("SELECT LTRIM('  a') || RTRIM('b  ')", text("ab")),
+        ("SELECT REPLACE('a-b-c', '-', '+')", text("a+b+c")),
+        ("SELECT REPLACE('abc', '', 'x')", text("abc")),
+        ("SELECT INSTR('héllo', 'll')", int(3)),
+        ("SELECT POSITION('z' IN 'hello')", int(0)),
+        ("SELECT LEFT('hello', 2) || RIGHT('hello', 2)", text("helo")),
+        ("SELECT LEFT('hello', -2) || RIGHT('hello', -4)", text("helo")),
+        ("SELECT REVERSE('abc')", text("cba")),
+        ("SELECT REPEAT('ab', 3)", text("ababab")),
+        ("SELECT LPAD('7', 3, '0') || RPAD('ab', 5, 'xy')", text("007abxyx")),
+        ("SELECT LPAD('hello', 2)", text("he")),
+        ("SELECT CONCAT('a', NULL, 1, TRUE)", text("a1true")),
+        ("SELECT CHAR_LENGTH('héllo')", int(5)),
+        ("SELECT CEIL(1.2)", real_value(2.0)),
+        ("SELECT FLOOR(-1.2)", real_value(-2.0)),
+        ("SELECT CEILING(7)", int(7)),
+        ("SELECT TRUNC(-1.99)", real_value(-1.0)),
+        ("SELECT CAST(TRUNC(DECIMAL '3.14159', 2) AS TEXT)", text("3.14")),
+        ("SELECT CAST(FLOOR(DECIMAL '-1.5') AS TEXT)", text("-2")),
+        ("SELECT SIGN(-5)", int(-1)),
+        ("SELECT SQRT(16)", real_value(4.0)),
+        ("SELECT POWER(2, 10)", real_value(1024.0)),
+        ("SELECT EXP(0) + LN(1)", real_value(1.0)),
+        ("SELECT LOG(100) + LOG(2, 8) + LOG10(1000)", real_value(8.0)),
+        ("SELECT ROUND(PI() * 100)", real_value(314.0)),
+        ("SELECT GREATEST(1, 5, NULL, 3)", int(5)),
+        ("SELECT LEAST('b', 'a', 'c')", text("a")),
+        ("SELECT GREATEST(NULL, NULL)", null()),
+        ("SELECT TRIM(NULL)", null()),
+    ] {
+        assert_eq!(one(&mut db, sql), expected, "{sql}");
+    }
+    for (sql, problem) in [
+        ("SELECT SQRT(-1)", "square root of a negative"),
+        ("SELECT LN(0)", "logarithm"),
+        ("SELECT REPEAT('x', 1000000000)", "too long"),
+        ("SELECT GREATEST(1, 'a')", "cannot compare"),
+        ("SELECT LEFT(1, 2)", "expects TEXT"),
+        ("SELECT DATE_TRUNC('fortnight', TIMESTAMP '2024-01-01')", "unknown unit"),
+    ] {
+        let e = db.execute(sql).expect_err(sql);
+        assert!(e.0.contains(problem), "{sql}: {e}");
     }
 }

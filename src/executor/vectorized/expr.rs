@@ -352,6 +352,8 @@ fn typed(left: &Vector, op: BinaryOp, right: &Vector) -> Option<Result<Vector>> 
             };
             Some(result.map(|(values, nulls)| Vector::Real(values, nulls)))
         }
+        // A row at a time, as `sql::eval` computes it.
+        Mod => None,
         Like | Concat => {
             let (a, b) = (texts(left)?, texts(right)?);
             Some(match op {

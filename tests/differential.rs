@@ -33,6 +33,12 @@
 //! table too, which no two rows share; the others are the same for peers.
 //! A recursive query's rows are compared in any order: SQLite runs it a row
 //! at a time, Sequoia a round at a time.
+//!
+//! SQLite's `SELECT *` of a USING or NATURAL join keeps FROM's order of the
+//! columns, where SQL puts the merged ones first, so such a join has no
+//! `SELECT *`; it names no columns of a derived table, so those of VALUES
+//! are renamed by a query of them; and its REPLACE of '' returns the text
+//! even when what replaces it is NULL, which no case does.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -134,6 +140,8 @@ struct Gen {
     rng: Rng,
     tables: Vec<Table>,
     indexes: Vec<Index>,
+    /// The named windows of the query being made, for its WINDOW clause.
+    windows: Vec<String>,
 }
 
 /// An index a case made, for queries meant to use it.
@@ -207,6 +215,17 @@ impl Gen {
                 8 => format!("NULLIF({}, {})", self.expr(ty, s, b), self.expr(ty, s, b)),
                 9 => format!("LENGTH({})", self.expr(Type::Text, s, b)),
                 10 => format!("ABS({})", self.expr(ty, s, b)),
+                // By a constant that is not zero, whose sign does not matter.
+                11 => format!(
+                    "({} % {})",
+                    self.expr(ty, s, b),
+                    self.rng.pick(&["2", "3", "-2", "5"])
+                ),
+                12 => format!(
+                    "INSTR({}, {})",
+                    self.expr(Type::Text, s, b),
+                    self.expr(Type::Text, s, b)
+                ),
                 _ => self.leaf(ty, s),
             },
             Type::Text => match self.rng.below(10) {
@@ -228,6 +247,27 @@ impl Gen {
                 },
                 4 => format!("COALESCE({}, {})", self.expr(ty, s, b), self.expr(ty, s, b)),
                 5 => self.case_expr(ty, s, b),
+                6 => match self.rng.chance(50) {
+                    true => format!(
+                        "{}({})",
+                        self.rng.pick(&["TRIM", "LTRIM", "RTRIM"]),
+                        self.expr(ty, s, b)
+                    ),
+                    false => format!(
+                        "{}({}, '{}')",
+                        self.rng.pick(&["TRIM", "LTRIM", "RTRIM"]),
+                        self.expr(ty, s, b),
+                        self.rng.pick(&["a", " ", "ab", "b a"])
+                    ),
+                },
+                // Not of '', for which SQLite returns the text even with a
+                // NULL to put in its place, where PostgreSQL returns NULL.
+                7 => format!(
+                    "REPLACE({}, '{}', {})",
+                    self.expr(ty, s, b),
+                    self.rng.pick(&["a", "b", "ab", " "]),
+                    self.expr(ty, s, b)
+                ),
                 _ => self.leaf(ty, s),
             },
             Type::Real => match self.rng.below(12) {
@@ -382,6 +422,22 @@ impl Gen {
         }
     }
 
+    /// An aggregate of a subquery's value on each row of `s`, which may
+    /// read the row (its own aggregate reads only its own table).
+    fn aggregate_of_subquery(&mut self, s: &Scope) -> String {
+        // The row's columns qualified, as a subquery must name them.
+        let rows = Scope {
+            cols: s.outer.clone(),
+            outer: s.outer.clone(),
+            subqueries: true,
+            sub_tables: (0..self.tables.len()).collect(),
+            depth: 1,
+            ..Scope::default()
+        };
+        let value = self.scalar_subquery(Type::Int, &rows);
+        format!("{}(({value}))", self.rng.pick(&["SUM", "MAX", "COUNT"]))
+    }
+
     // ---- subqueries ----
 
     /// The FROM of a subquery, and the scope of its expressions: its table,
@@ -468,6 +524,12 @@ impl Gen {
         // which tell its rows apart if it reads no derived table.
         let mut ctes: Vec<String> = Vec::new();
         let mut ids: Option<Vec<String>> = Some(Vec::new());
+        // The first table's columns, for a USING join of the second; and
+        // whether there is one, after which SELECT * differs (SQLite keeps
+        // FROM's order of the columns, where SQL puts the merged ones first).
+        let mut first: Vec<(String, Type)> = Vec::new();
+        let mut using = false;
+        self.windows.clear();
         for i in 0..n {
             // A table, or a subquery (a derived table) with columns x0, x1...,
             // maybe named by a WITH.
@@ -553,14 +615,46 @@ impl Gen {
                     }
                     on
                 };
-                from += &match self.rng.below(8) {
+                // The columns of the same name and type on both sides, for USING.
+                let common: Vec<String> = match i {
+                    1 => columns
+                        .iter()
+                        .filter(|c| first.contains(c))
+                        .map(|(c, _)| c.clone())
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                // NATURAL, if every column of the same name has the same type.
+                let natural = i == 1
+                    && columns
+                        .iter()
+                        .filter(|(c, _)| first.iter().any(|(f, _)| f == c))
+                        .all(|c| first.contains(c));
+                let kind = *self.rng.pick(&["", "LEFT ", "RIGHT ", "FULL "]);
+                from += &match self.rng.below(10) {
                     0 => format!(" CROSS JOIN {name} {alias}"),
                     1 => format!(", {name} {alias}"),
                     2 => format!(" LEFT JOIN {name} {alias} ON {}", condition(self)),
                     3 => format!(" RIGHT JOIN {name} {alias} ON {}", condition(self)),
                     4 => format!(" FULL JOIN {name} {alias} ON {}", condition(self)),
+                    5 if !common.is_empty() => {
+                        using = true;
+                        let mut named: Vec<String> =
+                            common.iter().filter(|_| self.rng.chance(60)).cloned().collect();
+                        if named.is_empty() {
+                            named.push(common[0].clone());
+                        }
+                        format!(" {kind}JOIN {name} {alias} USING ({})", named.join(", "))
+                    }
+                    6 if natural => {
+                        using = true;
+                        format!(" NATURAL {kind}JOIN {name} {alias}")
+                    }
                     _ => format!(" JOIN {name} {alias} ON {}", condition(self)),
                 };
+            }
+            if i == 0 {
+                first = columns.clone();
             }
             cols.extend(own);
         }
@@ -622,7 +716,7 @@ impl Gen {
         };
 
         let distinct = self.rng.chance(20);
-        let star = !grouped && self.rng.chance(15);
+        let star = !grouped && !using && self.rng.chance(15);
         let mut projection: Vec<String> = match star {
             true => Vec::new(),
             false => (0..1 + self.rng.below(3))
@@ -647,6 +741,15 @@ impl Gen {
             let at = self.rng.below(projection.len());
             projection[at] = self.window(&rows, ids.as_deref());
         }
+        // An aggregate of a subquery's values.
+        if grouped && self.rng.chance(15) {
+            let at = self.rng.below(projection.len());
+            projection[at] = self.aggregate_of_subquery(&rows);
+        }
+        let windows = match self.windows.is_empty() {
+            true => String::new(),
+            false => format!(" WINDOW {}", self.windows.join(", ")),
+        };
         // Some get an AS name, which ORDER BY may use in their place.
         let names: Vec<Option<String>> = (0..projection.len())
             .map(|i| self.rng.chance(30).then(|| format!("o{i}")))
@@ -725,7 +828,7 @@ impl Gen {
             false => format!("WITH {} ", ctes.join(", ")),
         };
         let sql = format!(
-            "{with}SELECT {}{projection} FROM {from}{filter}{group_by}{having}{order_by}{limit}",
+            "{with}SELECT {}{projection} FROM {from}{filter}{group_by}{having}{windows}{order_by}{limit}",
             if distinct { "DISTINCT " } else { "" }
         );
         stmt(sql, kind)
@@ -772,7 +875,7 @@ impl Gen {
                     4 => (format!("NTILE({})", self.rng.range(1, 4)), None),
                     _ => (
                         format!("SUM({})", int(self)),
-                        Some("ROWS BETWEEN 1 PRECEDING AND CURRENT ROW"),
+                        Some("ROWS BETWEEN 1 PRECEDING AND CURRENT ROW".to_string()),
                     ),
                 }
             }
@@ -791,15 +894,46 @@ impl Gen {
                         format!("{}({value})", self.rng.pick(&["MIN", "MAX", "COUNT"]))
                     }
                 };
-                let whole = "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING";
-                (function, self.rng.chance(20).then_some(whole))
+                // Frames that take in all peers or none, so the same for each.
+                let aggregate = !function.ends_with("()");
+                let ints = rows.cols.iter().any(|(_, ty)| *ty == Type::Int);
+                let frame = match self.rng.below(10) {
+                    0 | 1 => Some("ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING".into()),
+                    2 if aggregate && !keys.is_empty() => Some(format!(
+                        "GROUPS BETWEEN {} PRECEDING AND {}",
+                        self.rng.range(0, 2),
+                        self.rng.pick(&["CURRENT ROW", "1 FOLLOWING", "UNBOUNDED FOLLOWING"])
+                    )),
+                    3 if aggregate && ints => {
+                        // RANGE with offsets orders by one number.
+                        let key = self.key(Type::Int, &rows, 1);
+                        keys = vec![match self.rng.chance(40) {
+                            true => format!("{key} DESC"),
+                            false => key,
+                        }];
+                        Some(format!(
+                            "RANGE BETWEEN {} PRECEDING AND {} FOLLOWING",
+                            self.rng.range(0, 4),
+                            self.rng.pick(&["0", "2", "1.5"])
+                        ))
+                    }
+                    _ => None,
+                };
+                (function, frame)
             }
         };
         if !keys.is_empty() {
             over.push(format!("ORDER BY {}", keys.join(", ")));
         }
-        over.extend(frame.map(String::from));
-        format!("{function} OVER ({})", over.join(" "))
+        over.extend(frame);
+        let over = over.join(" ");
+        // Sometimes a named window, of the query's WINDOW clause.
+        if self.rng.chance(25) {
+            let name = format!("w{}", self.windows.len());
+            self.windows.push(format!("{name} AS ({over})"));
+            return format!("{function} OVER {name}");
+        }
+        format!("{function} OVER ({over})")
     }
 
     /// Queries combined by UNION [ALL], INTERSECT or EXCEPT, whose columns
@@ -874,6 +1008,9 @@ impl Gen {
             subqueries: true,
             ..Scope::default()
         };
+        if self.rng.chance(15) {
+            return self.values();
+        }
         let (from, inner, _) = self.sub_from(&s);
         let filter = self.where_clause(&inner, 50);
         let mut columns = Vec::new();
@@ -929,6 +1066,31 @@ impl Gen {
             .collect();
         (
             format!("(SELECT {distinct}{} FROM {from}{filter})", list.join(", ")),
+            names,
+        )
+    }
+
+    /// A derived table of VALUES: literals of a type for each column, its
+    /// columns renamed x0, x1... by a query of them, as SQLite names no
+    /// columns of a derived table.
+    fn values(&mut self) -> (String, Vec<(String, Type)>) {
+        let types: Vec<Type> = (0..1 + self.rng.below(3)).map(|_| *self.rng.pick(&TYPES)).collect();
+        let rows: Vec<String> = (0..1 + self.rng.below(4))
+            .map(|_| {
+                let values: Vec<String> = types.iter().map(|ty| self.literal(*ty)).collect();
+                format!("({})", values.join(", "))
+            })
+            .collect();
+        let names: Vec<(String, Type)> = types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| (format!("x{i}"), *ty))
+            .collect();
+        let list: Vec<String> = (0..types.len())
+            .map(|i| format!("column{} AS x{i}", i + 1))
+            .collect();
+        (
+            format!("(SELECT {} FROM (VALUES {}) v)", list.join(", "), rows.join(", ")),
             names,
         )
     }
@@ -1375,6 +1537,7 @@ impl Gen {
             rng: Rng::new(seed),
             tables: Vec::new(),
             indexes: Vec::new(),
+            windows: Vec::new(),
         };
         let mut out = Vec::new();
         for t in 0..2 + g.rng.below(2) {
@@ -1457,7 +1620,14 @@ impl Gen {
         }
         for _ in 0..40 {
             match g.rng.below(23) {
-                0..=9 => out.push(g.select()),
+                // Some after a comment, which both read as nothing.
+                0 => {
+                    let mut select = g.select();
+                    select.sequoia = format!("/* a query */ {}", select.sequoia);
+                    select.sqlite = format!("/* a query */ {}", select.sqlite);
+                    out.push(select);
+                }
+                1..=9 => out.push(g.select()),
                 10 | 11 => out.push(g.index_select()),
                 12..=13 => out.push(g.union()),
                 14..=17 => g.change(&mut out),

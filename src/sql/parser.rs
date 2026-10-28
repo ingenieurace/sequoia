@@ -16,6 +16,16 @@
 //! RECURSIVE` lets an expression's query name the expression itself; if it
 //! does, the expression becomes a [`RecursiveCte`] wherever it is named,
 //! and its own name inside it a [`TableSource::WorkTable`].
+//!
+//! **Named windows.** Likewise, `OVER w` and `OVER (w ...)` take in the parts
+//! of the window `WINDOW w AS (...)` names, after the select list they are
+//! in (or for ORDER BY, after the query's WINDOW clause), so nothing after
+//! the parser sees a window's name.
+//!
+//! **Names.** A word that is not a keyword is a name, and so is any text in
+//! double quotes, which is never a keyword nor one of the words that mean
+//! something only where they stand (`ANALYZE`, `RETURNING`, `LATERAL`,
+//! `OVER`, `WINDOW`...).
 
 use super::ast::{
     Aggregate, BinaryOp, ColumnRef, Compound, CreateIndex, Expr, Frame, FrameBound, FrameUnits,
@@ -34,6 +44,7 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
         tokens: tokenize(sql)?,
         pos: 0,
         ctes: Vec::new(),
+        core_windows: Vec::new(),
     };
     let mut statements = Vec::new();
     loop {
@@ -54,6 +65,9 @@ struct Parser {
     /// The common table expressions of the WITHs around the query being
     /// parsed, innermost last.
     ctes: Vec<Cte>,
+    /// The named windows of the last query parsed up to its HAVING, which
+    /// an ORDER BY after it may use.
+    core_windows: Vec<(String, Window)>,
 }
 
 /// A common table expression, and what its name stands for.
@@ -84,7 +98,7 @@ impl Parser {
             Some(Token::Ident(word)) if word.eq_ignore_ascii_case("ANALYZE") => {
                 self.pos += 1;
                 let table = match self.peek() {
-                    Some(Token::Ident(_)) => Some(self.ident()?),
+                    Some(Token::Ident(_) | Token::QuotedIdent(_)) => Some(self.ident()?),
                     _ => None,
                 };
                 return Ok(Statement::Analyze { table });
@@ -110,7 +124,7 @@ impl Parser {
                 })
             }
             "INSERT" => self.insert(),
-            "SELECT" | "WITH" => Ok(Statement::Select(Box::new(self.select()?))),
+            "SELECT" | "WITH" | "VALUES" => Ok(Statement::Select(Box::new(self.select()?))),
             "UPDATE" => self.update(),
             "DELETE" => self.delete(),
             _ => Err(self.unexpected("a statement")),
@@ -219,11 +233,19 @@ impl Parser {
             "DATE" => DataType::Date,
             "TIME" => DataType::Time,
             "TIMESTAMP" => DataType::Timestamp,
+            "TIMESTAMPTZ" => DataType::TimestampTz,
+            "INTERVAL" => DataType::Interval,
             "BLOB" => DataType::Blob,
             "DECIMAL" | "NUMERIC" => DataType::Decimal(None),
             _ => return Err(self.unexpected("a data type")),
         };
         self.pos += 1;
+        if data_type == DataType::Timestamp {
+            return Ok(match self.time_zone()? {
+                true => DataType::TimestampTz,
+                false => DataType::Timestamp,
+            });
+        }
         if data_type != DataType::Decimal(None) || !self.eat_symbol("(") {
             return Ok(data_type);
         }
@@ -239,6 +261,20 @@ impl Parser {
             )));
         }
         Ok(DataType::Decimal(Some((precision, scale))))
+    }
+
+    /// After TIMESTAMP, `WITH TIME ZONE` (true), `WITHOUT TIME ZONE` or nothing.
+    fn time_zone(&mut self) -> Result<bool> {
+        let with = self.peek() == Some(&Token::Keyword("WITH".into()))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("TIME"));
+        let without = matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("WITHOUT"));
+        if !with && !without {
+            return Ok(false);
+        }
+        self.pos += 1;
+        self.expect_word("TIME")?;
+        self.expect_word("ZONE")?;
+        Ok(with)
     }
 
     /// A number that fits a byte, as a DECIMAL's precision or scale.
@@ -326,10 +362,12 @@ impl Parser {
         } else {
             None
         };
-        let source = if self.query_follows() {
+        let source = if !self.eat_keyword("VALUES") {
+            if !self.query_follows() {
+                return Err(self.unexpected("VALUES or a query"));
+            }
             InsertSource::Select(Box::new(self.select()?))
         } else {
-            self.expect_keyword("VALUES")?;
             InsertSource::Values(self.comma_list(|p| {
                 p.expect_symbol("(")?;
                 let values = p.comma_list(Self::expr)?;
@@ -385,14 +423,19 @@ impl Parser {
         query
     }
 
-    /// Whether a query starts here: `SELECT` or `WITH`.
+    /// Whether a query starts here: `SELECT`, `WITH` or `VALUES`.
     fn query_follows(&self) -> bool {
-        matches!(self.peek(), Some(Token::Keyword(k)) if k == "SELECT" || k == "WITH")
+        matches!(self.peek(), Some(Token::Keyword(k)) if k == "SELECT" || k == "WITH" || k == "VALUES")
     }
 
     /// `intersection [{UNION | EXCEPT} [ALL] intersection]... [ORDER BY ...] [LIMIT n] [OFFSET m]`
     fn set_operations(&mut self) -> Result<Select> {
         let mut query = self.intersection()?;
+        // The named windows ORDER BY may use: the query's, if it is one.
+        let windows = match query.compound.is_empty() {
+            true => std::mem::take(&mut self.core_windows),
+            false => Vec::new(),
+        };
         loop {
             let op = if self.eat_keyword("UNION") {
                 SetOp::Union
@@ -411,7 +454,16 @@ impl Parser {
         }
         if self.eat_keyword("ORDER") {
             self.expect_keyword("BY")?;
-            query.order_by = self.order_list()?;
+            query.order_by = self
+                .order_list()?
+                .into_iter()
+                .map(|o| {
+                    Ok(OrderBy {
+                        expr: resolve_windows(&o.expr, &windows)?,
+                        desc: o.desc,
+                    })
+                })
+                .collect::<Result<_>>()?;
         }
         if self.eat_keyword("LIMIT") {
             query.limit = Some(self.number()? as usize);
@@ -518,6 +570,9 @@ impl Parser {
     /// query up to its set operations and ORDER BY. Without FROM, it reads
     /// a single row of no columns.
     fn select_core(&mut self) -> Result<Select> {
+        if self.eat_keyword("VALUES") {
+            return self.values();
+        }
         self.expect_keyword("SELECT")?;
         let distinct = self.eat_keyword("DISTINCT");
         let projection = self.projection()?;
@@ -539,6 +594,41 @@ impl Parser {
             true => Some(self.expr()?),
             false => None,
         };
+        // `WINDOW name AS (...), ...`: WINDOW is not a keyword, so that it
+        // stays free as a name; each may build on those before it.
+        let mut windows: Vec<(String, Window)> = Vec::new();
+        if self.eat_word("WINDOW") {
+            loop {
+                let name = self.ident()?;
+                if windows.iter().any(|(n, _)| *n == name) {
+                    return Err(Error(format!("window {name} is defined more than once")));
+                }
+                self.expect_keyword("AS")?;
+                self.expect_symbol("(")?;
+                let window = resolve_window(&self.window_spec()?, &windows)?;
+                self.expect_symbol(")")?;
+                windows.push((name, window));
+                if !self.eat_symbol(",") {
+                    break;
+                }
+            }
+        }
+        let projection = match projection {
+            Projection::All => Projection::All,
+            Projection::Exprs(items) => Projection::Exprs(
+                items
+                    .into_iter()
+                    .map(|item| {
+                        Ok(SelectItem {
+                            expr: resolve_windows(&item.expr, &windows)?,
+                            alias: item.alias,
+                        })
+                    })
+                    .collect::<Result<_>>()?,
+            ),
+        };
+        // For an ORDER BY after this query, if no other is combined with it.
+        self.core_windows = windows;
         let (order_by, limit, offset, compound) = (Vec::new(), None, None, Vec::new());
         Ok(Select {
             distinct,
@@ -554,25 +644,53 @@ impl Parser {
         })
     }
 
-    /// `table [, table | [INNER | {LEFT | RIGHT | FULL} [OUTER] | CROSS] JOIN table [ON expr]]...`
+    /// The rest of `VALUES (expr, ...), ...` after VALUES: `SELECT *` of
+    /// those rows, which must all have as many values.
+    fn values(&mut self) -> Result<Select> {
+        let rows = self.comma_list(|p| {
+            p.expect_symbol("(")?;
+            let values = p.comma_list(Self::expr)?;
+            p.expect_symbol(")")?;
+            Ok(values)
+        })?;
+        if let Some(row) = rows.iter().find(|row| row.len() != rows[0].len()) {
+            return Err(Error(format!(
+                "each row of VALUES must have as many values: {} and {}",
+                rows[0].len(),
+                row.len()
+            )));
+        }
+        self.core_windows = Vec::new();
+        Ok(Select {
+            distinct: false,
+            from: From {
+                table: TableRef::of(TableSource::Values(rows), None),
+                joins: Vec::new(),
+            },
+            projection: Projection::All,
+            filter: None,
+            group_by: Vec::new(),
+            having: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            compound: Vec::new(),
+        })
+    }
+
+    /// `table [, table | CROSS JOIN table | [NATURAL] [INNER | {LEFT | RIGHT
+    /// | FULL} [OUTER]] JOIN table [ON expr | USING (column, ...)]]...`
     fn from(&mut self) -> Result<From> {
         let table = self.table_ref()?;
         let mut joins = Vec::new();
         loop {
-            let kind = if self.eat_symbol(",") {
-                joins.push(Join {
-                    kind: JoinKind::Inner,
-                    table: self.table_ref()?,
-                    on: None,
-                });
+            let natural = self.eat_keyword("NATURAL");
+            let kind = if !natural && self.eat_symbol(",") {
+                joins.push(Join::on(JoinKind::Inner, self.table_ref()?, None));
                 continue;
-            } else if self.eat_keyword("CROSS") {
+            } else if !natural && self.eat_keyword("CROSS") {
                 self.expect_keyword("JOIN")?;
-                joins.push(Join {
-                    kind: JoinKind::Inner,
-                    table: self.table_ref()?,
-                    on: None,
-                });
+                joins.push(Join::on(JoinKind::Inner, self.table_ref()?, None));
                 continue;
             } else if self.eat_keyword("LEFT") {
                 self.eat_keyword("OUTER");
@@ -591,16 +709,30 @@ impl Parser {
                 JoinKind::Inner
             } else if self.eat_keyword("JOIN") {
                 JoinKind::Inner
+            } else if natural {
+                return Err(self.unexpected("JOIN"));
             } else {
                 return Ok(From { table, joins });
             };
             let table = self.table_ref()?;
-            self.expect_keyword("ON")?;
-            joins.push(Join {
-                kind,
-                table,
-                on: Some(self.expr()?),
-            });
+            let mut join = Join::on(kind, table, None);
+            if natural {
+                join.natural = true;
+            } else if self.eat_keyword("USING") {
+                self.expect_symbol("(")?;
+                join.using = self.comma_list(Self::ident)?;
+                self.expect_symbol(")")?;
+                if let Some(at) = (1..join.using.len()).find(|&i| join.using[..i].contains(&join.using[i])) {
+                    return Err(Error(format!(
+                        "column {} is named more than once in USING",
+                        join.using[at]
+                    )));
+                }
+            } else {
+                self.expect_keyword("ON")?;
+                join.on = Some(self.expr()?);
+            }
+            joins.push(join);
         }
     }
 
@@ -626,11 +758,14 @@ impl Parser {
                 }
             }
         };
-        // RETURNING may end the query of an INSERT: it is no alias without AS.
-        let returning = matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("RETURNING"));
+        // RETURNING may end the query of an INSERT, and WINDOW starts a
+        // clause: neither is an alias without AS.
+        let returning = matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("RETURNING") || w.eq_ignore_ascii_case("WINDOW"));
         let alias = match (self.eat_keyword("AS"), self.peek()) {
             (true, _) => Some(self.ident()?),
-            (false, Some(Token::Ident(_))) if !returning => Some(self.ident()?),
+            (false, Some(Token::Ident(_) | Token::QuotedIdent(_))) if !returning => {
+                Some(self.ident()?)
+            }
             _ if matches!(source, TableSource::Subquery(_)) && cte.is_none() => {
                 return Err(Error("a subquery in FROM must have an alias".into()));
             }
@@ -816,6 +951,7 @@ impl Parser {
             let op = match self.peek() {
                 Some(Token::Symbol("*")) => BinaryOp::Mul,
                 Some(Token::Symbol("/")) => BinaryOp::Div,
+                Some(Token::Symbol("%")) => BinaryOp::Mod,
                 _ => return Ok(left),
             };
             self.pos += 1;
@@ -836,7 +972,22 @@ impl Parser {
         if self.eat_symbol("-") {
             return Ok(Expr::Unary(UnaryOp::Neg, Box::new(self.unary()?)));
         }
-        self.primary()
+        self.at_time_zone()
+    }
+
+    /// `primary [AT TIME ZONE primary]...`: AT, TIME and ZONE are not
+    /// keywords, so that they stay free as names.
+    fn at_time_zone(&mut self) -> Result<Expr> {
+        let mut expr = self.primary()?;
+        loop {
+            let word = |at: usize, w: &str| matches!(self.tokens.get(self.pos + at), Some(Token::Ident(x)) if x.eq_ignore_ascii_case(w));
+            if !(word(0, "AT") && word(1, "TIME") && word(2, "ZONE")) {
+                return Ok(expr);
+            }
+            self.pos += 3;
+            let zone = self.primary()?;
+            expr = Expr::Function(Function::AtTimeZone, vec![expr, zone]);
+        }
     }
 
     fn primary(&mut self) -> Result<Expr> {
@@ -859,15 +1010,37 @@ impl Parser {
             self.expect_symbol(")")?;
             return Ok(expr);
         }
+        // `TIMESTAMP WITH TIME ZONE '...'`.
+        if matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("TIMESTAMP"))
+            && self.tokens.get(self.pos + 1) == Some(&Token::Keyword("WITH".into()))
+        {
+            let start = self.pos;
+            self.pos += 1;
+            if self.time_zone()?
+                && let Some(Token::Str(text)) = self.peek().cloned()
+            {
+                self.pos += 1;
+                return Ok(Expr::Literal(Value::TimestampTz(
+                    datetime::parse_timestamptz(&text)?,
+                )));
+            }
+            self.pos = start;
+        }
         // `DATE '2024-01-31'` and the like: a literal of a type written as text.
         if let (Some(Token::Ident(name)), Some(Token::Str(text))) =
             (self.peek(), self.tokens.get(self.pos + 1))
         {
+            let text = text.clone();
             let value = match name.to_uppercase().as_str() {
-                "DATE" => Some(datetime::parse_date(text).map(Value::Date)),
-                "TIME" => Some(datetime::parse_time(text).map(Value::Time)),
-                "TIMESTAMP" => Some(datetime::parse_timestamp(text).map(Value::Timestamp)),
-                "DECIMAL" | "NUMERIC" => Some(Decimal::parse(text).map(Value::Decimal)),
+                "DATE" => Some(datetime::parse_date(&text).map(Value::Date)),
+                "TIME" => Some(datetime::parse_time(&text).map(Value::Time)),
+                "TIMESTAMP" => Some(datetime::parse_timestamp(&text).map(Value::Timestamp)),
+                "TIMESTAMPTZ" => Some(datetime::parse_timestamptz(&text).map(Value::TimestampTz)),
+                "DECIMAL" | "NUMERIC" => Some(Decimal::parse(&text).map(Value::Decimal)),
+                "INTERVAL" => {
+                    self.pos += 2;
+                    return self.interval(&text);
+                }
                 _ => None,
             };
             if let Some(value) = value {
@@ -875,19 +1048,39 @@ impl Parser {
                 return Ok(Expr::Literal(value?));
             }
         }
+        // CURRENT_DATE and the like, written without parentheses.
+        if let Some(Token::Ident(name)) = self.peek()
+            && let Some(function) = Function::from_bare_name(name)
+            && !matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::Symbol("(" | "."))
+            )
+        {
+            self.pos += 1;
+            return Ok(Expr::Function(function, Vec::new()));
+        }
+        // LEFT and RIGHT are keywords for joins, and functions too.
+        if let Some(Token::Keyword(k)) = self.peek()
+            && (k == "LEFT" || k == "RIGHT")
+            && self.tokens.get(self.pos + 1) == Some(&Token::Symbol("("))
+        {
+            let name = k.clone();
+            self.pos += 2;
+            return self.aggregate(&name);
+        }
         let expr = match self.peek() {
             Some(Token::Number(n)) => Expr::Literal(Value::Int(*n)),
             Some(Token::Real(r)) => Expr::Literal(Value::Real(*r)),
             Some(Token::Str(s)) => Expr::Literal(Value::Text(s.clone())),
             Some(Token::Blob(b)) => Expr::Literal(Value::Blob(b.clone())),
-            Some(Token::Ident(name))
+            Some(Token::Ident(name) | Token::QuotedIdent(name))
                 if self.tokens.get(self.pos + 1) == Some(&Token::Symbol("(")) =>
             {
                 let name = name.clone();
                 self.pos += 2;
                 return self.aggregate(&name);
             }
-            Some(Token::Ident(table))
+            Some(Token::Ident(table) | Token::QuotedIdent(table))
                 if self.tokens.get(self.pos + 1) == Some(&Token::Symbol(".")) =>
             {
                 let table = table.clone();
@@ -897,7 +1090,9 @@ impl Parser {
                     name: self.ident()?,
                 }));
             }
-            Some(Token::Ident(name)) => Expr::Column(ColumnRef::bare(name.clone())),
+            Some(Token::Ident(name) | Token::QuotedIdent(name)) => {
+                Expr::Column(ColumnRef::bare(name.clone()))
+            }
             Some(Token::Keyword(k)) if k == "NULL" => Expr::Literal(Value::Null),
             Some(Token::Keyword(k)) if k == "TRUE" => Expr::Literal(Value::Bool(true)),
             Some(Token::Keyword(k)) if k == "FALSE" => Expr::Literal(Value::Bool(false)),
@@ -905,6 +1100,28 @@ impl Parser {
         };
         self.pos += 1;
         Ok(expr)
+    }
+
+    /// The rest of an INTERVAL literal after its text: maybe the unit the
+    /// text counts, as SQL writes it (`INTERVAL '3' DAY`).
+    fn interval(&mut self, text: &str) -> Result<Expr> {
+        let unit = match self.peek() {
+            Some(Token::Ident(word))
+                if ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"]
+                    .contains(&word.to_uppercase().as_str()) =>
+            {
+                Some(word.clone())
+            }
+            _ => None,
+        };
+        let interval = match unit {
+            Some(unit) => {
+                self.pos += 1;
+                datetime::Interval::parse(&format!("{text} {unit}"))?
+            }
+            None => datetime::Interval::parse(text)?,
+        };
+        Ok(Expr::Literal(Value::Interval(interval)))
     }
 
     /// The rest of `CASE ... END` after `CASE`.
@@ -946,13 +1163,49 @@ impl Parser {
                 self.expect_symbol(")")?;
                 return Ok(Expr::Function(Function::Cast(data_type), vec![value]));
             }
+            // `POSITION(part IN text)`, which INSTR(text, part) means.
+            "POSITION" => {
+                let part = self.additive()?;
+                self.expect_keyword("IN")?;
+                let text = self.expr()?;
+                self.expect_symbol(")")?;
+                return Ok(Expr::Function(Function::Instr, vec![text, part]));
+            }
+            // `TRIM([BOTH | LEADING | TRAILING] [characters] FROM text)`, or
+            // `TRIM(text[, characters])` as SQLite has it.
+            "TRIM" => {
+                let function = if self.eat_word("LEADING") {
+                    Function::Ltrim
+                } else if self.eat_word("TRAILING") {
+                    Function::Rtrim
+                } else {
+                    self.eat_word("BOTH");
+                    Function::Trim
+                };
+                let args = if self.eat_keyword("FROM") {
+                    vec![self.expr()?]
+                } else {
+                    let first = self.expr()?;
+                    if self.eat_keyword("FROM") {
+                        vec![self.expr()?, first]
+                    } else if function == Function::Trim && self.eat_symbol(",") {
+                        vec![first, self.expr()?]
+                    } else {
+                        vec![first]
+                    }
+                };
+                self.expect_symbol(")")?;
+                return Ok(Expr::Function(function, args));
+            }
             "EXTRACT" => {
                 let field = match self.peek() {
                     Some(Token::Ident(name)) => datetime::Field::from_name(name),
                     _ => None,
                 };
                 let Some(field) = field else {
-                    return Err(self.unexpected("YEAR, MONTH, DAY, HOUR, MINUTE or SECOND"));
+                    return Err(self.unexpected(
+                        "YEAR, QUARTER, MONTH, DAY, DOW, DOY, HOUR, MINUTE, SECOND or EPOCH",
+                    ));
                 };
                 self.pos += 1;
                 self.expect_keyword("FROM")?;
@@ -1032,9 +1285,38 @@ impl Parser {
             )));
         }
         self.expect_word("OVER")?;
-        self.expect_symbol("(")?;
-        // PARTITION, ROWS, RANGE and the words of frames are not keywords,
-        // so that they stay free as names.
+        let window = match self.eat_symbol("(") {
+            true => {
+                let window = self.window_spec()?;
+                self.expect_symbol(")")?;
+                window
+            }
+            // `OVER w`: the query's window named w.
+            false => Window {
+                base: Some(self.ident()?),
+                ..empty_window()
+            },
+        };
+        Ok(Expr::Window(Box::new(Window {
+            function,
+            args,
+            ..window
+        })))
+    }
+
+    /// The inside of `OVER (...)` or `WINDOW w AS (...)`: `[window]
+    /// [PARTITION BY expr, ...] [ORDER BY ...] [frame]`. PARTITION, ROWS,
+    /// RANGE, GROUPS and the words of frames are not keywords, so that they
+    /// stay free as names.
+    fn window_spec(&mut self) -> Result<Window> {
+        let starts_part = |w: &str| {
+            ["PARTITION", "ROWS", "RANGE", "GROUPS"].contains(&w.to_uppercase().as_str())
+        };
+        let base = match self.peek() {
+            Some(Token::Ident(w)) if !starts_part(w) => Some(self.ident()?),
+            Some(Token::QuotedIdent(_)) => Some(self.ident()?),
+            _ => None,
+        };
         let mut partition_by = Vec::new();
         if self.eat_word("PARTITION") {
             self.expect_keyword("BY")?;
@@ -1049,6 +1331,8 @@ impl Parser {
             Some(FrameUnits::Rows)
         } else if self.eat_word("RANGE") {
             Some(FrameUnits::Range)
+        } else if self.eat_word("GROUPS") {
+            Some(FrameUnits::Groups)
         } else {
             None
         };
@@ -1066,17 +1350,18 @@ impl Parser {
                 Some(frame(units, start, end)?)
             }
         };
-        self.expect_symbol(")")?;
-        Ok(Expr::Window(Box::new(Window {
-            function,
-            args,
+        Ok(Window {
             partition_by,
             order_by,
             frame,
-        })))
+            base,
+            ..empty_window()
+        })
     }
 
-    /// `UNBOUNDED {PRECEDING | FOLLOWING}`, `n {PRECEDING | FOLLOWING}` or `CURRENT ROW`.
+    /// `UNBOUNDED {PRECEDING | FOLLOWING}`, `offset {PRECEDING | FOLLOWING}`
+    /// or `CURRENT ROW`, where the offset is a literal: a number, or an
+    /// INTERVAL.
     fn frame_bound(&mut self) -> Result<FrameBound> {
         if self.eat_word("CURRENT") {
             self.expect_word("ROW")?;
@@ -1084,13 +1369,9 @@ impl Parser {
         }
         let offset = match self.eat_word("UNBOUNDED") {
             true => None,
-            false => match self.peek() {
-                Some(Token::Number(n)) if *n >= 0 => {
-                    let n = *n as u64;
-                    self.pos += 1;
-                    Some(n)
-                }
-                _ => return Err(self.unexpected("UNBOUNDED, CURRENT ROW or a number")),
+            false => match self.primary()? {
+                Expr::Literal(value) => Some(value),
+                _ => return Err(Error("a frame's offset must be a number or an INTERVAL, as a literal".into())),
             },
         };
         if self.eat_word("PRECEDING") {
@@ -1135,10 +1416,14 @@ impl Parser {
         }
     }
 
-    /// Whether `OVER (` follows: a window for the function call before it.
+    /// Whether `OVER (` or `OVER name` follows: a window for the function
+    /// call before it.
     fn over_follows(&self) -> bool {
         matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("OVER"))
-            && self.tokens.get(self.pos + 1) == Some(&Token::Symbol("("))
+            && matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::Symbol("(") | Token::Ident(_) | Token::QuotedIdent(_))
+            )
     }
 
     fn eat_symbol(&mut self, symbol: &'static str) -> bool {
@@ -1159,9 +1444,10 @@ impl Parser {
         }
     }
 
+    /// A name: a word that is not a keyword, or one in double quotes.
     fn ident(&mut self) -> Result<String> {
         match self.peek() {
-            Some(Token::Ident(name)) => {
+            Some(Token::Ident(name) | Token::QuotedIdent(name)) => {
                 let name = name.clone();
                 self.pos += 1;
                 Ok(name)
@@ -1202,12 +1488,112 @@ fn binary(left: Expr, op: BinaryOp, right: Expr) -> Expr {
     Expr::Binary(Box::new(left), op, Box::new(right))
 }
 
+/// A window of no function, parts or name, to fill in.
+fn empty_window() -> Window {
+    Window {
+        function: WindowFunction::RowNumber,
+        args: Vec::new(),
+        partition_by: Vec::new(),
+        order_by: Vec::new(),
+        frame: None,
+        base: None,
+    }
+}
+
+/// `window` with the parts of the window it names put in, from `defined`
+/// (the query's named windows): it may add an ORDER BY if that window has
+/// none, and a frame if that one has none; and if it adds nothing, it is
+/// that window, frame and all.
+fn resolve_window(window: &Window, defined: &[(String, Window)]) -> Result<Window> {
+    let Some(name) = &window.base else {
+        return Ok(window.clone());
+    };
+    let Some((_, base)) = defined.iter().find(|(n, _)| n == name) else {
+        return Err(Error(format!("window {name} does not exist")));
+    };
+    if !window.partition_by.is_empty() {
+        return Err(Error(format!(
+            "cannot give PARTITION BY to a window from window {name}"
+        )));
+    }
+    if !base.order_by.is_empty() && !window.order_by.is_empty() {
+        return Err(Error(format!(
+            "cannot give ORDER BY to a window from window {name}, which has one"
+        )));
+    }
+    if base.frame.is_some() && (!window.order_by.is_empty() || window.frame.is_some()) {
+        return Err(Error(format!(
+            "cannot add to window {name}, which has a frame"
+        )));
+    }
+    Ok(Window {
+        function: window.function,
+        args: window.args.clone(),
+        partition_by: base.partition_by.clone(),
+        order_by: match window.order_by.is_empty() {
+            true => base.order_by.clone(),
+            false => window.order_by.clone(),
+        },
+        frame: window.frame.clone().or_else(|| base.frame.clone()),
+        base: None,
+    })
+}
+
+/// The expression with the named windows of its window functions put in
+/// (see [`resolve_window`]), but in its subqueries, which have their own.
+fn resolve_windows(expr: &Expr, defined: &[(String, Window)]) -> Result<Expr> {
+    expr.replace(&mut |e| match e {
+        Expr::Window(window) => Some((|| {
+            let window = resolve_window(window, defined)?;
+            let resolved = Expr::Window(Box::new(window)).try_map_parts(&mut |part| {
+                resolve_windows(part, defined)
+            })?;
+            Ok(resolved)
+        })()),
+        Expr::Subquery(_) | Expr::Exists(_) => Some(Ok(e.clone())),
+        Expr::InSubquery(left, query, negated) => Some(
+            resolve_windows(left, defined)
+                .map(|left| Expr::InSubquery(Box::new(left), query.clone(), *negated)),
+        ),
+        _ => None,
+    })
+}
+
 /// A frame from `start` to `end`, if it can be one: it may not start after
-/// it ends, nor at the end of a partition or end at its start, and RANGE
-/// takes no offsets.
+/// it ends, nor at the end of a partition or end at its start; its offsets
+/// are not below zero, and for ROWS and GROUPS, INTs.
 fn frame(units: FrameUnits, start: FrameBound, end: FrameBound) -> Result<Frame> {
+    for bound in [&start, &end] {
+        let (FrameBound::Preceding(offset) | FrameBound::Following(offset)) = bound else {
+            continue;
+        };
+        let negative = match offset {
+            Value::Int(n) => *n < 0,
+            Value::Real(r) => *r < 0.0,
+            Value::Decimal(d) => d.signum() < 0,
+            Value::Interval(i) => i.length() < 0,
+            other => {
+                return Err(Error(format!(
+                    "a frame's offset must be a number or an INTERVAL, got {}",
+                    other.to_sql()
+                )));
+            }
+        };
+        if negative {
+            return Err(Error(format!(
+                "a frame's offset cannot be negative: {}",
+                offset.to_sql()
+            )));
+        }
+        if units != FrameUnits::Range && !matches!(offset, Value::Int(_)) {
+            return Err(Error(format!(
+                "a ROWS or GROUPS frame's offset must be an INT, got {}",
+                offset.to_sql()
+            )));
+        }
+    }
     // Where each bound stands, from the start of the partition to its end.
-    let place = |bound: FrameBound| match bound {
+    let place = |bound: &FrameBound| match bound {
         FrameBound::UnboundedPreceding => 0,
         FrameBound::Preceding(_) => 1,
         FrameBound::CurrentRow => 2,
@@ -1220,16 +1606,10 @@ fn frame(units: FrameUnits, start: FrameBound, end: FrameBound) -> Result<Frame>
     if end == FrameBound::UnboundedPreceding {
         return Err(Error("a frame cannot end at UNBOUNDED PRECEDING".into()));
     }
-    if place(start) > place(end) {
+    if place(&start) > place(&end) {
         return Err(Error(format!(
             "a frame cannot start at {start} and end at {end}, before it"
         )));
-    }
-    let offset = |bound| matches!(bound, FrameBound::Preceding(_) | FrameBound::Following(_));
-    if units == FrameUnits::Range && (offset(start) || offset(end)) {
-        return Err(Error(
-            "RANGE frames take only UNBOUNDED and CURRENT ROW bounds; ROWS takes offsets".into(),
-        ));
     }
     Ok(Frame { units, start, end })
 }

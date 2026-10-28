@@ -470,6 +470,8 @@ fn encode_value(value: &Value) -> String {
         Value::Date(d) => format!("D{d}"),
         Value::Time(t) => format!("T{t}"),
         Value::Timestamp(t) => format!("S{t}"),
+        Value::TimestampTz(t) => format!("Z{t}"),
+        Value::Interval(i) => format!("I{}:{}:{}", i.months, i.days, i.micros),
         Value::Blob(b) => format!("X{}", crate::types::hex(b)),
         Value::Decimal(d) => format!("N{d}"),
         Value::Null => unreachable!("statistics hold no NULL"),
@@ -481,7 +483,8 @@ fn encode_value(value: &Value) -> String {
 fn position(value: &Value) -> Option<f64> {
     match value {
         Value::Date(d) => Some(*d as f64),
-        Value::Time(t) | Value::Timestamp(t) => Some(*t as f64),
+        Value::Time(t) | Value::Timestamp(t) | Value::TimestampTz(t) => Some(*t as f64),
+        Value::Interval(i) => Some(i.length() as f64),
         other => other.to_f64(),
     }
 }
@@ -551,11 +554,28 @@ impl<'a> Reader<'a> {
                 Ok(d) => Value::Date(d),
                 Err(_) => return bad(),
             },
-            ("T" | "S", t) => match t.parse() {
+            ("T" | "S" | "Z", t) => match t.parse() {
                 Ok(t) if tag == "T" => Value::Time(t),
-                Ok(t) => Value::Timestamp(t),
+                Ok(t) if tag == "S" => Value::Timestamp(t),
+                Ok(t) => Value::TimestampTz(t),
                 Err(_) => return bad(),
             },
+            ("I", parts) => {
+                let parts: Vec<&str> = parts.split(':').collect();
+                match parts.as_slice() {
+                    [m, d, us] => match (m.parse(), d.parse(), us.parse()) {
+                        (Ok(months), Ok(days), Ok(micros)) => {
+                            Value::Interval(crate::datetime::Interval {
+                                months,
+                                days,
+                                micros,
+                            })
+                        }
+                        _ => return bad(),
+                    },
+                    _ => return bad(),
+                }
+            }
             ("X", hex) => match unhex(hex) {
                 Some(bytes) => Value::Blob(bytes),
                 None => return bad(),

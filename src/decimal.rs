@@ -333,6 +333,45 @@ impl Decimal {
         }
     }
 
+    /// The remainder of the division by `other`, with this one's sign, as
+    /// `%` gives it; an error for division by zero.
+    pub fn remainder(self, other: Decimal) -> Result<Decimal> {
+        if other.is_zero() {
+            return err("division by zero");
+        }
+        let scale = self.scale.max(other.scale);
+        let (a, b) = (self.rescale(scale)?, other.rescale(scale)?);
+        Decimal::new(a.mantissa % b.mantissa, scale)
+    }
+
+    /// Cut to `places` places (none if negative), toward zero: `TRUNC`.
+    pub fn trunc(self, places: i64) -> Decimal {
+        let places = places.clamp(0, MAX_PRECISION as i64) as u8;
+        match places >= self.scale {
+            true => self,
+            false => Decimal {
+                mantissa: self.mantissa / ten(self.scale - places),
+                scale: places,
+            },
+        }
+    }
+
+    /// The largest whole number not above it (`FLOOR`), or with `up`, the
+    /// least not below it (`CEIL`).
+    pub fn floor(self, up: bool) -> Result<Decimal> {
+        let divisor = ten(self.scale);
+        let whole = match up {
+            true => -(-self.mantissa).div_euclid(divisor),
+            false => self.mantissa.div_euclid(divisor),
+        };
+        Decimal::new(whole, 0)
+    }
+
+    /// -1, 0 or 1, as it is below, at or above zero.
+    pub fn signum(self) -> i64 {
+        self.mantissa.signum() as i64
+    }
+
     /// Rounded to `places` places (none if negative), halves away from zero.
     pub fn round(self, places: i64) -> Result<Decimal> {
         let places = places.clamp(0, MAX_PRECISION as i64) as u8;

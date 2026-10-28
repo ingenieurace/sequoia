@@ -62,7 +62,14 @@ pub fn encode(columns: &[Column], row: &[Value]) -> Result<Vec<u8>> {
                 bytes.extend_from_slice(s.as_bytes());
             }
             Value::Date(d) => bytes.extend_from_slice(&d.to_le_bytes()),
-            Value::Time(t) | Value::Timestamp(t) => bytes.extend_from_slice(&t.to_le_bytes()),
+            Value::Time(t) | Value::Timestamp(t) | Value::TimestampTz(t) => {
+                bytes.extend_from_slice(&t.to_le_bytes())
+            }
+            Value::Interval(i) => {
+                bytes.extend_from_slice(&i.months.to_le_bytes());
+                bytes.extend_from_slice(&i.days.to_le_bytes());
+                bytes.extend_from_slice(&i.micros.to_le_bytes());
+            }
             Value::Blob(b) => {
                 let Ok(len) = u16::try_from(b.len()) else {
                     return long("a blob");
@@ -123,9 +130,12 @@ fn decode_from(
         }
         if !needed(i) {
             match column.data_type {
-                DataType::Int | DataType::Real | DataType::Time | DataType::Timestamp => {
-                    reader.take(8)?
-                }
+                DataType::Int
+                | DataType::Real
+                | DataType::Time
+                | DataType::Timestamp
+                | DataType::TimestampTz => reader.take(8)?,
+                DataType::Interval => reader.take(16)?,
                 DataType::Date => reader.take(4)?,
                 DataType::Decimal(_) => reader.take(17)?,
                 DataType::Bool => reader.take(1)?,
@@ -155,6 +165,12 @@ fn decode_from(
             DataType::Date => Value::Date(i32::from_le_bytes(reader.array()?)),
             DataType::Time => Value::Time(i64::from_le_bytes(reader.array()?)),
             DataType::Timestamp => Value::Timestamp(i64::from_le_bytes(reader.array()?)),
+            DataType::TimestampTz => Value::TimestampTz(i64::from_le_bytes(reader.array()?)),
+            DataType::Interval => Value::Interval(crate::datetime::Interval {
+                months: i32::from_le_bytes(reader.array()?),
+                days: i32::from_le_bytes(reader.array()?),
+                micros: i64::from_le_bytes(reader.array()?),
+            }),
             DataType::Blob => {
                 let len = u16::from_le_bytes(reader.array()?) as usize;
                 Value::Blob(reader.take(len)?.to_vec())

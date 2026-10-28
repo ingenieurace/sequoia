@@ -36,7 +36,7 @@ pub mod stats;
 pub mod table;
 
 use crate::error::{Error, Result, err};
-use crate::sql::ast::{ColumnRef, CreateIndex, Expr, IndexKind, Statement};
+use crate::sql::ast::{ColumnRef, CreateIndex, Expr, IndexKind, Statement, quote_ident};
 use crate::sql::parse;
 use crate::storage::{BPlusTree, BufferPool, MAX_TUPLE_SIZE, PageId, RecordId, TableHeap, tuple};
 use crate::types::{Column, DataType, StorageKind, Value};
@@ -453,14 +453,18 @@ fn create_table_sql(name: &str, columns: &[Column], storage: StorageKind) -> Str
         .iter()
         .map(|c| {
             let pk = if c.primary_key { " PRIMARY KEY" } else { "" };
-            format!("{} {}{pk}", c.name, c.data_type)
+            format!("{} {}{pk}", quote_ident(&c.name), c.data_type)
         })
         .collect();
     let using = match storage {
         StorageKind::Heap => String::new(), // the default, as in files written before LSM existed
         other => format!(" USING {other}"),
     };
-    format!("CREATE TABLE {name} ({}){using}", columns.join(", "))
+    format!(
+        "CREATE TABLE {} ({}){using}",
+        quote_ident(name),
+        columns.join(", ")
+    )
 }
 
 fn page_id(raw: i64) -> Result<PageId> {

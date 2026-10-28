@@ -36,7 +36,11 @@
 //! TABLE`.
 //! Every column reference is first bound to the table it belongs to, which
 //! fails if it names no column or, unqualified, a column of several tables.
-//! With a single table, references stay as written.
+//! With a single table, references stay as written. A join with USING (or
+//! NATURAL) gets the ON of its columns' equalities, and an unqualified
+//! reference to one of them is bound to the column it merges (see
+//! `using_joins`). VALUES in FROM is a derived table of its rows: a `VALUES`
+//! step if they are constants, else a projection of each, one after another.
 //!
 //! **Filters.** WHERE is split at its ANDs, and so is the ON of an inner
 //! join, which means the same as WHERE. A condition on one table is pushed
@@ -176,7 +180,8 @@ use crate::plan::{access, filter, order};
 use crate::predicate::{Compare, Predicate};
 use crate::sql::ast::{
     Aggregate, BinaryOp, ColumnRef, Expr, From, JoinKind, OrderBy, Projection, Select, SelectItem,
-    SetOp, TableRef, TableSource, Window as WindowCall, WorkCell,
+    FrameBound, FrameUnits, SetOp, TableRef, TableSource, Window as WindowCall, WorkCell,
+    derived_name,
 };
 use crate::sql::eval::{Field, resolve};
 use crate::types::{StorageKind, Value};
@@ -535,8 +540,16 @@ fn table_names(catalog: &Catalog, table: &TableRef) -> Result<Vec<String>> {
         TableSource::Dual => Vec::new(),
         TableSource::Recursive(cte) => recursive_names(catalog, cte)?,
         TableSource::WorkTable { columns, .. } => columns.clone(),
+        TableSource::Values(rows) => values_names(rows),
     };
     renamed(names, &table.columns, table.qualifier())
+}
+
+/// The names of the columns of VALUES: `column1`, `column2`...
+fn values_names(rows: &[Vec<Expr>]) -> Vec<String> {
+    (1..=rows.first().map_or(0, Vec::len))
+        .map(|i| format!("column{i}"))
+        .collect()
 }
 
 /// The names of a recursive query's columns: its own, or else its anchor's.
@@ -614,6 +627,10 @@ fn sources<'a>(catalog: &'a Catalog, from: &From, choices: Choices) -> Result<Ve
                 };
                 (SourceKind::Node(Some(node)), Vec::new())
             }
+            TableSource::Values(rows) => {
+                let names = values_names(rows);
+                (SourceKind::Derived(Some(values(catalog, rows, &names)?)), names)
+            }
             TableSource::Recursive(cte) => {
                 let anchor = select(catalog, cte.anchor.clone(), choices)?;
                 let names = renamed(anchor.columns, &cte.columns, &cte.name)?;
@@ -670,6 +687,146 @@ fn sources<'a>(catalog: &'a Catalog, from: &From, choices: Choices) -> Result<Ve
     Ok(sources)
 }
 
+/// Plans the rows of VALUES, of columns `names`: those rows, if they are
+/// all constants; else a projection of each from the row of no columns, one
+/// after another.
+fn values<'a>(catalog: &'a Catalog, rows: &[Vec<Expr>], names: &[String]) -> Result<Node<'a>> {
+    let binder = Binder::new(catalog, &[]);
+    let mut bound = Vec::new();
+    for row in rows {
+        forbid(row, "VALUES")?;
+        forbid_windows(row, "VALUES")?;
+        bound.push(row.iter().map(|e| binder.bind(e)).collect::<Result<Vec<_>>>()?);
+    }
+    let constants: Option<Vec<Row>> = bound
+        .iter()
+        .map(|row| row.iter().map(filter::constant).collect())
+        .collect();
+    if let Some(rows) = constants {
+        let fields = names.iter().map(Field::named).collect();
+        return Ok(Node::Values {
+            rows: Arc::new(rows),
+            fields,
+        });
+    }
+    let dual = || Node::Values {
+        rows: Arc::new(vec![Vec::new()]),
+        fields: Vec::new(),
+    };
+    let mut inputs: Vec<Node> = bound
+        .into_iter()
+        .map(|exprs| Node::Project {
+            input: Box::new(dual()),
+            exprs,
+        })
+        .collect();
+    Ok(match inputs.len() {
+        1 => inputs.pop().expect("one"),
+        _ => Node::Union { inputs },
+    })
+}
+
+/// What USING and NATURAL make of FROM: the ON of each join (None for one
+/// without them), the columns they merge (each name, and what it reads: the
+/// left side's column for an inner or LEFT JOIN, the right side's for a
+/// RIGHT JOIN, and the first of them that is not NULL for a FULL JOIN), and
+/// if any did, the select list `SELECT *` means: the merged columns of each
+/// join first, then the rest of its left side's, then of its right side's.
+/// A merged column is what an unqualified reference to its name reads.
+#[allow(clippy::type_complexity)]
+fn using_joins(
+    from: &From,
+    sources: &[Source],
+) -> Result<(Vec<Option<Expr>>, Vec<(String, Expr)>, Option<Vec<SelectItem>>)> {
+    let column = |s: &Source, name: &str| {
+        Expr::Column(ColumnRef {
+            table: Some(s.qualifier.clone()),
+            name: name.into(),
+        })
+    };
+    let mut merged: Vec<(String, Expr)> = Vec::new();
+    // The columns of the joined rows so far, as SELECT * reads them.
+    let mut star: Vec<(String, Expr)> = sources[0]
+        .names
+        .iter()
+        .map(|n| (n.clone(), column(&sources[0], n)))
+        .collect();
+    let mut ons = Vec::new();
+    let mut any = false;
+    for (i, join) in from.joins.iter().enumerate() {
+        let right = &sources[i + 1];
+        let right_columns: Vec<(String, Expr)> = right
+            .names
+            .iter()
+            .map(|n| (n.clone(), column(right, n)))
+            .collect();
+        let mut names: Vec<String> = Vec::new();
+        if join.natural {
+            for (name, _) in &star {
+                if right.names.contains(name) && !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+        } else {
+            names = join.using.clone();
+        }
+        if names.is_empty() {
+            // A NATURAL JOIN of tables with no column in common joins every pair.
+            ons.push(None);
+            star.extend(right_columns);
+            continue;
+        }
+        any = true;
+        let (mut parts, mut merges) = (Vec::new(), Vec::new());
+        for name in &names {
+            let lefts: Vec<&Expr> = star.iter().filter(|(n, _)| n == name).map(|(_, e)| e).collect();
+            let left = match lefts.as_slice() {
+                [left] => (*left).clone(),
+                [] => return err(format!("column {name} of USING is not on the left of its join")),
+                _ => return err(format!("column {name} of USING is on the left of its join more than once")),
+            };
+            match right.names.iter().filter(|n| *n == name).count() {
+                1 => {}
+                0 => return err(format!("column {name} of USING is not in {}", right.qualifier)),
+                _ => return err(format!("column {name} of USING is in {} more than once", right.qualifier)),
+            }
+            let right_column = column(right, name);
+            parts.push(Expr::Binary(
+                Box::new(left.clone()),
+                BinaryOp::Eq,
+                Box::new(right_column.clone()),
+            ));
+            let value = match join.kind {
+                JoinKind::Inner | JoinKind::Left => left,
+                JoinKind::Right => right_column,
+                JoinKind::Full => Expr::Function(
+                    crate::sql::ast::Function::Coalesce,
+                    vec![left, right_column],
+                ),
+            };
+            merges.push((name.clone(), value));
+        }
+        ons.push(and(parts));
+        star = merges
+            .iter()
+            .cloned()
+            .chain(star.into_iter().filter(|(n, _)| !names.contains(n)))
+            .chain(right_columns.into_iter().filter(|(n, _)| !names.contains(n)))
+            .collect();
+        merged.retain(|(n, _)| !names.contains(n));
+        merged.extend(merges);
+    }
+    let star = any.then(|| {
+        star.into_iter()
+            .map(|(name, expr)| SelectItem {
+                alias: (!matches!(&expr, Expr::Column(c) if c.name == name)).then_some(name),
+                expr,
+            })
+            .collect()
+    });
+    Ok((ons, merged, star))
+}
+
 /// Plans a SELECT on the tables of the catalog, each of its joins (and
 /// those of its subqueries in FROM) as `choices` says.
 pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Result<Plan<'a>> {
@@ -701,6 +858,11 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Resu
             ));
         }
     }
+    let (using_ons, merged, star) = using_joins(&from, &sources)?;
+    let projection = match (projection, star) {
+        (Projection::All, Some(items)) => Projection::Exprs(items),
+        (projection, _) => projection,
+    };
     forbid(&filter, "WHERE")?;
     forbid(
         from.joins.iter().filter_map(|j| j.on.as_ref()),
@@ -726,7 +888,8 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Resu
     }
 
     // Bind every column reference to its table.
-    let binder = Binder::new(catalog, &sources);
+    let mut binder = Binder::new(catalog, &sources);
+    binder.merged = merged;
     let bind = |e: &Expr| binder.bind(e);
     let bind_all = |exprs: &[Expr]| exprs.iter().map(bind).collect::<Result<Vec<_>>>();
     let projection = match projection {
@@ -747,7 +910,8 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Resu
     let ons = from
         .joins
         .iter()
-        .map(|j| j.on.as_ref().map(bind).transpose())
+        .zip(&using_ons)
+        .map(|(j, using)| j.on.as_ref().or(using.as_ref()).map(bind).transpose())
         .collect::<Result<Vec<_>>>()?;
     // A repeated GROUP BY expression groups by nothing more, and would make its column ambiguous.
     let mut distinct_group_by: Vec<Expr> = Vec::new();
@@ -1197,8 +1361,9 @@ fn gathered(node: Node<'_>, workers: usize) -> Node<'_> {
             group_by,
             aggregates,
             phase: Phase::Whole,
-        } if !aggregates.iter().any(|(_, _, distinct)| *distinct)
-            && !group_by.iter().any(Expr::has_subquery)
+        } if !aggregates.iter().any(|(_, arg, distinct)| {
+            *distinct || arg.as_ref().is_some_and(Expr::has_subquery)
+        }) && !group_by.iter().any(Expr::has_subquery)
             && chain(&input) =>
         {
             // Folded in the workers, then merged.
@@ -1289,7 +1454,7 @@ fn windows<'a>(
             if !calls.contains(window) {
                 calls.push(window.clone());
             }
-            Ok(Expr::Column(ColumnRef::bare(window.to_string())))
+            Ok(Expr::Column(ColumnRef::bare(derived_name(window))))
         })
     };
     let exprs = match exprs {
@@ -1317,6 +1482,19 @@ fn windows<'a>(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    for call in &calls {
+        let frame = call.frame();
+        let offset = |b: &FrameBound| matches!(b, FrameBound::Preceding(_) | FrameBound::Following(_));
+        if frame.units == FrameUnits::Range
+            && (offset(&frame.start) || offset(&frame.end))
+            && call.order_by.len() != 1
+        {
+            return err(format!("{call}: a RANGE frame with an offset needs exactly one ORDER BY key"));
+        }
+        if frame.units == FrameUnits::Groups && call.order_by.is_empty() {
+            return err(format!("{call}: a GROUPS frame needs an ORDER BY"));
+        }
+    }
     let mut by_window: Vec<Vec<WindowCall>> = Vec::new();
     for call in calls {
         match by_window.iter_mut().find(|same| same[0].same_window(&call)) {
@@ -2301,6 +2479,9 @@ struct Binder<'c> {
     /// The position in FROM of the table of each field.
     owners: Vec<usize>,
     single: bool,
+    /// The columns USING and NATURAL joins merged, which an unqualified
+    /// reference to their names reads (see `using_joins`).
+    merged: Vec<(String, Expr)>,
 }
 
 impl<'c> Binder<'c> {
@@ -2317,6 +2498,19 @@ impl<'c> Binder<'c> {
             fields,
             owners,
             single: sources.len() == 1,
+            merged: Vec::new(),
+        }
+    }
+
+    /// What an unqualified column merged by USING reads, if `column` is one.
+    fn merged(&self, column: &ColumnRef) -> Option<&Expr> {
+        match column.table {
+            Some(_) => None,
+            None => self
+                .merged
+                .iter()
+                .find(|(name, _)| *name == column.name)
+                .map(|(_, expr)| expr),
         }
     }
 
@@ -2326,6 +2520,7 @@ impl<'c> Binder<'c> {
         let bind = |e: &Expr| self.bind(e).map(Box::new);
         Ok(match expr {
             Expr::Literal(_) | Expr::Slot(..) => expr.clone(),
+            Expr::Column(column) if let Some(merged) = self.merged(column) => self.bind(merged)?,
             Expr::Column(column) => {
                 let field = &self.fields[resolve(&self.fields, column)?];
                 match self.single {
@@ -2340,9 +2535,6 @@ impl<'c> Binder<'c> {
             Expr::Binary(left, op, right) => Expr::Binary(bind(left)?, *op, bind(right)?),
             Expr::IsNull(inner, negated) => Expr::IsNull(bind(inner)?, *negated),
             Expr::Aggregate(function, arg, distinct) => {
-                if arg.as_deref().is_some_and(Expr::has_subquery) {
-                    return err("subqueries are not allowed in aggregate functions");
-                }
                 Expr::Aggregate(*function, arg.as_deref().map(bind).transpose()?, *distinct)
             }
             Expr::InList(left, items, negated) => Expr::InList(
@@ -2404,6 +2596,11 @@ impl<'c> Binder<'c> {
                     let step = with_work_table(&cte.step, &names, None);
                     cte.step = self.correlate(&step, scopes)?;
                 }
+                TableSource::Values(rows) => {
+                    for e in rows.iter_mut().flatten() {
+                        *e = self.correlate_expr(e, scopes)?;
+                    }
+                }
                 TableSource::Table(_) | TableSource::Dual | TableSource::WorkTable { .. } => {}
             }
             let names = table_names(self.catalog, table)?;
@@ -2420,6 +2617,17 @@ impl<'c> Binder<'c> {
 
     fn correlate_expr(&self, expr: &Expr, scopes: &mut Vec<Vec<Field>>) -> Result<Expr> {
         expr.replace(&mut |e| match e {
+            // A column merged by USING, as the outer columns it reads.
+            Expr::Column(column)
+                if !scopes.iter().flatten().any(|f| f.is_named_by(column))
+                    && self.merged(column).is_some() =>
+            {
+                let merged = self.merged(column).expect("checked").clone();
+                Some(merged.replace(&mut |e| match e {
+                    Expr::Column(c) => Some(Ok(Expr::Outer(c.clone()))),
+                    _ => None,
+                }))
+            }
             Expr::Column(column)
                 if !scopes.iter().flatten().any(|f| f.is_named_by(column))
                     && self.fields.iter().any(|f| f.is_named_by(column)) =>
@@ -2544,8 +2752,8 @@ impl Node<'_> {
                 ..
             } => group_by
                 .iter()
-                .map(Expr::to_string)
-                .chain(aggregates.iter().map(aggregate_name))
+                .map(derived_name)
+                .chain(aggregates.iter().map(|a| derived_name(aggregate_name(a))))
                 .map(Field::named)
                 .collect(),
             Node::Project { exprs, .. } => {
@@ -2569,7 +2777,7 @@ impl Node<'_> {
             } => input
                 .columns()
                 .into_iter()
-                .chain(functions.iter().map(|w| Field::named(w.to_string())))
+                .chain(functions.iter().map(|w| Field::named(derived_name(w))))
                 .collect(),
             Node::Lateral {
                 left,
@@ -2870,7 +3078,7 @@ fn aggregate_name((function, arg, distinct): &AggregateCall) -> String {
 /// Rewrites a bound expression to read an aggregate's rows, as the module docs describe.
 fn rewrite(expr: &Expr, group_by: &[Expr], aggregates: &mut Vec<AggregateCall>) -> Result<Expr> {
     if group_by.contains(expr) {
-        return Ok(Expr::Column(ColumnRef::bare(expr.to_string())));
+        return Ok(Expr::Column(ColumnRef::bare(derived_name(expr))));
     }
     let mut rewrite = |e: &Expr| rewrite(e, group_by, aggregates).map(Box::new);
     Ok(match expr {
@@ -2913,7 +3121,7 @@ fn rewrite(expr: &Expr, group_by: &[Expr], aggregates: &mut Vec<AggregateCall>) 
             if !aggregates.contains(&call) {
                 aggregates.push(call.clone());
             }
-            Expr::Column(ColumnRef::bare(aggregate_name(&call)))
+            Expr::Column(ColumnRef::bare(derived_name(aggregate_name(&call))))
         }
     })
 }
@@ -2930,7 +3138,7 @@ fn regroup(query: &Select, group_by: &[Expr]) -> Result<Select> {
                     .map(Expr::Column)
                     .find(|e| group_by.contains(e))
                 {
-                    Some(grouped) => Ok(Expr::Outer(ColumnRef::bare(grouped.to_string()))),
+                    Some(grouped) => Ok(Expr::Outer(ColumnRef::bare(derived_name(grouped)))),
                     None => err(format!("column {column} must appear in GROUP BY or be used in an aggregate function")),
                 },
             ),

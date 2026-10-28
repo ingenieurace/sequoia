@@ -69,7 +69,8 @@ pub fn temp_file() -> Result<Arc<dyn Medium>> {
 /// ```text
 /// 0 = NULL | 1, i64 | 2, bool byte | 3, u32 length, UTF-8 bytes | 4, f64
 ///   | 5, i32 days | 6, i64 time | 7, i64 timestamp | 8, u32 length, bytes
-///   | 9, i128 mantissa, scale byte
+///   | 9, i128 mantissa, scale byte | 10, i64 timestamp with time zone
+///   | 11, i32 months, i32 days, i64 microseconds
 /// ```
 pub fn encode_value(value: &Value, out: &mut Vec<u8>) {
     match value {
@@ -77,13 +78,19 @@ pub fn encode_value(value: &Value, out: &mut Vec<u8>) {
             out.push(5);
             out.extend_from_slice(&d.to_le_bytes());
         }
-        Value::Time(t) | Value::Timestamp(t) => {
-            out.push(if matches!(value, Value::Time(_)) {
-                6
-            } else {
-                7
+        Value::Time(t) | Value::Timestamp(t) | Value::TimestampTz(t) => {
+            out.push(match value {
+                Value::Time(_) => 6,
+                Value::Timestamp(_) => 7,
+                _ => 10,
             });
             out.extend_from_slice(&t.to_le_bytes());
+        }
+        Value::Interval(i) => {
+            out.push(11);
+            out.extend_from_slice(&i.months.to_le_bytes());
+            out.extend_from_slice(&i.days.to_le_bytes());
+            out.extend_from_slice(&i.micros.to_le_bytes());
         }
         Value::Blob(b) => {
             out.push(8);
@@ -130,6 +137,12 @@ pub fn decode_value(bytes: &[u8], pos: &mut usize) -> Result<Value> {
         5 => Value::Date(i32::from_le_bytes(take(4)?.try_into().unwrap())),
         6 => Value::Time(i64::from_le_bytes(take(8)?.try_into().unwrap())),
         7 => Value::Timestamp(i64::from_le_bytes(take(8)?.try_into().unwrap())),
+        10 => Value::TimestampTz(i64::from_le_bytes(take(8)?.try_into().unwrap())),
+        11 => Value::Interval(crate::datetime::Interval {
+            months: i32::from_le_bytes(take(4)?.try_into().unwrap()),
+            days: i32::from_le_bytes(take(4)?.try_into().unwrap()),
+            micros: i64::from_le_bytes(take(8)?.try_into().unwrap()),
+        }),
         8 => {
             let len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
             Value::Blob(take(len)?.to_vec())

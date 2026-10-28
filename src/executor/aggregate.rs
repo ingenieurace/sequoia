@@ -60,7 +60,7 @@ use crate::decimal::Decimal;
 use crate::error::{Error, Result, err};
 use crate::plan::query::AggregateCall;
 use crate::sql::ast::{Aggregate, BinaryOp, Expr};
-use crate::sql::eval::{Field, Subqueries, binary, eval, eval_with};
+use crate::sql::eval::{Field, Subqueries, binary, eval_with};
 use crate::types::Value;
 
 /// Reads every row of `input` (whose columns are `columns`) and returns one
@@ -160,10 +160,15 @@ impl Folder {
             budget,
             ..
         } = self;
-        let args = aggregates
+        let args: Vec<Result<Option<Value>>> = aggregates
             .iter()
-            .map(|(_, arg, _)| arg.as_ref().map(|arg| eval(arg, columns, row)).transpose());
-        table.add(key, args, aggregates, *budget, scratch)
+            .map(|(_, arg, _)| {
+                arg.as_ref()
+                    .map(|arg| eval_with(arg, columns, row, subqueries))
+                    .transpose()
+            })
+            .collect();
+        table.add(key, args.into_iter(), aggregates, *budget, scratch)
     }
 
     /// Adds a row of this group key and these aggregate arguments (`None`

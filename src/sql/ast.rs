@@ -1,5 +1,6 @@
 use crate::datetime;
 use crate::error::Result;
+pub use crate::sql::lexer::quote_ident;
 use crate::types::{Column, DataType, StorageKind, Value};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -123,13 +124,18 @@ impl std::fmt::Display for CreateIndex {
             .collect::<Vec<_>>()
             .join(", ");
         let unique = if self.unique { "UNIQUE " } else { "" };
-        write!(f, "CREATE {unique}INDEX {} ON {}", self.name, self.table)?;
+        write!(
+            f,
+            "CREATE {unique}INDEX {} ON {}",
+            quote_ident(&self.name),
+            quote_ident(&self.table)
+        )?;
         if self.using != IndexKind::BTree {
             write!(f, " USING {}", self.using)?;
         }
         write!(f, " ({keys})")?;
         if !self.include.is_empty() {
-            write!(f, " INCLUDE ({})", self.include.join(", "))?;
+            write!(f, " INCLUDE ({})", quoted_list(&self.include))?;
         }
         if let Some(predicate) = &self.predicate {
             write!(f, " WHERE {predicate}")?;
@@ -221,6 +227,7 @@ impl Select {
                     exprs.extend(cte.anchor.exprs());
                     exprs.extend(cte.step.exprs());
                 }
+                TableSource::Values(rows) => exprs.extend(rows.iter().flatten()),
                 TableSource::Table(_) | TableSource::Dual | TableSource::WorkTable { .. } => {}
             }
         }
@@ -240,6 +247,11 @@ impl Select {
                 TableSource::Recursive(cte) => {
                     cte.anchor = cte.anchor.try_map(f)?;
                     cte.step = cte.step.try_map(f)?;
+                }
+                TableSource::Values(rows) => {
+                    for e in rows.iter_mut().flatten() {
+                        *e = f(e)?;
+                    }
                 }
                 TableSource::Table(_) | TableSource::Dual | TableSource::WorkTable { .. } => {}
             }
@@ -321,6 +333,9 @@ pub enum TableSource {
     Dual,
     /// A recursive common table expression, wherever it is named.
     Recursive(Box<RecursiveCte>),
+    /// `VALUES (expr, ...), ...`: these rows, of columns `column1`,
+    /// `column2`...; the FROM of the query a VALUES is, `SELECT *` of it.
+    Values(Vec<Vec<Expr>>),
     /// Inside the recursive part of a recursive common table expression,
     /// the rows its last round added, by the expression's name. `columns`
     /// are the expression's, and `cell` what the rows are handed in: both
@@ -403,18 +418,38 @@ impl TableRef {
             (None, TableSource::Table(name) | TableSource::WorkTable { name, .. }) => name,
             (None, TableSource::Recursive(cte)) => &cte.name,
             (None, TableSource::Dual) => "",
+            (None, TableSource::Values(_)) => "values",
             (None, TableSource::Subquery(_)) => unreachable!("a subquery in FROM has an alias"),
         }
     }
 }
 
-/// `[INNER | LEFT | RIGHT | FULL] JOIN table ON condition`; `CROSS JOIN`
-/// and `,` have no condition.
+/// `[NATURAL] [INNER | LEFT | RIGHT | FULL] JOIN table [ON condition |
+/// USING (column, ...)]`; `CROSS JOIN` and `,` have no condition.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Join {
     pub kind: JoinKind,
     pub table: TableRef,
     pub on: Option<Expr>,
+    /// `USING (column, ...)`: the columns of the same names on both sides
+    /// are equal, and each pair is one column of the joined rows. The
+    /// planner makes an ON of them.
+    pub using: Vec<String>,
+    /// `NATURAL`: USING the columns both sides have.
+    pub natural: bool,
+}
+
+impl Join {
+    /// A join on `on`, or on nothing.
+    pub fn on(kind: JoinKind, table: TableRef, on: Option<Expr>) -> Self {
+        Join {
+            kind,
+            table,
+            on,
+            using: Vec::new(),
+            natural: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -468,11 +503,25 @@ impl ColumnRef {
     }
 }
 
+/// The mark at the start of the name of a column the planner makes of an
+/// expression, named by its SQL text (an aggregate's result, a GROUP BY
+/// expression's value, a window function's): no name a query writes has
+/// it, and such a name prints as that text.
+pub const DERIVED: char = '\u{1}';
+
+/// The name of a column that holds the value of `expr` (see [`DERIVED`]).
+pub fn derived_name(expr: impl std::fmt::Display) -> String {
+    format!("{DERIVED}{expr}")
+}
+
 impl std::fmt::Display for ColumnRef {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        if let Some(text) = self.name.strip_prefix(DERIVED) {
+            return f.write_str(text);
+        }
         match &self.table {
-            Some(table) => write!(f, "{table}.{}", self.name),
-            None => f.write_str(&self.name),
+            Some(table) => write!(f, "{}.{}", quote_ident(table), quote_ident(&self.name)),
+            None => f.write_str(&quote_ident(&self.name)),
         }
     }
 }
@@ -558,12 +607,16 @@ pub struct Window {
     /// reads, around the current row; if not given, those from the start
     /// of the partition to the current row's last peer.
     pub frame: Option<Frame>,
+    /// `OVER w` or `OVER (w ...)`: the window of the query's `WINDOW w AS
+    /// (...)` this one is, or adds to. The parser puts that window's parts
+    /// in and leaves this None, so nothing after it sees a name.
+    pub base: Option<String>,
 }
 
 impl Window {
     /// The window's frame, as given or by default.
     pub fn frame(&self) -> Frame {
-        self.frame.unwrap_or(Frame {
+        self.frame.clone().unwrap_or(Frame {
             units: FrameUnits::Range,
             start: FrameBound::UnboundedPreceding,
             end: FrameBound::CurrentRow,
@@ -665,8 +718,8 @@ impl WindowFunction {
     }
 }
 
-/// `{ROWS | RANGE} [BETWEEN] start [AND end]`: the rows of a window's frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// `{ROWS | RANGE | GROUPS} [BETWEEN] start [AND end]`: the rows of a window's frame.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Frame {
     pub units: FrameUnits,
     pub start: FrameBound,
@@ -678,17 +731,24 @@ pub struct Frame {
 pub enum FrameUnits {
     /// Rows: `n PRECEDING` is the row `n` before the current one.
     Rows,
-    /// Peers: `CURRENT ROW` takes in all of the current row's peers. Only
-    /// `UNBOUNDED` bounds and `CURRENT ROW`, not offsets.
+    /// Values of the window's one ORDER BY key: `CURRENT ROW` takes in all
+    /// of the current row's peers, and `n PRECEDING` the rows whose key is
+    /// at most `n` before the current row's (a number, or an INTERVAL for
+    /// dates and times).
     Range,
+    /// Peer groups: `n PRECEDING` starts `n` groups of peers before the
+    /// current row's.
+    Groups,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// A bound of a frame. An offset is a number not below zero (an INT for
+/// ROWS and GROUPS), or for RANGE over dates and times, an INTERVAL.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FrameBound {
     UnboundedPreceding,
-    Preceding(u64),
+    Preceding(Value),
     CurrentRow,
-    Following(u64),
+    Following(Value),
     UnboundedFollowing,
 }
 
@@ -696,9 +756,9 @@ impl std::fmt::Display for FrameBound {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             FrameBound::UnboundedPreceding => f.write_str("UNBOUNDED PRECEDING"),
-            FrameBound::Preceding(n) => write!(f, "{n} PRECEDING"),
+            FrameBound::Preceding(n) => write!(f, "{} PRECEDING", n.to_sql()),
             FrameBound::CurrentRow => f.write_str("CURRENT ROW"),
-            FrameBound::Following(n) => write!(f, "{n} FOLLOWING"),
+            FrameBound::Following(n) => write!(f, "{} FOLLOWING", n.to_sql()),
             FrameBound::UnboundedFollowing => f.write_str("UNBOUNDED FOLLOWING"),
         }
     }
@@ -729,6 +789,7 @@ impl std::fmt::Display for Window {
             let units = match frame.units {
                 FrameUnits::Rows => "ROWS",
                 FrameUnits::Range => "RANGE",
+                FrameUnits::Groups => "GROUPS",
             };
             parts.push(format!(
                 "{units} BETWEEN {} AND {}",
@@ -746,7 +807,7 @@ pub enum Function {
     Coalesce,
     /// NULL if its two arguments are equal, else the first.
     Nullif,
-    /// The number of characters in a TEXT.
+    /// The number of characters in a TEXT (also `CHAR_LENGTH`).
     Length,
     /// A TEXT with its ASCII letters in upper case, as SQLite does.
     Upper,
@@ -764,9 +825,80 @@ pub enum Function {
     Round,
     /// `CAST(value AS type)`: the value as one of the type (see `eval.rs`).
     Cast(DataType),
-    /// `EXTRACT(field FROM value)`: a part of a date, a time or a timestamp,
-    /// as an INT.
+    /// `EXTRACT(field FROM value)`: a part of a date, a time, a timestamp or
+    /// an interval, as an INT (EPOCH as a REAL).
     Extract(datetime::Field),
+    /// `TRIM(text[, characters])`: the text without the characters (spaces
+    /// by default) at either end; also written `TRIM([BOTH] [characters]
+    /// FROM text)`.
+    Trim,
+    /// `LTRIM`, or `TRIM(LEADING ...)`: at its start only.
+    Ltrim,
+    /// `RTRIM`, or `TRIM(TRAILING ...)`: at its end only.
+    Rtrim,
+    /// `REPLACE(text, from, to)`: each `from` in the text as `to`.
+    Replace,
+    /// `INSTR(text, part)`, or `POSITION(part IN text)`: where `part` first
+    /// starts, counted in characters from 1; 0 if nowhere.
+    Instr,
+    /// `LEFT(text, n)`: its first `n` characters; with a negative `n`, all
+    /// but its last `-n`.
+    Left,
+    /// `RIGHT(text, n)`: its last `n` characters; with a negative `n`, all
+    /// but its first `-n`.
+    Right,
+    /// The characters of a TEXT in the other order.
+    Reverse,
+    /// `REPEAT(text, n)`: the text `n` times.
+    Repeat,
+    /// `LPAD(text, length[, fill])`: the text, filled out at its start to
+    /// `length` characters with `fill` (spaces by default), or cut to them.
+    Lpad,
+    /// `RPAD(...)`: likewise, at its end.
+    Rpad,
+    /// `CONCAT(value, ...)`: the values as TEXT, one after another, NULLs left out.
+    Concat,
+    /// The least whole number not below a number (also `CEILING`).
+    Ceil,
+    /// The largest whole number not above a number.
+    Floor,
+    /// `TRUNC(number[, digits])`: cut to `digits` decimal places, toward zero.
+    Trunc,
+    /// -1, 0 or 1, as a number is below, at or above zero.
+    Sign,
+    Sqrt,
+    /// `POWER(base, exponent)` (also `POW`), as a REAL.
+    Power,
+    Exp,
+    /// The natural logarithm.
+    Ln,
+    /// `LOG(number)`, the logarithm to base 10, or `LOG(base, number)`.
+    Log,
+    Log10,
+    /// `MOD(a, b)`: `a % b`.
+    Mod,
+    Pi,
+    /// The greatest of the values, NULLs left out, as in PostgreSQL.
+    Greatest,
+    /// The least of the values, NULLs left out.
+    Least,
+    /// `NOW()`, or `CURRENT_TIMESTAMP`: the time the statement started, as
+    /// a TIMESTAMP WITH TIME ZONE.
+    Now,
+    /// `CURRENT_DATE`: the date the statement started on, in UTC.
+    CurrentDate,
+    /// `CURRENT_TIME`, or `LOCALTIME`: the time of day it started at, in UTC.
+    CurrentTime,
+    /// `LOCALTIMESTAMP`: when it started, in UTC, as a TIMESTAMP.
+    LocalTimestamp,
+    /// `DATE_TRUNC(unit, timestamp)`: the timestamp cut to the unit (see
+    /// `datetime::truncate`); of a DATE, its midnight's.
+    DateTrunc,
+    /// `value AT TIME ZONE zone`: a TIMESTAMP WITH TIME ZONE as the wall
+    /// time in that zone, a TIMESTAMP; or a TIMESTAMP, as a wall time there,
+    /// as the instant it is. The zone is a TEXT (see `datetime::parse_zone`)
+    /// or an INTERVAL, its offset east of UTC.
+    AtTimeZone,
 }
 
 impl Function {
@@ -775,12 +907,52 @@ impl Function {
         Some(match name.to_uppercase().as_str() {
             "COALESCE" => Function::Coalesce,
             "NULLIF" => Function::Nullif,
-            "LENGTH" => Function::Length,
+            "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" => Function::Length,
             "UPPER" => Function::Upper,
             "LOWER" => Function::Lower,
-            "SUBSTR" => Function::Substr,
+            "SUBSTR" | "SUBSTRING" => Function::Substr,
             "ABS" => Function::Abs,
             "ROUND" => Function::Round,
+            "TRIM" => Function::Trim,
+            "LTRIM" => Function::Ltrim,
+            "RTRIM" => Function::Rtrim,
+            "REPLACE" => Function::Replace,
+            "INSTR" => Function::Instr,
+            "LEFT" => Function::Left,
+            "RIGHT" => Function::Right,
+            "REVERSE" => Function::Reverse,
+            "REPEAT" => Function::Repeat,
+            "LPAD" => Function::Lpad,
+            "RPAD" => Function::Rpad,
+            "CONCAT" => Function::Concat,
+            "CEIL" | "CEILING" => Function::Ceil,
+            "FLOOR" => Function::Floor,
+            "TRUNC" => Function::Trunc,
+            "SIGN" => Function::Sign,
+            "SQRT" => Function::Sqrt,
+            "POWER" | "POW" => Function::Power,
+            "EXP" => Function::Exp,
+            "LN" => Function::Ln,
+            "LOG" => Function::Log,
+            "LOG10" => Function::Log10,
+            "MOD" => Function::Mod,
+            "PI" => Function::Pi,
+            "GREATEST" => Function::Greatest,
+            "LEAST" => Function::Least,
+            "NOW" => Function::Now,
+            "DATE_TRUNC" => Function::DateTrunc,
+            _ => return None,
+        })
+    }
+
+    /// The function a word written without parentheses calls, as SQL has
+    /// them: `CURRENT_DATE` and the like.
+    pub fn from_bare_name(name: &str) -> Option<Function> {
+        Some(match name.to_uppercase().as_str() {
+            "CURRENT_TIMESTAMP" => Function::Now,
+            "CURRENT_DATE" => Function::CurrentDate,
+            "CURRENT_TIME" | "LOCALTIME" => Function::CurrentTime,
+            "LOCALTIMESTAMP" => Function::LocalTimestamp,
             _ => return None,
         })
     }
@@ -798,23 +970,88 @@ impl Function {
             Function::Round => "round",
             Function::Cast(_) => "cast",
             Function::Extract(_) => "extract",
+            Function::Trim => "trim",
+            Function::Ltrim => "ltrim",
+            Function::Rtrim => "rtrim",
+            Function::Replace => "replace",
+            Function::Instr => "instr",
+            Function::Left => "left",
+            Function::Right => "right",
+            Function::Reverse => "reverse",
+            Function::Repeat => "repeat",
+            Function::Lpad => "lpad",
+            Function::Rpad => "rpad",
+            Function::Concat => "concat",
+            Function::Ceil => "ceil",
+            Function::Floor => "floor",
+            Function::Trunc => "trunc",
+            Function::Sign => "sign",
+            Function::Sqrt => "sqrt",
+            Function::Power => "power",
+            Function::Exp => "exp",
+            Function::Ln => "ln",
+            Function::Log => "log",
+            Function::Log10 => "log10",
+            Function::Mod => "mod",
+            Function::Pi => "pi",
+            Function::Greatest => "greatest",
+            Function::Least => "least",
+            Function::Now => "now",
+            Function::CurrentDate => "current_date",
+            Function::CurrentTime => "current_time",
+            Function::LocalTimestamp => "localtimestamp",
+            Function::DateTrunc => "date_trunc",
+            Function::AtTimeZone => "timezone",
         }
     }
 
     /// The fewest and most arguments it takes.
     pub fn arity(self) -> (usize, usize) {
         match self {
-            Function::Coalesce => (2, usize::MAX),
-            Function::Nullif => (2, 2),
-            Function::Substr => (2, 3),
-            Function::Round => (1, 2),
+            Function::Coalesce | Function::Greatest | Function::Least => (2, usize::MAX),
+            Function::Concat => (1, usize::MAX),
+            Function::Nullif
+            | Function::Instr
+            | Function::Left
+            | Function::Right
+            | Function::Repeat
+            | Function::Power
+            | Function::Mod
+            | Function::DateTrunc
+            | Function::AtTimeZone => (2, 2),
+            Function::Substr | Function::Lpad | Function::Rpad => (2, 3),
+            Function::Replace => (3, 3),
+            Function::Round | Function::Trim | Function::Ltrim | Function::Rtrim => (1, 2),
+            Function::Trunc | Function::Log => (1, 2),
+            Function::Pi
+            | Function::Now
+            | Function::CurrentDate
+            | Function::CurrentTime
+            | Function::LocalTimestamp => (0, 0),
             Function::Length
             | Function::Upper
             | Function::Lower
             | Function::Abs
             | Function::Cast(_)
-            | Function::Extract(_) => (1, 1),
+            | Function::Extract(_)
+            | Function::Reverse
+            | Function::Ceil
+            | Function::Floor
+            | Function::Sign
+            | Function::Sqrt
+            | Function::Exp
+            | Function::Ln
+            | Function::Log10 => (1, 1),
         }
+    }
+
+    /// Whether it gives the time the statement started: replaced by that
+    /// value before the statement runs (see `sql::eval::at_time`).
+    pub fn reads_clock(self) -> bool {
+        matches!(
+            self,
+            Function::Now | Function::CurrentDate | Function::CurrentTime | Function::LocalTimestamp
+        )
     }
 }
 
@@ -1056,6 +1293,8 @@ pub enum BinaryOp {
     Sub,
     Mul,
     Div,
+    /// `a % b`: the remainder of INTs (with the sign of `a`) or DECIMALs.
+    Mod,
     /// `text LIKE pattern`: `%` matches any characters, `_` any one; ASCII
     /// letters match in either case, as in SQLite.
     Like,
@@ -1150,6 +1389,21 @@ impl std::fmt::Display for Expr {
             Expr::Function(Function::Extract(field), args) => {
                 write!(f, "EXTRACT({} FROM {})", field.name(), args[0])
             }
+            Expr::Function(Function::AtTimeZone, args) => {
+                write!(f, "({} AT TIME ZONE {})", operand(&args[0]), operand(&args[1]))
+            }
+            Expr::Function(
+                function @ (Function::Now
+                | Function::CurrentDate
+                | Function::CurrentTime
+                | Function::LocalTimestamp),
+                _,
+            ) => f.write_str(match function {
+                Function::Now => "NOW()",
+                Function::CurrentDate => "CURRENT_DATE",
+                Function::CurrentTime => "CURRENT_TIME",
+                _ => "LOCALTIMESTAMP",
+            }),
             Expr::Function(function, args) => {
                 let args = args
                     .iter()
@@ -1167,6 +1421,17 @@ impl std::fmt::Display for Select {
     /// Writes the query as SQL that parses back to it.
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let list = |exprs: &mut dyn Iterator<Item = String>| exprs.collect::<Vec<_>>().join(", ");
+        // A VALUES query: `SELECT *` of its rows.
+        if let (TableSource::Values(rows), Projection::All, None, true, false) = (
+            &self.from.table.source,
+            &self.projection,
+            &self.from.table.alias,
+            self.from.joins.is_empty() && self.filter.is_none() && self.group_by.is_empty(),
+            self.distinct || self.having.is_some(),
+        ) {
+            f.write_str(&values_sql(rows))?;
+            return self.write_tail(f);
+        }
         f.write_str(if self.distinct {
             "SELECT DISTINCT "
         } else {
@@ -1176,7 +1441,7 @@ impl std::fmt::Display for Select {
             Projection::All => f.write_str("*")?,
             Projection::Exprs(items) => {
                 let items = items.iter().map(|item| match &item.alias {
-                    Some(alias) => format!("{} AS {alias}", item.expr),
+                    Some(alias) => format!("{} AS {}", item.expr, quote_ident(alias)),
                     None => item.expr.to_string(),
                 });
                 f.write_str(&list(&mut items.into_iter()))?
@@ -1186,12 +1451,18 @@ impl std::fmt::Display for Select {
             write!(f, " FROM {}", self.from.table)?;
         }
         for join in &self.from.joins {
+            let natural = if join.natural { "NATURAL " } else { "" };
             match (join.kind, &join.on) {
-                (JoinKind::Inner, None) => write!(f, " CROSS JOIN {}", join.table)?,
+                (JoinKind::Inner, None) if !join.natural && join.using.is_empty() => {
+                    write!(f, " CROSS JOIN {}", join.table)?
+                }
                 (kind, on) => {
-                    write!(f, " {}JOIN {}", kind.keyword(), join.table)?;
+                    write!(f, " {natural}{}JOIN {}", kind.keyword(), join.table)?;
                     if let Some(on) = on {
                         write!(f, " ON {on}")?;
+                    }
+                    if !join.using.is_empty() {
+                        write!(f, " USING ({})", quoted_list(&join.using))?;
                     }
                 }
             }
@@ -1209,6 +1480,14 @@ impl std::fmt::Display for Select {
         if let Some(having) = &self.having {
             write!(f, " HAVING {having}")?;
         }
+        self.write_tail(f)
+    }
+}
+
+impl Select {
+    /// Writes the queries combined with this one, then ORDER BY, LIMIT and OFFSET.
+    fn write_tail(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let list = |exprs: &mut dyn Iterator<Item = String>| exprs.collect::<Vec<_>>().join(", ");
         for part in &self.compound {
             let all = if part.all { "ALL " } else { "" };
             write!(f, " {} {all}{}", part.op.name(), part.query)?;
@@ -1238,13 +1517,16 @@ impl std::fmt::Display for TableRef {
             f.write_str("LATERAL ")?;
         }
         match &self.source {
-            TableSource::Table(name) | TableSource::WorkTable { name, .. } => f.write_str(name)?,
+            TableSource::Table(name) | TableSource::WorkTable { name, .. } => {
+                f.write_str(&quote_ident(name))?
+            }
             TableSource::Subquery(query) => write!(f, "({query})")?,
             TableSource::Dual => {}
+            TableSource::Values(rows) => write!(f, "({})", values_sql(rows))?,
             TableSource::Recursive(cte) => {
                 let columns = match cte.columns.is_empty() {
                     true => String::new(),
-                    false => format!("({})", cte.columns.join(", ")),
+                    false => format!("({})", quoted_list(&cte.columns)),
                 };
                 let all = if cte.all { "ALL " } else { "" };
                 write!(
@@ -1252,14 +1534,14 @@ impl std::fmt::Display for TableRef {
                     "(WITH RECURSIVE {name}{columns} AS ({} UNION {all}{}) SELECT * FROM {name}) {}",
                     cte.anchor,
                     cte.step,
-                    self.qualifier(),
-                    name = cte.name
+                    quote_ident(self.qualifier()),
+                    name = quote_ident(&cte.name)
                 )?;
                 return self.write_columns(f);
             }
         }
         if let Some(alias) = &self.alias {
-            write!(f, " {alias}")?;
+            write!(f, " {}", quote_ident(alias))?;
         }
         self.write_columns(f)
     }
@@ -1269,9 +1551,30 @@ impl TableRef {
     fn write_columns(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self.columns.is_empty() {
             true => Ok(()),
-            false => write!(f, "({})", self.columns.join(", ")),
+            false => write!(f, "({})", quoted_list(&self.columns)),
         }
     }
+}
+
+/// `VALUES (a, b), (c, d)`.
+fn values_sql(rows: &[Vec<Expr>]) -> String {
+    let rows: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let values: Vec<String> = row.iter().map(Expr::to_string).collect();
+            format!("({})", values.join(", "))
+        })
+        .collect();
+    format!("VALUES {}", rows.join(", "))
+}
+
+/// Names, each as [`quote_ident`] writes it, separated by commas.
+pub fn quoted_list(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| quote_ident(name))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl BinaryOp {
@@ -1289,6 +1592,7 @@ impl BinaryOp {
             BinaryOp::Sub => "-",
             BinaryOp::Mul => "*",
             BinaryOp::Div => "/",
+            BinaryOp::Mod => "%",
             BinaryOp::Like => "LIKE",
             BinaryOp::Concat => "||",
         }
@@ -1347,6 +1651,15 @@ mod tests {
             "(SELECT ROW_NUMBER() OVER () FROM t) = (SELECT COUNT(*) OVER (ORDER BY a RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t)",
             "(SELECT LAG(a, 2, 0) OVER (ORDER BY a ROWS UNBOUNDED PRECEDING) + NTILE(4) OVER (PARTITION BY b) FROM t) > 1",
             "x IN (WITH c (k) AS (SELECT a FROM t), d AS (SELECT k FROM c) SELECT k FROM d)",
+            r#""select" % 3 = "Mixed Case" AND "it""s" > t."order""#,
+            "(ts AT TIME ZONE '+02:00') > (NOW() AT TIME ZONE INTERVAL '-01:30:00') OR CURRENT_DATE IS NULL",
+            "d + INTERVAL '1 year 2 mons 3 days 04:05:06.5' < TIMESTAMPTZ '2024-01-01 08:00:00+00'",
+            "TRIM(LEADING 'x' FROM a) = LEFT(b, 2) AND POSITION('z' IN c) > 0 AND GREATEST(d, 1) % 2 = 1",
+            "EXISTS (SELECT * FROM a NATURAL LEFT JOIN b JOIN c USING (k, \"j k\") FULL JOIN d USING (k))",
+            "x IN (VALUES (1, 'a'), (2, 'b')) OR y IN (SELECT column1 FROM (VALUES (1)) v (n))",
+            "(SELECT SUM(a) OVER w FROM t WINDOW w AS (PARTITION BY b ORDER BY c GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW)) > 1",
+            "(SELECT COUNT(*) OVER (ORDER BY d RANGE BETWEEN INTERVAL '3 days' PRECEDING AND 2.5 FOLLOWING) FROM t) = 1",
+            "(SELECT SUM((SELECT 1)) FROM t) = 1",
         ] {
             let expr = where_clause(sql);
             assert_eq!(
