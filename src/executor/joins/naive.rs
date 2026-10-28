@@ -12,7 +12,7 @@ use crate::catalog::table::Row;
 use crate::error::Result;
 use crate::executor::operator::Rows;
 use crate::sql::ast::{Expr, JoinKind};
-use crate::sql::eval::{Field, locate, matches};
+use crate::sql::eval::{Field, NoSubqueries, Subqueries, locate, matches_with};
 use crate::types::Value;
 
 /// A naive nested loop join: pairs each left row with every right row,
@@ -24,6 +24,8 @@ pub struct NaiveJoin<'a> {
     right_width: usize,
     kind: JoinKind,
     condition: Option<Expr>,
+    /// Runs the subqueries of the condition, if it has any.
+    subqueries: Box<dyn Subqueries + 'a>,
     /// The left fields, then the right ones: the fields of a joined row.
     fields: Vec<Field>,
     /// The left row being joined, with the right side as read again for it,
@@ -37,6 +39,12 @@ pub struct NaiveJoin<'a> {
 }
 
 impl<'a> NaiveJoin<'a> {
+    /// Runs the subqueries of the join's condition with `subqueries`.
+    pub fn running(mut self, subqueries: Box<dyn Subqueries + 'a>) -> Self {
+        self.subqueries = subqueries;
+        self
+    }
+
     pub fn new(
         left: Rows<'a>,
         left_fields: Vec<Field>,
@@ -53,6 +61,7 @@ impl<'a> NaiveJoin<'a> {
             right_width,
             kind,
             condition: condition.map(|c| locate(&c, &fields)),
+            subqueries: Box::new(NoSubqueries),
             fields,
             current: None,
             matched: false,
@@ -79,7 +88,7 @@ impl Iterator for NaiveJoin<'_> {
                     self.pair.clear();
                     self.pair.extend(left.iter().cloned());
                     self.pair.extend(row);
-                    match matches(&self.condition, &self.fields, &self.pair) {
+                    match matches_with(&self.condition, &self.fields, &self.pair, &mut *self.subqueries) {
                         Ok(true) => {
                             self.matched = true;
                             return Some(Ok(std::mem::take(&mut self.pair))); // the next pair allocates anew

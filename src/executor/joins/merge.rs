@@ -7,7 +7,7 @@ use crate::error::Result;
 use crate::executor::operator::Rows;
 use crate::executor::sort::{Sorted, Sorter};
 use crate::sql::ast::{Expr, JoinKind, OrderBy};
-use crate::sql::eval::{Field, eval, locate, locate_all, matches};
+use crate::sql::eval::{Field, NoSubqueries, Subqueries, eval, locate, locate_all, matches_with};
 use crate::types::Value;
 
 /// How a merge join sorts its sides: see [`JoinMethod::Merge`](crate::plan::query::JoinMethod::Merge).
@@ -35,6 +35,8 @@ pub struct MergeJoin<'a> {
     right_width: usize,
     kind: JoinKind,
     condition: Option<Expr>,
+    /// Runs the subqueries of the condition, if it has any.
+    subqueries: Box<dyn Subqueries + 'a>,
     /// The left fields, then the right ones: the fields of a joined row.
     fields: Vec<Field>,
     /// The next right row, with its keys, once read and until it joins `group`.
@@ -50,6 +52,12 @@ pub struct MergeJoin<'a> {
 }
 
 impl<'a> MergeJoin<'a> {
+    /// Runs the subqueries of the join's condition with `subqueries`.
+    pub fn running(mut self, subqueries: Box<dyn Subqueries + 'a>) -> Self {
+        self.subqueries = subqueries;
+        self
+    }
+
     pub fn new(
         left: Rows<'a>,
         left_fields: Vec<Field>,
@@ -88,6 +96,7 @@ impl<'a> MergeJoin<'a> {
             kind,
             condition,
             lookahead: None,
+            subqueries: Box::new(NoSubqueries),
             group_key: None,
             group: Vec::new(),
             current: None,
@@ -191,7 +200,7 @@ impl Iterator for MergeJoin<'_> {
                 let right = &self.group[self.next];
                 self.next += 1;
                 let joined: Row = left.iter().chain(right).cloned().collect();
-                match matches(&self.condition, &self.fields, &joined) {
+                match matches_with(&self.condition, &self.fields, &joined, &mut *self.subqueries) {
                     Ok(true) => {
                         self.matched = true;
                         return Some(Ok(joined));

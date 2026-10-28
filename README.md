@@ -83,7 +83,8 @@ that make those estimates closer, and let the planner reorder joins.
 | Buffer pool | 256 frames in 8 shards; ARC, LRU-K or CLOCK replacement, switchable at runtime |
 | Durability | write-ahead log of full pages with chained checksums; atomic statements; transactions and savepoints; checkpoints |
 | Execution models | iterator (Volcano), materialization, vectorized (batches of 1024 rows, a column at a time, SIMD-friendly loops) |
-| Joins | hash join (hybrid, spills to disk), index join, sort-merge join, block nested loop join, naive nested loop join (for comparison only) |
+| Joins | hash join (hybrid, spills to disk), index join, sort-merge join, block nested loop join, naive nested loop join (for comparison only); inner, `LEFT`, `RIGHT`, `FULL` and `LATERAL` |
+| Queries | subqueries anywhere a value goes; `UNION`, `INTERSECT`, `EXCEPT`; common table expressions, recursive too; window functions over partitions and frames |
 | Parallelism | parallel heap scans, parallel grace hash join, gathered hash and index joins, two-phase (partial and final) aggregation |
 | Sort and aggregation | external merge sort with a tournament tree, top-N heap for `LIMIT`; hash aggregation that spills partitions |
 | Planner | access path choice, predicate pushdown, cost-based choice between index and hash joins, merge join to save a sort, join reordering by dynamic programming |
@@ -167,7 +168,8 @@ workers, and a join method to force on every join (see
 - `CREATE TABLE name (column TYPE [PRIMARY KEY], ...) [USING HEAP | LSM | COLUMN]`, `DROP TABLE name`
 - `CREATE [UNIQUE] INDEX name ON table [USING BTREE | HASH] (key, ...) [INCLUDE (column, ...)] [WHERE condition]`, `DROP INDEX name`.
   A key is a column or an expression of columns, such as `LOWER(name)`.
-- `INSERT INTO table [(column, ...)] VALUES (...), ...`
+- `INSERT INTO table [(column, ...)] VALUES (...), ...`, or `INSERT INTO table [(column, ...)] SELECT ...`
+  (the query's rows are all read before the first is inserted)
 - `SELECT`, `UPDATE table SET column = expr, ... [WHERE ...]`, `DELETE FROM table [WHERE ...]`
 - `RETURNING * | expr [AS name], ...` after `INSERT`, `UPDATE` or `DELETE` returns the rows written instead of a count
 - `EXPLAIN` before `SELECT`, `UPDATE` or `DELETE`; `EXPLAIN ANALYZE` before `SELECT`
@@ -209,16 +211,42 @@ the rows it holds).
 
 **Queries**
 
-- `SELECT [DISTINCT] * | expr [AS name], ... FROM ...`. `FROM` is required.
-- `FROM` takes tables with aliases, `[INNER] JOIN ... ON`, `LEFT [OUTER] JOIN ... ON`,
-  `CROSS JOIN`, commas, and subqueries with an alias: `(SELECT ...) d`
+- `[WITH ...] SELECT [DISTINCT] * | expr [AS name], ... [FROM ...]`. Without
+  `FROM`, a query reads one row of no columns: `SELECT 1 + 1`.
+- `FROM` takes tables with aliases, `[INNER] JOIN ... ON`,
+  `{LEFT | RIGHT | FULL} [OUTER] JOIN ... ON`, `CROSS JOIN`, commas, and
+  subqueries with an alias, which may rename their columns: `(SELECT ...) d (a, b)`.
+  `LATERAL (SELECT ...) d`, after a comma, `CROSS JOIN`, `JOIN` or `LEFT
+  JOIN`, may read the columns of the tables before it, and runs for each of
+  their rows.
 - `WHERE`, `GROUP BY` (expressions), `HAVING`, `ORDER BY expr [ASC | DESC], ...`
   (NULL first, stable; may name a select-list alias), `LIMIT n [OFFSET m]`
-- `UNION` and `UNION ALL`; an `ORDER BY`, `LIMIT` or `OFFSET` after the last query applies to all rows
+- `UNION`, `INTERSECT` and `EXCEPT`, each also with `ALL`. `INTERSECT` binds
+  tighter than the others, which go left to right, as in standard SQL
+  (SQLite gives them all the same precedence). Rows equal in every column,
+  NULLs included, are the same row. An `ORDER BY`, `LIMIT` or `OFFSET` after
+  the last query applies to all rows.
+- `WITH name [(column, ...)] AS (query), ...` names queries for the
+  statement: each is read like a derived table wherever `FROM` names it, and
+  hides a table of the same name. `WITH RECURSIVE` lets one read itself:
+  `anchor UNION [ALL] step`, where only `step` names it, once, in its `FROM`.
+  The step runs on the rows the last round returned until a round returns
+  none; with `UNION`, rows returned before are dropped, so a walk of a cycle
+  ends, and a `LIMIT` above ends one that would not.
 - Aggregates: `COUNT(*)`, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, each also with `DISTINCT`
+- Window functions, in the select list and `ORDER BY`:
+  `function(...) OVER ([PARTITION BY expr, ...] [ORDER BY ...] [frame])`.
+  The functions are `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `PERCENT_RANK`,
+  `CUME_DIST`, `NTILE(n)`, `LAG(x[, offset[, default]])`, `LEAD(...)`,
+  `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE(x, n)`, and the aggregates (without
+  `DISTINCT`). A frame is `ROWS` or `RANGE`, `[BETWEEN] start [AND end]`,
+  each bound `UNBOUNDED PRECEDING`, `n PRECEDING`, `CURRENT ROW`, `n
+  FOLLOWING` or `UNBOUNDED FOLLOWING` (`RANGE` only without `n`). By default
+  it runs from the start of the partition to the current row's last peer.
+  In a grouped query they read the groups: `SUM(COUNT(*)) OVER ()`.
 - Subqueries as a value, with `EXISTS` and with `[NOT] IN`, in the select
-  list, `WHERE`, `HAVING`, `ORDER BY`, `UPDATE`, `DELETE` and `VALUES`. They
-  may be correlated and nested.
+  list, `WHERE`, `ON`, `GROUP BY`, `HAVING`, `ORDER BY`, `UPDATE`, `DELETE`
+  and `VALUES`. They may be correlated and nested.
 
 **Expressions**: `+ - * /` (INT division truncates toward zero), `||`,
 `= != <> < <= > >=`, `AND OR NOT` with three-valued logic, `IS [NOT] NULL`,
@@ -246,12 +274,13 @@ durable once it returns. A transaction is durable once `COMMIT` returns; a
 crash, `ROLLBACK` or closing the database undoes it. A statement that fails
 inside a transaction is undone alone, and the transaction goes on.
 
-**Not supported**: `SELECT` without `FROM`, `INSERT ... SELECT`, `RIGHT` and
-`FULL` joins, `LATERAL`, subqueries in `ON` or `GROUP BY`, CTEs (`WITH`),
-window functions, `ALTER TABLE`, `NOT NULL`, `DEFAULT`, `CHECK`, foreign
-keys, composite primary keys, the `%` operator, quoted identifiers, `/* */`
-comments, time zones, `INTERVAL`, `CURRENT_DATE` and the like, and text
-stored in a DATE, TIME or TIMESTAMP column without a cast or a typed literal.
+**Not supported**: `NATURAL` joins and `USING`, `VALUES` as a table in
+`FROM`, subqueries inside aggregates, named windows (`WINDOW w AS ...`),
+`GROUPS` frames, `RANGE` frames with offsets, `ALTER TABLE`, `NOT NULL`,
+`DEFAULT`, `CHECK`, foreign keys, composite primary keys, the `%` operator,
+quoted identifiers, `/* */` comments, time zones, `INTERVAL`, `CURRENT_DATE`
+and the like, and text stored in a DATE, TIME or TIMESTAMP column without a
+cast or a typed literal.
 
 ## Source layout
 
@@ -298,11 +327,13 @@ src/
   executor/
     mod.rs           runs statements; INSERT, UPDATE, DELETE, RETURNING, EXPLAIN ANALYZE
     model.rs         the three execution models and how a query picks one
-    operator.rs      iterator model; the join and sort steps every model shares
+    operator.rs      iterator model; the steps every model shares: joins (RIGHT and FULL
+                     too), sorts, INTERSECT and EXCEPT, recursive queries, LATERAL
     materialize.rs   materialization model
     vectorized/      vectorized model: batches, column vectors, expressions over columns
     gather.rs        steps run on worker threads, their rows gathered
     aggregate.rs     hash aggregation, partial and final phases, column-at-a-time folds
+    window.rs        window functions: partitions sorted, peers, frames
     sort.rs          external merge sort, top-N
     spill.rs         temporary files of rows; hash partitioning
     subquery.rs      runs subqueries, remembering answers per distinct outer values
@@ -419,7 +450,18 @@ A `SELECT` becomes a tree of steps. Column references are bound to their
 tables. `WHERE` and the `ON` of inner joins are split at `AND`; a condition
 on one table is pushed down to its scan, and a condition on several tables
 goes to the join that brings in the last of them. Conditions on the right
-side of a `LEFT JOIN` are kept in the join.
+side of a `LEFT JOIN` are kept in the join. Nothing is pushed below a join
+that may pad a table with NULLs: a condition of `WHERE` on the tables before
+a `RIGHT` or `FULL JOIN` (or on none) is checked after it, and the `ON` of
+an outer join stays in it, but for a `LEFT JOIN`'s conditions on its right
+table alone.
+
+Common table expressions are put in by the parser wherever they are named,
+as derived tables, so the planner sees none; a recursive one becomes a
+`RECURSIVE UNION` step over its anchor and its step, whose `WORK TABLE`
+reads the rows of the last round. Window functions are computed above the
+joins, the grouping and `HAVING`, by a `WINDOW` step for each distinct
+`PARTITION BY` and `ORDER BY`, which the expressions above read as columns.
 
 **Access paths.** Conditions of the form `expr op literal` choose how a table
 is read: an LSM primary key lookup or key range, or the index that narrows
@@ -447,8 +489,8 @@ equalities keeps `1 / max(distinct left, distinct right)` of the pairs. A
 condition on tables never analyzed is guessed as before (below).
 `EXPLAIN ANALYZE` shows each step's estimate next to the rows it returned.
 
-**Join order.** The inner joins up to the first `LEFT JOIN` may be done in
-any order. The planner finds the cheapest left-deep order by dynamic
+**Join order.** The inner joins up to the first outer join or `LATERAL`
+subquery may be done in any order. The planner finds the cheapest left-deep order by dynamic
 programming over the sets of tables (greedily beyond 10 tables), never adding
 a table no condition links to those joined so far while a linked one waits.
 Each join is costed with the method it would use and the rows it would
@@ -462,6 +504,9 @@ between the two sides:
   table of the right side;
 - otherwise a **hash join**;
 - a **merge join** only when its output order lets `ORDER BY` skip its sort.
+
+A `RIGHT` or `FULL JOIN` uses a hash, merge or nested loop join, never an
+index join: it must read all of its right side (see Execution).
 
 Without an equality, a **block nested loop join** is used. The costs are
 constants measured with `benches/joins.rs` (except for the cost of making a
@@ -495,7 +540,25 @@ Temporary files are deleted as soon as they are created.
 
 Subqueries are planned and run like any query, after their outer references
 are replaced by the current row's values. Answers are remembered per
-distinct set of outer values, so an uncorrelated subquery runs once.
+distinct set of outer values, so an uncorrelated subquery runs once. A
+`LATERAL` subquery is planned and run alike for each left row (`LATERAL
+JOIN`), reusing its rows while the values it reads stay the same.
+
+A `RIGHT JOIN` is an inner join, and a `FULL JOIN` a `LEFT JOIN`, of its two
+sides; then come the right rows no left row matched, padded with NULLs. To
+find them, each right row is joined the other way round with the left rows,
+marked, by the same method with its keys swapped, and kept if no marked
+row came with it. So both sides are read twice, within the method's budget.
+
+A `WINDOW` step sorts its input by `PARTITION BY` and then `ORDER BY` (with
+the sort's budget, writing runs past it), carrying the values of the
+functions' arguments, and then holds one partition at a time. An aggregate
+over a frame keeps its running state from one row to the next while the
+frame only grows at its end, so a running total folds each row once; a
+sliding frame folds its rows again for each row. A `RECURSIVE UNION` hands
+on the rows of each round as they come, and runs the step again on them
+once the round is over. `INTERSECT` and `EXCEPT` read their right side into
+a hash table of rows and their counts, then stream the left side.
 
 ### Parallelism
 
@@ -569,6 +632,10 @@ open.
   because the manifest is one page.
 - **One writer at a time**: there is no MVCC and no row locking, so a long
   write transaction blocks every other session.
+- **Steps that hold rows in memory, with no budget**: `INTERSECT` and
+  `EXCEPT` hold their right side's rows; a recursive `UNION` (not `ALL`)
+  every row it returned; a window step one partition; a `LATERAL` join the
+  rows its subquery returned for one left row.
 - **Statistics only on request**: they are computed by `ANALYZE` and not
   kept up to date by writes (there is no autovacuum); estimates treat the
   conditions on different columns as independent (no multi-column

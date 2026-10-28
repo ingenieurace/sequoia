@@ -14,7 +14,10 @@
 //! ```
 //!
 //! A LEFT JOIN also returns each left row that no right row matched, with a
-//! NULL for every right column. The right side of a hash join is read into
+//! NULL for every right column. RIGHT and FULL JOINs are made of these (see
+//! `operator.rs`): the right rows nothing matched are found by a LEFT JOIN
+//! the other way round. A join whose condition has a subquery runs it with
+//! a runner of its own, in the query's thread. The right side of a hash join is read into
 //! a hash table when the first left row is, within a memory budget
 //! ([`HASH_MEMORY`] by default) past which it is partitioned and partly
 //! written out (see `hash.rs`): then the left rows of the partitions

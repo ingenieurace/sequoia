@@ -23,11 +23,13 @@ const KEYWORDS: &[&str] = &[
     "DROP",
     "ELSE",
     "END",
+    "EXCEPT",
     "EXISTS",
     "EXPLAIN",
     "FALSE",
     "FLOAT",
     "FROM",
+    "FULL",
     "GROUP",
     "HAVING",
     "IN",
@@ -36,6 +38,7 @@ const KEYWORDS: &[&str] = &[
     "INSERT",
     "INT",
     "INTEGER",
+    "INTERSECT",
     "INTO",
     "IS",
     "JOIN",
@@ -53,6 +56,7 @@ const KEYWORDS: &[&str] = &[
     "PRIMARY",
     "REAL",
     "RELEASE",
+    "RIGHT",
     "ROLLBACK",
     "SAVEPOINT",
     "SELECT",
@@ -70,6 +74,7 @@ const KEYWORDS: &[&str] = &[
     "VALUES",
     "WHEN",
     "WHERE",
+    "WITH",
 ];
 
 #[derive(Debug, Clone, PartialEq)]

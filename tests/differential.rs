@@ -24,6 +24,15 @@
 //! every number as a REAL (see `Kind::Returned`). REALs are compared
 //! to 10 significant digits: summing in another order may change the last
 //! of the 17 SQLite prints.
+//!
+//! SQLite gives every set operation the same precedence, where Sequoia (as
+//! standard SQL) binds INTERSECT tighter, so INTERSECT comes only before any
+//! UNION or EXCEPT; and it has no INTERSECT ALL or EXCEPT ALL. A window
+//! function whose value depends on the order of rows equal in its ORDER BY
+//! (ROW_NUMBER, LAG, a frame of ROWS...) is ordered by the ids of every
+//! table too, which no two rows share; the others are the same for peers.
+//! A recursive query's rows are compared in any order: SQLite runs it a row
+//! at a time, Sequoia a round at a time.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -455,12 +464,24 @@ impl Gen {
         let mut cols: Vec<(String, Type)> = Vec::new();
         let mut outer: Vec<(String, Type)> = Vec::new();
         let mut from = String::new();
+        // Common table expressions the FROM names, and the ids of its tables,
+        // which tell its rows apart if it reads no derived table.
+        let mut ctes: Vec<String> = Vec::new();
+        let mut ids: Option<Vec<String>> = Some(Vec::new());
         for i in 0..n {
-            // A table, or a subquery (a derived table) with columns x0, x1...
+            // A table, or a subquery (a derived table) with columns x0, x1...,
+            // maybe named by a WITH.
             let (name, columns, derived) = match self.rng.chance(20) {
                 true => {
                     let (sql, columns) = self.derived();
-                    (sql, columns, true)
+                    ids = None;
+                    match self.rng.chance(40) {
+                        true => {
+                            ctes.push(format!("w{i} AS {sql}"));
+                            (format!("w{i}"), columns, true)
+                        }
+                        false => (sql, columns, true),
+                    }
                 }
                 false => {
                     let t = self.rng.below(self.tables.len());
@@ -473,6 +494,12 @@ impl Gen {
             };
             let bare = n == 1 && !derived && self.rng.chance(30);
             let alias = format!("a{i}");
+            if let Some(ids) = &mut ids {
+                ids.push(match bare {
+                    true => "id".into(),
+                    false => format!("{alias}.id"),
+                });
+            }
             let own: Vec<(String, Type)> = columns
                 .iter()
                 .map(|(c, ty)| {
@@ -495,8 +522,13 @@ impl Gen {
             } else if i == 0 {
                 from = format!("{name} {alias}");
             } else {
+                // Its subqueries, if any, may read the tables it joins.
+                let on_cols = [cols.clone(), own.clone()].concat();
                 let on_scope = Scope {
-                    cols: [cols.clone(), own.clone()].concat(),
+                    outer: on_cols.clone(),
+                    cols: on_cols,
+                    subqueries: self.rng.chance(25),
+                    sub_tables: all.clone(),
                     ..Scope::default()
                 };
                 let condition = |g: &mut Gen| {
@@ -521,10 +553,12 @@ impl Gen {
                     }
                     on
                 };
-                from += &match self.rng.below(5) {
+                from += &match self.rng.below(8) {
                     0 => format!(" CROSS JOIN {name} {alias}"),
                     1 => format!(", {name} {alias}"),
                     2 => format!(" LEFT JOIN {name} {alias} ON {}", condition(self)),
+                    3 => format!(" RIGHT JOIN {name} {alias} ON {}", condition(self)),
+                    4 => format!(" FULL JOIN {name} {alias} ON {}", condition(self)),
                     _ => format!(" JOIN {name} {alias} ON {}", condition(self)),
                 };
             }
@@ -551,12 +585,14 @@ impl Gen {
                     let (c, ty) = self.rng.pick(&cols).clone();
                     let ints: Vec<&(String, Type)> =
                         cols.iter().filter(|(_, t)| *t == Type::Int).collect();
-                    groups.push(match self.rng.chance(30) && !ints.is_empty() {
-                        true => (
+                    groups.push(match self.rng.below(10) {
+                        0..=2 if !ints.is_empty() => (
                             format!("({} + {})", self.rng.pick(&ints).0, self.rng.range(1, 3)),
                             Type::Int,
                         ),
-                        false => (c, ty),
+                        // A subquery, maybe correlated with the row.
+                        3 => (self.scalar_subquery(Type::Int, &rows), Type::Int),
+                        _ => (c, ty),
                     });
                 }
             }
@@ -605,6 +641,11 @@ impl Gen {
         if scope.groups.as_ref().is_some_and(Vec::is_empty) {
             let ty = *self.rng.pick(&TYPES);
             projection[0] = self.aggregate(ty, &scope);
+        }
+        // A window function, over the rows of an ungrouped query.
+        if !star && !grouped && self.rng.chance(25) {
+            let at = self.rng.below(projection.len());
+            projection[at] = self.window(&rows, ids.as_deref());
         }
         // Some get an AS name, which ORDER BY may use in their place.
         let names: Vec<Option<String>> = (0..projection.len())
@@ -679,28 +720,109 @@ impl Gen {
                 items.collect::<Vec<_>>().join(", ")
             }
         };
+        let with = match ctes.is_empty() {
+            true => String::new(),
+            false => format!("WITH {} ", ctes.join(", ")),
+        };
         let sql = format!(
-            "SELECT {}{projection} FROM {from}{filter}{group_by}{having}{order_by}{limit}",
+            "{with}SELECT {}{projection} FROM {from}{filter}{group_by}{having}{order_by}{limit}",
             if distinct { "DISTINCT " } else { "" }
         );
         stmt(sql, kind)
     }
 
-    /// Queries joined by UNION or UNION ALL, whose columns have the same
-    /// types, maybe sorted by every column (which fixes the order), then
-    /// limited and offset.
+    /// A window function over the rows of `s`: one the same for rows equal
+    /// in its ORDER BY, or, if `ids` tell every row apart, one ordered by
+    /// them after its own keys.
+    fn window(&mut self, s: &Scope, ids: Option<&[String]>) -> String {
+        let rows = Scope {
+            subqueries: false,
+            ..s.clone()
+        };
+        // Keys of the types of the columns there are: without subqueries,
+        // a key of another type may never read a column.
+        let types: Vec<Type> = rows.cols.iter().map(|(_, ty)| *ty).collect();
+        let mut over = Vec::new();
+        if self.rng.chance(50) {
+            let ty = *self.rng.pick(&types);
+            over.push(format!("PARTITION BY {}", self.key(ty, &rows, 1)));
+        }
+        let mut keys: Vec<String> = (0..self.rng.below(3))
+            .map(|_| {
+                let ty = *self.rng.pick(&types);
+                let key = self.key(ty, &rows, 1);
+                match self.rng.chance(40) {
+                    true => format!("{key} DESC"),
+                    false => key,
+                }
+            })
+            .collect();
+        let int = |g: &mut Gen| g.expr(Type::Int, &rows, 1);
+        // The function, and the frame it reads, if not the default one.
+        let (function, frame) = match ids {
+            Some(ids) if self.rng.chance(40) => {
+                keys.extend(ids.iter().cloned());
+                let ty = *self.rng.pick(&TYPES);
+                let value = self.expr(ty, &rows, 1);
+                match self.rng.below(6) {
+                    0 => ("ROW_NUMBER()".to_string(), None),
+                    1 => (format!("LAG({value})"), None),
+                    2 => (format!("LEAD({value}, 2)"), None),
+                    3 => (format!("FIRST_VALUE({value})"), None),
+                    4 => (format!("NTILE({})", self.rng.range(1, 4)), None),
+                    _ => (
+                        format!("SUM({})", int(self)),
+                        Some("ROWS BETWEEN 1 PRECEDING AND CURRENT ROW"),
+                    ),
+                }
+            }
+            _ => {
+                let function = match self.rng.below(9) {
+                    0 => "RANK()".to_string(),
+                    1 => "DENSE_RANK()".to_string(),
+                    2 => "CUME_DIST()".to_string(),
+                    3 => "PERCENT_RANK()".to_string(),
+                    4 => "COUNT(*)".to_string(),
+                    5 => format!("SUM({})", int(self)),
+                    6 => format!("AVG({})", int(self)),
+                    _ => {
+                        let ty = *self.rng.pick(&TYPES);
+                        let value = self.expr(ty, &rows, 1);
+                        format!("{}({value})", self.rng.pick(&["MIN", "MAX", "COUNT"]))
+                    }
+                };
+                let whole = "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING";
+                (function, self.rng.chance(20).then_some(whole))
+            }
+        };
+        if !keys.is_empty() {
+            over.push(format!("ORDER BY {}", keys.join(", ")));
+        }
+        over.extend(frame.map(String::from));
+        format!("{function} OVER ({})", over.join(" "))
+    }
+
+    /// Queries combined by UNION [ALL], INTERSECT or EXCEPT, whose columns
+    /// have the same types, maybe sorted by every column (which fixes the
+    /// order), then limited and offset.
     fn union(&mut self) -> Stmt {
         let types: Vec<Type> = (0..1 + self.rng.below(2))
             .map(|_| *self.rng.pick(&TYPES))
             .collect();
         let mut sql = String::new();
+        // INTERSECT only before the others, where both databases agree on what it binds.
+        let mut intersecting = true;
         for part in 0..2 + self.rng.below(2) {
             if part > 0 {
-                sql += if self.rng.chance(50) {
-                    " UNION ALL "
-                } else {
-                    " UNION "
+                let op = match self.rng.below(4) {
+                    0 if intersecting => " INTERSECT ",
+                    0 => " UNION ",
+                    1 => " EXCEPT ",
+                    2 => " UNION ALL ",
+                    _ => " UNION ",
                 };
+                intersecting &= op == " INTERSECT ";
+                sql += op;
             }
             let t = self.rng.below(self.tables.len());
             let s = self.table_scope(t, Vec::new());
@@ -854,6 +976,9 @@ impl Gen {
                 .collect(),
             false => (0..columns.len()).collect(),
         };
+        if self.rng.chance(25) {
+            return self.insert_select(t, &named);
+        }
         let rows: Vec<String> = (0..1 + self.rng.below(3))
             .map(|_| {
                 let values: Vec<String> = named
@@ -892,6 +1017,100 @@ impl Gen {
             ),
             kind,
         )
+    }
+
+    /// `INSERT INTO t ... SELECT`: the rows of a query of a table (maybe
+    /// `t` itself), each with an id it may already have, which both
+    /// databases must refuse alike.
+    fn insert_select(&mut self, t: usize, named: &[usize]) -> Stmt {
+        let columns = self.tables[t].columns.clone();
+        let source = self.rng.below(self.tables.len());
+        let s = Scope {
+            subqueries: false,
+            ..self.table_scope(source, Vec::new())
+        };
+        let id = s.cols[0].0.clone();
+        let values: Vec<String> = named
+            .iter()
+            .map(|&i| match i {
+                0 => format!("{id} + {}", self.rng.range(0, 60)),
+                _ => self.expr(columns[i].1, &s, 2),
+            })
+            .collect();
+        let list = match named.len() == columns.len() {
+            true => String::new(),
+            false => format!(
+                " ({})",
+                named
+                    .iter()
+                    .map(|&i| columns[i].0.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        let filter = self.where_clause(&s, 60);
+        let target = self.table_scope(t, Vec::new());
+        let (returning, kind) = self.returning(&target);
+        stmt(
+            format!(
+                "INSERT INTO {}{list} SELECT {} FROM {}{filter}{returning}",
+                self.tables[t].name,
+                values.join(", "),
+                self.tables[source].name
+            ),
+            kind,
+        )
+    }
+
+    /// A query without FROM: of literals and subqueries.
+    fn constant_select(&mut self) -> Stmt {
+        let s = Scope {
+            subqueries: true,
+            sub_tables: (0..self.tables.len()).collect(),
+            ..Scope::default()
+        };
+        let items: Vec<String> = (0..1 + self.rng.below(3))
+            .map(|_| {
+                let ty = *self.rng.pick(&TYPES);
+                self.expr(ty, &s, 3)
+            })
+            .collect();
+        let filter = self.where_clause(&s, 30);
+        stmt(format!("SELECT {}{filter}", items.join(", ")), Kind::Unordered)
+    }
+
+    /// A recursive query: a count, a walk that comes back to where it was
+    /// (which UNION ends), or a walk along a table's ids.
+    fn recursive(&mut self) -> Stmt {
+        let t = self.rng.below(self.tables.len());
+        let table = self.tables[t].name.clone();
+        let (c, _) = self.rng.pick(&self.tables[t].columns).clone();
+        let union = if self.rng.chance(50) { "UNION" } else { "UNION ALL" };
+        let sql = match self.rng.below(3) {
+            0 => format!(
+                "WITH RECURSIVE r(n) AS (SELECT {} {union} SELECT n + {} FROM r WHERE n < {}) \
+                 SELECT r.n, a.{c} FROM r LEFT JOIN {table} a ON a.id = r.n",
+                self.rng.range(-3, 5),
+                self.rng.range(1, 3),
+                self.rng.range(0, 40),
+            ),
+            1 => {
+                let (a, b, m) = (self.rng.range(1, 4), self.rng.range(0, 5), self.rng.range(2, 9));
+                let next = format!("(n * {a} + {b})");
+                format!(
+                    "WITH RECURSIVE r(n) AS (SELECT {} UNION SELECT {next} - ({next} / {m}) * {m} FROM r) SELECT n FROM r",
+                    self.rng.range(0, m - 1),
+                )
+            }
+            _ => format!(
+                "WITH RECURSIVE r(id, d) AS (SELECT id, 0 FROM {table} WHERE id < {} {union} \
+                 SELECT a.id, r.d + 1 FROM {table} a JOIN r ON a.id = r.id + {} WHERE r.d < {}) SELECT id, d FROM r",
+                self.rng.range(0, 20),
+                self.rng.range(1, 4),
+                self.rng.range(1, 5),
+            ),
+        };
+        stmt(sql, Kind::Unordered)
     }
 
     /// Maybe a RETURNING list for a change to the table of `s`, and the
@@ -1237,12 +1456,14 @@ impl Gen {
             }
         }
         for _ in 0..40 {
-            match g.rng.below(21) {
+            match g.rng.below(23) {
                 0..=9 => out.push(g.select()),
                 10 | 11 => out.push(g.index_select()),
                 12..=13 => out.push(g.union()),
                 14..=17 => g.change(&mut out),
                 18 | 19 => g.transaction(&mut out),
+                20 => out.push(g.recursive()),
+                21 => out.push(g.constant_select()),
                 // Statistics, for the planner to estimate with, pick
                 // access paths and order joins by.
                 _ => {
@@ -1402,8 +1623,15 @@ fn run_sequoia(script: &[Stmt], model: Option<Model>, memory: Option<usize>) -> 
         db.set_join_memory(bytes);
         db.set_hash_memory(bytes);
     }
+    // SEQUOIA_DIFF_TRACE=1 prints each statement before it runs, to find one that never ends.
+    let trace = std::env::var_os("SEQUOIA_DIFF_TRACE").is_some();
     script
         .iter()
+        .inspect(|s| {
+            if trace {
+                eprintln!("{model:?} {memory:?}: {};", s.sequoia);
+            }
+        })
         .map(|s| match db.execute(&s.sequoia) {
             Ok(mut results) => match results.pop() {
                 Some(QueryResult::Rows { rows, .. }) => Outcome::Rows(
@@ -1607,3 +1835,4 @@ fn keys_sqlite_folds_to_constants_are_found() {
         assert!(!folds_is_null(kept), "{kept}");
     }
 }
+

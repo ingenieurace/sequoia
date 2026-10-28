@@ -5,7 +5,7 @@ use crate::error::Result;
 use crate::executor::operator::Rows;
 use crate::executor::sort::value_size;
 use crate::sql::ast::{Expr, JoinKind};
-use crate::sql::eval::{Field, locate, matches};
+use crate::sql::eval::{Field, NoSubqueries, Subqueries, locate, matches_with};
 use crate::types::Value;
 
 /// A block nested loop join: pairs each block of left rows with every right
@@ -23,6 +23,8 @@ pub struct BlockJoin<'a> {
     right_width: usize,
     kind: JoinKind,
     condition: Option<Expr>,
+    /// Runs the subqueries of the condition, if it has any.
+    subqueries: Box<dyn Subqueries + 'a>,
     /// The left fields, then the right ones: the fields of a joined row.
     fields: Vec<Field>,
     /// Bytes of left rows a block may hold, and of right rows kept; a block holds at least one row.
@@ -71,6 +73,12 @@ enum Phase {
 }
 
 impl<'a> BlockJoin<'a> {
+    /// Runs the subqueries of the join's condition with `subqueries`.
+    pub fn running(mut self, subqueries: Box<dyn Subqueries + 'a>) -> Self {
+        self.subqueries = subqueries;
+        self
+    }
+
     pub fn new(
         left: Rows<'a>,
         left_fields: Vec<Field>,
@@ -88,6 +96,7 @@ impl<'a> BlockJoin<'a> {
             right_width,
             kind,
             condition: condition.map(|c| locate(&c, &fields)),
+            subqueries: Box::new(NoSubqueries),
             fields,
             budget,
             block: Vec::new(),
@@ -196,7 +205,7 @@ impl Iterator for BlockJoin<'_> {
                     };
                     self.pair.clear();
                     self.pair.extend(self.block[i].iter().chain(right).cloned());
-                    match matches(&self.condition, &self.fields, &self.pair) {
+                    match matches_with(&self.condition, &self.fields, &self.pair, &mut *self.subqueries) {
                         Ok(true) => {
                             self.matched[i] = true;
                             return Some(Ok(std::mem::take(&mut self.pair))); // the next pair allocates anew

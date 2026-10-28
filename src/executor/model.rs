@@ -10,7 +10,8 @@
 //! They return the same rows, errors included: a step of any model that
 //! fails hands on the rows before the error first, so a LIMIT that has its
 //! rows by then ends a query without the error in every model. Joins and
-//! sorts are the iterator model's in all three.
+//! sorts are the iterator model's in all three, and so are window steps,
+//! INTERSECT and EXCEPT, recursive queries and LATERAL joins.
 //!
 //! Which model runs a query: the one the session set ([`Settings::model`]),
 //! or else one [`choose`] picks for the query from the planner's estimates
@@ -100,6 +101,19 @@ pub fn choose(root: &Node, settings: &Settings) -> (Model, String) {
             Node::Filter { predicate, .. } => subqueries |= predicate.has_subquery(),
             Node::Project { exprs, .. } => subqueries |= exprs.iter().any(Expr::has_subquery),
             Node::Sort { keys, .. } => subqueries |= keys.iter().any(|key| key.expr.has_subquery()),
+            Node::Aggregate { group_by, .. } => {
+                subqueries |= group_by.iter().any(Expr::has_subquery)
+            }
+            Node::Window { functions, .. } => {
+                subqueries |= functions
+                    .iter()
+                    .any(|w| Expr::Window(Box::new(w.clone())).has_subquery())
+            }
+            // A LATERAL subquery runs once per row, as a subquery does.
+            Node::Lateral { .. } => {
+                joins = true;
+                subqueries = true;
+            }
             _ => {}
         }
     });

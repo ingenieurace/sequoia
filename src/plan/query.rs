@@ -18,14 +18,22 @@
 //! **Tables.** The tables of FROM are joined one at a time, each join
 //! reading the rows joined so far on its left and one table on its right:
 //! left to right, unless another order of the inner joins before the first
-//! LEFT JOIN costs clearly less (see `join_order` below and `order.rs`).
-//! Then they are planned as if FROM were written in that order, its ONs
-//! joining WHERE, and `SELECT *` is projected back to FROM's order.
+//! outer join or LATERAL subquery costs clearly less (see `join_order`
+//! below and `order.rs`).
+//! Then they are planned as if FROM were written in that order, the ONs of
+//! those joins all the last one's, and `SELECT *` is projected back to
+//! FROM's order.
 //! A subquery in FROM (a derived table) is planned like any SELECT, and its
 //! columns are named by its select list (an `AS` name, a column's name, an
 //! aggregate's function or `?column?`) and qualified by its alias. It cannot
 //! refer to the other tables of the FROM it is in, only, if it is itself in
-//! a subquery, to the queries around that.
+//! a subquery, to the queries around that; but a LATERAL one may read the
+//! tables before it, whose columns it reads are marked as its outer
+//! references, and a `LATERAL JOIN` step plans and runs it for each of
+//! their rows. A SELECT without FROM reads a single row of no columns
+//! (`VALUES`), and a recursive query is a `RECURSIVE UNION` of its anchor
+//! and its step, which reads the rows of the last round from a `WORK
+//! TABLE`.
 //! Every column reference is first bound to the table it belongs to, which
 //! fails if it names no column or, unqualified, a column of several tables.
 //! With a single table, references stay as written.
@@ -38,7 +46,13 @@
 //! kept, so only its conditions on the right table alone are pushed down, and
 //! the rest stay in the join. Nothing in WHERE is pushed down to the right
 //! table of a LEFT JOIN, or into its condition: it is checked after the join,
-//! on rows padded with NULLs too.
+//! on rows padded with NULLs too. Likewise, a RIGHT or FULL JOIN may pad
+//! every table before it: a condition of WHERE (or of the ON of an inner
+//! join after it) that reads only those, or none, is checked after it, and
+//! its own ON stays whole in the join. Its right table keeps its rows, so
+//! conditions on it alone are pushed down to it, but for a FULL JOIN's.
+//! A RIGHT or FULL JOIN is never an index join: the right rows that match
+//! nothing are found by joining the other way round (see `operator.rs`).
 //!
 //! **Joins.** Each join picks how to find the right rows that may match a
 //! left row from its equalities `left expression = right column`:
@@ -105,7 +119,9 @@
 //! for each row scans in one thread.
 //!
 //! **Steps.** On top of the scans and joins, a SELECT has an aggregate (and a
-//! filter for HAVING) if it groups, a sort if it has ORDER BY that no merge
+//! filter for HAVING) if it groups, a window step for each distinct window
+//! its window functions are computed over (`PARTITION BY` and `ORDER BY`),
+//! which adds a column for each, named by its SQL text, a sort if it has ORDER BY that no merge
 //! join sorted for (which applies the LIMIT itself, as a top-N sort) or else
 //! a limit, and a projection unless
 //! it is `SELECT *`. `SELECT DISTINCT` adds a distinct step above the
@@ -126,9 +142,14 @@
 //! neither grouped nor aggregated. The names are unique: a `GROUP BY`
 //! expression has no aggregate in it, and no other expression prints the same.
 //!
+//! **Set operations.** `UNION ALL` is a step that returns the rows of each
+//! query in turn, under a distinct step for `UNION`; `INTERSECT` and
+//! `EXCEPT` [ALL] are a step that keeps or drops the left rows the right
+//! query has too. They combine left to right, as the parser nests them.
+//!
 //! **Subqueries.** A subquery may be used as a value, with `EXISTS` or with
-//! `IN`, in the select list, WHERE, HAVING and ORDER BY, and in UPDATE,
-//! DELETE and INSERT; not in ON or GROUP BY, nor inside an aggregate. Binding
+//! `IN`, in the select list, WHERE, ON, GROUP BY, HAVING and ORDER BY, and
+//! in UPDATE, DELETE and INSERT; not inside an aggregate. Binding
 //! marks the subquery's columns that belong to the query around it, not to
 //! its own tables (whose columns win when names clash), as outer references,
 //! qualified by their table.
@@ -137,21 +158,25 @@
 //! index on what it compares with them. The subquery is planned once when
 //! the query is, too, so that its mistakes are reported even if it never runs.
 //! A condition with a subquery in it is checked after the joins that bring in
-//! the tables it reads, never inside one. In a grouped query, a subquery's
-//! outer references must be `GROUP BY` expressions, like any column there.
+//! the tables it reads, but in the ON of an outer join, whose join runs its
+//! subqueries (in its own thread: it is never a parallel one), and it is never
+//! a join's key. A `GROUP BY` expression with a subquery is computed by the
+//! aggregate. In a grouped query, a subquery's outer references must be
+//! `GROUP BY` expressions, like any column there.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use crate::catalog::Catalog;
 use crate::catalog::index::{Index, Key};
-use crate::catalog::table::{Access, Table};
+use crate::catalog::table::{Access, Row, Table};
 use crate::error::{Result, err};
 use crate::plan::selectivity::{self, EQUAL_KEEPS, OTHER_KEEPS, Scope, table_rows};
 use crate::plan::{access, filter, order};
 use crate::predicate::{Compare, Predicate};
 use crate::sql::ast::{
     Aggregate, BinaryOp, ColumnRef, Expr, From, JoinKind, OrderBy, Projection, Select, SelectItem,
-    TableRef, TableSource,
+    SetOp, TableRef, TableSource, Window as WindowCall, WorkCell,
 };
 use crate::sql::eval::{Field, resolve};
 use crate::types::{StorageKind, Value};
@@ -240,6 +265,57 @@ pub enum Node<'a> {
     Gather {
         input: Box<Node<'a>>,
         workers: usize,
+    },
+    /// Rows given in the plan: for a SELECT without FROM, one of no columns.
+    Values {
+        rows: Arc<Vec<Row>>,
+        fields: Vec<Field>,
+    },
+    /// The rows a recursive query's last round returned, which the
+    /// `Recursive` step above hands its step in `cell`, under the
+    /// expression's name.
+    WorkTable {
+        cell: WorkCell,
+        qualifier: String,
+        names: Vec<String>,
+    },
+    /// A recursive query: the rows of `anchor`, then of `step` run on them
+    /// (through its `WorkTable`, which reads `cell`), then of `step` run on
+    /// the rows it returned, until a round returns none. Without `all`, a
+    /// row equal to one returned before is dropped, and not run on.
+    Recursive {
+        anchor: Box<Node<'a>>,
+        step: Box<Node<'a>>,
+        all: bool,
+        cell: WorkCell,
+    },
+    /// `INTERSECT [ALL]` or `EXCEPT [ALL]` of the rows of `left` and `right`.
+    SetOp {
+        left: Box<Node<'a>>,
+        right: Box<Node<'a>>,
+        op: SetOp,
+        all: bool,
+    },
+    /// Each row with the value of each window function in `functions`, all
+    /// over the partitions of `partition_by` in the order of `order_by`.
+    /// Its rows come out in that order.
+    Window {
+        input: Box<Node<'a>>,
+        partition_by: Vec<Expr>,
+        order_by: Vec<OrderBy>,
+        functions: Vec<WindowCall>,
+    },
+    /// Pairs each left row with the rows `query` returns for it, its outer
+    /// references taking their values from the row, where `condition`
+    /// holds; with a LEFT `kind`, a left row matching none with NULLs. The
+    /// query's columns are `names`, qualified by `qualifier`.
+    Lateral {
+        left: Box<Node<'a>>,
+        query: Select,
+        qualifier: String,
+        names: Vec<String>,
+        kind: JoinKind,
+        condition: Option<Expr>,
     },
 }
 
@@ -362,6 +438,12 @@ enum SourceKind<'a> {
     Table(&'a Table),
     /// A derived table's plan, until `joins` takes it.
     Derived(Option<Node<'a>>),
+    /// A plan read as it is, whose columns are its own: the row of a SELECT
+    /// without FROM, or a recursive query's work table.
+    Node(Option<Node<'a>>),
+    /// A LATERAL subquery, its references to the tables before it marked as
+    /// outer ones: planned for each of their rows, by `joins`.
+    Lateral(Select),
 }
 
 impl<'a> Source<'a> {
@@ -391,6 +473,8 @@ impl<'a> Source<'a> {
             kind: match &self.kind {
                 SourceKind::Table(table) => SourceKind::Table(table),
                 SourceKind::Derived(plan) => SourceKind::Derived(plan.clone()),
+                SourceKind::Node(plan) => SourceKind::Node(plan.clone()),
+                SourceKind::Lateral(query) => SourceKind::Lateral(query.clone()),
             },
             qualifier: self.qualifier.clone(),
             names: self.names.clone(),
@@ -400,24 +484,27 @@ impl<'a> Source<'a> {
 
     /// Plans reading the rows `filter` matches; `needed` marks the columns read above.
     fn read(&mut self, filter: Option<Expr>, needed: Vec<bool>) -> Node<'a> {
-        match &mut self.kind {
-            SourceKind::Table(table) => scan(table, &self.qualifier, &filter, needed),
-            SourceKind::Derived(plan) => {
-                let input = Box::new(plan.take().expect("read once"));
-                let node = Node::Derived {
-                    input,
-                    qualifier: self.qualifier.clone(),
-                    names: self.names.clone(),
-                };
-                match filter {
-                    Some(predicate) => Node::Filter {
-                        input: Box::new(node),
-                        predicate,
-                    },
-                    None => node,
-                }
-            }
+        let node = match &mut self.kind {
+            SourceKind::Table(table) => return scan(table, &self.qualifier, &filter, needed),
+            SourceKind::Derived(plan) => Node::Derived {
+                input: Box::new(plan.take().expect("read once")),
+                qualifier: self.qualifier.clone(),
+                names: self.names.clone(),
+            },
+            SourceKind::Node(plan) => plan.take().expect("read once"),
+            SourceKind::Lateral(_) => unreachable!("a LATERAL subquery is planned by joins"),
+        };
+        match filter {
+            Some(predicate) => Node::Filter {
+                input: Box::new(node),
+                predicate,
+            },
+            None => node,
         }
+    }
+
+    fn is_lateral(&self) -> bool {
+        matches!(self.kind, SourceKind::Lateral(_))
     }
 }
 
@@ -428,23 +515,166 @@ pub fn output_names(catalog: &Catalog, query: &Select) -> Result<Vec<String>> {
         Projection::All => {
             let mut names = Vec::new();
             for table in query.from.tables() {
-                match &table.source {
-                    TableSource::Table(name) => {
-                        names.extend(catalog.get(name)?.columns.iter().map(|c| c.name.clone()))
-                    }
-                    TableSource::Subquery(query) => names.extend(output_names(catalog, query)?),
-                }
+                names.extend(table_names(catalog, table)?);
             }
             Ok(names)
         }
     }
 }
 
+/// The names of the columns of a table in FROM, as a query reads them.
+fn table_names(catalog: &Catalog, table: &TableRef) -> Result<Vec<String>> {
+    let names = match &table.source {
+        TableSource::Table(name) => catalog
+            .get(name)?
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect(),
+        TableSource::Subquery(query) => output_names(catalog, query)?,
+        TableSource::Dual => Vec::new(),
+        TableSource::Recursive(cte) => recursive_names(catalog, cte)?,
+        TableSource::WorkTable { columns, .. } => columns.clone(),
+    };
+    renamed(names, &table.columns, table.qualifier())
+}
+
+/// The names of a recursive query's columns: its own, or else its anchor's.
+fn recursive_names(catalog: &Catalog, cte: &crate::sql::ast::RecursiveCte) -> Result<Vec<String>> {
+    let anchor = output_names(catalog, &cte.anchor)?;
+    renamed(anchor, &cte.columns, &cte.name)
+}
+
+/// `names` with the first of them replaced by `columns`, as `alias(column,
+/// ...)` renames them; fails if there are more of those than of these.
+fn renamed(mut names: Vec<String>, columns: &[String], table: &str) -> Result<Vec<String>> {
+    if columns.len() > names.len() {
+        return err(format!(
+            "{table} has {} columns, but {} are named",
+            names.len(),
+            columns.len()
+        ));
+    }
+    names[..columns.len()].clone_from_slice(columns);
+    Ok(names)
+}
+
+/// The recursive part of a recursive query, its work table given the
+/// query's column `names`, and `cell` if given, to read its rows from.
+fn with_work_table(step: &Select, names: &[String], cell: Option<&WorkCell>) -> Select {
+    let mut step = step.clone();
+    for table in step.from.tables_mut() {
+        if let TableSource::WorkTable { columns, cell: c, .. } = &mut table.source {
+            *columns = names.to_vec();
+            if let Some(cell) = cell {
+                *c = Some(cell.clone());
+            }
+        }
+    }
+    step
+}
+
+/// What the tables of FROM read, in order: for a LATERAL subquery, bound to
+/// the tables before it.
+fn sources<'a>(catalog: &'a Catalog, from: &From, choices: Choices) -> Result<Vec<Source<'a>>> {
+    let mut sources: Vec<Source<'a>> = Vec::new();
+    for (i, r) in from.tables().enumerate() {
+        let qualifier = r.qualifier().to_string();
+        if !r.columns.is_empty() && matches!(r.source, TableSource::Table(_)) {
+            return err(format!(
+                "columns can be named only for a subquery in FROM, not for the table {qualifier}"
+            ));
+        }
+        let (kind, names) = match &r.source {
+            TableSource::Table(name) => {
+                sources.push(Source::table(catalog.get(name)?, &qualifier));
+                continue;
+            }
+            TableSource::Subquery(query) if r.lateral && i > 0 => {
+                let kind = from.joins[i - 1].kind;
+                if kind.keeps_right() {
+                    return err(format!(
+                        "a LATERAL subquery can be joined only by an inner or LEFT JOIN, and {qualifier} is in a {}JOIN",
+                        kind.keyword()
+                    ));
+                }
+                let query = Binder::new(catalog, &sources).correlate(query, &mut Vec::new())?;
+                let check = substitute(&query, &mut |_| Ok(Value::Null))?;
+                let names = select(catalog, check, choices)?.columns;
+                (SourceKind::Lateral(query), names)
+            }
+            TableSource::Subquery(query) => {
+                let plan = select(catalog, (**query).clone(), choices)?;
+                (SourceKind::Derived(Some(plan.root)), plan.columns)
+            }
+            TableSource::Dual => {
+                let node = Node::Values {
+                    rows: Arc::new(vec![Vec::new()]),
+                    fields: Vec::new(),
+                };
+                (SourceKind::Node(Some(node)), Vec::new())
+            }
+            TableSource::Recursive(cte) => {
+                let anchor = select(catalog, cte.anchor.clone(), choices)?;
+                let names = renamed(anchor.columns, &cte.columns, &cte.name)?;
+                let cell = WorkCell::default();
+                let step = with_work_table(&cte.step, &names, Some(&cell));
+                let step = select(catalog, step, choices)?;
+                if step.columns.len() != names.len() {
+                    return err(format!(
+                        "both parts of the recursive query {} must return as many columns: {} and {}",
+                        cte.name,
+                        names.len(),
+                        step.columns.len()
+                    ));
+                }
+                let node = Node::Recursive {
+                    anchor: Box::new(anchor.root),
+                    step: Box::new(step.root),
+                    all: cte.all,
+                    cell,
+                };
+                (SourceKind::Derived(Some(node)), names)
+            }
+            TableSource::WorkTable {
+                name,
+                columns,
+                cell,
+            } => {
+                let Some(cell) = cell else {
+                    return err(format!(
+                        "{name} can be read only by the recursive part of its query"
+                    ));
+                };
+                let names = renamed(columns.clone(), &r.columns, &qualifier)?;
+                let node = Node::WorkTable {
+                    cell: cell.clone(),
+                    qualifier: qualifier.clone(),
+                    names: names.clone(),
+                };
+                sources.push(Source {
+                    kind: SourceKind::Node(Some(node)),
+                    qualifier,
+                    names,
+                });
+                continue;
+            }
+        };
+        let names = renamed(names, &r.columns, &qualifier)?;
+        sources.push(Source {
+            kind,
+            qualifier,
+            names,
+        });
+    }
+    Ok(sources)
+}
+
 /// Plans a SELECT on the tables of the catalog, each of its joins (and
 /// those of its subqueries in FROM) as `choices` says.
 pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Result<Plan<'a>> {
     if !query.compound.is_empty() {
-        return union(catalog, query, choices);
+        return set_operations(catalog, query, choices);
     }
     let Select {
         distinct,
@@ -459,21 +689,10 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Resu
         ..
     } = query;
     let offset = offset.unwrap_or(0);
-    let mut sources = from
-        .tables()
-        .map(|r| match &r.source {
-            TableSource::Table(name) => Ok(Source::table(catalog.get(name)?, r.qualifier())),
-            TableSource::Subquery(query) => {
-                let plan = select(catalog, (**query).clone(), choices)?;
-                let kind = SourceKind::Derived(Some(plan.root));
-                Ok(Source {
-                    kind,
-                    qualifier: r.qualifier().into(),
-                    names: plan.columns,
-                })
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut sources = sources(catalog, &from, choices)?;
+    if from.table.source == TableSource::Dual && projection == Projection::All {
+        return err("SELECT * needs a table to read: there is no FROM");
+    }
     for (i, source) in sources.iter().enumerate() {
         if sources[..i].iter().any(|s| s.qualifier == source.qualifier) {
             return err(format!(
@@ -487,11 +706,13 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Resu
         from.joins.iter().filter_map(|j| j.on.as_ref()),
         "JOIN ... ON",
     )?;
-    forbid_subqueries(
+    forbid_windows(&filter, "WHERE")?;
+    forbid_windows(
         from.joins.iter().filter_map(|j| j.on.as_ref()),
         "JOIN ... ON",
     )?;
-    forbid_subqueries(&group_by, "GROUP BY")?;
+    forbid_windows(&group_by, "GROUP BY")?;
+    forbid_windows(&having, "HAVING")?;
 
     // ORDER BY may name a column of the select list by its AS name.
     if let Projection::Exprs(items) = &projection {
@@ -582,7 +803,20 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Resu
         ));
     }
 
-    // The columns each table must read: those any expression uses.
+    // The columns each table must read: those any expression uses, and
+    // those the LATERAL subqueries after it read.
+    let lateral_columns: Vec<Expr> = sources
+        .iter()
+        .filter_map(|s| match &s.kind {
+            SourceKind::Lateral(query) => Some(query),
+            _ => None,
+        })
+        .flat_map(|query| {
+            let mut columns = Vec::new();
+            filter::visit_outer(query, &mut |c| columns.push(Expr::Column(c.clone())));
+            columns
+        })
+        .collect();
     let used: Vec<&Expr> = exprs
         .iter()
         .flatten()
@@ -591,6 +825,7 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Resu
         .chain(&group_by)
         .chain(&having)
         .chain(order_by.iter().map(|o| &o.expr))
+        .chain(&lateral_columns)
         .collect();
     let needed: Vec<Vec<bool>> = sources
         .iter()
@@ -606,7 +841,7 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Resu
     let mut kinds: Vec<JoinKind> = std::iter::once(JoinKind::Inner)
         .chain(from.joins.iter().map(|j| j.kind))
         .collect();
-    let (mut filter, mut ons, mut needed) = (filter, ons, needed);
+    let (filter, mut ons, mut needed) = (filter, ons, needed);
     // SELECT * returns the columns in the order of FROM, whatever the order
     // of the joins: a projection puts them back in it, if they are named
     // apart (a derived table may have two of a name).
@@ -641,13 +876,15 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Resu
     let binder = match &reordered {
         None => &binder,
         Some(order) => {
-            // The ONs of the inner joins reordered join the WHERE, which they mean the same as.
-            let prefix = (1..sources.len())
-                .find(|&i| kinds[i] == JoinKind::Left)
-                .unwrap_or(sources.len());
-            let mut parts: Vec<Expr> = filter.into_iter().collect();
-            parts.extend(ons[..prefix - 1].iter_mut().filter_map(Option::take));
-            filter = and(parts);
+            // The ONs of the inner joins reordered all go to the last of
+            // them, which they mean the same as: any join after it may pad
+            // their tables with NULLs.
+            let prefix = reorderable(&sources, &kinds);
+            let parts: Vec<Expr> = ons[..prefix - 1]
+                .iter_mut()
+                .filter_map(Option::take)
+                .collect();
+            ons[prefix - 2] = and(parts);
             sources = permute(sources, order);
             needed = permute(needed, order);
             kinds = permute(kinds, order);
@@ -656,7 +893,17 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Resu
         }
     };
 
-    let order = if grouped { &[][..] } else { &order_by };
+    // Window functions sort rows of their own, after the joins.
+    let windowed = exprs
+        .iter()
+        .flatten()
+        .chain(order_by.iter().map(|o| &o.expr))
+        .any(Expr::has_window);
+    let order = if grouped || windowed {
+        &[][..]
+    } else {
+        &order_by
+    };
     let (mut node, ordered) = joins(
         &mut sources,
         kinds,
@@ -706,6 +953,14 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Resu
             predicate,
         };
     }
+    let (exprs, order_by) = match windowed {
+        true => {
+            let (windowed, exprs, order_by) = windows(node, exprs, order_by)?;
+            node = windowed;
+            (exprs, order_by)
+        }
+        false => (exprs, order_by),
+    };
     // A sort keeps the rows the limit and offset take, and is all the limit
     // there is without an offset. Under DISTINCT, they wait until rows equal
     // to earlier ones are dropped.
@@ -779,7 +1034,7 @@ fn gathered(node: Node<'_>, workers: usize) -> Node<'_> {
                         keep_order: false, ..
                     },
                 condition,
-                ..
+                kind: JoinKind::Inner | JoinKind::Left,
             } => {
                 !condition.as_ref().is_some_and(Expr::has_subquery)
                     && scan_chain(left)
@@ -790,7 +1045,7 @@ fn gathered(node: Node<'_>, workers: usize) -> Node<'_> {
                 right,
                 method: JoinMethod::Index,
                 condition,
-                ..
+                kind: JoinKind::Inner | JoinKind::Left,
             } => {
                 !condition.as_ref().is_some_and(Expr::has_subquery)
                     && scan_chain(left)
@@ -867,10 +1122,62 @@ fn gathered(node: Node<'_>, workers: usize) -> Node<'_> {
         Box::new(gathered(input, workers))
     }
     match node {
-        Node::Scan { .. } | Node::Lookup { .. } | Node::Gather { .. } => node,
+        Node::Scan { .. }
+        | Node::Lookup { .. }
+        | Node::Gather { .. }
+        | Node::Values { .. }
+        | Node::WorkTable { .. } => node,
         Node::Filter { input, predicate } => Node::Filter {
             input: inner(*input, workers),
             predicate,
+        },
+        Node::Recursive {
+            anchor,
+            step,
+            all,
+            cell,
+        } => Node::Recursive {
+            anchor: inner(*anchor, workers),
+            step: inner(*step, workers),
+            all,
+            cell,
+        },
+        Node::SetOp {
+            left,
+            right,
+            op,
+            all,
+        } => Node::SetOp {
+            left: inner(*left, workers),
+            right: inner(*right, workers),
+            op,
+            all,
+        },
+        Node::Window {
+            input,
+            partition_by,
+            order_by,
+            functions,
+        } => Node::Window {
+            input: inner(*input, workers),
+            partition_by,
+            order_by,
+            functions,
+        },
+        Node::Lateral {
+            left,
+            query,
+            qualifier,
+            names,
+            kind,
+            condition,
+        } => Node::Lateral {
+            left: inner(*left, workers),
+            query,
+            qualifier,
+            names,
+            kind,
+            condition,
         },
         Node::Join {
             left,
@@ -890,7 +1197,10 @@ fn gathered(node: Node<'_>, workers: usize) -> Node<'_> {
             group_by,
             aggregates,
             phase: Phase::Whole,
-        } if !aggregates.iter().any(|(_, _, distinct)| *distinct) && chain(&input) => {
+        } if !aggregates.iter().any(|(_, _, distinct)| *distinct)
+            && !group_by.iter().any(Expr::has_subquery)
+            && chain(&input) =>
+        {
             // Folded in the workers, then merged.
             let partial = Node::Aggregate {
                 input: Box::new(one_thread(*input)),
@@ -955,22 +1265,110 @@ fn gathered(node: Node<'_>, workers: usize) -> Node<'_> {
     }
 }
 
-/// Plans queries joined by `UNION [ALL]`: the rows of each in turn, left to
-/// right, a distinct step dropping repeats wherever `UNION` without ALL
-/// stands. With an ORDER BY, LIMIT or OFFSET, the union is planned as a
-/// subquery in FROM of a query that has them, so that ORDER BY names its
-/// columns as it would a table's.
-fn union<'a>(catalog: &'a Catalog, mut query: Select, choices: Choices) -> Result<Plan<'a>> {
+/// Plans the window functions of the select list (`exprs`, or for `SELECT
+/// *` the columns of `node`) and of ORDER BY above `node`: a window step for
+/// each window, which computes all of the functions over it, in the order
+/// they first appear. Returns the plan, and the select list and ORDER BY
+/// reading their results as columns, named by their SQL text.
+#[allow(clippy::type_complexity)]
+fn windows<'a>(
+    mut node: Node<'a>,
+    exprs: Option<Vec<Expr>>,
+    order_by: Vec<OrderBy>,
+) -> Result<(Node<'a>, Option<Vec<Expr>>, Vec<OrderBy>)> {
+    let mut calls: Vec<WindowCall> = Vec::new();
+    let mut read = |expr: &Expr| {
+        replace_windows(expr, &mut |window| {
+            let parts = window.args.iter().chain(&window.partition_by);
+            if parts
+                .chain(window.order_by.iter().map(|o| &o.expr))
+                .any(Expr::has_window)
+            {
+                return err("window functions cannot be nested");
+            }
+            if !calls.contains(window) {
+                calls.push(window.clone());
+            }
+            Ok(Expr::Column(ColumnRef::bare(window.to_string())))
+        })
+    };
+    let exprs = match exprs {
+        Some(exprs) => exprs.iter().map(&mut read).collect::<Result<Vec<_>>>()?,
+        // The columns as they are before the windows' are added to them.
+        None => node
+            .columns()
+            .into_iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let column = ColumnRef {
+                    table: f.table,
+                    name: f.name,
+                };
+                Expr::Slot(i, column)
+            })
+            .collect(),
+    };
+    let order_by = order_by
+        .iter()
+        .map(|o| {
+            Ok(OrderBy {
+                expr: read(&o.expr)?,
+                desc: o.desc,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut by_window: Vec<Vec<WindowCall>> = Vec::new();
+    for call in calls {
+        match by_window.iter_mut().find(|same| same[0].same_window(&call)) {
+            Some(same) => same.push(call),
+            None => by_window.push(vec![call]),
+        }
+    }
+    for functions in by_window {
+        node = Node::Window {
+            input: Box::new(node),
+            partition_by: functions[0].partition_by.clone(),
+            order_by: functions[0].order_by.clone(),
+            functions,
+        };
+    }
+    Ok((node, Some(exprs), order_by))
+}
+
+/// The expression with each window function in it replaced by `f`'s
+/// result, but those of its subqueries, which are theirs.
+fn replace_windows(
+    expr: &Expr,
+    f: &mut dyn FnMut(&WindowCall) -> Result<Expr>,
+) -> Result<Expr> {
+    expr.replace(&mut |e| match e {
+        Expr::Window(window) => Some(f(window)),
+        Expr::Subquery(_) | Expr::Exists(_) => Some(Ok(e.clone())),
+        Expr::InSubquery(left, query, negated) => Some(
+            replace_windows(left, f)
+                .map(|left| Expr::InSubquery(Box::new(left), query.clone(), *negated)),
+        ),
+        _ => None,
+    })
+}
+
+/// Plans queries combined by set operations, left to right: for `UNION
+/// [ALL]`, the rows of each in turn, a distinct step dropping repeats
+/// wherever `UNION` without ALL stands; for `INTERSECT` and `EXCEPT`, a step
+/// that keeps or drops the rows the query on its right has. With an ORDER
+/// BY, LIMIT or OFFSET, they are planned as a subquery in FROM of a query
+/// that has them, so that ORDER BY names its columns as it would a table's.
+fn set_operations<'a>(catalog: &'a Catalog, mut query: Select, choices: Choices) -> Result<Plan<'a>> {
     if !query.order_by.is_empty() || query.limit.is_some() || query.offset.is_some() {
         let (order_by, limit, offset) = (
             std::mem::take(&mut query.order_by),
             query.limit.take(),
             query.offset.take(),
         );
-        let table = TableRef {
-            source: TableSource::Subquery(Box::new(query)),
-            alias: Some("union".into()),
-        };
+        let table = TableRef::of(
+            TableSource::Subquery(Box::new(query)),
+            Some("union".into()),
+        );
         let projection = Projection::All;
         let (filter, group_by, having, compound) = (None, Vec::new(), None, Vec::new());
         let from = From {
@@ -995,14 +1393,29 @@ fn union<'a>(catalog: &'a Catalog, mut query: Select, choices: Choices) -> Resul
     let first = select(catalog, query, choices)?;
     let columns = first.columns;
     let mut node = first.root;
-    for (all, part) in parts {
-        let part = select(catalog, part, choices)?;
+    for part in parts {
+        let (op, all) = (part.op, part.all);
+        let part = select(catalog, part.query, choices)?;
         if part.columns.len() != columns.len() {
+            let op = match op {
+                SetOp::Union => "a UNION",
+                SetOp::Intersect => "an INTERSECT",
+                SetOp::Except => "an EXCEPT",
+            };
             return err(format!(
-                "each query of a UNION must return as many columns: {} and {}",
+                "each query of {op} must return as many columns: {} and {}",
                 columns.len(),
                 part.columns.len()
             ));
+        }
+        if op != SetOp::Union {
+            node = Node::SetOp {
+                left: Box::new(node),
+                right: Box::new(part.root),
+                op,
+                all,
+            };
+            continue;
         }
         node = match node {
             Node::Union { mut inputs } => {
@@ -1050,18 +1463,24 @@ fn joins<'a>(
     if n == 1 {
         pushed[0].extend(filter); // kept whole, as written
     } else {
-        let mut pool = Vec::new();
-        filter.iter().for_each(|f| conjuncts(f, &mut pool));
+        // The conditions of WHERE and of the ONs of inner joins, each with
+        // the last join it must be checked by: an ON's own, or for WHERE,
+        // the last one.
+        let mut pool: Vec<(Expr, usize)> = Vec::new();
+        let mut parts = Vec::new();
+        filter.iter().for_each(|f| conjuncts(f, &mut parts));
+        pool.extend(parts.drain(..).map(|part| (part, n - 1)));
         for (i, on) in ons.iter().enumerate() {
-            match (kinds[i + 1], on) {
-                (JoinKind::Inner, Some(on)) => conjuncts(on, &mut pool),
-                (JoinKind::Left, Some(on)) => {
-                    let mut parts = Vec::new();
-                    conjuncts(on, &mut parts);
-                    for part in parts {
+            let Some(on) = on else { continue };
+            conjuncts(on, &mut parts);
+            match kinds[i + 1] {
+                JoinKind::Inner => pool.extend(parts.drain(..).map(|part| (part, i + 1))),
+                JoinKind::Left => {
+                    for part in parts.drain(..) {
                         let tables = binder.tables(&part);
                         let right_only = tables.len() == 1 && tables.contains(&(i + 1));
-                        if right_only {
+                        // A subquery runs in the join, which can run it, and not in an index lookup.
+                        if right_only && !part.has_subquery() {
                             &mut pushed[i + 1]
                         } else {
                             &mut conditions[i + 1]
@@ -1069,25 +1488,39 @@ fn joins<'a>(
                         .push(part);
                     }
                 }
-                (_, None) => {}
+                // Each side may be kept where the other matches nothing, so
+                // nothing is pushed down to either.
+                JoinKind::Right | JoinKind::Full => conditions[i + 1].append(&mut parts),
             }
         }
-        for part in pool {
+        for (part, by) in pool {
             let tables = binder.tables(&part);
+            let last = tables.last().copied();
+            // A RIGHT or FULL JOIN after the tables the condition reads, up
+            // to the last join it must be checked by, may pad them with
+            // NULLs: it is checked after that join, on the padded rows too.
+            if let Some(join) = (1..=by)
+                .rev()
+                .find(|&j| kinds[j].keeps_right() && last.is_none_or(|last| j > last))
+            {
+                after[join].push(part);
+                continue;
+            }
             if part.has_subquery() {
-                match tables.last() {
-                    Some(&last) if last > 0 => after[last].push(part),
+                match last {
+                    Some(last) if last > 0 => after[last].push(part),
                     _ => pushed[0].push(part), // a filter step above the first table's scan
                 }
                 continue;
             }
-            match tables.last() {
+            match last {
                 None => pushed[0].push(part), // constant: filters all rows or none
-                Some(&last) if tables.len() == 1 && kinds[last] == JoinKind::Inner => {
+                // The right table of an inner join or a RIGHT JOIN keeps its rows.
+                Some(last) if tables.len() == 1 && !kinds[last].keeps_left() => {
                     pushed[last].push(part)
                 }
-                Some(&last) if kinds[last] == JoinKind::Inner => conditions[last].push(part),
-                Some(&last) => after[last].push(part),
+                Some(last) if kinds[last] == JoinKind::Inner => conditions[last].push(part),
+                Some(last) => after[last].push(part),
             }
         }
     }
@@ -1104,6 +1537,11 @@ fn joins<'a>(
     };
     if !order_by.is_empty() {
         for i in (1..n).rev().take(tried) {
+            // A RIGHT or FULL JOIN's right rows that match nothing come
+            // last, and a LATERAL subquery is no merge join.
+            if kinds[i].keeps_right() || sources[i].is_lateral() {
+                break;
+            }
             let keys = equalities(&conditions[i], i, binder);
             if keys.is_empty() {
                 break;
@@ -1123,7 +1561,35 @@ fn joins<'a>(
         let source = &mut sources[i];
         let right_filter = and(std::mem::take(&mut pushed[i]));
         let mut residual = std::mem::take(&mut conditions[i]);
+        if let SourceKind::Lateral(query) = &source.kind {
+            if let Some(force @ (ForceJoin::Hash | ForceJoin::Index | ForceJoin::Merge)) = force {
+                return cannot(
+                    force,
+                    &source.qualifier,
+                    "a LATERAL subquery runs for each left row, as a nested loop",
+                );
+            }
+            // Its conditions on itself alone are checked on each pair too.
+            residual.extend(right_filter);
+            node = Node::Lateral {
+                left: Box::new(node),
+                query: query.clone(),
+                qualifier: source.qualifier.clone(),
+                names: source.names.clone(),
+                kind: kinds[i],
+                condition: and(residual),
+            };
+            if let Some(predicate) = and(std::mem::take(&mut after[i])) {
+                node = Node::Filter {
+                    input: Box::new(node),
+                    predicate,
+                };
+            }
+            continue;
+        }
         let keys = equalities(&residual, i, binder);
+        // A join whose condition runs subqueries runs in one thread, which can run them.
+        let one_thread = residual.iter().any(Expr::has_subquery);
 
         let index = keys.iter().find_map(|(at, left, right)| {
             let (Expr::Column(column), SourceKind::Table(table)) = (right, &source.kind) else {
@@ -1138,8 +1604,18 @@ fn joins<'a>(
                 lookup_key(table, column)?,
             ))
         });
+        // The right rows a RIGHT or FULL JOIN keeps are found by reading the
+        // right side once more (see `executor/operator.rs`), not by lookups.
+        let index = index.filter(|_| !kinds[i].keeps_right());
         let index = match force {
             None => index.filter(|(.., table, key)| lookups_win(estimate(&node), table, *key)),
+            Some(ForceJoin::Index) if kinds[i].keeps_right() => {
+                return cannot(
+                    ForceJoin::Index,
+                    &source.qualifier,
+                    "a RIGHT or FULL JOIN reads all of its right side, to keep the rows that match nothing",
+                );
+            }
             Some(ForceJoin::Index) if index.is_none() => {
                 return cannot(
                     ForceJoin::Index,
@@ -1231,7 +1707,7 @@ fn joins<'a>(
                                 left_keys,
                                 right_keys,
                                 keep_order,
-                                workers: match keep_order {
+                                workers: match keep_order || one_thread {
                                     true => 1,
                                     false => choices.join_workers.max(1),
                                 },
@@ -1279,7 +1755,7 @@ fn join_order(
     choices: Choices,
 ) -> Option<Vec<usize>> {
     let n = sources.len();
-    let prefix = (1..n).find(|&i| kinds[i] == JoinKind::Left).unwrap_or(n);
+    let prefix = reorderable(sources, kinds);
     if choices.force_join.is_some() || prefix < 2 || prefix > 63 {
         return None;
     }
@@ -1425,6 +1901,16 @@ fn join_order(
     Some(best.into_iter().chain(prefix..n).collect())
 }
 
+/// How many of the tables of FROM, from the first, may be joined in any
+/// order: those up to the first outer join or LATERAL subquery. An outer
+/// join keeps rows of one side that an inner join would drop, and a LATERAL
+/// subquery reads the tables before it.
+fn reorderable(sources: &[Source], kinds: &[JoinKind]) -> usize {
+    (1..sources.len())
+        .find(|&i| kinds[i] != JoinKind::Inner || sources[i].is_lateral())
+        .unwrap_or(sources.len())
+}
+
 /// The items in `order`, which gives their positions.
 fn permute<T>(items: Vec<T>, order: &[usize]) -> Vec<T> {
     let mut items: Vec<Option<T>> = items.into_iter().map(Some).collect();
@@ -1452,6 +1938,10 @@ fn equalities(parts: &[Expr], i: usize, binder: &Binder) -> Vec<(usize, Expr, Ex
             let Expr::Binary(a, BinaryOp::Eq, b) = part else {
                 return None;
             };
+            // A key is evaluated where no subquery can run.
+            if part.has_subquery() {
+                return None;
+            }
             let side = |e: &Expr| {
                 let tables = binder.tables(e);
                 match tables.last() {
@@ -1617,12 +2107,28 @@ pub fn estimate(node: &Node) -> f64 {
         } => {
             let (l, r) = (estimate(left), estimate(right));
             let rows = join_estimate(left, right, method, condition.as_ref(), l, r);
-            if *kind == JoinKind::Left {
-                rows.max(l)
-            } else {
-                rows
+            match kind {
+                JoinKind::Inner => rows,
+                JoinKind::Left => rows.max(l),
+                JoinKind::Right => rows.max(r),
+                JoinKind::Full => rows.max(l).max(r),
             }
         }
+        Node::Values { rows, .. } => rows.len() as f64,
+        // Nothing tells how many rows a round adds, nor how many rounds there are.
+        Node::WorkTable { .. } => RECURSIVE_ROUND_ROWS,
+        Node::Recursive { anchor, step, .. } => {
+            estimate(anchor) + estimate(step) * RECURSIVE_ROUNDS
+        }
+        Node::SetOp {
+            left, right, op, ..
+        } => match op {
+            SetOp::Intersect => estimate(left).min(estimate(right)),
+            _ => estimate(left),
+        },
+        Node::Window { input, .. } => estimate(input),
+        // As if each left row found one row, as a join without statistics guesses.
+        Node::Lateral { left, .. } => estimate(left),
         Node::Aggregate {
             input, group_by, ..
         } => match group_by.is_empty() {
@@ -1648,8 +2154,13 @@ pub fn estimate(node: &Node) -> f64 {
     }
 }
 
+/// What the planner guesses of a recursive query, which it cannot know: the
+/// rows a round reads, and how many rounds run.
+const RECURSIVE_ROUND_ROWS: f64 = 10.0;
+const RECURSIVE_ROUNDS: f64 = 10.0;
+
 /// How many rows a join of `l` left rows and `r` right ones returns, before
-/// a LEFT JOIN adds the left rows that match none.
+/// an outer join adds the rows that match none.
 fn join_estimate(
     left: &Node,
     right: &Node,
@@ -1845,7 +2356,9 @@ impl<'c> Binder<'c> {
                 Expr::InSubquery(bind(left)?, Box::new(self.subquery(query, true)?), *negated)
             }
             Expr::Outer(_) => expr.clone(),
-            Expr::Case { .. } | Expr::Function(..) => expr.try_map_parts(&mut |e| self.bind(e))?,
+            Expr::Case { .. } | Expr::Function(..) | Expr::Window(_) => {
+                expr.try_map_parts(&mut |e| self.bind(e))?
+            }
         })
     }
 
@@ -1871,23 +2384,29 @@ impl<'c> Binder<'c> {
     /// this query's do.
     /// A subquery in its FROM sees only the queries around this one, not the
     /// other tables of that FROM.
+    ///
+    /// A LATERAL subquery in it sees the tables before it in that FROM too.
     fn correlate(&self, query: &Select, scopes: &mut Vec<Vec<Field>>) -> Result<Select> {
         let mut query = query.clone();
-        let mut own = Vec::new();
+        let mut own: Vec<Field> = Vec::new();
         for table in query.from.tables_mut() {
-            let names = match &mut table.source {
-                TableSource::Table(name) => self
-                    .catalog
-                    .get(name)?
-                    .columns
-                    .iter()
-                    .map(|c| c.name.clone())
-                    .collect(),
-                TableSource::Subquery(sub) => {
-                    **sub = self.correlate(sub, scopes)?;
-                    output_names(self.catalog, sub)?
+            match &mut table.source {
+                TableSource::Subquery(sub) if table.lateral => {
+                    scopes.push(own.clone());
+                    let correlated = self.correlate(sub, scopes);
+                    scopes.pop();
+                    **sub = correlated?;
                 }
-            };
+                TableSource::Subquery(sub) => **sub = self.correlate(sub, scopes)?,
+                TableSource::Recursive(cte) => {
+                    let names = recursive_names(self.catalog, cte)?;
+                    cte.anchor = self.correlate(&cte.anchor, scopes)?;
+                    let step = with_work_table(&cte.step, &names, None);
+                    cte.step = self.correlate(&step, scopes)?;
+                }
+                TableSource::Table(_) | TableSource::Dual | TableSource::WorkTable { .. } => {}
+            }
+            let names = table_names(self.catalog, table)?;
             own.extend(names.into_iter().map(|name| Field {
                 table: Some(table.qualifier().into()),
                 name,
@@ -2034,13 +2553,30 @@ impl Node<'_> {
             }
             Node::Derived {
                 qualifier, names, ..
-            } => names
-                .iter()
-                .map(|name| Field {
-                    table: Some(qualifier.clone()),
-                    name: name.clone(),
-                })
+            }
+            | Node::WorkTable {
+                qualifier, names, ..
+            } => qualified(qualifier, names),
+            Node::Values { fields, .. } => fields.clone(),
+            // Named by the anchor's columns, as a union is by its first query's.
+            Node::Recursive { anchor: first, .. } | Node::SetOp { left: first, .. } => first
+                .columns()
+                .into_iter()
+                .map(|f| Field::named(f.name))
                 .collect(),
+            Node::Window {
+                input, functions, ..
+            } => input
+                .columns()
+                .into_iter()
+                .chain(functions.iter().map(|w| Field::named(w.to_string())))
+                .collect(),
+            Node::Lateral {
+                left,
+                qualifier,
+                names,
+                ..
+            } => [left.columns(), qualified(qualifier, names)].concat(),
         }
     }
 
@@ -2070,8 +2606,12 @@ impl Node<'_> {
     /// The steps this one reads from, in the order EXPLAIN lists them.
     pub fn inputs(&self) -> Vec<&Self> {
         match self {
-            Node::Scan { .. } | Node::Lookup { .. } => vec![],
-            Node::Join { left, right, .. } => vec![left, right],
+            Node::Scan { .. } | Node::Lookup { .. } | Node::Values { .. } | Node::WorkTable { .. } => {
+                vec![]
+            }
+            Node::Join { left, right, .. } | Node::SetOp { left, right, .. } => vec![left, right],
+            Node::Recursive { anchor, step, .. } => vec![anchor, step],
+            Node::Window { input, .. } | Node::Lateral { left: input, .. } => vec![input],
             Node::Union { inputs } => inputs.iter().collect(),
             Node::Filter { input, .. }
             | Node::Aggregate { input, .. }
@@ -2129,7 +2669,7 @@ impl Node<'_> {
                 condition,
                 ..
             } => {
-                let kind = if *kind == JoinKind::Left { "LEFT " } else { "" };
+                let kind = kind.keyword();
                 let (name, mut on) = match method {
                     JoinMethod::Block => ("BLOCK NESTED LOOP", Vec::new()),
                     JoinMethod::Naive => ("NAIVE NESTED LOOP", Vec::new()),
@@ -2223,12 +2763,51 @@ impl Node<'_> {
             }
             Node::Derived { qualifier, .. } => format!("SUBQUERY {qualifier}"),
             Node::Gather { workers, .. } => format!("GATHER ({workers} WORKERS)"),
+            Node::Values { rows, .. } => match rows.len() {
+                1 => "VALUES (1 ROW)".into(),
+                n => format!("VALUES ({n} ROWS)"),
+            },
+            Node::WorkTable { qualifier, .. } => format!("WORK TABLE {qualifier}"),
+            Node::Recursive { all, .. } => {
+                format!("RECURSIVE UNION{}", if *all { " ALL" } else { "" })
+            }
+            Node::SetOp { op, all, .. } => {
+                format!("{}{}", op.name(), if *all { " ALL" } else { "" })
+            }
+            Node::Window { functions, .. } => {
+                format!("WINDOW {}", list(&mut functions.iter().map(|w| w.to_string())))
+            }
+            Node::Lateral {
+                qualifier,
+                kind,
+                condition,
+                ..
+            } => {
+                let on = condition
+                    .as_ref()
+                    .map_or(String::new(), |c| format!(" ON {c}"));
+                format!(
+                    "{}LATERAL JOIN {qualifier}{on} (PLANNED FOR EACH LEFT ROW)",
+                    kind.keyword()
+                )
+            }
         };
         lines.push(format!("{}{line}", "  ".repeat(depth)));
         for input in self.inputs() {
             input.explain_into(depth + 1, lines);
         }
     }
+}
+
+/// The fields of columns named `names`, qualified by `qualifier`.
+fn qualified(qualifier: &str, names: &[String]) -> Vec<Field> {
+    names
+        .iter()
+        .map(|name| Field {
+            table: Some(qualifier.into()),
+            name: name.clone(),
+        })
+        .collect()
 }
 
 /// A sort key as EXPLAIN shows it: `u.city`, or `u.city DESC`.
@@ -2277,6 +2856,7 @@ fn output_name(expr: &Expr) -> String {
         Expr::Column(column) | Expr::Slot(_, column) => column.name.clone(),
         Expr::Aggregate(function, ..) => function.name().into(),
         Expr::Function(function, _) => function.name().into(),
+        Expr::Window(window) => window.function.name().into(),
         Expr::Case { .. } => "case".into(),
         _ => "?column?".into(),
     }
@@ -2318,12 +2898,16 @@ fn rewrite(expr: &Expr, group_by: &[Expr], aggregates: &mut Vec<AggregateCall>) 
             *negated,
         ),
         Expr::Outer(_) => unreachable!("outer references are inside subqueries"),
-        Expr::Case { .. } | Expr::Function(..) => {
+        // A window function is computed on the groups, from what they hold.
+        Expr::Case { .. } | Expr::Function(..) | Expr::Window(_) => {
             expr.try_map_parts(&mut |e| rewrite(e).map(|e| *e))?
         }
         Expr::Aggregate(function, arg, distinct) => {
             if arg.as_deref().is_some_and(contains_aggregate) {
                 return err("aggregate functions cannot be nested");
+            }
+            if arg.as_deref().is_some_and(Expr::has_window) {
+                return err("aggregate functions cannot use window functions");
             }
             let call = (*function, arg.as_deref().cloned(), *distinct);
             if !aggregates.contains(&call) {
@@ -2355,10 +2939,11 @@ fn regroup(query: &Select, group_by: &[Expr]) -> Result<Select> {
     })
 }
 
-/// Fails if one of the expressions has a subquery in it.
-fn forbid_subqueries<'a>(exprs: impl IntoIterator<Item = &'a Expr>, clause: &str) -> Result<()> {
-    match exprs.into_iter().any(Expr::has_subquery) {
-        true => err(format!("subqueries are not allowed in {clause}")),
+/// Fails if one of the expressions uses a window function: windows are
+/// computed only after rows are joined, filtered and grouped.
+fn forbid_windows<'a>(exprs: impl IntoIterator<Item = &'a Expr>, clause: &str) -> Result<()> {
+    match exprs.into_iter().any(Expr::has_window) {
+        true => err(format!("window functions are not allowed in {clause}")),
         false => Ok(()),
     }
 }
@@ -2389,6 +2974,9 @@ fn contains_aggregate(expr: &Expr) -> bool {
         Expr::InSubquery(left, ..) => contains_aggregate(left),
         Expr::Unary(_, inner) | Expr::IsNull(inner, _) => contains_aggregate(inner),
         Expr::Binary(left, _, right) => contains_aggregate(left) || contains_aggregate(right),
-        Expr::Case { .. } | Expr::Function(..) => expr.parts().into_iter().any(contains_aggregate),
+        // A window's own aggregate is computed over its window, not a group.
+        Expr::Case { .. } | Expr::Function(..) | Expr::Window(_) => {
+            expr.parts().into_iter().any(contains_aggregate)
+        }
     }
 }

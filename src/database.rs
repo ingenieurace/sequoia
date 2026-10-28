@@ -291,7 +291,7 @@ impl Database {
         let mut statements = parse(sql)?;
         match (statements.pop(), statements.is_empty()) {
             (Some(Statement::Select(query)), true) => {
-                executor::select(&self.core.catalog, query, &self.session.settings)
+                executor::select(&self.core.catalog, *query, &self.session.settings)
             }
             _ => err("query runs a single SELECT; use execute for other statements"),
         }

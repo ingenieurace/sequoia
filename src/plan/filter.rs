@@ -48,7 +48,7 @@ pub fn visit_columns(expr: &Expr, f: &mut impl FnMut(&ColumnRef)) {
             visit_columns(left, f);
             visit_outer(query, f);
         }
-        Expr::Case { .. } | Expr::Function(..) => {
+        Expr::Case { .. } | Expr::Function(..) | Expr::Window(_) => {
             expr.parts().into_iter().for_each(|e| visit_columns(e, f))
         }
     }
@@ -219,9 +219,11 @@ pub(crate) fn constant(expr: &Expr) -> Option<Value> {
             Expr::Column(_) | Expr::Outer(_) | Expr::Slot(..) => true,
             Expr::Unary(_, inner) | Expr::IsNull(inner, _) => reads_columns(inner),
             Expr::InList(left, items, _) => reads_columns(left) || items.iter().any(reads_columns),
-            Expr::Aggregate(..) | Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(..) => {
-                true
-            }
+            Expr::Aggregate(..)
+            | Expr::Window(_)
+            | Expr::Subquery(_)
+            | Expr::Exists(_)
+            | Expr::InSubquery(..) => true,
             Expr::Binary(left, _, right) => reads_columns(left) || reads_columns(right),
             Expr::Case { .. } | Expr::Function(..) => expr.parts().into_iter().any(reads_columns),
         }

@@ -1,14 +1,26 @@
 //! Recursive-descent SQL parser.
 //!
-//! A name followed by `(` is an aggregate function call, and `(SELECT` starts
-//! a subquery.
+//! A name followed by `(` is an aggregate function call, and `(SELECT` (or
+//! `(WITH`) starts a subquery.
 //!
 //! Expression precedence, lowest first:
 //! OR, AND, NOT, comparison / IS NULL / IN, + -, * /, unary -, primary.
+//! Of the set operations, INTERSECT binds tighter than UNION and EXCEPT,
+//! which go left to right.
+//!
+//! **Common table expressions.** `WITH name AS (query)` names a query for
+//! the statement after it, and the parser puts the query in wherever FROM
+//! names it, as a derived table: a common table expression means no more
+//! than that, so nothing after the parser sees one. Names are found in the
+//! innermost WITH that has them first, then in the database. `WITH
+//! RECURSIVE` lets an expression's query name the expression itself; if it
+//! does, the expression becomes a [`RecursiveCte`] wherever it is named,
+//! and its own name inside it a [`TableSource::WorkTable`].
 
 use super::ast::{
-    Aggregate, BinaryOp, ColumnRef, CreateIndex, Expr, From, Function, IndexKind, Join, JoinKind,
-    OrderBy, Projection, Select, SelectItem, Statement, TableRef, TableSource, UnaryOp,
+    Aggregate, BinaryOp, ColumnRef, Compound, CreateIndex, Expr, Frame, FrameBound, FrameUnits,
+    From, Function, IndexKind, InsertSource, Join, JoinKind, OrderBy, Projection, RecursiveCte,
+    Select, SelectItem, SetOp, Statement, TableRef, TableSource, UnaryOp, Window, WindowFunction,
 };
 use super::lexer::{Token, tokenize};
 use crate::datetime;
@@ -21,6 +33,7 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
     let mut parser = Parser {
         tokens: tokenize(sql)?,
         pos: 0,
+        ctes: Vec::new(),
     };
     let mut statements = Vec::new();
     loop {
@@ -38,6 +51,27 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// The common table expressions of the WITHs around the query being
+    /// parsed, innermost last.
+    ctes: Vec<Cte>,
+}
+
+/// A common table expression, and what its name stands for.
+struct Cte {
+    name: String,
+    kind: CteKind,
+}
+
+enum CteKind {
+    /// A query, read as a derived table, its columns renamed by `columns`.
+    Derived {
+        query: Box<Select>,
+        columns: Vec<String>,
+    },
+    Recursive(Box<RecursiveCte>),
+    /// A recursive expression's own name, in its query being parsed:
+    /// `refs` counts how often it is named there.
+    Work { columns: Vec<String>, refs: usize },
 }
 
 impl Parser {
@@ -76,7 +110,7 @@ impl Parser {
                 })
             }
             "INSERT" => self.insert(),
-            "SELECT" => Ok(Statement::Select(self.select()?)),
+            "SELECT" | "WITH" => Ok(Statement::Select(Box::new(self.select()?))),
             "UPDATE" => self.update(),
             "DELETE" => self.delete(),
             _ => Err(self.unexpected("a statement")),
@@ -292,18 +326,22 @@ impl Parser {
         } else {
             None
         };
-        self.expect_keyword("VALUES")?;
-        let rows = self.comma_list(|p| {
-            p.expect_symbol("(")?;
-            let values = p.comma_list(Self::expr)?;
-            p.expect_symbol(")")?;
-            Ok(values)
-        })?;
+        let source = if self.query_follows() {
+            InsertSource::Select(Box::new(self.select()?))
+        } else {
+            self.expect_keyword("VALUES")?;
+            InsertSource::Values(self.comma_list(|p| {
+                p.expect_symbol("(")?;
+                let values = p.comma_list(Self::expr)?;
+                p.expect_symbol(")")?;
+                Ok(values)
+            })?)
+        };
         let returning = self.returning()?;
         Ok(Statement::Insert {
             table,
             columns,
-            rows,
+            source,
             returning,
         })
     }
@@ -335,24 +373,45 @@ impl Parser {
         })?))
     }
 
-    /// A query: one SELECT, or several joined by `UNION [ALL]`, then the
-    /// ORDER BY, LIMIT and OFFSET of all of them.
+    /// A query: `[WITH ...]` one SELECT, or several combined by set
+    /// operations, then the ORDER BY, LIMIT and OFFSET of all of them.
     fn select(&mut self) -> Result<Select> {
-        let mut query = self.select_core()?;
-        while self.eat_keyword("UNION") {
+        let scope = self.ctes.len();
+        let query = match self.eat_keyword("WITH") {
+            true => self.with().and_then(|()| self.set_operations()),
+            false => self.set_operations(),
+        };
+        self.ctes.truncate(scope);
+        query
+    }
+
+    /// Whether a query starts here: `SELECT` or `WITH`.
+    fn query_follows(&self) -> bool {
+        matches!(self.peek(), Some(Token::Keyword(k)) if k == "SELECT" || k == "WITH")
+    }
+
+    /// `intersection [{UNION | EXCEPT} [ALL] intersection]... [ORDER BY ...] [LIMIT n] [OFFSET m]`
+    fn set_operations(&mut self) -> Result<Select> {
+        let mut query = self.intersection()?;
+        loop {
+            let op = if self.eat_keyword("UNION") {
+                SetOp::Union
+            } else if self.eat_keyword("EXCEPT") {
+                SetOp::Except
+            } else {
+                break;
+            };
             let all = self.eat_keyword("ALL");
-            query.compound.push((all, self.select_core()?));
+            let part = self.intersection()?;
+            query.compound.push(Compound {
+                op,
+                all,
+                query: part,
+            });
         }
         if self.eat_keyword("ORDER") {
             self.expect_keyword("BY")?;
-            query.order_by = self.comma_list(|p| {
-                let expr = p.expr()?;
-                let desc = p.eat_keyword("DESC");
-                if !desc {
-                    p.eat_keyword("ASC");
-                }
-                Ok(OrderBy { expr, desc })
-            })?;
+            query.order_by = self.order_list()?;
         }
         if self.eat_keyword("LIMIT") {
             query.limit = Some(self.number()? as usize);
@@ -363,13 +422,112 @@ impl Parser {
         Ok(query)
     }
 
-    /// `SELECT ... [HAVING ...]`: a query up to its ORDER BY.
+    /// `select_core [INTERSECT [ALL] select_core]...`
+    fn intersection(&mut self) -> Result<Select> {
+        let mut query = self.select_core()?;
+        while self.eat_keyword("INTERSECT") {
+            let all = self.eat_keyword("ALL");
+            let part = self.select_core()?;
+            query.compound.push(Compound {
+                op: SetOp::Intersect,
+                all,
+                query: part,
+            });
+        }
+        Ok(query)
+    }
+
+    /// `expr [ASC | DESC], ...`
+    fn order_list(&mut self) -> Result<Vec<OrderBy>> {
+        self.comma_list(|p| {
+            let expr = p.expr()?;
+            let desc = p.eat_keyword("DESC");
+            if !desc {
+                p.eat_keyword("ASC");
+            }
+            Ok(OrderBy { expr, desc })
+        })
+    }
+
+    /// The rest of `WITH [RECURSIVE] name [(column, ...)] AS (query), ...`
+    /// after WITH: each expression is in scope for those after it, and for
+    /// the query after them all, until [`Parser::select`] ends the scope.
+    fn with(&mut self) -> Result<()> {
+        // Not a keyword, so that it stays free as a name.
+        let recursive = self.eat_word("RECURSIVE");
+        let scope = self.ctes.len();
+        loop {
+            let name = self.ident()?;
+            let columns = self.column_list()?;
+            self.expect_keyword("AS")?;
+            self.expect_symbol("(")?;
+            let kind = if recursive {
+                self.ctes.push(Cte {
+                    name: name.clone(),
+                    kind: CteKind::Work {
+                        columns: columns.clone(),
+                        refs: 0,
+                    },
+                });
+                let body = self.select();
+                let Some(Cte {
+                    kind: CteKind::Work { refs, .. },
+                    ..
+                }) = self.ctes.pop()
+                else {
+                    unreachable!("pushed above, below the scope of the query")
+                };
+                match refs {
+                    0 => CteKind::Derived {
+                        query: Box::new(body?),
+                        columns,
+                    },
+                    _ => CteKind::Recursive(Box::new(recursive_cte(&name, columns, body?)?)),
+                }
+            } else {
+                CteKind::Derived {
+                    query: Box::new(self.select()?),
+                    columns,
+                }
+            };
+            self.expect_symbol(")")?;
+            if self.ctes[scope..].iter().any(|cte| cte.name == name) {
+                return Err(Error(format!(
+                    "WITH query name {name} is given more than once"
+                )));
+            }
+            self.ctes.push(Cte { name, kind });
+            if !self.eat_symbol(",") {
+                return Ok(());
+            }
+        }
+    }
+
+    /// `[(name, ...)]`: the names a common table expression or a derived
+    /// table gives its columns, if any.
+    fn column_list(&mut self) -> Result<Vec<String>> {
+        if !self.eat_symbol("(") {
+            return Ok(Vec::new());
+        }
+        let names = self.comma_list(Self::ident)?;
+        self.expect_symbol(")")?;
+        Ok(names)
+    }
+
+    /// `SELECT ... [FROM ...] [WHERE ...] [GROUP BY ...] [HAVING ...]`: a
+    /// query up to its set operations and ORDER BY. Without FROM, it reads
+    /// a single row of no columns.
     fn select_core(&mut self) -> Result<Select> {
         self.expect_keyword("SELECT")?;
         let distinct = self.eat_keyword("DISTINCT");
         let projection = self.projection()?;
-        self.expect_keyword("FROM")?;
-        let from = self.from()?;
+        let from = match self.eat_keyword("FROM") {
+            true => self.from()?,
+            false => From {
+                table: TableRef::of(TableSource::Dual, None),
+                joins: Vec::new(),
+            },
+        };
         let filter = self.where_clause()?;
 
         let mut group_by = Vec::new();
@@ -396,7 +554,7 @@ impl Parser {
         })
     }
 
-    /// `table [, table | [INNER | LEFT [OUTER] | CROSS] JOIN table [ON expr]]...`
+    /// `table [, table | [INNER | {LEFT | RIGHT | FULL} [OUTER] | CROSS] JOIN table [ON expr]]...`
     fn from(&mut self) -> Result<From> {
         let table = self.table_ref()?;
         let mut joins = Vec::new();
@@ -420,6 +578,14 @@ impl Parser {
                 self.eat_keyword("OUTER");
                 self.expect_keyword("JOIN")?;
                 JoinKind::Left
+            } else if self.eat_keyword("RIGHT") {
+                self.eat_keyword("OUTER");
+                self.expect_keyword("JOIN")?;
+                JoinKind::Right
+            } else if self.eat_keyword("FULL") {
+                self.eat_keyword("OUTER");
+                self.expect_keyword("JOIN")?;
+                JoinKind::Full
             } else if self.eat_keyword("INNER") {
                 self.expect_keyword("JOIN")?;
                 JoinKind::Inner
@@ -438,24 +604,73 @@ impl Parser {
         }
     }
 
-    /// `name [[AS] alias]`, or `(SELECT ...) [AS] alias`
+    /// `name [[AS] alias [(column, ...)]]`, or `[LATERAL] (SELECT ...) [AS]
+    /// alias [(column, ...)]`. A name of a common table expression in scope
+    /// reads it, under that name if not an alias.
     fn table_ref(&mut self) -> Result<TableRef> {
-        let source = match self.eat_symbol("(") {
+        // Not a keyword, so that it stays free as a name: a table's is never followed by `(`.
+        let lateral = matches!(self.peek(), Some(Token::Ident(word)) if word.eq_ignore_ascii_case("LATERAL"))
+            && self.tokens.get(self.pos + 1) == Some(&Token::Symbol("("));
+        self.pos += lateral as usize;
+        let (source, mut columns, cte) = match self.eat_symbol("(") {
             true => {
                 let query = self.select()?;
                 self.expect_symbol(")")?;
-                TableSource::Subquery(Box::new(query))
+                (TableSource::Subquery(Box::new(query)), Vec::new(), None)
             }
-            false => TableSource::Table(self.ident()?),
+            false => {
+                let name = self.ident()?;
+                match self.cte(&name) {
+                    Some((source, columns)) => (source, columns, Some(name)),
+                    None => (TableSource::Table(name), Vec::new(), None),
+                }
+            }
         };
+        // RETURNING may end the query of an INSERT: it is no alias without AS.
+        let returning = matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("RETURNING"));
         let alias = match (self.eat_keyword("AS"), self.peek()) {
-            (true, _) | (false, Some(Token::Ident(_))) => Some(self.ident()?),
-            _ if matches!(source, TableSource::Subquery(_)) => {
+            (true, _) => Some(self.ident()?),
+            (false, Some(Token::Ident(_))) if !returning => Some(self.ident()?),
+            _ if matches!(source, TableSource::Subquery(_)) && cte.is_none() => {
                 return Err(Error("a subquery in FROM must have an alias".into()));
             }
             _ => None,
         };
-        Ok(TableRef { source, alias })
+        if alias.is_some() {
+            // The reference's names for the columns, then the expression's for the rest.
+            let renamed = self.column_list()?;
+            let rest = columns.split_off(renamed.len().min(columns.len()));
+            columns = renamed.into_iter().chain(rest).collect();
+        }
+        // A common table expression's derived table goes by its name.
+        let alias = alias.or(cte.filter(|_| matches!(source, TableSource::Subquery(_))));
+        Ok(TableRef {
+            source,
+            alias,
+            columns,
+            lateral,
+        })
+    }
+
+    /// What a name in FROM reads if it is a common table expression's in
+    /// scope, and the names it gives its columns.
+    fn cte(&mut self, name: &str) -> Option<(TableSource, Vec<String>)> {
+        let cte = self.ctes.iter_mut().rev().find(|cte| cte.name == name)?;
+        Some(match &mut cte.kind {
+            CteKind::Derived { query, columns } => {
+                (TableSource::Subquery(query.clone()), columns.clone())
+            }
+            CteKind::Recursive(cte) => (TableSource::Recursive(cte.clone()), Vec::new()),
+            CteKind::Work { columns, refs } => {
+                *refs += 1;
+                let source = TableSource::WorkTable {
+                    name: name.into(),
+                    columns: columns.clone(),
+                    cell: None,
+                };
+                (source, Vec::new())
+            }
+        })
     }
 
     fn update(&mut self) -> Result<Statement> {
@@ -561,7 +776,7 @@ impl Parser {
         }
         if self.eat_keyword("IN") {
             self.expect_symbol("(")?;
-            let expr = if self.peek() == Some(&Token::Keyword("SELECT".into())) {
+            let expr = if self.query_follows() {
                 Expr::InSubquery(Box::new(left), Box::new(self.select()?), negated)
             } else {
                 Expr::InList(Box::new(left), self.comma_list(Self::expr)?, negated)
@@ -635,7 +850,7 @@ impl Parser {
             return Ok(Expr::Exists(Box::new(query)));
         }
         if self.eat_symbol("(") {
-            if self.peek() == Some(&Token::Keyword("SELECT".into())) {
+            if self.query_follows() {
                 let query = self.select()?;
                 self.expect_symbol(")")?;
                 return Ok(Expr::Subquery(Box::new(query)));
@@ -747,6 +962,22 @@ impl Parser {
             }
             _ => {}
         }
+        let window_only = Aggregate::from_name(name).is_none()
+            && Function::from_name(name).is_none()
+            && WindowFunction::from_name(name).is_some();
+        if window_only {
+            let function = WindowFunction::from_name(name).expect("checked above");
+            let args = match self.peek() == Some(&Token::Symbol(")")) {
+                true => Vec::new(),
+                false => self.comma_list(Self::expr)?,
+            };
+            self.expect_symbol(")")?;
+            if !self.over_follows() {
+                let name = function.name().to_uppercase();
+                return Err(Error(format!("{name} needs an OVER clause")));
+            }
+            return self.window(function, args);
+        }
         let Some(function) = Aggregate::from_name(name) else {
             let Some(function) = Function::from_name(name) else {
                 return Err(Error(format!("unknown function: {name}")));
@@ -756,6 +987,10 @@ impl Parser {
                 false => self.comma_list(Self::expr)?,
             };
             self.expect_symbol(")")?;
+            if self.over_follows() {
+                let name = function.name().to_uppercase();
+                return Err(Error(format!("{name} is not a window function")));
+            }
             let (fewest, most) = function.arity();
             if args.len() < fewest || args.len() > most {
                 let name = function.name().to_uppercase();
@@ -773,7 +1008,98 @@ impl Parser {
             Some(Box::new(self.expr()?))
         };
         self.expect_symbol(")")?;
+        if self.over_follows() {
+            if distinct {
+                return Err(Error(
+                    "DISTINCT is not supported in an aggregate over a window".into(),
+                ));
+            }
+            let args = arg.map(|arg| *arg).into_iter().collect();
+            return self.window(WindowFunction::Aggregate(function), args);
+        }
         Ok(Expr::Aggregate(function, arg, distinct))
+    }
+
+    /// The rest of a window function's call after its arguments: `OVER
+    /// ([PARTITION BY expr, ...] [ORDER BY ...] [frame])`.
+    fn window(&mut self, function: WindowFunction, args: Vec<Expr>) -> Result<Expr> {
+        let (fewest, most) = function.arity();
+        if args.len() < fewest || args.len() > most {
+            let name = function.name().to_uppercase();
+            return Err(Error(format!(
+                "wrong number of arguments to {name}: {}",
+                args.len()
+            )));
+        }
+        self.expect_word("OVER")?;
+        self.expect_symbol("(")?;
+        // PARTITION, ROWS, RANGE and the words of frames are not keywords,
+        // so that they stay free as names.
+        let mut partition_by = Vec::new();
+        if self.eat_word("PARTITION") {
+            self.expect_keyword("BY")?;
+            partition_by = self.comma_list(Self::expr)?;
+        }
+        let mut order_by = Vec::new();
+        if self.eat_keyword("ORDER") {
+            self.expect_keyword("BY")?;
+            order_by = self.order_list()?;
+        }
+        let units = if self.eat_word("ROWS") {
+            Some(FrameUnits::Rows)
+        } else if self.eat_word("RANGE") {
+            Some(FrameUnits::Range)
+        } else {
+            None
+        };
+        let frame = match units {
+            None => None,
+            Some(units) => {
+                let (start, end) = match self.eat_keyword("BETWEEN") {
+                    true => {
+                        let start = self.frame_bound()?;
+                        self.expect_keyword("AND")?;
+                        (start, self.frame_bound()?)
+                    }
+                    false => (self.frame_bound()?, FrameBound::CurrentRow),
+                };
+                Some(frame(units, start, end)?)
+            }
+        };
+        self.expect_symbol(")")?;
+        Ok(Expr::Window(Box::new(Window {
+            function,
+            args,
+            partition_by,
+            order_by,
+            frame,
+        })))
+    }
+
+    /// `UNBOUNDED {PRECEDING | FOLLOWING}`, `n {PRECEDING | FOLLOWING}` or `CURRENT ROW`.
+    fn frame_bound(&mut self) -> Result<FrameBound> {
+        if self.eat_word("CURRENT") {
+            self.expect_word("ROW")?;
+            return Ok(FrameBound::CurrentRow);
+        }
+        let offset = match self.eat_word("UNBOUNDED") {
+            true => None,
+            false => match self.peek() {
+                Some(Token::Number(n)) if *n >= 0 => {
+                    let n = *n as u64;
+                    self.pos += 1;
+                    Some(n)
+                }
+                _ => return Err(self.unexpected("UNBOUNDED, CURRENT ROW or a number")),
+            },
+        };
+        if self.eat_word("PRECEDING") {
+            Ok(offset.map_or(FrameBound::UnboundedPreceding, FrameBound::Preceding))
+        } else if self.eat_word("FOLLOWING") {
+            Ok(offset.map_or(FrameBound::UnboundedFollowing, FrameBound::Following))
+        } else {
+            Err(self.unexpected("PRECEDING or FOLLOWING"))
+        }
     }
 
     // ---- token helpers ----
@@ -792,6 +1118,27 @@ impl Parser {
 
     fn eat_keyword(&mut self, keyword: &str) -> bool {
         self.eat(&Token::Keyword(keyword.into()))
+    }
+
+    /// Eats a word that is not a keyword, in any case: one that means
+    /// something only where it stands, and is a name elsewhere.
+    fn eat_word(&mut self, word: &str) -> bool {
+        let matched = matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case(word));
+        self.pos += matched as usize;
+        matched
+    }
+
+    fn expect_word(&mut self, word: &str) -> Result<()> {
+        match self.eat_word(word) {
+            true => Ok(()),
+            false => Err(self.unexpected(word)),
+        }
+    }
+
+    /// Whether `OVER (` follows: a window for the function call before it.
+    fn over_follows(&self) -> bool {
+        matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("OVER"))
+            && self.tokens.get(self.pos + 1) == Some(&Token::Symbol("("))
     }
 
     fn eat_symbol(&mut self, symbol: &'static str) -> bool {
@@ -853,4 +1200,120 @@ impl Parser {
 
 fn binary(left: Expr, op: BinaryOp, right: Expr) -> Expr {
     Expr::Binary(Box::new(left), op, Box::new(right))
+}
+
+/// A frame from `start` to `end`, if it can be one: it may not start after
+/// it ends, nor at the end of a partition or end at its start, and RANGE
+/// takes no offsets.
+fn frame(units: FrameUnits, start: FrameBound, end: FrameBound) -> Result<Frame> {
+    // Where each bound stands, from the start of the partition to its end.
+    let place = |bound: FrameBound| match bound {
+        FrameBound::UnboundedPreceding => 0,
+        FrameBound::Preceding(_) => 1,
+        FrameBound::CurrentRow => 2,
+        FrameBound::Following(_) => 3,
+        FrameBound::UnboundedFollowing => 4,
+    };
+    if start == FrameBound::UnboundedFollowing {
+        return Err(Error("a frame cannot start at UNBOUNDED FOLLOWING".into()));
+    }
+    if end == FrameBound::UnboundedPreceding {
+        return Err(Error("a frame cannot end at UNBOUNDED PRECEDING".into()));
+    }
+    if place(start) > place(end) {
+        return Err(Error(format!(
+            "a frame cannot start at {start} and end at {end}, before it"
+        )));
+    }
+    let offset = |bound| matches!(bound, FrameBound::Preceding(_) | FrameBound::Following(_));
+    if units == FrameUnits::Range && (offset(start) || offset(end)) {
+        return Err(Error(
+            "RANGE frames take only UNBOUNDED and CURRENT ROW bounds; ROWS takes offsets".into(),
+        ));
+    }
+    Ok(Frame { units, start, end })
+}
+
+/// A recursive common table expression from its query, `body`: the part
+/// after its last UNION is its step, and the rest its anchor. Only the step
+/// may name the expression, once, in its FROM, and not on a side of an
+/// outer join that may be padded with NULLs: else a round could return
+/// rows when the last one returned none, and the recursion would not end.
+fn recursive_cte(name: &str, columns: Vec<String>, mut body: Select) -> Result<RecursiveCte> {
+    if !body.order_by.is_empty() || body.limit.is_some() || body.offset.is_some() {
+        return Err(Error(format!(
+            "ORDER BY, LIMIT and OFFSET are not supported in the recursive query {name}"
+        )));
+    }
+    let form = || {
+        Error(format!(
+            "the recursive query {name} must be a query that does not name {name}, then UNION [ALL], then one that does"
+        ))
+    };
+    let (all, step) = match body.compound.pop() {
+        Some(Compound {
+            op: SetOp::Union,
+            all,
+            query,
+        }) => (all, query),
+        _ => return Err(form()),
+    };
+    if work_refs(&body) > 0 {
+        return Err(form());
+    }
+    let tables: Vec<&TableRef> = step.from.tables().collect();
+    let direct: Vec<usize> = (0..tables.len())
+        .filter(|&i| matches!(tables[i].source, TableSource::WorkTable { .. }))
+        .collect();
+    if direct.len() != 1 || work_refs(&step) != 1 {
+        return Err(Error(format!(
+            "the recursive part of {name} must name {name} once, in its FROM, not in a subquery"
+        )));
+    }
+    let at = direct[0];
+    let kinds: Vec<JoinKind> = std::iter::once(JoinKind::Inner)
+        .chain(step.from.joins.iter().map(|j| j.kind))
+        .collect();
+    if kinds[at].keeps_left() || kinds[at + 1..].iter().any(|k| k.keeps_right()) {
+        return Err(Error(format!(
+            "the recursive part of {name} cannot read {name} on a side of an outer join padded with NULLs"
+        )));
+    }
+    Ok(RecursiveCte {
+        name: name.into(),
+        columns,
+        anchor: body,
+        step,
+        all,
+    })
+}
+
+/// How many times the query names a recursive expression's own rows (as
+/// [`TableSource::WorkTable`]), in its FROM, its subqueries, and the
+/// queries combined with it.
+fn work_refs(query: &Select) -> usize {
+    // Those in the FROMs of the query, of its derived tables and of the
+    // queries combined with it.
+    fn direct(query: &Select) -> usize {
+        let from: usize = query
+            .from
+            .tables()
+            .map(|table| match &table.source {
+                TableSource::WorkTable { .. } => 1,
+                TableSource::Subquery(query) => direct(query),
+                _ => 0,
+            })
+            .sum();
+        from + query.compound.iter().map(|c| direct(&c.query)).sum::<usize>()
+    }
+    // Every subquery of an expression, at any depth, is visited once.
+    let mut count = direct(query);
+    for expr in query.exprs() {
+        expr.visit(&mut |e| {
+            if let Expr::Subquery(q) | Expr::Exists(q) | Expr::InSubquery(_, q, _) = e {
+                count += direct(q);
+            }
+        });
+    }
+    count
 }

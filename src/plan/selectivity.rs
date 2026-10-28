@@ -92,7 +92,9 @@ impl<'a> Scope<'a> {
                 | Node::Sort { input, .. }
                 | Node::Limit { input, .. }
                 | Node::Distinct { input }
-                | Node::Gather { input, .. } => collect(input, out),
+                | Node::Gather { input, .. }
+                | Node::Window { input, .. }
+                | Node::Lateral { left: input, .. } => collect(input, out),
                 Node::Join { left, right, .. } => {
                     collect(left, out);
                     collect(right, out);
@@ -100,7 +102,11 @@ impl<'a> Scope<'a> {
                 Node::Aggregate { .. }
                 | Node::Project { .. }
                 | Node::Derived { .. }
-                | Node::Union { .. } => {}
+                | Node::Union { .. }
+                | Node::Values { .. }
+                | Node::WorkTable { .. }
+                | Node::Recursive { .. }
+                | Node::SetOp { .. } => {}
             }
         }
         let mut tables = Vec::new();

@@ -11,10 +11,25 @@
 //! nested loop join reads its left side a block at a time, and its right side
 //! again for each block. A merge join sorts both sides when its first row is
 //! asked for.
+//!
+//! **Outer joins on the right.** A RIGHT JOIN is an inner join, and a FULL
+//! JOIN a LEFT JOIN, of the same two sides; then the right rows no left row
+//! matched come, with NULLs for the left columns. Those are found by a
+//! second join, the other way round: each right row LEFT JOINed with the
+//! left rows, marked, by the same method with its keys swapped, and kept if
+//! no marked row came with it. So both sides are read twice, and every
+//! method that can join them one way can the other, within its budget.
+//!
+//! The steps the models share, here too, are those that work on rows in
+//! all of them: a window step (see `window.rs`), INTERSECT and EXCEPT, which
+//! hold the right side's rows, a recursive query, which holds the rows of
+//! its last round (and with UNION, all it returned), and a LATERAL
+//! subquery's join, which plans and runs the subquery for each left row.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::Settings;
@@ -22,14 +37,17 @@ use super::aggregate;
 use super::joins::{
     BlockJoin, Join, Lookup, MergeJoin, MergeSort, NaiveJoin, ParallelHashJoin, Right,
 };
+use super::model;
 use super::sort::{Sorted, Sorter};
 use super::subquery::Runner;
 use crate::catalog::Catalog;
 use crate::catalog::table::Row;
 use crate::error::Result;
-use crate::plan::query::{JoinMethod, Node, Phase};
-use crate::sql::ast::{Expr, JoinKind, OrderBy};
-use crate::sql::eval::{Field, eval_with, locate, locate_all, matches_with};
+use crate::plan::filter::visit_outer;
+use crate::plan::query::{self, Choices, JoinMethod, Node, Phase};
+use crate::sql::ast::{ColumnRef, Expr, JoinKind, OrderBy, Select, SetOp, WorkCell};
+use crate::sql::eval::{Field, Subqueries, eval_with, locate, locate_all, matches_with, resolve};
+use crate::types::Value;
 
 /// Rows produced by an operator, or the error that stopped it.
 pub type Rows<'a> = Box<dyn Iterator<Item = Result<Row>> + 'a>;
@@ -177,23 +195,94 @@ fn open_node<'a>(
             method,
             condition,
         } => {
-            let left_fields = left.columns();
             let right_step = below(step, left.steps());
-            let left = open(*left, below(step, 0));
-            let reopen = {
+            let open_left = {
+                let (settings, left_step) = (settings.clone(), below(step, 0));
+                move |node| open_step(node, catalog, &settings, left_step.clone())
+            };
+            let open_right = {
                 let (settings, right_step) = (settings.clone(), right_step.clone());
                 move |node| open_step(node, catalog, &settings, right_step.clone())
             };
             join(
-                left,
-                left_fields,
+                *left,
                 *right,
                 kind,
                 method,
                 condition,
+                catalog,
                 settings,
                 &right_step,
-                reopen,
+                open_left,
+                open_right,
+            )
+        }
+        Node::Values { rows, .. } => values(rows),
+        Node::WorkTable { cell, .. } => values(cell.rows()),
+        Node::Recursive {
+            anchor,
+            step: round,
+            all,
+            cell,
+        } => {
+            let round_step = below(step, anchor.steps());
+            let anchor = open(*anchor, below(step, 0));
+            let settings = settings.clone();
+            let open_round = move || open_step((*round).clone(), catalog, &settings, round_step.clone());
+            recursive(anchor, open_round, all, cell)
+        }
+        Node::SetOp {
+            left,
+            right,
+            op,
+            all,
+        } => {
+            let right_step = below(step, left.steps());
+            let left = open(*left, below(step, 0));
+            set_op(left, open(*right, right_step), op, all)
+        }
+        Node::Window {
+            input,
+            partition_by,
+            order_by,
+            functions,
+        } => {
+            let fields = input.columns();
+            let input = open(*input, below(step, 0));
+            let budget = settings.sort_memory;
+            let mut subqueries = Runner::new(catalog, settings);
+            deferred(move || {
+                super::window::window(
+                    input,
+                    &fields,
+                    &partition_by,
+                    &order_by,
+                    &functions,
+                    budget,
+                    &mut subqueries,
+                )
+            })
+        }
+        Node::Lateral {
+            left,
+            query,
+            qualifier,
+            names,
+            kind,
+            condition,
+        } => {
+            let left_fields = left.columns();
+            let left = open(*left, below(step, 0));
+            lateral(
+                left,
+                left_fields,
+                query,
+                &qualifier,
+                &names,
+                kind,
+                condition,
+                catalog,
+                settings,
             )
         }
         Node::Filter { input, predicate } => {
@@ -286,11 +375,17 @@ fn open_node<'a>(
             let columns = input.columns();
             let input = open(*input, below(step, 0));
             let budget = settings.hash_memory;
+            let mut subqueries = Runner::new(catalog, settings);
             deferred(move || {
                 Ok(Box::new(match phase {
-                    Phase::Whole => {
-                        aggregate::fold(input, &columns, &group_by, &aggregates, budget)?
-                    }
+                    Phase::Whole => aggregate::fold(
+                        input,
+                        &columns,
+                        &group_by,
+                        &aggregates,
+                        budget,
+                        &mut subqueries,
+                    )?,
                     Phase::Final => aggregate::merge(input, group_by.len(), &aggregates, budget)?,
                     Phase::Partial => {
                         unreachable!("a partial aggregate runs in a gather's workers")
@@ -301,28 +396,164 @@ fn open_node<'a>(
     }
 }
 
-/// Joins `left` rows, whose columns are `left_fields`, with the rows of
-/// `right` as `method` says: the join step of every model, which hands it
-/// its sides as rows. `open_right` opens the right side (again for each
-/// block of a block nested loop join), counted in `right_step`.
+/// The name of the column that marks the left rows of the second join of a
+/// RIGHT or FULL JOIN (see the module docs): a name no column can have.
+const MATCHED: &str = "?matched?";
+
+/// Joins the rows of `left` with those of `right` as `method` says: the
+/// join step of every model, which opens its sides as rows with `open_left`
+/// and `open_right` (the right side again for each block of a block nested
+/// loop join, and both again for the right rows a RIGHT or FULL JOIN keeps,
+/// see the module docs), the right side counted in `right_step`. The
+/// condition's subqueries run on `catalog`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn join<'a>(
-    left: Rows<'a>,
-    left_fields: Vec<Field>,
+    left: Node<'a>,
     right: Node<'a>,
     kind: JoinKind,
     method: JoinMethod,
     condition: Option<Expr>,
+    catalog: &'a Catalog,
+    settings: &Settings,
+    right_step: &Step,
+    open_left: impl Fn(Node<'a>) -> Rows<'a> + 'a,
+    open_right: impl Fn(Node<'a>) -> Rows<'a> + 'a,
+) -> Rows<'a> {
+    let (left_fields, right_fields) = (left.columns(), right.columns());
+    if !kind.keeps_right() {
+        let left = open_left(left);
+        return join_rows(
+            left,
+            left_fields,
+            right,
+            right_fields,
+            kind,
+            method,
+            condition,
+            catalog,
+            settings,
+            right_step,
+            open_right,
+        );
+    }
+    let (open_left, open_right) = (Rc::new(open_left), Rc::new(open_right));
+    let first = {
+        let open_right = open_right.clone();
+        join_rows(
+            open_left(left.clone()),
+            left_fields.clone(),
+            right.clone(),
+            right_fields.clone(),
+            match kind {
+                JoinKind::Full => JoinKind::Left,
+                _ => JoinKind::Inner,
+            },
+            method.clone(),
+            condition.clone(),
+            catalog,
+            settings,
+            right_step,
+            move |node| open_right(node),
+        )
+    };
+    let settings = settings.clone();
+    let unmatched = deferred(move || {
+        // Each right row, with the left rows that match it, marked.
+        let width = left_fields.len();
+        let marked = [left_fields, vec![Field::named(MATCHED)]].concat();
+        let mark = move |node| -> Rows<'a> {
+            Box::new(open_left(node).map(|row| {
+                row.map(|mut row| {
+                    row.push(Value::Bool(true));
+                    row
+                })
+            }))
+        };
+        let rows = join_rows(
+            open_right(right),
+            right_fields,
+            left,
+            marked,
+            JoinKind::Left,
+            swapped(method),
+            condition,
+            catalog,
+            &settings,
+            &None,
+            mark,
+        );
+        // Those that came without one, the left columns first, NULL.
+        Ok(Box::new(rows.filter_map(move |item| match item {
+            Ok(row) if row.last() == Some(&Value::Null) => {
+                let right = row.len() - width - 1;
+                let mut padded = vec![Value::Null; width];
+                padded.extend(row.into_iter().take(right));
+                Some(Ok(padded))
+            }
+            Ok(_) => None,
+            Err(e) => Some(Err(e)),
+        })) as Rows<'a>)
+    });
+    Box::new(first.chain(unmatched))
+}
+
+/// The method of a join the other way round: its keys swapped. A merge
+/// join's right side sorts by its keys alone.
+fn swapped(method: JoinMethod) -> JoinMethod {
+    match method {
+        JoinMethod::Hash {
+            left_keys,
+            right_keys,
+            workers,
+            ..
+        } => JoinMethod::Hash {
+            left_keys: right_keys,
+            right_keys: left_keys,
+            keep_order: false,
+            workers,
+        },
+        JoinMethod::Merge {
+            left_keys,
+            right_keys,
+            desc,
+            ..
+        } => JoinMethod::Merge {
+            left_keys: right_keys,
+            right_keys: left_keys,
+            desc,
+            then: Vec::new(),
+        },
+        JoinMethod::Index => unreachable!("a RIGHT or FULL JOIN is never an index join"),
+        method => method,
+    }
+}
+
+/// Joins `left` rows, whose columns are `left_fields`, with the rows of
+/// `right` (whose columns are `right_fields`) as `method` says, for an
+/// inner or LEFT JOIN. `open_right` opens the right side (again for each
+/// block of a block nested loop join), counted in `right_step`.
+#[allow(clippy::too_many_arguments)]
+fn join_rows<'a>(
+    left: Rows<'a>,
+    left_fields: Vec<Field>,
+    right: Node<'a>,
+    right_fields: Vec<Field>,
+    kind: JoinKind,
+    method: JoinMethod,
+    condition: Option<Expr>,
+    catalog: &'a Catalog,
     settings: &Settings,
     right_step: &Step,
     open_right: impl Fn(Node<'a>) -> Rows<'a> + 'a,
 ) -> Rows<'a> {
-    let right_fields = right.columns();
+    // The subqueries of the condition run in the join, in this thread.
+    let runs_subqueries = condition.as_ref().is_some_and(Expr::has_subquery);
+    let runner = || -> Box<dyn Subqueries + 'a> { Box::new(Runner::new(catalog, settings)) };
     let right = match method {
         JoinMethod::Block => {
             let budget = settings.join_memory;
             let reopen = Box::new(move || open_right(right.clone()));
-            return Box::new(BlockJoin::new(
+            let join = BlockJoin::new(
                 left,
                 left_fields,
                 reopen,
@@ -330,18 +561,19 @@ pub(super) fn join<'a>(
                 kind,
                 condition,
                 budget,
-            ));
+            );
+            return match runs_subqueries {
+                true => Box::new(join.running(runner())),
+                false => Box::new(join),
+            };
         }
         JoinMethod::Naive => {
             let reopen = Box::new(move || open_right(right.clone()));
-            return Box::new(NaiveJoin::new(
-                left,
-                left_fields,
-                reopen,
-                right_fields,
-                kind,
-                condition,
-            ));
+            let join = NaiveJoin::new(left, left_fields, reopen, right_fields, kind, condition);
+            return match runs_subqueries {
+                true => Box::new(join.running(runner())),
+                false => Box::new(join),
+            };
         }
         JoinMethod::Merge {
             left_keys,
@@ -357,15 +589,11 @@ pub(super) fn join<'a>(
                 then,
                 budget: settings.sort_memory,
             };
-            return Box::new(MergeJoin::new(
-                left,
-                left_fields,
-                right,
-                right_fields,
-                sort,
-                kind,
-                condition,
-            ));
+            let join = MergeJoin::new(left, left_fields, right, right_fields, sort, kind, condition);
+            return match runs_subqueries {
+                true => Box::new(join.running(runner())),
+                false => Box::new(join),
+            };
         }
         JoinMethod::Hash {
             left_keys,
@@ -399,6 +627,10 @@ pub(super) fn join<'a>(
                 0,
             );
             let join = Join::new(left, left_fields, right, right_fields, kind, condition);
+            let join = match runs_subqueries {
+                true => join.running(runner()),
+                false => join,
+            };
             return Box::new(if keep_order {
                 join.keeping_order(settings.sort_memory)
             } else {
@@ -442,14 +674,257 @@ pub(super) fn join<'a>(
             }
         }
     };
-    Box::new(Join::new(
+    let join = Join::new(left, left_fields, right, right_fields, kind, condition);
+    match runs_subqueries {
+        true => Box::new(join.running(runner())),
+        false => Box::new(join),
+    }
+}
+
+/// The rows given, one at a time.
+pub(super) fn values<'a>(rows: Arc<Vec<Row>>) -> Rows<'a> {
+    Box::new((0..rows.len()).map(move |i| Ok(rows[i].clone())))
+}
+
+/// The rows of a recursive query: those of `anchor`, then those of each
+/// round, which `open_round` opens after the rows of the last one are put
+/// in `cell`, until one returns none. Without `all`, a row equal to one
+/// returned before is dropped.
+pub(super) fn recursive<'a>(
+    anchor: Rows<'a>,
+    open_round: impl FnMut() -> Rows<'a> + 'a,
+    all: bool,
+    cell: WorkCell,
+) -> Rows<'a> {
+    Box::new(Recursion {
+        rows: anchor,
+        open_round: Box::new(open_round),
+        cell,
+        round: Vec::new(),
+        seen: (!all).then(HashSet::new),
+        done: false,
+    })
+}
+
+struct Recursion<'a> {
+    /// The rows of the anchor, or of the round running.
+    rows: Rows<'a>,
+    open_round: Box<dyn FnMut() -> Rows<'a> + 'a>,
+    cell: WorkCell,
+    /// The rows returned in this round, for the next one to read.
+    round: Vec<Row>,
+    /// Every row returned, for UNION without ALL.
+    seen: Option<HashSet<Row>>,
+    done: bool,
+}
+
+impl Iterator for Recursion<'_> {
+    type Item = Result<Row>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while !self.done {
+            match self.rows.next() {
+                Some(Ok(row)) => {
+                    if let Some(seen) = &mut self.seen
+                        && !seen.insert(row.clone())
+                    {
+                        continue;
+                    }
+                    self.round.push(row.clone());
+                    return Some(Ok(row));
+                }
+                Some(Err(e)) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+                None if self.round.is_empty() => self.done = true,
+                None => {
+                    self.cell.set(std::mem::take(&mut self.round));
+                    self.rows = (self.open_round)();
+                }
+            }
+        }
+        None
+    }
+}
+
+/// The rows of `left` that `right` has too (INTERSECT), or does not
+/// (EXCEPT): with ALL, a row as many times more as it is in `left`, less
+/// (or up to) as many as in `right`; without, each once. Reads all of
+/// `right` when the first row is asked for, and holds its rows.
+pub(super) fn set_op<'a>(left: Rows<'a>, right: Rows<'a>, op: SetOp, all: bool) -> Rows<'a> {
+    deferred(move || {
+        let mut counts: HashMap<Row, usize> = HashMap::new();
+        for row in right {
+            *counts.entry(row?).or_default() += 1;
+        }
+        let mut returned: HashSet<Row> = HashSet::new();
+        // Takes one of the right side's copies of the row, if one is left.
+        fn take(counts: &mut HashMap<Row, usize>, row: &Row) -> bool {
+            match counts.get_mut(row) {
+                Some(n) if *n > 0 => {
+                    *n -= 1;
+                    true
+                }
+                _ => false,
+            }
+        }
+        Ok(Box::new(left.filter_map(move |item| {
+            let row = match item {
+                Ok(row) => row,
+                Err(e) => return Some(Err(e)),
+            };
+            let keep = match (op, all) {
+                (SetOp::Intersect, true) => take(&mut counts, &row),
+                (SetOp::Except, true) => !take(&mut counts, &row),
+                (SetOp::Intersect, false) => !returned.contains(&row) && counts.contains_key(&row),
+                (SetOp::Except, false) => !returned.contains(&row) && !counts.contains_key(&row),
+                (SetOp::Union, _) => unreachable!("a union has steps of its own"),
+            };
+            if keep && !all {
+                returned.insert(row.clone());
+            }
+            keep.then_some(Ok(row))
+        })) as Rows<'a>)
+    })
+}
+
+/// Joins each `left` row (whose columns are `left_fields`) with the rows
+/// `query` returns for it, its outer references taking their values from
+/// the row: planned and run for each left row, but for a row with the same
+/// values as the last one, which reuses its rows. The query's columns are
+/// `names`, qualified by `qualifier`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn lateral<'a>(
+    left: Rows<'a>,
+    left_fields: Vec<Field>,
+    query: Select,
+    qualifier: &str,
+    names: &[String],
+    kind: JoinKind,
+    condition: Option<Expr>,
+    catalog: &'a Catalog,
+    settings: &Settings,
+) -> Rows<'a> {
+    let mut outer: Vec<ColumnRef> = Vec::new();
+    visit_outer(&query, &mut |column| {
+        if !outer.contains(column) {
+            outer.push(column.clone());
+        }
+    });
+    let right_fields: Vec<Field> = names
+        .iter()
+        .map(|name| Field {
+            table: Some(qualifier.into()),
+            name: name.clone(),
+        })
+        .collect();
+    let width = right_fields.len();
+    let fields = [left_fields.clone(), right_fields].concat();
+    Box::new(LateralJoin {
         left,
         left_fields,
-        right,
-        right_fields,
+        query,
+        outer,
+        condition: condition.map(|c| locate(&c, &fields)),
+        fields,
+        width,
         kind,
-        condition,
-    ))
+        catalog,
+        settings: settings.clone(),
+        subqueries: Runner::new(catalog, settings),
+        last: None,
+        current: None,
+    })
+}
+
+struct LateralJoin<'a> {
+    left: Rows<'a>,
+    left_fields: Vec<Field>,
+    query: Select,
+    /// The query's outer references, which the left row gives values.
+    outer: Vec<ColumnRef>,
+    condition: Option<Expr>,
+    /// The left fields, then the query's: the fields of a joined row.
+    fields: Vec<Field>,
+    /// How many columns the query returns.
+    width: usize,
+    kind: JoinKind,
+    catalog: &'a Catalog,
+    settings: Settings,
+    subqueries: Runner<'a>,
+    /// The values of the outer references the query last ran with, and its rows.
+    last: Option<(Vec<Value>, Rc<Vec<Row>>)>,
+    /// The left row being joined, the query's rows for it, the next to pair,
+    /// and whether one matched.
+    current: Option<(Row, Rc<Vec<Row>>, usize, bool)>,
+}
+
+impl LateralJoin<'_> {
+    /// The rows the query returns for `left`.
+    fn run(&mut self, left: &Row) -> Result<Rc<Vec<Row>>> {
+        let values = self
+            .outer
+            .iter()
+            .map(|c| Ok(left[resolve(&self.left_fields, c)?].clone()))
+            .collect::<Result<Vec<_>>>()?;
+        if let Some((last, rows)) = &self.last
+            && *last == values
+        {
+            return Ok(rows.clone());
+        }
+        let bound = query::substitute(&self.query, &mut |column| {
+            let i = self.outer.iter().position(|c| c == column);
+            Ok(values[i.expect("collected above")].clone())
+        })?;
+        // Run once per left row, it reads too little to be worth threads to scan.
+        let choices = Choices {
+            scan_workers: 1,
+            ..self.settings.choices()
+        };
+        let plan = query::select(self.catalog, bound, choices)?;
+        let rows = model::open(plan.root, self.catalog, &self.settings).collect::<Result<Vec<_>>>()?;
+        let rows = Rc::new(rows);
+        self.last = Some((values, rows.clone()));
+        Ok(rows)
+    }
+}
+
+impl Iterator for LateralJoin<'_> {
+    type Item = Result<Row>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.current.is_none() {
+                let left = match self.left.next()? {
+                    Ok(row) => row,
+                    Err(e) => return Some(Err(e)),
+                };
+                match self.run(&left) {
+                    Ok(rows) => self.current = Some((left, rows, 0, false)),
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+            let (left, rows, next, matched) = self.current.as_mut().expect("set above");
+            while *next < rows.len() {
+                let joined: Row = left.iter().chain(&rows[*next]).cloned().collect();
+                *next += 1;
+                match matches_with(&self.condition, &self.fields, &joined, &mut self.subqueries) {
+                    Ok(true) => {
+                        *matched = true;
+                        return Some(Ok(joined));
+                    }
+                    Ok(false) => {}
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+            let (mut left, _, _, matched) = self.current.take().expect("set above");
+            if self.kind == JoinKind::Left && !matched {
+                left.extend(std::iter::repeat_n(Value::Null, self.width));
+                return Some(Ok(left));
+            }
+        }
+    }
 }
 
 /// Reads all of `input`, whose columns are `columns`, and sorts it by

@@ -15,6 +15,7 @@ pub mod sort;
 pub mod spill;
 pub mod subquery;
 pub mod vectorized;
+mod window;
 
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -25,7 +26,7 @@ use crate::error::{Result, err};
 use crate::plan::query::{self, Choices, ForceJoin, forbid};
 use crate::plan::{access, filter};
 use crate::result::QueryResult;
-use crate::sql::ast::{ColumnRef, Expr, Projection, Select, SelectItem, Statement};
+use crate::sql::ast::{ColumnRef, Expr, InsertSource, Projection, Select, SelectItem, Statement};
 use crate::sql::eval::{Field, eval_with, locate, matches_with};
 use crate::types::Value;
 use joins::{HASH_MEMORY, JOIN_MEMORY};
@@ -108,11 +109,11 @@ pub fn execute_read(
             statement,
             analyze: true,
         } => match *statement {
-            Statement::Select(query) => explain_analyze(catalog, query, settings),
+            Statement::Select(query) => explain_analyze(catalog, *query, settings),
             _ => err("EXPLAIN ANALYZE supports only SELECT"),
         },
         Statement::Select(query) => {
-            let query = select(catalog, query, settings)?;
+            let query = select(catalog, *query, settings)?;
             let columns = query.columns.clone();
             Ok(QueryResult::Rows {
                 columns,
@@ -182,9 +183,9 @@ pub fn execute(
         Statement::Insert {
             table,
             columns,
-            rows,
+            source,
             returning,
-        } => insert(catalog, &table, columns, rows, returning, settings),
+        } => insert(catalog, &table, columns, source, returning, settings),
         Statement::Update {
             table,
             assignments,
@@ -226,7 +227,7 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, settings: &Settings) -> R
 /// scan (and the index it uses, if any) last.
 fn explain(catalog: &Catalog, statement: Statement, settings: &Settings) -> Result<QueryResult> {
     let plan = match statement {
-        Statement::Select(query) => query::select(catalog, query, settings.choices())?.root,
+        Statement::Select(query) => query::select(catalog, *query, settings.choices())?.root,
         Statement::Update { table, filter, .. } | Statement::Delete { table, filter, .. } => {
             let table = catalog.get(&table)?;
             let filter = filter
@@ -347,11 +348,14 @@ fn ms(time: Duration) -> String {
     }
 }
 
+/// Inserts the rows of VALUES, or of a query: all of its rows are read
+/// before the first is inserted, so a query of the table never reads the
+/// rows it adds.
 fn insert(
     catalog: &mut Catalog,
     table: &str,
     columns: Option<Vec<String>>,
-    rows: Vec<Vec<Expr>>,
+    source: InsertSource,
     returning: Option<Projection>,
     settings: &Settings,
 ) -> Result<QueryResult> {
@@ -369,6 +373,27 @@ fn insert(
         };
         let mut subqueries = Runner::new(catalog, settings);
         let mut new_rows = Vec::new();
+        let rows = match source {
+            InsertSource::Values(rows) => rows,
+            InsertSource::Select(query) => {
+                let query = select(catalog, *query, settings)?;
+                if query.columns.len() != targets.len() {
+                    return err(format!(
+                        "expected {} values, got {} from the query",
+                        targets.len(),
+                        query.columns.len()
+                    ));
+                }
+                for values in query {
+                    let mut row = vec![Value::Null; table.columns.len()];
+                    for (&i, value) in targets.iter().zip(values?) {
+                        row[i] = value;
+                    }
+                    new_rows.push(row);
+                }
+                Vec::new()
+            }
+        };
         for exprs in rows {
             if exprs.len() != targets.len() {
                 return err(format!(

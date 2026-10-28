@@ -405,7 +405,9 @@ impl<'a> Sink<'a> {
 
     pub(crate) fn push(&mut self, row: Row) -> Result<()> {
         match &mut self.partial {
-            Some((p, folder)) => folder.add_row(&row, &p.fields, &p.group_by),
+            Some((p, folder)) => {
+                folder.add_row(&row, &p.fields, &p.group_by, &mut crate::sql::eval::NoSubqueries)
+            }
             None => {
                 self.out.push(row);
                 Ok(())

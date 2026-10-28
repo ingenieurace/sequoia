@@ -26,7 +26,10 @@
 //! Joins, sorts and aggregates run the iterator model's algorithms (see
 //! `operator.rs`), within its memory budgets, on all of their inputs' rows,
 //! before returning any. A join runs its right side once and keeps its rows
-//! for each block of a block nested loop join.
+//! for each block of a block nested loop join. So do window steps,
+//! INTERSECT and EXCEPT, recursive queries (each round run to completion)
+//! and LATERAL subqueries' joins, but that those hand on only as many rows
+//! as are wanted: a LIMIT stops a recursive query that would never end.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -277,8 +280,16 @@ fn run_node<'a>(
             let fields = input.columns();
             let input = run(*input, below(step, 0), None).into_rows();
             let budget = settings.hash_memory;
+            let mut subqueries = Runner::new(catalog, settings);
             let groups = match phase {
-                Phase::Whole => aggregate::fold(input, &fields, &group_by, &aggregates, budget),
+                Phase::Whole => aggregate::fold(
+                    input,
+                    &fields,
+                    &group_by,
+                    &aggregates,
+                    budget,
+                    &mut subqueries,
+                ),
                 Phase::Final => aggregate::merge(input, group_by.len(), &aggregates, budget),
                 Phase::Partial => unreachable!("a partial aggregate runs in a gather's workers"),
             };
@@ -287,6 +298,78 @@ fn run_node<'a>(
                 Err(e) => Output::failed(e),
             }
         }
+        Node::Values { rows, .. } => Output::read(operator::values(rows), wanted),
+        Node::WorkTable { cell, .. } => Output::read(operator::values(cell.rows()), wanted),
+        Node::Recursive {
+            anchor,
+            step: round,
+            all,
+            cell,
+        } => {
+            let round_step = below(step, anchor.steps());
+            let anchor = run(*anchor, below(step, 0), None).into_rows();
+            let settings = settings.clone();
+            let open_round = move || {
+                self::run((*round).clone(), catalog, &settings, &round_step, None).into_rows()
+            };
+            Output::read(operator::recursive(anchor, open_round, all, cell), wanted)
+        }
+        Node::SetOp {
+            left,
+            right,
+            op,
+            all,
+        } => {
+            let right_step = below(step, left.steps());
+            let left = run(*left, below(step, 0), None).into_rows();
+            let right = run(*right, right_step, None).into_rows();
+            Output::read(operator::set_op(left, right, op, all), wanted)
+        }
+        Node::Window {
+            input,
+            partition_by,
+            order_by,
+            functions,
+        } => {
+            let fields = input.columns();
+            let input = run(*input, below(step, 0), None).into_rows();
+            let mut subqueries = Runner::new(catalog, settings);
+            match super::window::window(
+                input,
+                &fields,
+                &partition_by,
+                &order_by,
+                &functions,
+                settings.sort_memory,
+                &mut subqueries,
+            ) {
+                Ok(rows) => Output::read(rows, wanted),
+                Err(e) => Output::failed(e),
+            }
+        }
+        Node::Lateral {
+            left,
+            query,
+            qualifier,
+            names,
+            kind,
+            condition,
+        } => {
+            let left_fields = left.columns();
+            let left = run(*left, below(step, 0), None).into_rows();
+            let joined = operator::lateral(
+                left,
+                left_fields,
+                query,
+                &qualifier,
+                &names,
+                kind,
+                condition,
+                catalog,
+                settings,
+            );
+            Output::read(joined, wanted)
+        }
         Node::Join {
             left,
             right,
@@ -294,9 +377,11 @@ fn run_node<'a>(
             method,
             condition,
         } => {
-            let left_fields = left.columns();
             let right_step = below(step, left.steps());
-            let left = run(*left, below(step, 0), None).into_rows();
+            let open_left = {
+                let (settings, left_step) = (settings.clone(), below(step, 0));
+                move |node| self::run(node, catalog, &settings, &left_step, None).into_rows()
+            };
             // The right side runs when the join first reads it, once.
             let kept: RefCell<Option<Rc<Output>>> = RefCell::new(None);
             let open_right = {
@@ -312,14 +397,15 @@ fn run_node<'a>(
                 }
             };
             let joined = operator::join(
-                left,
-                left_fields,
+                *left,
                 *right,
                 kind,
                 method,
                 condition,
+                catalog,
                 settings,
                 &right_step,
+                open_left,
                 open_right,
             );
             Output::read(joined, wanted)

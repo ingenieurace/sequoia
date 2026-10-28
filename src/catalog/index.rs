@@ -476,6 +476,9 @@ fn own_expr(expr: &Expr, table: &str, columns: &[Column], what: &str) -> Result<
         Expr::Aggregate(..) => {
             _ = problem.get_or_insert_with(|| format!("{what} cannot use an aggregate"))
         }
+        Expr::Window(_) => {
+            _ = problem.get_or_insert_with(|| format!("{what} cannot use a window function"))
+        }
         Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(..) | Expr::Outer(_) => {
             _ = problem.get_or_insert_with(|| format!("{what} cannot use a subquery"))
         }

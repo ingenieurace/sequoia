@@ -60,18 +60,20 @@ use crate::decimal::Decimal;
 use crate::error::{Error, Result, err};
 use crate::plan::query::AggregateCall;
 use crate::sql::ast::{Aggregate, BinaryOp, Expr};
-use crate::sql::eval::{Field, binary, eval};
+use crate::sql::eval::{Field, Subqueries, binary, eval, eval_with};
 use crate::types::Value;
 
 /// Reads every row of `input` (whose columns are `columns`) and returns one
 /// row per group: its `group_by` values, then the result of each aggregate,
-/// holding groups within `budget` bytes, about.
+/// holding groups within `budget` bytes, about. The subqueries of `GROUP
+/// BY` run with `subqueries`.
 pub fn fold(
     input: Rows,
     columns: &[Field],
     group_by: &[Expr],
     aggregates: &[AggregateCall],
     budget: usize,
+    subqueries: &mut dyn Subqueries,
 ) -> Result<Groups> {
     let (group_by, aggregates) = (
         crate::sql::eval::locate_all(group_by, columns),
@@ -79,7 +81,7 @@ pub fn fold(
     );
     let mut folder = Folder::new(group_by.len(), &aggregates, budget);
     for row in input {
-        folder.add_row(&row?, columns, &group_by)?;
+        folder.add_row(&row?, columns, &group_by, subqueries)?;
     }
     Ok(folder.finish())
 }
@@ -138,11 +140,18 @@ impl Folder {
         }
     }
 
-    /// Adds a row whose columns are `columns`, grouped by `group_by`.
-    pub fn add_row(&mut self, row: &[Value], columns: &[Field], group_by: &[Expr]) -> Result<()> {
+    /// Adds a row whose columns are `columns`, grouped by `group_by`, whose
+    /// subqueries run with `subqueries`.
+    pub fn add_row(
+        &mut self,
+        row: &[Value],
+        columns: &[Field],
+        group_by: &[Expr],
+        subqueries: &mut dyn Subqueries,
+    ) -> Result<()> {
         let key: Row = group_by
             .iter()
-            .map(|e| eval(e, columns, row))
+            .map(|e| eval_with(e, columns, row, subqueries))
             .collect::<Result<_>>()?;
         let Folder {
             table,
@@ -518,6 +527,27 @@ impl State {
             accumulator: Accumulator::new(function),
             seen: tracks.then(HashSet::new),
         }
+    }
+}
+
+/// One aggregate's running state, as a window function folds its frame's
+/// rows into it (see `window.rs`): the same as a group's.
+#[derive(Clone)]
+pub struct Running(Accumulator);
+
+impl Running {
+    pub fn new(function: Aggregate) -> Self {
+        Running(Accumulator::new(function))
+    }
+
+    /// Adds one row's argument value; `None` is a row of `COUNT(*)`.
+    pub fn add(&mut self, value: Option<Value>) -> Result<()> {
+        self.0.add(value)
+    }
+
+    /// The aggregate of the values added so far.
+    pub fn result(&self) -> Value {
+        self.0.result()
     }
 }
 

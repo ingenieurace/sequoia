@@ -12,7 +12,7 @@ use crate::error::Result;
 use crate::executor::operator::Rows;
 use crate::executor::sort::{Sorted, Sorter};
 use crate::sql::ast::{Expr, JoinKind};
-use crate::sql::eval::{Field, eval, locate, matches, resolve};
+use crate::sql::eval::{Field, NoSubqueries, Subqueries, eval, locate, matches_with, resolve};
 use crate::types::Value;
 
 pub struct Join<'a> {
@@ -22,6 +22,8 @@ pub struct Join<'a> {
     right_width: usize,
     kind: JoinKind,
     condition: Option<Expr>,
+    /// Runs the subqueries of the condition, if it has any.
+    subqueries: Box<dyn Subqueries + 'a>,
     /// The left fields, then the right ones: the fields of a joined row.
     fields: Vec<Field>,
     /// The left row being joined, its number among the left rows, how
@@ -58,6 +60,12 @@ pub enum Key {
 }
 
 impl<'a> Join<'a> {
+    /// Runs the subqueries of the join's condition with `subqueries`.
+    pub fn running(mut self, subqueries: Box<dyn Subqueries + 'a>) -> Self {
+        self.subqueries = subqueries;
+        self
+    }
+
     pub fn new(
         left: Rows<'a>,
         left_fields: Vec<Field>,
@@ -73,6 +81,7 @@ impl<'a> Join<'a> {
             right_width: fields.len() - left_fields.len(),
             kind,
             condition: condition.map(|c| locate(&c, &fields)),
+            subqueries: Box::new(NoSubqueries),
             fields,
             left_fields,
             current: None,
@@ -125,7 +134,7 @@ impl<'a> Join<'a> {
                 let right = self.right.candidate(self.next);
                 self.next += 1;
                 let joined: Row = left.iter().chain(right).cloned().collect();
-                match matches(&self.condition, &self.fields, &joined) {
+                match matches_with(&self.condition, &self.fields, &joined, &mut *self.subqueries) {
                     Ok(true) => {
                         self.matched = true;
                         return Some(Ok((self.number, joined)));

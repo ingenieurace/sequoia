@@ -44,7 +44,9 @@ use crate::error::{Error, Result};
 use crate::plan::query::{AggregateCall, Node, Phase};
 use crate::predicate::Predicate;
 use crate::sql::ast::Expr;
-use crate::sql::eval::{Field, NoSubqueries, eval_with, locate, locate_all, matches_with};
+use crate::sql::eval::{
+    Field, NoSubqueries, Subqueries, eval_with, locate, locate_all, matches_with,
+};
 use crate::types::Value;
 use batch::{BATCH_SIZE, Batch, Vector};
 
@@ -226,11 +228,17 @@ fn open_node<'a>(
             let fields = input.columns();
             let input = open(*input, below(step, 0));
             let budget = settings.hash_memory;
+            let mut subqueries = Runner::new(catalog, settings);
             let groups = deferred(move || {
                 Ok(match phase {
-                    Phase::Whole => {
-                        Box::new(aggregate(input, &fields, &group_by, &aggregates, budget)?)
-                    }
+                    Phase::Whole => Box::new(aggregate(
+                        input,
+                        &fields,
+                        &group_by,
+                        &aggregates,
+                        budget,
+                        &mut subqueries,
+                    )?),
                     // The gather's rows, a group's states each, merged.
                     Phase::Final => Box::new(super::aggregate::merge(
                         rows_of(input),
@@ -252,23 +260,100 @@ fn open_node<'a>(
             method,
             condition,
         } => {
-            let left_fields = left.columns();
             let right_step = below(step, left.steps());
-            let left = rows_of(open(*left, below(step, 0)));
-            let reopen = {
+            let open_left = {
+                let (settings, left_step) = (settings.clone(), below(step, 0));
+                move |node| rows_of(open_step(node, catalog, &settings, left_step.clone()))
+            };
+            let open_right = {
                 let (settings, right_step) = (settings.clone(), right_step.clone());
                 move |node| rows_of(open_step(node, catalog, &settings, right_step.clone()))
             };
             let joined = operator::join(
-                left,
-                left_fields,
+                *left,
                 *right,
                 kind,
                 method,
                 condition,
+                catalog,
                 settings,
                 &right_step,
-                reopen,
+                open_left,
+                open_right,
+            );
+            batches_of(joined, width)
+        }
+        // These work on rows, as the iterator model's steps do.
+        Node::Values { rows, .. } => batches_of(operator::values(rows), width),
+        Node::WorkTable { cell, .. } => batches_of(operator::values(cell.rows()), width),
+        Node::Recursive {
+            anchor,
+            step: round,
+            all,
+            cell,
+        } => {
+            let round_step = below(step, anchor.steps());
+            let anchor = rows_of(open(*anchor, below(step, 0)));
+            let settings = settings.clone();
+            let open_round = move || {
+                rows_of(open_step((*round).clone(), catalog, &settings, round_step.clone()))
+            };
+            batches_of(operator::recursive(anchor, open_round, all, cell), width)
+        }
+        Node::SetOp {
+            left,
+            right,
+            op,
+            all,
+        } => {
+            let right_step = below(step, left.steps());
+            let left = rows_of(open(*left, below(step, 0)));
+            let right = rows_of(open(*right, right_step));
+            batches_of(operator::set_op(left, right, op, all), width)
+        }
+        Node::Window {
+            input,
+            partition_by,
+            order_by,
+            functions,
+        } => {
+            let fields = input.columns();
+            let input = rows_of(open(*input, below(step, 0)));
+            let budget = settings.sort_memory;
+            let mut subqueries = Runner::new(catalog, settings);
+            let rows = deferred(move || {
+                super::window::window(
+                    input,
+                    &fields,
+                    &partition_by,
+                    &order_by,
+                    &functions,
+                    budget,
+                    &mut subqueries,
+                )
+            });
+            batches_of(rows, width)
+        }
+        Node::Lateral {
+            left,
+            query,
+            qualifier,
+            names,
+            kind,
+            condition,
+        } => {
+            let left_fields = left.columns();
+            let left = rows_of(open(*left, below(step, 0)));
+            let joined = operator::lateral(
+                left,
+                left_fields,
+                query,
+                &qualifier,
+                &names,
+                kind,
+                condition,
+                catalog,
+                settings,
             );
             batches_of(joined, width)
         }
@@ -300,13 +385,15 @@ fn scan<'a>(
 }
 
 /// Folds batches into groups, evaluating group keys and arguments a column
-/// at a time; a batch they fail on, again a row at a time.
+/// at a time; a batch they fail on (as group keys with subqueries do), again
+/// a row at a time, running the subqueries with `subqueries`.
 fn aggregate(
     input: Batches,
     fields: &[Field],
     group_by: &[Expr],
     aggregates: &[AggregateCall],
     budget: usize,
+    subqueries: &mut dyn Subqueries,
 ) -> Result<Groups> {
     let (group_by, aggregates) = (
         locate_all(group_by, fields),
@@ -338,7 +425,7 @@ fn aggregate(
             }
             _ => {
                 for i in 0..rows {
-                    folder.add_row(&batch.row(i), fields, group_by)?;
+                    folder.add_row(&batch.row(i), fields, group_by, subqueries)?;
                 }
             }
         }

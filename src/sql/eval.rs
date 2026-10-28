@@ -170,6 +170,12 @@ pub fn eval_with(
             "{} is not allowed here",
             function.name().to_uppercase()
         )),
+        // Queries compute window functions in steps of their own, which the
+        // expressions above read as columns.
+        Expr::Window(window) => err(format!(
+            "window functions are not allowed here: {}",
+            window.function.name().to_uppercase()
+        )),
         Expr::Unary(op, inner) => unary(*op, eval(inner)?),
         // FALSE AND x is FALSE, and TRUE OR x TRUE, whatever x: x is not
         // evaluated, so it fails on no row the left side decides.

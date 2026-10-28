@@ -49,10 +49,10 @@ pub enum Statement {
     Insert {
         table: String,
         columns: Option<Vec<String>>,
-        rows: Vec<Vec<Expr>>,
+        source: InsertSource,
         returning: Option<Projection>,
     },
-    Select(Select),
+    Select(Box<Select>),
     Update {
         table: String,
         assignments: Vec<(String, Expr)>,
@@ -64,6 +64,16 @@ pub enum Statement {
         filter: Option<Expr>,
         returning: Option<Projection>,
     },
+}
+
+/// The rows an INSERT adds.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InsertSource {
+    /// `VALUES (expr, ...), ...`
+    Values(Vec<Vec<Expr>>),
+    /// `SELECT ...`: the query's rows, all read before the first is inserted,
+    /// so that a query of the table itself never sees the rows it adds.
+    Select(Box<Select>),
 }
 
 /// `CREATE [UNIQUE] INDEX name ON table [USING BTREE | HASH] (key, ...) [INCLUDE (column, ...)] [WHERE condition]`
@@ -143,11 +153,43 @@ pub struct Select {
     pub limit: Option<usize>,
     /// `OFFSET n`: the first `n` rows are left out.
     pub offset: Option<usize>,
-    /// `UNION [ALL] query`...: the queries whose rows follow this one's, each
-    /// with whether it is `UNION ALL`, which keeps rows equal to earlier
-    /// ones. They have no ORDER BY, LIMIT or OFFSET of their own: this
-    /// query's apply to all of the rows.
-    pub compound: Vec<(bool, Select)>,
+    /// `UNION [ALL] query`, `INTERSECT [ALL] query`, `EXCEPT [ALL] query`...:
+    /// the queries this one's rows are combined with, left to right. They
+    /// have no ORDER BY, LIMIT or OFFSET of their own: this query's apply
+    /// to all of the rows. INTERSECT binds tighter than the others, so the
+    /// parser puts `a UNION b INTERSECT c` here as `a UNION (b INTERSECT c)`:
+    /// b with an INTERSECT of its own.
+    pub compound: Vec<Compound>,
+}
+
+/// One query combined with those before it by a set operation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Compound {
+    pub op: SetOp,
+    /// `ALL`: rows equal to others count as many times as they appear.
+    pub all: bool,
+    pub query: Select,
+}
+
+/// How a query's rows combine with those of the queries before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SetOp {
+    /// The rows of both.
+    Union,
+    /// The rows of the ones before that this one has too.
+    Intersect,
+    /// The rows of the ones before that this one does not have.
+    Except,
+}
+
+impl SetOp {
+    pub fn name(self) -> &'static str {
+        match self {
+            SetOp::Union => "UNION",
+            SetOp::Intersect => "INTERSECT",
+            SetOp::Except => "EXCEPT",
+        }
+    }
 }
 
 impl Select {
@@ -173,13 +215,18 @@ impl Select {
     pub fn exprs(&self) -> Vec<&Expr> {
         let mut exprs = Vec::new();
         for table in self.from.tables() {
-            if let TableSource::Subquery(query) = &table.source {
-                exprs.extend(query.exprs());
+            match &table.source {
+                TableSource::Subquery(query) => exprs.extend(query.exprs()),
+                TableSource::Recursive(cte) => {
+                    exprs.extend(cte.anchor.exprs());
+                    exprs.extend(cte.step.exprs());
+                }
+                TableSource::Table(_) | TableSource::Dual | TableSource::WorkTable { .. } => {}
             }
         }
         exprs.extend(self.own_exprs());
-        for (_, part) in &self.compound {
-            exprs.extend(part.exprs());
+        for part in &self.compound {
+            exprs.extend(part.query.exprs());
         }
         exprs
     }
@@ -188,12 +235,17 @@ impl Select {
     pub fn try_map(&self, f: &mut dyn FnMut(&Expr) -> Result<Expr>) -> Result<Select> {
         let mut query = self.clone();
         for table in query.from.tables_mut() {
-            if let TableSource::Subquery(sub) = &mut table.source {
-                **sub = sub.try_map(f)?;
+            match &mut table.source {
+                TableSource::Subquery(sub) => **sub = sub.try_map(f)?,
+                TableSource::Recursive(cte) => {
+                    cte.anchor = cte.anchor.try_map(f)?;
+                    cte.step = cte.step.try_map(f)?;
+                }
+                TableSource::Table(_) | TableSource::Dual | TableSource::WorkTable { .. } => {}
             }
         }
-        for (_, part) in &mut query.compound {
-            *part = part.try_map(f)?;
+        for part in &mut query.compound {
+            part.query = part.query.try_map(f)?;
         }
         query.try_map_own(f)
     }
@@ -248,6 +300,12 @@ pub struct TableRef {
     pub source: TableSource,
     /// Always given for a subquery.
     pub alias: Option<String>,
+    /// `alias (name, ...)`: new names for the first columns of a derived
+    /// table, in order; empty to keep its own.
+    pub columns: Vec<String>,
+    /// `LATERAL (SELECT ...)`: a subquery that may read the columns of the
+    /// tables before it in FROM, run again for each of their rows.
+    pub lateral: bool,
 }
 
 /// What a table in FROM reads.
@@ -255,16 +313,86 @@ pub struct TableRef {
 pub enum TableSource {
     /// A table of the database, by name.
     Table(String),
-    /// `(SELECT ...)`: a derived table, whose columns are the query's.
+    /// `(SELECT ...)`: a derived table, whose columns are the query's. A
+    /// common table expression (`WITH name AS (...)`) is one wherever it is
+    /// named, as the parser puts it there.
     Subquery(Box<Select>),
+    /// No table, for a SELECT without FROM: a single row of no columns.
+    Dual,
+    /// A recursive common table expression, wherever it is named.
+    Recursive(Box<RecursiveCte>),
+    /// Inside the recursive part of a recursive common table expression,
+    /// the rows its last round added, by the expression's name. `columns`
+    /// are the expression's, and `cell` what the rows are handed in: both
+    /// are given by the planner, when it plans the expression.
+    WorkTable {
+        name: String,
+        columns: Vec<String>,
+        cell: Option<WorkCell>,
+    },
+}
+
+/// `WITH RECURSIVE name [(column, ...)] AS (anchor UNION [ALL] step)`: the
+/// rows of `anchor`, then those of `step` run on them, then those of `step`
+/// run on the rows it last returned, and so on until it returns none. With
+/// `UNION`, not `ALL`, a row equal to one returned before is dropped, and
+/// not run on.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RecursiveCte {
+    pub name: String,
+    /// The names of its columns; empty for those of `anchor`.
+    pub columns: Vec<String>,
+    /// The part that reads no rows of the expression itself.
+    pub anchor: Select,
+    /// The part that reads them: its FROM names the expression once, as a
+    /// [`TableSource::WorkTable`], and no subquery of it does.
+    pub step: Select,
+    pub all: bool,
+}
+
+/// Where a recursive query's working rows are handed to the step that reads
+/// them, for each round. Two are equal only if they are the same cell.
+#[derive(Debug, Clone, Default)]
+pub struct WorkCell(pub std::sync::Arc<std::sync::Mutex<std::sync::Arc<Vec<Vec<Value>>>>>);
+
+impl WorkCell {
+    /// The rows the cell holds now.
+    pub fn rows(&self) -> std::sync::Arc<Vec<Vec<Value>>> {
+        self.0.lock().expect("never poisoned").clone()
+    }
+
+    pub fn set(&self, rows: Vec<Vec<Value>>) {
+        *self.0.lock().expect("never poisoned") = std::sync::Arc::new(rows);
+    }
+}
+
+impl PartialEq for WorkCell {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for WorkCell {}
+
+impl std::hash::Hash for WorkCell {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::sync::Arc::as_ptr(&self.0).hash(state)
+    }
 }
 
 impl TableRef {
     /// A table of the database, under its own name.
     pub fn table(name: impl Into<String>) -> Self {
+        TableRef::of(TableSource::Table(name.into()), None)
+    }
+
+    /// A table in FROM read from `source`, under `alias` if given.
+    pub fn of(source: TableSource, alias: Option<String>) -> Self {
         TableRef {
-            source: TableSource::Table(name.into()),
-            alias: None,
+            source,
+            alias,
+            columns: Vec::new(),
+            lateral: false,
         }
     }
 
@@ -272,13 +400,16 @@ impl TableRef {
     pub fn qualifier(&self) -> &str {
         match (&self.alias, &self.source) {
             (Some(alias), _) => alias,
-            (None, TableSource::Table(name)) => name,
+            (None, TableSource::Table(name) | TableSource::WorkTable { name, .. }) => name,
+            (None, TableSource::Recursive(cte)) => &cte.name,
+            (None, TableSource::Dual) => "",
             (None, TableSource::Subquery(_)) => unreachable!("a subquery in FROM has an alias"),
         }
     }
 }
 
-/// `[INNER | LEFT] JOIN table ON condition`; `CROSS JOIN` and `,` have no condition.
+/// `[INNER | LEFT | RIGHT | FULL] JOIN table ON condition`; `CROSS JOIN`
+/// and `,` have no condition.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Join {
     pub kind: JoinKind,
@@ -292,6 +423,32 @@ pub enum JoinKind {
     Inner,
     /// Those, plus each left row no right row matches, with NULLs for the right columns.
     Left,
+    /// The pairs, plus each right row no left row matches, with NULLs for the left columns.
+    Right,
+    /// The pairs, plus the left rows and the right rows that match none, padded with NULLs.
+    Full,
+}
+
+impl JoinKind {
+    /// Whether the left rows that match no right row are kept.
+    pub fn keeps_left(self) -> bool {
+        matches!(self, JoinKind::Left | JoinKind::Full)
+    }
+
+    /// Whether the right rows that match no left row are kept.
+    pub fn keeps_right(self) -> bool {
+        matches!(self, JoinKind::Right | JoinKind::Full)
+    }
+
+    /// How SQL writes it before `JOIN`, if it writes anything.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            JoinKind::Inner => "",
+            JoinKind::Left => "LEFT ",
+            JoinKind::Right => "RIGHT ",
+            JoinKind::Full => "FULL ",
+        }
+    }
 }
 
 /// A column, `name` or `table.name`.
@@ -380,6 +537,206 @@ pub enum Expr {
     /// name for every row. The parser and planner never make one. It prints
     /// as the column, so a step's columns are named as before.
     Slot(usize, ColumnRef),
+    /// `function(args) OVER (...)`: a value computed from the rows of the
+    /// current row's window. The planner computes each in a step of its own
+    /// and reads it as a column, named by its SQL text, as it does an
+    /// aggregate's result.
+    Window(Box<Window>),
+}
+
+/// `function(args) OVER ([PARTITION BY expr, ...] [ORDER BY ...] [frame])`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Window {
+    pub function: WindowFunction,
+    /// None for `COUNT(*)`.
+    pub args: Vec<Expr>,
+    /// The rows of a row's partition are those with the same values of these.
+    pub partition_by: Vec<Expr>,
+    /// The order of the rows within a partition; rows equal in it are peers.
+    pub order_by: Vec<OrderBy>,
+    /// The rows an aggregate, `FIRST_VALUE`, `LAST_VALUE` or `NTH_VALUE`
+    /// reads, around the current row; if not given, those from the start
+    /// of the partition to the current row's last peer.
+    pub frame: Option<Frame>,
+}
+
+impl Window {
+    /// The window's frame, as given or by default.
+    pub fn frame(&self) -> Frame {
+        self.frame.unwrap_or(Frame {
+            units: FrameUnits::Range,
+            start: FrameBound::UnboundedPreceding,
+            end: FrameBound::CurrentRow,
+        })
+    }
+
+    /// Whether `other` reads the same partitions in the same order, so that
+    /// one step can compute both.
+    pub fn same_window(&self, other: &Window) -> bool {
+        self.partition_by == other.partition_by && self.order_by == other.order_by
+    }
+}
+
+/// What a window function computes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WindowFunction {
+    /// The row's number in its partition, from 1.
+    RowNumber,
+    /// 1 plus the number of rows before its first peer.
+    Rank,
+    /// The number of its peer group, from 1.
+    DenseRank,
+    /// `(rank - 1) / (rows - 1)`, as a REAL; 0 for a partition of one row.
+    PercentRank,
+    /// The share of the partition's rows up to its last peer, as a REAL.
+    CumeDist,
+    /// `NTILE(n)`: which of `n` groups as equal as can be the row falls in, from 1.
+    Ntile,
+    /// `LAG(value[, offset[, default]])`: `value` on the row `offset` rows
+    /// (1 by default) before this one in its partition, or else `default`.
+    Lag,
+    /// `LEAD(...)`: likewise, on the row after.
+    Lead,
+    /// `value` on the first row of the frame.
+    FirstValue,
+    /// `value` on the last row of the frame.
+    LastValue,
+    /// `NTH_VALUE(value, n)`: `value` on the `n`th row of the frame, from 1.
+    NthValue,
+    /// An aggregate of the frame's rows.
+    Aggregate(Aggregate),
+}
+
+impl WindowFunction {
+    /// The function with this name, in any case: a window function's or an aggregate's.
+    pub fn from_name(name: &str) -> Option<WindowFunction> {
+        if let Some(aggregate) = Aggregate::from_name(name) {
+            return Some(WindowFunction::Aggregate(aggregate));
+        }
+        Some(match name.to_uppercase().as_str() {
+            "ROW_NUMBER" => WindowFunction::RowNumber,
+            "RANK" => WindowFunction::Rank,
+            "DENSE_RANK" => WindowFunction::DenseRank,
+            "PERCENT_RANK" => WindowFunction::PercentRank,
+            "CUME_DIST" => WindowFunction::CumeDist,
+            "NTILE" => WindowFunction::Ntile,
+            "LAG" => WindowFunction::Lag,
+            "LEAD" => WindowFunction::Lead,
+            "FIRST_VALUE" => WindowFunction::FirstValue,
+            "LAST_VALUE" => WindowFunction::LastValue,
+            "NTH_VALUE" => WindowFunction::NthValue,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            WindowFunction::RowNumber => "row_number",
+            WindowFunction::Rank => "rank",
+            WindowFunction::DenseRank => "dense_rank",
+            WindowFunction::PercentRank => "percent_rank",
+            WindowFunction::CumeDist => "cume_dist",
+            WindowFunction::Ntile => "ntile",
+            WindowFunction::Lag => "lag",
+            WindowFunction::Lead => "lead",
+            WindowFunction::FirstValue => "first_value",
+            WindowFunction::LastValue => "last_value",
+            WindowFunction::NthValue => "nth_value",
+            WindowFunction::Aggregate(aggregate) => aggregate.name(),
+        }
+    }
+
+    /// The fewest and most arguments it takes.
+    pub fn arity(self) -> (usize, usize) {
+        match self {
+            WindowFunction::RowNumber
+            | WindowFunction::Rank
+            | WindowFunction::DenseRank
+            | WindowFunction::PercentRank
+            | WindowFunction::CumeDist => (0, 0),
+            WindowFunction::Ntile | WindowFunction::FirstValue | WindowFunction::LastValue => {
+                (1, 1)
+            }
+            WindowFunction::Lag | WindowFunction::Lead => (1, 3),
+            WindowFunction::NthValue => (2, 2),
+            WindowFunction::Aggregate(Aggregate::Count) => (0, 1),
+            WindowFunction::Aggregate(_) => (1, 1),
+        }
+    }
+}
+
+/// `{ROWS | RANGE} [BETWEEN] start [AND end]`: the rows of a window's frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Frame {
+    pub units: FrameUnits,
+    pub start: FrameBound,
+    pub end: FrameBound,
+}
+
+/// What a frame's bounds count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FrameUnits {
+    /// Rows: `n PRECEDING` is the row `n` before the current one.
+    Rows,
+    /// Peers: `CURRENT ROW` takes in all of the current row's peers. Only
+    /// `UNBOUNDED` bounds and `CURRENT ROW`, not offsets.
+    Range,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(u64),
+    CurrentRow,
+    Following(u64),
+    UnboundedFollowing,
+}
+
+impl std::fmt::Display for FrameBound {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            FrameBound::UnboundedPreceding => f.write_str("UNBOUNDED PRECEDING"),
+            FrameBound::Preceding(n) => write!(f, "{n} PRECEDING"),
+            FrameBound::CurrentRow => f.write_str("CURRENT ROW"),
+            FrameBound::Following(n) => write!(f, "{n} FOLLOWING"),
+            FrameBound::UnboundedFollowing => f.write_str("UNBOUNDED FOLLOWING"),
+        }
+    }
+}
+
+impl std::fmt::Display for Window {
+    /// `function(args) OVER (...)`, as SQL that parses back to it.
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let list = |exprs: &mut dyn Iterator<Item = String>| exprs.collect::<Vec<_>>().join(", ");
+        let name = self.function.name().to_uppercase();
+        match (self.function, self.args.is_empty()) {
+            (WindowFunction::Aggregate(Aggregate::Count), true) => write!(f, "{name}(*)")?,
+            _ => write!(f, "{name}({})", list(&mut self.args.iter().map(Expr::to_string)))?,
+        }
+        let mut parts = Vec::new();
+        if !self.partition_by.is_empty() {
+            let keys = list(&mut self.partition_by.iter().map(Expr::to_string));
+            parts.push(format!("PARTITION BY {keys}"));
+        }
+        if !self.order_by.is_empty() {
+            let keys = self
+                .order_by
+                .iter()
+                .map(|o| format!("{}{}", o.expr, if o.desc { " DESC" } else { "" }));
+            parts.push(format!("ORDER BY {}", list(&mut keys.into_iter())));
+        }
+        if let Some(frame) = &self.frame {
+            let units = match frame.units {
+                FrameUnits::Rows => "ROWS",
+                FrameUnits::Range => "RANGE",
+            };
+            parts.push(format!(
+                "{units} BETWEEN {} AND {}",
+                frame.start, frame.end
+            ));
+        }
+        write!(f, " OVER ({})", parts.join(" "))
+    }
 }
 
 /// The scalar functions, which take values and give one.
@@ -515,6 +872,7 @@ impl Expr {
                 *function,
                 args.iter().map(|e| e.replace(f)).collect::<Result<_>>()?,
             ),
+            Expr::Window(_) => self.try_map_parts(&mut |e| e.replace(f))?,
         })
     }
 
@@ -545,13 +903,15 @@ impl Expr {
                 left.visit(f);
                 query.exprs().into_iter().for_each(|e| e.visit(f));
             }
-            Expr::Case { .. } | Expr::Function(..) => {
+            Expr::Case { .. } | Expr::Function(..) | Expr::Window(_) => {
                 self.parts().into_iter().for_each(|e| e.visit(f))
             }
         }
     }
 
-    /// The expressions a CASE or a function call is made of, in order; none for others.
+    /// The expressions a CASE, a function call or a window function is
+    /// made of, in order (a window's arguments, then its PARTITION BY, then
+    /// its ORDER BY); none for others.
     pub fn parts(&self) -> Vec<&Expr> {
         match self {
             Expr::Case {
@@ -565,6 +925,12 @@ impl Expr {
                 .chain(otherwise.as_deref())
                 .collect(),
             Expr::Function(_, args) => args.iter().collect(),
+            Expr::Window(window) => window
+                .args
+                .iter()
+                .chain(&window.partition_by)
+                .chain(window.order_by.iter().map(|o| &o.expr))
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -591,8 +957,36 @@ impl Expr {
             Expr::Function(function, args) => {
                 Expr::Function(*function, args.iter().map(f).collect::<Result<_>>()?)
             }
+            Expr::Window(window) => {
+                let mut window = (**window).clone();
+                for e in window.args.iter_mut().chain(&mut window.partition_by) {
+                    *e = f(e)?;
+                }
+                for o in &mut window.order_by {
+                    o.expr = f(&o.expr)?;
+                }
+                Expr::Window(Box::new(window))
+            }
             other => other.clone(),
         })
+    }
+
+    /// Whether the expression has a window function in it, not counting
+    /// those of its subqueries.
+    pub fn has_window(&self) -> bool {
+        match self {
+            Expr::Window(_) => true,
+            Expr::Subquery(_) | Expr::Exists(_) => false,
+            Expr::InSubquery(left, ..) => left.has_window(),
+            Expr::Literal(_) | Expr::Column(_) | Expr::Outer(_) | Expr::Slot(..) => false,
+            Expr::Unary(_, inner) | Expr::IsNull(inner, _) => inner.has_window(),
+            Expr::Aggregate(_, arg, _) => arg.as_deref().is_some_and(Expr::has_window),
+            Expr::Binary(left, _, right) => left.has_window() || right.has_window(),
+            Expr::InList(left, items, _) => {
+                left.has_window() || items.iter().any(Expr::has_window)
+            }
+            Expr::Case { .. } | Expr::Function(..) => self.parts().into_iter().any(Expr::has_window),
+        }
     }
 
     /// Whether the expression has a subquery in it.
@@ -764,6 +1158,7 @@ impl std::fmt::Display for Expr {
                     .join(", ");
                 write!(f, "{}({args})", function.name().to_uppercase())
             }
+            Expr::Window(window) => write!(f, "{window}"),
         }
     }
 }
@@ -787,13 +1182,14 @@ impl std::fmt::Display for Select {
                 f.write_str(&list(&mut items.into_iter()))?
             }
         }
-        write!(f, " FROM {}", self.from.table)?;
+        if self.from.table.source != TableSource::Dual {
+            write!(f, " FROM {}", self.from.table)?;
+        }
         for join in &self.from.joins {
             match (join.kind, &join.on) {
                 (JoinKind::Inner, None) => write!(f, " CROSS JOIN {}", join.table)?,
-                (JoinKind::Inner, Some(on)) => write!(f, " JOIN {} ON {on}", join.table)?,
-                (JoinKind::Left, on) => {
-                    write!(f, " LEFT JOIN {}", join.table)?;
+                (kind, on) => {
+                    write!(f, " {}JOIN {}", kind.keyword(), join.table)?;
                     if let Some(on) = on {
                         write!(f, " ON {on}")?;
                     }
@@ -813,8 +1209,9 @@ impl std::fmt::Display for Select {
         if let Some(having) = &self.having {
             write!(f, " HAVING {having}")?;
         }
-        for (all, part) in &self.compound {
-            write!(f, " UNION {}{part}", if *all { "ALL " } else { "" })?;
+        for part in &self.compound {
+            let all = if part.all { "ALL " } else { "" };
+            write!(f, " {} {all}{}", part.op.name(), part.query)?;
         }
         if !self.order_by.is_empty() {
             let keys = self
@@ -834,14 +1231,45 @@ impl std::fmt::Display for Select {
 }
 
 impl std::fmt::Display for TableRef {
+    /// Writes the table as SQL that means the same: a recursive common table
+    /// expression as a subquery that defines it and reads all of it.
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match &self.source {
-            TableSource::Table(name) => f.write_str(name)?,
-            TableSource::Subquery(query) => write!(f, "({query})")?,
+        if self.lateral {
+            f.write_str("LATERAL ")?;
         }
-        match &self.alias {
-            Some(alias) => write!(f, " {alias}"),
-            None => Ok(()),
+        match &self.source {
+            TableSource::Table(name) | TableSource::WorkTable { name, .. } => f.write_str(name)?,
+            TableSource::Subquery(query) => write!(f, "({query})")?,
+            TableSource::Dual => {}
+            TableSource::Recursive(cte) => {
+                let columns = match cte.columns.is_empty() {
+                    true => String::new(),
+                    false => format!("({})", cte.columns.join(", ")),
+                };
+                let all = if cte.all { "ALL " } else { "" };
+                write!(
+                    f,
+                    "(WITH RECURSIVE {name}{columns} AS ({} UNION {all}{}) SELECT * FROM {name}) {}",
+                    cte.anchor,
+                    cte.step,
+                    self.qualifier(),
+                    name = cte.name
+                )?;
+                return self.write_columns(f);
+            }
+        }
+        if let Some(alias) = &self.alias {
+            write!(f, " {alias}")?;
+        }
+        self.write_columns(f)
+    }
+}
+
+impl TableRef {
+    fn write_columns(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self.columns.is_empty() {
+            true => Ok(()),
+            false => write!(f, "({})", self.columns.join(", ")),
         }
     }
 }
@@ -877,10 +1305,10 @@ mod tests {
             .unwrap()
             .pop()
         {
-            Some(Statement::Select(Select {
-                filter: Some(filter),
-                ..
-            })) => filter,
+            Some(Statement::Select(query)) if query.filter.is_some() => {
+                let Select { filter, .. } = *query;
+                filter.expect("checked above")
+            }
             other => panic!("{other:?}"),
         }
     }
@@ -910,6 +1338,15 @@ mod tests {
             "SUBSTR(LOWER(a), 2, -1) LIKE 'a%' AND NOT b LIKE '_'",
             "ROUND(a * 2.5, 1) > 1e20 OR b < 0.1 OR c BETWEEN 1.5 AND 2",
             "x IN (SELECT a FROM t UNION ALL SELECT b FROM u UNION SELECT c FROM v ORDER BY a LIMIT 3 OFFSET 1)",
+            "x IN (SELECT a FROM t INTERSECT SELECT b FROM u EXCEPT ALL SELECT c FROM v)",
+            "x IN (SELECT 1 UNION SELECT 2 INTERSECT ALL SELECT 2 EXCEPT SELECT 3)",
+            "EXISTS (SELECT 1 WHERE x > 2) AND (SELECT 2) = 2",
+            "x IN (SELECT a.x FROM a RIGHT JOIN b ON b.y = a.y FULL JOIN c ON c.z = b.z LEFT JOIN d ON TRUE)",
+            "EXISTS (SELECT * FROM a, LATERAL (SELECT a.x AS y) d(z) LEFT JOIN LATERAL (SELECT 1) e ON TRUE)",
+            "x > (SELECT SUM(a) OVER (PARTITION BY b, c ORDER BY c DESC ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING) FROM t)",
+            "(SELECT ROW_NUMBER() OVER () FROM t) = (SELECT COUNT(*) OVER (ORDER BY a RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t)",
+            "(SELECT LAG(a, 2, 0) OVER (ORDER BY a ROWS UNBOUNDED PRECEDING) + NTILE(4) OVER (PARTITION BY b) FROM t) > 1",
+            "x IN (WITH c (k) AS (SELECT a FROM t), d AS (SELECT k FROM c) SELECT k FROM d)",
         ] {
             let expr = where_clause(sql);
             assert_eq!(
