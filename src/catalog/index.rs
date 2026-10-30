@@ -461,9 +461,9 @@ fn columns_of(expr: &Expr, columns: &[Column], out: &mut Vec<usize>) {
     });
 }
 
-/// An expression of an index on `table`, with its columns unqualified;
+/// An expression of an index on `table`, or of a CHECK, with its columns unqualified;
 /// fails if it reads anything but the table's columns, or aggregates.
-fn own_expr(expr: &Expr, table: &str, columns: &[Column], what: &str) -> Result<Expr> {
+pub(crate) fn own_expr(expr: &Expr, table: &str, columns: &[Column], what: &str) -> Result<Expr> {
     let mut problem = None;
     expr.visit(&mut |e| match e {
         Expr::Column(column) => {

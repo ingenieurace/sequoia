@@ -619,25 +619,31 @@ fn apply_more(function: Function, values: &[Value]) -> Option<Result<Value>> {
     })())
 }
 
+/// The expression with every function of the current time replaced by its
+/// value at `now` (see [`at_time`]): for a column's default, which a
+/// statement takes at its own time.
+pub fn expr_at_time(expr: &Expr, now: i64) -> Result<Expr> {
+    expr.replace(&mut |e| match e {
+        Expr::Function(function, _) if function.reads_clock() => {
+            let (day, time) = datetime::split_timestamp(now);
+            Some(Ok(Expr::Literal(match function {
+                Function::Now => Value::TimestampTz(now),
+                Function::CurrentDate => Value::Date(day),
+                Function::CurrentTime => Value::Time(time),
+                _ => Value::Timestamp(now),
+            })))
+        }
+        _ => None,
+    })
+}
+
 /// The statement with every function of the current time (`NOW()`,
 /// `CURRENT_DATE` and the like) replaced by its value at `now`, so that a
 /// statement sees one time throughout, as SQLite has it (PostgreSQL's is
 /// the transaction's).
 pub fn at_time(statement: Statement, now: i64) -> Result<Statement> {
-    let fix = |e: &Expr| {
-        e.replace(&mut |e| match e {
-            Expr::Function(function, _) if function.reads_clock() => {
-                let (day, time) = datetime::split_timestamp(now);
-                Some(Ok(Expr::Literal(match function {
-                    Function::Now => Value::TimestampTz(now),
-                    Function::CurrentDate => Value::Date(day),
-                    Function::CurrentTime => Value::Time(time),
-                    _ => Value::Timestamp(now),
-                })))
-            }
-            _ => None,
-        })
-    };
+    let fix = |e: &Expr| expr_at_time(e, now);
+    let value = |e: &Option<Expr>| e.as_ref().map(fix).transpose();
     let returning = |p: Option<Projection>| -> Result<Option<Projection>> {
         Ok(match p {
             Some(Projection::Exprs(items)) => Some(Projection::Exprs(
@@ -671,10 +677,11 @@ pub fn at_time(statement: Statement, now: i64) -> Result<Statement> {
             source: match source {
                 InsertSource::Values(rows) => InsertSource::Values(
                     rows.iter()
-                        .map(|row| row.iter().map(fix).collect::<Result<_>>())
+                        .map(|row| row.iter().map(value).collect::<Result<_>>())
                         .collect::<Result<_>>()?,
                 ),
                 InsertSource::Select(query) => InsertSource::Select(Box::new(query.try_map(&mut |e| fix(e))?)),
+                InsertSource::DefaultValues => InsertSource::DefaultValues,
             },
             returning: returning(r)?,
         },
@@ -687,7 +694,7 @@ pub fn at_time(statement: Statement, now: i64) -> Result<Statement> {
             table,
             assignments: assignments
                 .into_iter()
-                .map(|(c, e)| Ok((c, fix(&e)?)))
+                .map(|(c, e)| Ok((c, value(&e)?)))
                 .collect::<Result<_>>()?,
             filter: filter.as_ref().map(fix).transpose()?,
             returning: returning(r)?,

@@ -169,13 +169,21 @@ pub fn execute(
         return execute_read(catalog, statement, settings);
     }
     // The current time, as the statement starts: the same for all of it.
-    match at_time(statement, datetime::now())? {
+    let now = datetime::now();
+    match at_time(statement, now)? {
         Statement::CreateTable {
             name,
             columns,
+            constraints,
             storage,
         } => {
-            catalog.create_table(name.clone(), columns, storage, settings.snapshot())?;
+            catalog.create_table(
+                name.clone(),
+                columns,
+                constraints,
+                storage,
+                settings.snapshot(),
+            )?;
             Ok(message(format!("table {name} created")))
         }
         Statement::DropTable { name } => {
@@ -227,13 +235,21 @@ pub fn execute(
             columns,
             source,
             returning,
-        } => insert(catalog, &table, columns, source, returning, settings),
+        } => insert(catalog, &table, columns, source, returning, settings, now),
         Statement::Update {
             table,
             assignments,
             filter,
             returning,
-        } => update(catalog, &table, assignments, filter, returning, settings),
+        } => update(
+            catalog,
+            &table,
+            assignments,
+            filter,
+            returning,
+            settings,
+            now,
+        ),
         Statement::Delete {
             table,
             filter,
@@ -405,12 +421,16 @@ fn insert(
     source: InsertSource,
     returning: Option<Projection>,
     settings: &Settings,
+    now: i64,
 ) -> Result<QueryResult> {
     let (new_rows, returned) = {
         let catalog: &Catalog = catalog;
         let table = catalog.get(table)?;
         let returning = Returning::bind(catalog, table, returning)?;
-        // Which column each supplied value goes to; omitted columns become NULL.
+        // Omitted columns, and those given DEFAULT, take their defaults, the
+        // same for every row: NULL for a column without one.
+        let defaults = table.defaults(now)?;
+        // Which column each supplied value goes to.
         let targets: Vec<usize> = match columns {
             Some(names) => names
                 .iter()
@@ -422,6 +442,10 @@ fn insert(
         let mut new_rows = Vec::new();
         let rows = match source {
             InsertSource::Values(rows) => rows,
+            InsertSource::DefaultValues => {
+                new_rows.push(defaults.clone());
+                Vec::new()
+            }
             InsertSource::Select(query) => {
                 let query = select(catalog, *query, settings)?;
                 if query.columns.len() != targets.len() {
@@ -432,7 +456,7 @@ fn insert(
                     ));
                 }
                 for values in query {
-                    let mut row = vec![Value::Null; table.columns.len()];
+                    let mut row = defaults.clone();
                     for (&i, value) in targets.iter().zip(values?) {
                         row[i] = value;
                     }
@@ -449,15 +473,17 @@ fn insert(
                     exprs.len()
                 ));
             }
-            let mut row = vec![Value::Null; table.columns.len()];
-            forbid(&exprs, "VALUES")?;
+            let mut row = defaults.clone();
+            forbid(exprs.iter().flatten(), "VALUES")?;
             for (&i, expr) in targets.iter().zip(&exprs) {
-                row[i] = eval_with(
-                    &query::bind(catalog, None, expr)?,
-                    &[],
-                    &[],
-                    &mut subqueries,
-                )?;
+                if let Some(expr) = expr {
+                    row[i] = eval_with(
+                        &query::bind(catalog, None, expr)?,
+                        &[],
+                        &[],
+                        &mut subqueries,
+                    )?;
+                }
             }
             new_rows.push(row);
         }
@@ -480,13 +506,14 @@ fn insert(
 fn update(
     catalog: &mut Catalog,
     table: &str,
-    assignments: Vec<(String, Expr)>,
+    assignments: Vec<(String, Option<Expr>)>,
     filter: Option<Expr>,
     returning: Option<Projection>,
     settings: &Settings,
+    now: i64,
 ) -> Result<QueryResult> {
     forbid(&filter, "WHERE")?;
-    forbid(assignments.iter().map(|(_, e)| e), "UPDATE")?;
+    forbid(assignments.iter().filter_map(|(_, e)| e.as_ref()), "UPDATE")?;
     let (changes, returned) = {
         let catalog: &Catalog = catalog;
         let table = catalog.get(table)?;
@@ -494,13 +521,19 @@ fn update(
         let filter = filter
             .map(|f| query::bind(catalog, Some(table), &f))
             .transpose()?;
+        // `SET column = DEFAULT` sets the default, the same for every row.
+        let defaults = match assignments.iter().any(|(_, e)| e.is_none()) {
+            true => table.defaults(now)?,
+            false => Vec::new(),
+        };
         let assignments: Vec<(usize, Expr)> = assignments
             .into_iter()
             .map(|(name, expr)| {
-                Ok((
-                    table.column_index(&name)?,
-                    query::bind(catalog, Some(table), &expr)?,
-                ))
+                let i = table.column_index(&name)?;
+                Ok(match expr {
+                    Some(expr) => (i, query::bind(catalog, Some(table), &expr)?),
+                    None => (i, Expr::Literal(defaults[i].clone())),
+                })
             })
             .collect::<Result<_>>()?;
 

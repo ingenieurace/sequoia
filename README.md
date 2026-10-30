@@ -166,12 +166,14 @@ workers, and a join method to force on every join (see
 
 **Statements**
 
-- `CREATE TABLE name (column TYPE [PRIMARY KEY], ...) [USING HEAP | LSM | COLUMN]`, `DROP TABLE name`
+- `CREATE TABLE name (column TYPE [constraint ...], ... [, table constraint, ...]) [USING HEAP | LSM | COLUMN]`, `DROP TABLE name`
+  (see Constraints below)
 - `CREATE [UNIQUE] INDEX name ON table [USING BTREE | HASH] (key, ...) [INCLUDE (column, ...)] [WHERE condition]`, `DROP INDEX name`.
   A key is a column or an expression of columns, such as `LOWER(name)`.
-- `INSERT INTO table [(column, ...)] VALUES (...), ...`, or `INSERT INTO table [(column, ...)] SELECT ...`
-  (the query's rows are all read before the first is inserted)
-- `SELECT`, `UPDATE table SET column = expr, ... [WHERE ...]`, `DELETE FROM table [WHERE ...]`
+- `INSERT INTO table [(column, ...)] VALUES (...), ...`, `INSERT INTO table [(column, ...)] SELECT ...`
+  (the query's rows are all read before the first is inserted), or `INSERT INTO table DEFAULT VALUES`;
+  a value in `VALUES` may be `DEFAULT`
+- `SELECT`, `UPDATE table SET column = expr | DEFAULT, ... [WHERE ...]`, `DELETE FROM table [WHERE ...]`
 - `RETURNING * | expr [AS name], ...` after `INSERT`, `UPDATE` or `DELETE` returns the rows written instead of a count
 - `EXPLAIN` before `SELECT`, `UPDATE` or `DELETE`; `EXPLAIN ANALYZE` before `SELECT`
 - `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT name`, `ROLLBACK TO [SAVEPOINT] name`, `RELEASE [SAVEPOINT] name` (each may add `TRANSACTION`)
@@ -231,9 +233,32 @@ as a wall time there; a zone is UTC, an offset east of it (`'+05:30'`), or
 an INTERVAL of one. There are no zones by name, and so no daylight saving
 time: there is no time zone database.
 
-**Constraints**: `PRIMARY KEY` on one column (unique, not NULL), and unique
-indexes (rows with a NULL key may repeat; a partial unique index checks only
-the rows it holds).
+**Constraints**: after a column's type, in any order:
+
+- `PRIMARY KEY`: one column only (unique, not NULL)
+- `NOT NULL` (or `NULL`, which is the default anyway)
+- `DEFAULT expr`: what the column takes when an INSERT leaves it out or gives
+  `DEFAULT`, or an UPDATE sets it to `DEFAULT`. An expression of no column
+  and no subquery, which may read the current time (`DEFAULT CURRENT_DATE`),
+  taken when the statement starts, the same for all its rows. It is checked
+  against the column's type when the table is created. Unparenthesized, it is
+  read up to the next constraint (`DEFAULT 0 NOT NULL`); `DEFAULT (a = b)`
+  takes any expression.
+- `UNIQUE`: no two rows share the value, but NULLs may repeat. A unique
+  index named `<table>_<column>_key` keeps it, and cannot be dropped alone.
+  Not on COLUMN tables, which have no indexes.
+- `CHECK (condition)`: a row may not make it false (NULL passes). It reads
+  only the row: no subquery, aggregate or current time.
+
+Any of them may be named with `CONSTRAINT name` before it. Among the
+columns, a table may also have `[CONSTRAINT name] CHECK (condition)`,
+`UNIQUE (column, ...)` and `PRIMARY KEY (column)`. An unnamed CHECK is named
+`<table>_<column>_check`, or `<table>_check`, as in PostgreSQL, with a
+number after if that is taken; errors name it: `new row violates check
+constraint item_price_check`. Every row an INSERT or UPDATE writes is
+checked before any is written, so a statement that breaks a constraint
+changes nothing. Unique indexes also stand on their own (rows with a NULL
+key may repeat; a partial unique index checks only the rows it holds).
 
 **Queries**
 
@@ -343,8 +368,8 @@ can be rolled back and run again. Write skew is possible, as under any
 snapshot isolation: two transactions may each read what the other changes.
 See [Transactions and MVCC](#transactions-and-mvcc).
 
-**Not supported**: `ALTER TABLE`, `NOT NULL`, `DEFAULT`, `CHECK`, foreign
-keys, composite primary keys, time zones by name (only UTC and offsets),
+**Not supported**: `ALTER TABLE`, foreign keys, primary keys of several
+columns, time zones by name (only UTC and offsets),
 `SET TIME ZONE`, frame `EXCLUDE` clauses, and text stored in a DATE, TIME,
 TIMESTAMP, TIMESTAMPTZ or INTERVAL column without a cast or a typed literal.
 

@@ -28,14 +28,15 @@
 //! `OVER`, `WINDOW`...).
 
 use super::ast::{
-    Aggregate, BinaryOp, ColumnRef, Compound, CreateIndex, Expr, Frame, FrameBound, FrameUnits,
-    From, Function, IndexKind, InsertSource, Join, JoinKind, OrderBy, Projection, RecursiveCte,
-    Select, SelectItem, SetOp, Statement, TableRef, TableSource, UnaryOp, Window, WindowFunction,
+    Aggregate, BinaryOp, Check, ColumnRef, Compound, Constraints, CreateIndex, Expr, Frame,
+    FrameBound, FrameUnits, From, Function, IndexKind, InsertSource, Join, JoinKind, OrderBy,
+    Projection, RecursiveCte, Select, SelectItem, SetOp, Statement, TableRef, TableSource, UnaryOp,
+    Unique, Window, WindowFunction,
 };
 use super::lexer::{Token, tokenize};
 use crate::datetime;
 use crate::decimal::Decimal;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, err};
 use crate::types::{Column, DataType, StorageKind, Value};
 
 /// Parses one or more `;`-separated statements.
@@ -56,6 +57,92 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
         if parser.peek().is_some() {
             parser.expect_symbol(";")?;
         }
+    }
+}
+
+/// The constraints of a CREATE TABLE as they are read, before the unnamed
+/// ones get names.
+#[derive(Default)]
+struct Found {
+    not_null: Vec<String>,
+    defaults: Vec<(String, Expr)>,
+    /// Each CHECK's name, if given; the column it was written with, if any;
+    /// and its condition.
+    checks: Vec<(Option<String>, Option<String>, Expr)>,
+    unique: Vec<(Option<String>, Vec<String>)>,
+    /// The columns of the table's `PRIMARY KEY (...)`.
+    primary_key: Vec<String>,
+}
+
+impl Found {
+    /// The table's constraints, each CHECK and UNIQUE named as written, or
+    /// as PostgreSQL names them (`t_c_check`, `t_check`, `t_a_b_key`), with a
+    /// number after if that is taken. `PRIMARY KEY (column)` marks the column.
+    fn constraints(self, table: &str, columns: &mut [Column]) -> Result<Constraints> {
+        match self.primary_key.as_slice() {
+            [] => {}
+            [key] => match columns.iter_mut().find(|c| &c.name == key) {
+                Some(column) => column.primary_key = true,
+                None => return err(format!("unknown column in PRIMARY KEY: {key}")),
+            },
+            _ => return err("a primary key of several columns is not supported"),
+        }
+        let mut taken: Vec<String> = Vec::new();
+        let given = self
+            .checks
+            .iter()
+            .map(|c| &c.0)
+            .chain(self.unique.iter().map(|u| &u.0));
+        for name in given.flatten() {
+            if taken.contains(name) {
+                return err(format!("constraint {name} is declared twice"));
+            }
+            taken.push(name.clone());
+        }
+        let mut name = |given: Option<String>, base: String| {
+            given.unwrap_or_else(|| {
+                let mut name = base.clone();
+                for n in 1.. {
+                    if !taken.contains(&name) {
+                        break;
+                    }
+                    name = format!("{base}{n}");
+                }
+                taken.push(name.clone());
+                name
+            })
+        };
+        let checks = self
+            .checks
+            .into_iter()
+            .map(|(given, column, condition)| Check {
+                name: name(
+                    given,
+                    match column {
+                        Some(column) => format!("{table}_{column}_check"),
+                        None => format!("{table}_check"),
+                    },
+                ),
+                condition,
+            })
+            .collect();
+        let unique = self
+            .unique
+            .into_iter()
+            .map(|(given, columns)| Unique {
+                name: name(given, format!("{table}_{}_key", columns.join("_"))),
+                columns,
+            })
+            .collect();
+        let mut not_null = self.not_null;
+        not_null.sort();
+        not_null.dedup();
+        Ok(Constraints {
+            not_null,
+            defaults: self.defaults,
+            checks,
+            unique,
+        })
     }
 }
 
@@ -182,8 +269,19 @@ impl Parser {
         self.expect_keyword("TABLE")?;
         let name = self.ident()?;
         self.expect_symbol("(")?;
-        let columns = self.comma_list(Self::column_def)?;
+        let mut columns = Vec::new();
+        let mut found = Found::default();
+        loop {
+            match self.table_constraint_follows() {
+                true => self.table_constraint(&mut found)?,
+                false => columns.push(self.column_def(&mut found)?),
+            }
+            if !self.eat_symbol(",") {
+                break;
+            }
+        }
         self.expect_symbol(")")?;
+        let constraints = found.constraints(&name, &mut columns)?;
         let mut storage = StorageKind::default();
         if self.eat_keyword("USING") {
             // HEAP, LSM and COLUMN are not keywords, so they stay usable as names.
@@ -201,22 +299,126 @@ impl Parser {
         Ok(Statement::CreateTable {
             name,
             columns,
+            constraints,
             storage,
         })
     }
 
-    fn column_def(&mut self) -> Result<Column> {
+    /// A column and what follows its type, in any order: `[CONSTRAINT name]`
+    /// then `NOT NULL`, `NULL`, `PRIMARY KEY`, `UNIQUE`, `DEFAULT expr` or
+    /// `CHECK (condition)`. A default is read up to `+`, `-`, `||` and the
+    /// like, so that `DEFAULT 0 NOT NULL` reads as two; in parentheses it
+    /// may be any expression.
+    fn column_def(&mut self, found: &mut Found) -> Result<Column> {
         let name = self.ident()?;
         let data_type = self.data_type()?;
-        let primary_key = self.eat_keyword("PRIMARY");
-        if primary_key {
-            self.expect_keyword("KEY")?;
+        let mut primary_key = false;
+        loop {
+            let constraint = match self.eat_word("CONSTRAINT") {
+                true => Some(self.ident()?),
+                false => None,
+            };
+            if self.eat_keyword("NOT") {
+                self.expect_keyword("NULL")?;
+                found.not_null.push(name.clone());
+            } else if self.eat_keyword("NULL") {
+                // Allowed to be NULL, as it is anyway.
+            } else if self.eat_keyword("PRIMARY") {
+                self.expect_keyword("KEY")?;
+                primary_key = true;
+            } else if self.eat_keyword("UNIQUE") {
+                found.unique.push((constraint, vec![name.clone()]));
+            } else if self.eat_word("DEFAULT") {
+                if found.defaults.iter().any(|(c, _)| c == &name) {
+                    return err(format!("column {name} has two defaults"));
+                }
+                found.defaults.push((name.clone(), self.additive()?));
+            } else if self.eat_word("CHECK") {
+                let condition = self.parenthesized()?;
+                found
+                    .checks
+                    .push((constraint, Some(name.clone()), condition));
+            } else if constraint.is_some() {
+                return Err(self.unexpected("a constraint"));
+            } else {
+                break;
+            }
         }
         Ok(Column {
             name,
             data_type,
             primary_key,
         })
+    }
+
+    /// Whether a table constraint follows, rather than a column: `UNIQUE (`,
+    /// `PRIMARY KEY`, `CHECK (`, or `CONSTRAINT name` before one of them.
+    fn table_constraint_follows(&self) -> bool {
+        let at = |i: usize| self.tokens.get(self.pos + i);
+        let word = |token: Option<&Token>, word: &str| matches!(token, Some(Token::Ident(w)) if w.eq_ignore_ascii_case(word));
+        let starts = |i: usize| match at(i) {
+            Some(Token::Keyword(k)) if k == "UNIQUE" || k == "PRIMARY" => true,
+            token => word(token, "CHECK") && at(i + 1) == Some(&Token::Symbol("(")),
+        };
+        starts(0)
+            || (word(at(0), "CONSTRAINT")
+                && matches!(at(1), Some(Token::Ident(_) | Token::QuotedIdent(_)))
+                && starts(2))
+    }
+
+    /// `[CONSTRAINT name] CHECK (condition)`, `UNIQUE (column, ...)` or
+    /// `PRIMARY KEY (column)`, among a table's columns.
+    fn table_constraint(&mut self, found: &mut Found) -> Result<()> {
+        let constraint = match self.eat_word("CONSTRAINT") {
+            true => Some(self.ident()?),
+            false => None,
+        };
+        let columns = |p: &mut Self| -> Result<Vec<String>> {
+            p.expect_symbol("(")?;
+            let columns = p.comma_list(Self::ident)?;
+            p.expect_symbol(")")?;
+            Ok(columns)
+        };
+        if self.eat_word("CHECK") {
+            let condition = self.parenthesized()?;
+            found.checks.push((constraint, None, condition));
+        } else if self.eat_keyword("UNIQUE") {
+            found.unique.push((constraint, columns(self)?));
+        } else {
+            self.expect_keyword("PRIMARY")?;
+            self.expect_keyword("KEY")?;
+            found.primary_key.extend(columns(self)?);
+        }
+        Ok(())
+    }
+
+    /// `(expr)`
+    fn parenthesized(&mut self) -> Result<Expr> {
+        self.expect_symbol("(")?;
+        let expr = self.expr()?;
+        self.expect_symbol(")")?;
+        Ok(expr)
+    }
+
+    /// A value in `VALUES (...)` or after `SET column =`: an expression, or
+    /// none for `DEFAULT` (a word that is a name elsewhere), when what
+    /// follows ends the value.
+    fn value_or_default(&mut self) -> Result<Option<Expr>> {
+        let default = matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("DEFAULT"))
+            && match self.tokens.get(self.pos + 1) {
+                None => true,
+                Some(Token::Symbol(s)) => [",", ")", ";"].contains(s),
+                Some(Token::Keyword(k)) => k == "WHERE",
+                Some(Token::Ident(w)) => w.eq_ignore_ascii_case("RETURNING"),
+                Some(_) => false,
+            };
+        match default {
+            true => {
+                self.pos += 1;
+                Ok(None)
+            }
+            false => self.expr().map(Some),
+        }
     }
 
     /// A data type: INT, TEXT, BOOL, REAL, DATE, TIME, TIMESTAMP, BLOB or
@@ -368,7 +570,10 @@ impl Parser {
         } else {
             None
         };
-        let source = if !self.eat_keyword("VALUES") {
+        let source = if columns.is_none() && self.eat_word("DEFAULT") {
+            self.expect_keyword("VALUES")?;
+            InsertSource::DefaultValues
+        } else if !self.eat_keyword("VALUES") {
             if !self.query_follows() {
                 return Err(self.unexpected("VALUES or a query"));
             }
@@ -376,7 +581,7 @@ impl Parser {
         } else {
             InsertSource::Values(self.comma_list(|p| {
                 p.expect_symbol("(")?;
-                let values = p.comma_list(Self::expr)?;
+                let values = p.comma_list(Self::value_or_default)?;
                 p.expect_symbol(")")?;
                 Ok(values)
             })?)
@@ -821,7 +1026,7 @@ impl Parser {
         let assignments = self.comma_list(|p| {
             let column = p.ident()?;
             p.expect_symbol("=")?;
-            Ok((column, p.expr()?))
+            Ok((column, p.value_or_default()?))
         })?;
         let filter = self.where_clause()?;
         let returning = self.returning()?;

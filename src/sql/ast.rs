@@ -8,6 +8,7 @@ pub enum Statement {
     CreateTable {
         name: String,
         columns: Vec<Column>,
+        constraints: Constraints,
         storage: StorageKind,
     },
     DropTable {
@@ -61,7 +62,9 @@ pub enum Statement {
     Select(Box<Select>),
     Update {
         table: String,
-        assignments: Vec<(String, Expr)>,
+        /// Each column set, and its new value: an expression, or none for
+        /// `DEFAULT`, the column's default.
+        assignments: Vec<(String, Option<Expr>)>,
         filter: Option<Expr>,
         returning: Option<Projection>,
     },
@@ -75,11 +78,60 @@ pub enum Statement {
 /// The rows an INSERT adds.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InsertSource {
-    /// `VALUES (expr, ...), ...`
-    Values(Vec<Vec<Expr>>),
+    /// `VALUES (expr, ...), ...`: none for `DEFAULT`, the column's default.
+    Values(Vec<Vec<Option<Expr>>>),
     /// `SELECT ...`: the query's rows, all read before the first is inserted,
     /// so that a query of the table itself never sees the rows it adds.
     Select(Box<Select>),
+    /// `DEFAULT VALUES`: one row of every column's default.
+    DefaultValues,
+}
+
+/// What a table asks of its rows besides its columns' types, as CREATE TABLE
+/// declares it: columns that may not be NULL, columns' defaults, CHECK
+/// conditions and UNIQUE column lists. A column's `PRIMARY KEY` is kept on
+/// the column itself.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Constraints {
+    /// The columns declared `NOT NULL`, by name.
+    pub not_null: Vec<String>,
+    /// `DEFAULT expr`: what a column takes when an INSERT gives it no value,
+    /// or an UPDATE sets it to `DEFAULT`. An expression of no column, which
+    /// may read the current time.
+    pub defaults: Vec<(String, Expr)>,
+    pub checks: Vec<Check>,
+    pub unique: Vec<Unique>,
+}
+
+/// `[CONSTRAINT name] CHECK (condition)`: a row may not make the condition
+/// false (NULL passes, as in standard SQL).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Check {
+    pub name: String,
+    pub condition: Expr,
+}
+
+/// `[CONSTRAINT name] UNIQUE (column, ...)`: no two rows may share these
+/// columns' values, unless one of them is NULL. A unique index of the same
+/// name keeps it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Unique {
+    pub name: String,
+    pub columns: Vec<String>,
+}
+
+impl Constraints {
+    /// Whether the column with this name was declared `NOT NULL`.
+    pub fn is_not_null(&self, column: &str) -> bool {
+        self.not_null.iter().any(|c| c == column)
+    }
+
+    /// The default of the column with this name, if it has one.
+    pub fn default_of(&self, column: &str) -> Option<&Expr> {
+        self.defaults
+            .iter()
+            .find_map(|(c, expr)| (c == column).then_some(expr))
+    }
 }
 
 /// `CREATE [UNIQUE] INDEX name ON table [USING BTREE | HASH] (key, ...) [INCLUDE (column, ...)] [WHERE condition]`

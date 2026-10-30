@@ -3,12 +3,14 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 
-use super::index::{Bound, Index, encode_keys};
+use super::index::{Bound, Index, encode_keys, own_expr};
 use super::stats::TableStats;
+use crate::datetime;
 use crate::error::{Error, Result, err};
 use crate::mvcc::{Claim, Holding, Snapshot, Transactions};
 use crate::predicate::Predicate;
-use crate::sql::ast::CreateIndex;
+use crate::sql::ast::{Constraints, CreateIndex, Expr};
+use crate::sql::eval::{Field, eval, expr_at_time, locate};
 use crate::storage::version::{All, Fate, HEADER, Header, Horizon, Visibility, Xid};
 use crate::storage::{
     BufferPool, ColumnChunk, ColumnConfig, ColumnStore, LsmConfig, LsmTree, MAX_TUPLE_SIZE, PageId,
@@ -40,7 +42,9 @@ pub enum RowId {
 }
 
 /// A table: a schema plus the storage holding its encoded rows, and the
-/// indexes over them. Enforces column types, primary keys and unique indexes.
+/// indexes over them. Enforces column types, primary keys, unique indexes,
+/// NOT NULL columns and CHECK conditions, and gives columns their defaults
+/// (see [`Constraints`]; a UNIQUE constraint is kept by a unique index).
 ///
 /// Every stored row is a version, with the header of `storage/version.rs`:
 /// reads see the versions their snapshot sees (see `mvcc/snapshot.rs`), and
@@ -56,6 +60,10 @@ pub enum RowId {
 pub struct Table {
     pub name: String,
     pub columns: Vec<Column>,
+    /// What CREATE TABLE asked of the rows besides the columns' types.
+    pub constraints: Constraints,
+    /// The same, made ready to check rows by.
+    rules: Rules,
     pool: Arc<BufferPool>,
     txns: Arc<Transactions>,
     storage: Storage,
@@ -76,6 +84,133 @@ pub struct Table {
 
 /// A row count not counted yet.
 const UNCOUNTED: u64 = u64::MAX;
+
+/// A table's constraints, made ready to check rows by.
+struct Rules {
+    /// Whether each column, by position, was declared NOT NULL.
+    not_null: Vec<bool>,
+    /// Each CHECK's name and condition, its columns found among the table's.
+    checks: Vec<(String, Expr)>,
+    /// The table's columns, for the conditions to read.
+    fields: Vec<Field>,
+}
+
+impl Rules {
+    /// Checks that the constraints name only the table's columns, that
+    /// CHECK conditions read nothing but the row (no subquery, aggregate or
+    /// current time), and that defaults read no column.
+    fn new(table: &str, columns: &[Column], constraints: &Constraints) -> Result<Rules> {
+        let known = |name: &str, what: &str| {
+            column_index(columns, name)
+                .map_err(|_| Error(format!("unknown column in {what}: {name}")))
+        };
+        let mut not_null = vec![false; columns.len()];
+        for name in &constraints.not_null {
+            not_null[known(name, "NOT NULL")?] = true;
+        }
+        for (name, default) in &constraints.defaults {
+            known(name, "DEFAULT")?;
+            let mut problem = None;
+            default.visit(&mut |e| match e {
+                Expr::Column(_) | Expr::Outer(_) => {
+                    _ = problem.get_or_insert("cannot read a column")
+                }
+                Expr::Aggregate(..) => _ = problem.get_or_insert("cannot use an aggregate"),
+                Expr::Window(_) => _ = problem.get_or_insert("cannot use a window function"),
+                Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(..) => {
+                    _ = problem.get_or_insert("cannot use a subquery")
+                }
+                _ => {}
+            });
+            if let Some(problem) = problem {
+                return err(format!("the default of column {name} {problem}"));
+            }
+        }
+        for unique in &constraints.unique {
+            for name in &unique.columns {
+                known(name, "UNIQUE")?;
+            }
+        }
+        let fields: Vec<Field> = columns.iter().map(|c| Field::named(&c.name)).collect();
+        let checks = constraints
+            .checks
+            .iter()
+            .map(|check| {
+                let condition = own_expr(&check.condition, table, columns, "a CHECK")?;
+                Ok((check.name.clone(), locate(&condition, &fields)))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Rules {
+            not_null,
+            checks,
+            fields,
+        })
+    }
+
+    /// Checks that each default is a value its column can hold, as it would
+    /// be now.
+    fn check_defaults(&self, columns: &[Column], constraints: &Constraints) -> Result<()> {
+        for (i, value) in defaults(columns, constraints, datetime::now())?
+            .into_iter()
+            .enumerate()
+        {
+            let column = &columns[i];
+            let fault = |problem: String| {
+                Error(format!("the default of column {}: {problem}", column.name))
+            };
+            let value = match value.fits(column.data_type) {
+                true => value,
+                false => value.assign(column.data_type).map_err(|e| fault(e.0))?,
+            };
+            if !value.fits(column.data_type) {
+                return Err(fault(format!(
+                    "{} is not a {}",
+                    value.to_sql(),
+                    column.data_type
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks rows against the NOT NULL columns and the CHECK conditions: a
+    /// condition may be true or NULL, but not false.
+    fn check(&self, columns: &[Column], rows: &[Row]) -> Result<()> {
+        for row in rows {
+            for (value, (column, not_null)) in row.iter().zip(columns.iter().zip(&self.not_null)) {
+                if *not_null && value.is_null() {
+                    return err(format!("column {} cannot be NULL", column.name));
+                }
+            }
+            for (name, condition) in &self.checks {
+                match eval(condition, &self.fields, row)? {
+                    Value::Bool(true) | Value::Null => {}
+                    Value::Bool(false) => {
+                        return err(format!("new row violates check constraint {name}"));
+                    }
+                    other => {
+                        return err(format!(
+                            "check constraint {name} must be a condition, not {}",
+                            other.to_sql()
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Every column's default at time `now`, or NULL for a column without one.
+fn defaults(columns: &[Column], constraints: &Constraints, now: i64) -> Result<Row> {
+    columns
+        .iter()
+        .map(|column| match constraints.default_of(&column.name) {
+            Some(default) => eval(&expr_at_time(default, now)?, &[], &[]),
+            None => Ok(Value::Null),
+        })
+        .collect()
+}
 
 /// The rows of a heap table, read by threads together: see [`Table::shared_scan`].
 pub struct SharedTableScan {
@@ -238,14 +373,19 @@ fn steps<'a>(steps: impl Iterator<Item = Result<Step>> + 'a) -> Versions<'a> {
 }
 
 impl Table {
-    /// Creates an empty table.
+    /// Creates an empty table. Fails if a constraint names a column the
+    /// table does not have, a CHECK reads anything but the row, or a default
+    /// reads a column or is not of its column's type.
     pub fn create(
         pool: Arc<BufferPool>,
         txns: Arc<Transactions>,
         name: String,
         columns: Vec<Column>,
+        constraints: Constraints,
         kind: StorageKind,
     ) -> Result<Self> {
+        let rules = Rules::new(&name, &columns, &constraints)?;
+        rules.check_defaults(&columns, &constraints)?;
         let storage = match kind {
             StorageKind::Heap => Storage::Heap(TableHeap::create(pool.clone())?),
             StorageKind::Lsm => Storage::Lsm {
@@ -261,6 +401,8 @@ impl Table {
         Ok(Table {
             name,
             columns,
+            constraints,
+            rules,
             pool,
             txns,
             storage,
@@ -276,15 +418,18 @@ impl Table {
     /// indexes are added afterwards with [`Table::open_index`]. A `legacy`
     /// table was written before rows had versions, and can only be read
     /// with [`Table::legacy_rows`].
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         pool: Arc<BufferPool>,
         txns: Arc<Transactions>,
         name: String,
         columns: Vec<Column>,
+        constraints: Constraints,
         kind: StorageKind,
         (first, last): (PageId, PageId),
         legacy: bool,
     ) -> Result<Self> {
+        let rules = Rules::new(&name, &columns, &constraints)?;
         let storage = match kind {
             StorageKind::Heap => Storage::Heap(TableHeap::open(pool.clone(), first, last)?),
             StorageKind::Lsm => {
@@ -312,6 +457,8 @@ impl Table {
         Ok(Table {
             name,
             columns,
+            constraints,
+            rules,
             pool,
             txns,
             storage,
@@ -690,6 +837,7 @@ impl Table {
     pub fn insert(&mut self, snapshot: &Snapshot, rows: Vec<Row>) -> Result<()> {
         let xid = snapshot.xid()?;
         let rows = self.coerce_all(rows)?;
+        self.rules.check(&self.columns, &rows)?;
         let stored = self.encode_all(&rows, xid)?;
         self.check_unique(snapshot, &HashSet::new(), &rows, &[])?;
         let pk = primary_key(&self.columns);
@@ -749,6 +897,7 @@ impl Table {
             .map(|(id, old, new)| ((id, old), new))
             .unzip();
         let rows = self.coerce_all(rows)?;
+        self.rules.check(&self.columns, &rows)?;
         let ids: Vec<RowId> = old_rows.iter().map(|(id, _)| id.clone()).collect();
         let stored = self.encode_all(&rows, xid)?;
         self.check_unique(snapshot, &ids.iter().cloned().collect(), &rows, &old_rows)?;
@@ -1153,6 +1302,12 @@ impl Table {
             Storage::Lsm { .. } => Ok(RowId::Key(bytes)),
             Storage::Column(_) => err("COLUMN tables cannot have indexes"),
         }
+    }
+
+    /// A row of every column's default, as a statement that began at `now`
+    /// gives it; NULL for a column without one.
+    pub fn defaults(&self, now: i64) -> Result<Row> {
+        defaults(&self.columns, &self.constraints, now)
     }
 
     /// Rows with each value made one of its column's type as it is stored

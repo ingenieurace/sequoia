@@ -7610,3 +7610,321 @@ fn lsm_versions_under_one_key_leave_no_stale_index_entries() {
     assert_eq!(ids(&mut db, "z").len(), 10);
     assert_eq!(query(&mut db, "SELECT id FROM t").len(), 300);
 }
+
+/// A table with every kind of constraint and a default, stored as `using`.
+fn setup_constraints(db: &mut Database, using: &str) {
+    db.execute(&format!(
+        "CREATE TABLE item (
+             id INT PRIMARY KEY,
+             name TEXT NOT NULL,
+             price REAL DEFAULT 1.5 NOT NULL CHECK (price >= 0),
+             qty INT DEFAULT (2 * 5),
+             note TEXT DEFAULT 'none' NULL,
+             CONSTRAINT \"stock limit\" CHECK (qty BETWEEN 0 AND 100 OR name = 'bulk')
+         ) USING {using}"
+    ))
+    .unwrap();
+}
+
+#[test]
+fn defaults_fill_what_inserts_and_updates_leave_out() {
+    for using in ["HEAP", "LSM", "COLUMN"] {
+        let mut db = in_memory();
+        setup_constraints(&mut db, using);
+        db.execute("INSERT INTO item (id, name) VALUES (1, 'pen')")
+            .unwrap();
+        db.execute(
+            "INSERT INTO item VALUES (2, 'ink', DEFAULT, 5, DEFAULT), (3, 'cap', 0.25, DEFAULT, NULL)",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO item (name, id) SELECT name || '2', id + 10 FROM item WHERE id < 3",
+        )
+        .unwrap();
+        let rows = query(&mut db, "SELECT * FROM item ORDER BY id");
+        let row = |id, name: &str, price: f64, qty, note: Option<&str>| {
+            vec![
+                int(id),
+                text(name),
+                Value::Real(price),
+                int(qty),
+                note.map_or(Value::Null, text),
+            ]
+        };
+        assert_eq!(
+            rows,
+            [
+                row(1, "pen", 1.5, 10, Some("none")),
+                row(2, "ink", 1.5, 5, Some("none")),
+                row(3, "cap", 0.25, 10, None),
+                row(11, "pen2", 1.5, 10, Some("none")),
+                row(12, "ink2", 1.5, 10, Some("none")),
+            ],
+            "{using}"
+        );
+        // UPDATE ... SET column = DEFAULT, and RETURNING shows what was stored.
+        let returned = query(
+            &mut db,
+            "UPDATE item SET qty = DEFAULT, note = DEFAULT WHERE id IN (2, 3) RETURNING id, qty, note",
+        );
+        assert_eq!(returned.len(), 2, "{using}");
+        assert!(
+            returned
+                .iter()
+                .all(|r| r[1] == int(10) && r[2] == text("none")),
+            "{using}"
+        );
+        let returned = query(
+            &mut db,
+            "INSERT INTO item (id, name) VALUES (4, 'box') RETURNING *",
+        );
+        assert_eq!(returned, [row(4, "box", 1.5, 10, Some("none"))], "{using}");
+    }
+}
+
+#[test]
+fn not_null_and_check_constraints_refuse_rows() {
+    for using in ["HEAP", "LSM", "COLUMN"] {
+        let mut db = in_memory();
+        setup_constraints(&mut db, using);
+        db.execute("INSERT INTO item (id, name) VALUES (1, 'pen'), (2, 'ink')")
+            .unwrap();
+        let price = "new row violates check constraint item_price_check";
+        let stock = "new row violates check constraint stock limit";
+        for (sql, message) in [
+            (
+                "INSERT INTO item (id, name) VALUES (3, NULL)",
+                "column name cannot be NULL",
+            ),
+            (
+                "INSERT INTO item (id) VALUES (3)",
+                "column name cannot be NULL",
+            ),
+            (
+                "INSERT INTO item (id, name, price) VALUES (3, 'x', NULL)",
+                "column price cannot be NULL",
+            ),
+            (
+                "UPDATE item SET name = NULL WHERE id = 2",
+                "column name cannot be NULL",
+            ),
+            (
+                "INSERT INTO item (id, name, price) VALUES (3, 'x', -1)",
+                price,
+            ),
+            ("UPDATE item SET price = price - 2", price),
+            (
+                "INSERT INTO item (id, name, qty) VALUES (3, 'x', 101)",
+                stock,
+            ),
+            // One bad row, and none of them goes in.
+            (
+                "INSERT INTO item (id, name, qty) VALUES (3, 'a', 1), (4, 'b', -1)",
+                stock,
+            ),
+        ] {
+            assert_eq!(error(&mut db, sql), message, "{using}: {sql}");
+        }
+        // NULL makes a condition neither true nor false: it passes, as does
+        // an OR another part of decides.
+        db.execute("INSERT INTO item (id, name, qty) VALUES (3, 'x', NULL), (4, 'bulk', 500)")
+            .unwrap();
+        assert_eq!(
+            query(&mut db, "SELECT COUNT(*) FROM item"),
+            [[int(4)]],
+            "{using}"
+        );
+        // In a transaction, the statement that fails is undone alone.
+        db.execute("BEGIN; UPDATE item SET qty = 7 WHERE id = 1")
+            .unwrap();
+        assert!(
+            db.execute("UPDATE item SET qty = 1000 WHERE id = 2")
+                .is_err()
+        );
+        db.execute("COMMIT").unwrap();
+        assert_eq!(
+            query(&mut db, "SELECT id, qty FROM item WHERE id < 3 ORDER BY id"),
+            [[int(1), int(7)], [int(2), int(10)]],
+            "{using}"
+        );
+    }
+}
+
+#[test]
+fn unique_constraints_are_kept_by_indexes() {
+    let mut db = in_memory();
+    db.execute(
+        "CREATE TABLE person (
+             id INT, email TEXT UNIQUE, first TEXT, last TEXT,
+             PRIMARY KEY (id), UNIQUE (first, last)
+         )",
+    )
+    .unwrap();
+    db.execute("INSERT INTO person VALUES (1, 'a@x', 'Ann', 'Lee'), (2, NULL, 'Ann', 'Ray')")
+        .unwrap();
+    assert_eq!(
+        error(&mut db, "INSERT INTO person VALUES (3, 'a@x', 'Bo', 'Li')"),
+        "duplicate value in unique index person_email_key: 'a@x'"
+    );
+    assert_eq!(
+        error(&mut db, "UPDATE person SET last = 'Lee' WHERE id = 2"),
+        "duplicate value in unique index person_first_last_key: ('Ann', 'Lee')"
+    );
+    assert_eq!(
+        error(&mut db, "INSERT INTO person VALUES (1, 'b@x', 'Bo', 'Li')"),
+        "duplicate primary key: 1"
+    );
+    // NULLs are never equal: they may repeat.
+    db.execute("INSERT INTO person VALUES (3, NULL, NULL, 'Lee'), (4, NULL, NULL, 'Lee')")
+        .unwrap();
+    assert!(
+        explain(&mut db, "SELECT id FROM person WHERE email = 'a@x'").contains("person_email_key")
+    );
+    assert_eq!(
+        error(&mut db, "DROP INDEX person_email_key"),
+        "cannot drop index person_email_key: the UNIQUE constraint of person of that name needs it"
+    );
+    assert_eq!(
+        error(
+            &mut db,
+            "CREATE TABLE c (id INT PRIMARY KEY, n INT UNIQUE) USING COLUMN"
+        ),
+        "COLUMN tables cannot have UNIQUE constraints, which need an index"
+    );
+    // A name an unnamed constraint would take, taken, gets a number after it.
+    db.execute("CREATE TABLE v (a INT UNIQUE, b INT, CONSTRAINT v_a_key UNIQUE (b))")
+        .unwrap();
+    assert!(error(&mut db, "DROP INDEX v_a_key1").contains("the UNIQUE constraint of v"));
+    // An index of another table's name is no such name.
+    db.execute("CREATE INDEX taken ON person (last)").unwrap();
+    assert_eq!(
+        error(&mut db, "CREATE TABLE u (a INT CONSTRAINT taken UNIQUE)"),
+        "index already exists: taken"
+    );
+    assert!(db.execute("SELECT * FROM u").is_err(), "no table is left");
+    // An LSM table keeps them too.
+    db.execute("CREATE TABLE l (id INT PRIMARY KEY, code TEXT UNIQUE) USING LSM")
+        .unwrap();
+    db.execute("INSERT INTO l VALUES (1, 'a'), (2, NULL), (3, NULL)")
+        .unwrap();
+    assert_eq!(
+        error(&mut db, "INSERT INTO l VALUES (4, 'a')"),
+        "duplicate value in unique index l_code_key: 'a'"
+    );
+}
+
+#[test]
+fn constraints_are_checked_when_the_table_is_created() {
+    let mut db = in_memory();
+    for (sql, message) in [
+        (
+            "CREATE TABLE t (a INT DEFAULT 'x')",
+            "the default of column a: 'x' is not a INT",
+        ),
+        (
+            "CREATE TABLE t (a TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+            "the default of column a: TIMESTAMPTZ",
+        ),
+        (
+            "CREATE TABLE t (a INT, b INT DEFAULT (a + 1))",
+            "the default of column b cannot read a column",
+        ),
+        (
+            "CREATE TABLE t (a INT DEFAULT (SELECT 1))",
+            "the default of column a cannot use a subquery",
+        ),
+        (
+            "CREATE TABLE t (a INT DEFAULT 1 DEFAULT 2)",
+            "column a has two defaults",
+        ),
+        ("CREATE TABLE t (a INT CHECK (b > 0))", "unknown column: b"),
+        (
+            "CREATE TABLE t (a INT CHECK (a > (SELECT 1)))",
+            "a CHECK cannot use a subquery",
+        ),
+        (
+            "CREATE TABLE t (a DATE CHECK (a < CURRENT_DATE))",
+            "a CHECK cannot use the current time",
+        ),
+        (
+            "CREATE TABLE t (a INT, UNIQUE (b))",
+            "unknown column in UNIQUE: b",
+        ),
+        (
+            "CREATE TABLE t (a INT, b INT, PRIMARY KEY (a, b))",
+            "a primary key of several columns is not supported",
+        ),
+        (
+            "CREATE TABLE t (a INT, PRIMARY KEY (b))",
+            "unknown column in PRIMARY KEY: b",
+        ),
+        (
+            "CREATE TABLE t (a INT PRIMARY KEY, b INT, PRIMARY KEY (b))",
+            "a table can have only one primary key",
+        ),
+        (
+            "CREATE TABLE t (a INT CONSTRAINT c CHECK (a > 0), b INT CONSTRAINT c CHECK (b > 0))",
+            "constraint c is declared twice",
+        ),
+    ] {
+        let found = error(&mut db, sql);
+        assert!(found.starts_with(message), "{sql}: {found}");
+    }
+    assert!(db.table_names().is_empty());
+    // A value converts as a stored one does; the current time is the statement's.
+    db.execute(
+        "CREATE TABLE t (id INT PRIMARY KEY, r REAL DEFAULT 2, d DECIMAL(5, 1) DEFAULT 1.25,
+                         at TIMESTAMP DEFAULT LOCALTIMESTAMP, today DATE DEFAULT CURRENT_DATE)",
+    )
+    .unwrap();
+    db.execute("INSERT INTO t (id) VALUES (1), (2), (3)")
+        .unwrap();
+    let rows = query(
+        &mut db,
+        "SELECT DISTINCT r, d, at, today = CAST(at AS DATE) FROM t",
+    );
+    assert_eq!(rows.len(), 1, "one time for the whole statement");
+    assert_eq!(rows[0][0], Value::Real(2.0));
+    assert_eq!(rows[0][1].to_string(), "1.3");
+    assert_eq!(rows[0][3], Value::Bool(true));
+}
+
+#[test]
+fn constraints_survive_reopening() {
+    let path = TempDb::new("constraints");
+    {
+        let mut db = open(&path.0).unwrap();
+        setup_constraints(&mut db, "HEAP");
+        db.execute(
+            "CREATE TABLE \"odd table\" (
+                 \"a b\" INT CONSTRAINT \"it's\" CHECK (\"a b\" <> 0) UNIQUE DEFAULT (-1)
+             )",
+        )
+        .unwrap();
+        db.execute("INSERT INTO item (id, name) VALUES (1, 'pen')")
+            .unwrap();
+    }
+    let mut db = open(&path.0).unwrap();
+    db.execute("INSERT INTO item (id, name) VALUES (2, 'ink')")
+        .unwrap();
+    assert_eq!(
+        query(&mut db, "SELECT price, qty, note FROM item WHERE id = 2"),
+        [[Value::Real(1.5), int(10), text("none")]]
+    );
+    assert_eq!(
+        error(&mut db, "UPDATE item SET qty = -1"),
+        "new row violates check constraint stock limit"
+    );
+    assert_eq!(
+        error(&mut db, "INSERT INTO item (id) VALUES (3)"),
+        "column name cannot be NULL"
+    );
+    db.execute("INSERT INTO \"odd table\" DEFAULT VALUES")
+        .unwrap();
+    assert_eq!(query(&mut db, "SELECT * FROM \"odd table\""), [[int(-1)]]);
+    assert_eq!(
+        error(&mut db, "INSERT INTO \"odd table\" VALUES (0)"),
+        "new row violates check constraint it's"
+    );
+    assert!(error(&mut db, "INSERT INTO \"odd table\" VALUES (-1)").contains("duplicate value"));
+}

@@ -46,7 +46,9 @@ pub mod table;
 
 use crate::error::{Error, Result, err};
 use crate::mvcc::{Snapshot, Transactions};
-use crate::sql::ast::{ColumnRef, CreateIndex, Expr, IndexKind, Statement, quote_ident};
+use crate::sql::ast::{
+    ColumnRef, Constraints, CreateIndex, Expr, IndexKind, Statement, quote_ident,
+};
 use crate::sql::parse;
 use crate::storage::{BPlusTree, BufferPool, MAX_TUPLE_SIZE, PageId, RecordId, TableHeap, tuple};
 use crate::types::{Column, DataType, StorageKind, Value};
@@ -132,11 +134,12 @@ impl Catalog {
                     Statement::CreateTable {
                         name,
                         columns,
+                        constraints,
                         storage,
                     },
                     first,
                     last,
-                ) => table_rows.push((rid, name, columns, storage, (first, last))),
+                ) => table_rows.push((rid, name, columns, constraints, storage, (first, last))),
                 (Statement::CreateIndex(definition), root, format) => {
                     index_rows.push((rid, definition, root, format))
                 }
@@ -150,12 +153,13 @@ impl Catalog {
         }
 
         let mut tables = BTreeMap::new();
-        for (rid, name, columns, storage, pages) in table_rows {
+        for (rid, name, columns, constraints, storage, pages) in table_rows {
             let table = Table::open(
                 pool.clone(),
                 txns.clone(),
                 name.clone(),
                 columns,
+                constraints,
                 storage,
                 pages,
                 legacy,
@@ -268,6 +272,7 @@ impl Catalog {
         &mut self,
         name: String,
         columns: Vec<Column>,
+        constraints: Constraints,
         storage: StorageKind,
         snapshot: &Snapshot,
     ) -> Result<()> {
@@ -275,22 +280,37 @@ impl Catalog {
             return err(format!("table already exists: {name}"));
         }
         validate_schema(&columns)?;
-        let pk_index = match (storage, primary_key(&columns)) {
-            (StorageKind::Heap, Some(pk)) => Some(CreateIndex {
-                name: pk_index_name(&name),
-                table: name.clone(),
-                using: IndexKind::BTree,
-                keys: vec![Expr::Column(ColumnRef::bare(&columns[pk].name))],
-                include: Vec::new(),
-                predicate: None,
-                unique: true,
-            }),
-            _ => None,
+        let unique_index = |index: String, keys: &[String]| CreateIndex {
+            name: index,
+            table: name.clone(),
+            using: IndexKind::BTree,
+            keys: keys
+                .iter()
+                .map(|key| Expr::Column(ColumnRef::bare(key)))
+                .collect(),
+            include: Vec::new(),
+            predicate: None,
+            unique: true,
         };
-        if let Some(index) = &pk_index
-            && self.indexes.contains_key(&index.name)
-        {
-            return err(format!("index already exists: {}", index.name));
+        let mut indexes = Vec::new();
+        if let (StorageKind::Heap, Some(pk)) = (storage, primary_key(&columns)) {
+            indexes.push(unique_index(
+                pk_index_name(&name),
+                &[columns[pk].name.clone()],
+            ));
+        }
+        if !constraints.unique.is_empty() && matches!(storage, StorageKind::Column) {
+            return err("COLUMN tables cannot have UNIQUE constraints, which need an index");
+        }
+        for unique in &constraints.unique {
+            indexes.push(unique_index(unique.name.clone(), &unique.columns));
+        }
+        for (i, index) in indexes.iter().enumerate() {
+            if self.indexes.contains_key(&index.name)
+                || indexes[..i].iter().any(|other| other.name == index.name)
+            {
+                return err(format!("index already exists: {}", index.name));
+            }
         }
 
         let table = Table::create(
@@ -298,6 +318,7 @@ impl Catalog {
             self.txns.clone(),
             name.clone(),
             columns,
+            constraints,
             storage,
         )?;
         let rid = match encode_table_entry(&table).and_then(|bytes| self.heap.insert(&bytes)) {
@@ -318,11 +339,11 @@ impl Catalog {
             },
         );
 
-        if let Some(index) = pk_index
-            && let Err(e) = self.create_index(index, snapshot)
-        {
-            self.drop_table(&name)?;
-            return Err(e);
+        for index in indexes {
+            if let Err(e) = self.create_index(index, snapshot) {
+                self.drop_table(&name)?;
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -431,6 +452,13 @@ impl Catalog {
                 index.table
             ));
         }
+        let table = &self.tables[&index.table].table;
+        if table.constraints.unique.iter().any(|u| u.name == name) {
+            return err(format!(
+                "cannot drop index {name}: the UNIQUE constraint of {} of that name needs it",
+                index.table
+            ));
+        }
         let index = self.indexes.remove(name).expect("found above");
         self.heap.delete(index.rid)?;
         self.tables
@@ -535,6 +563,7 @@ fn upgrade(
             txns.clone(),
             old.name.clone(),
             old.columns.clone(),
+            old.constraints.clone(),
             old.storage_kind(),
         )?;
         table.insert(&snapshot, rows)?;
@@ -582,7 +611,12 @@ fn catalog_columns() -> Vec<Column> {
 
 fn encode_table_entry(table: &Table) -> Result<Vec<u8>> {
     encode_entry(
-        create_table_sql(&table.name, &table.columns, table.storage_kind()),
+        create_table_sql(
+            &table.name,
+            &table.columns,
+            &table.constraints,
+            table.storage_kind(),
+        ),
         table.root_pages(),
     )
 }
@@ -617,14 +651,40 @@ fn pk_index_name(table: &str) -> String {
     format!("{table}_pkey")
 }
 
-fn create_table_sql(name: &str, columns: &[Column], storage: StorageKind) -> String {
-    let columns: Vec<String> = columns
+/// The CREATE TABLE statement a table's catalog row keeps: each column with
+/// its `PRIMARY KEY`, `NOT NULL` and `DEFAULT (expr)`, then every CHECK and
+/// UNIQUE constraint by name.
+fn create_table_sql(
+    name: &str,
+    columns: &[Column],
+    constraints: &Constraints,
+    storage: StorageKind,
+) -> String {
+    let mut items: Vec<String> = columns
         .iter()
         .map(|c| {
-            let pk = if c.primary_key { " PRIMARY KEY" } else { "" };
-            format!("{} {}{pk}", quote_ident(&c.name), c.data_type)
+            let mut item = format!("{} {}", quote_ident(&c.name), c.data_type);
+            if c.primary_key {
+                item += " PRIMARY KEY";
+            }
+            if constraints.is_not_null(&c.name) {
+                item += " NOT NULL";
+            }
+            if let Some(default) = constraints.default_of(&c.name) {
+                item += &format!(" DEFAULT ({default})");
+            }
+            item
         })
         .collect();
+    for check in &constraints.checks {
+        let name = quote_ident(&check.name);
+        items.push(format!("CONSTRAINT {name} CHECK ({})", check.condition));
+    }
+    for unique in &constraints.unique {
+        let columns: Vec<String> = unique.columns.iter().map(|c| quote_ident(c)).collect();
+        let name = quote_ident(&unique.name);
+        items.push(format!("CONSTRAINT {name} UNIQUE ({})", columns.join(", ")));
+    }
     let using = match storage {
         StorageKind::Heap => String::new(), // the default, as in files written before LSM existed
         other => format!(" USING {other}"),
@@ -632,7 +692,7 @@ fn create_table_sql(name: &str, columns: &[Column], storage: StorageKind) -> Str
     format!(
         "CREATE TABLE {} ({}){using}",
         quote_ident(name),
-        columns.join(", ")
+        items.join(", ")
     )
 }
 
@@ -667,7 +727,13 @@ mod tests {
     fn create_table(catalog: &mut Catalog, columns: Vec<Column>, rows: Vec<Vec<Value>>) {
         let snapshot = Snapshot::frozen(catalog.transactions());
         catalog
-            .create_table("t".into(), columns, StorageKind::Heap, &snapshot)
+            .create_table(
+                "t".into(),
+                columns,
+                Constraints::default(),
+                StorageKind::Heap,
+                &snapshot,
+            )
             .unwrap();
         catalog
             .get_mut("t")
@@ -816,7 +882,13 @@ mod tests {
                 _ => StorageKind::Column,
             };
             catalog
-                .create_table(table.into(), columns.clone(), storage, &snapshot)
+                .create_table(
+                    table.into(),
+                    columns.clone(),
+                    Constraints::default(),
+                    storage,
+                    &snapshot,
+                )
                 .unwrap();
         }
         create_index(&mut catalog, "CREATE INDEX h_name ON h (name)");
