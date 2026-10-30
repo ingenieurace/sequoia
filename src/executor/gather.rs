@@ -44,6 +44,7 @@ use std::thread::{self, JoinHandle};
 
 use crate::catalog::table::{Row, SharedLookup, SharedTableScan};
 use crate::error::{Result, err};
+use crate::mvcc::Snapshot;
 use crate::plan::query::{AggregateCall, JoinMethod, LookupKey, Node, Phase};
 use crate::sql::ast::Expr;
 use crate::sql::eval::{Field, eval, locate, matches};
@@ -117,7 +118,8 @@ pub(super) fn open<'a>(input: Node<'a>, workers: usize, settings: &Settings) -> 
         } => {
             let fields = [left.columns(), right.columns()].concat();
             let steps = Steps::new(&filters, project.as_deref(), &fields);
-            let (left, right) = (Source::of(*left), Source::of(*right));
+            let snapshot = settings.snapshot();
+            let (left, right) = (Source::of(*left, snapshot), Source::of(*right, snapshot));
             joins::scan_join(
                 left,
                 right,
@@ -140,13 +142,18 @@ pub(super) fn open<'a>(input: Node<'a>, workers: usize, settings: &Settings) -> 
         } => {
             let fields = [left.columns(), right.columns()].concat();
             let steps = Steps::new(&filters, project.as_deref(), &fields);
-            let left = Source::of(*left);
-            let right = Lookups::of(*right, left.fields());
+            let left = Source::of(*left, settings.snapshot());
+            let right = Lookups::of(*right, left.fields(), settings.snapshot());
             joins::scan_index_join(left, right, kind, condition, steps, partial, workers)
         }
         node => {
             let steps = Steps::new(&[], project.as_deref(), &node.columns());
-            scan(Source::of(node), steps, partial, workers)
+            scan(
+                Source::of(node, settings.snapshot()),
+                steps,
+                partial,
+                workers,
+            )
         }
     };
     match started {
@@ -170,7 +177,7 @@ pub(crate) struct Lookups {
 impl Lookups {
     /// The lookups of an index join's right side, a heap's under filters,
     /// maybe, for left rows whose fields are `left_fields`.
-    fn of(mut node: Node, left_fields: &[Field]) -> Lookups {
+    fn of(mut node: Node, left_fields: &[Field], snapshot: &Snapshot) -> Lookups {
         let mut filters = Vec::new();
         loop {
             match node {
@@ -189,7 +196,7 @@ impl Lookups {
                     let fields = Field::of_table(&qualifier, &table.columns);
                     return Lookups {
                         lookup: table
-                            .shared_lookup(index, column, &needed)
+                            .shared_lookup(snapshot, index, column, &needed)
                             .expect("only a heap's lookups are gathered"),
                         left_key: locate(&left_key, left_fields),
                         filters: filters.iter().map(|f| Some(locate(f, &fields))).collect(),
@@ -235,7 +242,7 @@ pub(crate) struct Source {
 
 impl Source {
     /// The source of a scan of a heap under filters, maybe.
-    fn of(mut node: Node) -> Source {
+    fn of(mut node: Node, snapshot: &Snapshot) -> Source {
         let mut filters = Vec::new();
         loop {
             match node {
@@ -252,7 +259,7 @@ impl Source {
                     let fields = Field::of_table(&qualifier, &table.columns);
                     return Source {
                         scan: table
-                            .shared_scan(&needed)
+                            .shared_scan(snapshot, &needed)
                             .expect("only a heap's scan is gathered"),
                         filters: filters.iter().map(|f| Some(locate(f, &fields))).collect(),
                         fields,

@@ -41,6 +41,7 @@ use super::subquery::Runner;
 use crate::catalog::Catalog;
 use crate::catalog::table::{Access, Row, Table};
 use crate::error::{Error, Result};
+use crate::mvcc::Snapshot;
 use crate::plan::query::{AggregateCall, Node, Phase};
 use crate::predicate::Predicate;
 use crate::sql::ast::Expr;
@@ -120,7 +121,7 @@ fn open_node<'a>(
             predicates,
             access,
             ..
-        } => scan(table, &needed, &predicates, &access),
+        } => scan(table, settings.snapshot(), &needed, &predicates, &access),
         Node::Lookup { .. } => unreachable!("a lookup is only an index join's right side"),
         Node::Filter { input, predicate } => {
             let fields = input.columns();
@@ -364,11 +365,12 @@ fn open_node<'a>(
 /// table's straight from its columns, others' taken apart into columns.
 fn scan<'a>(
     table: &'a Table,
+    snapshot: &Snapshot,
     needed: &[bool],
     predicates: &[Predicate],
     access: &Access,
 ) -> Batches<'a> {
-    if let Some(chunks) = table.scan_by_column(needed, predicates, BATCH_SIZE) {
+    if let Some(chunks) = table.scan_by_column(snapshot, needed, predicates, BATCH_SIZE) {
         return Box::new(chunks.map(|chunk| {
             let chunk = chunk?;
             let rows = chunk.rows;
@@ -379,7 +381,7 @@ fn scan<'a>(
         }));
     }
     let rows = table
-        .scan_filtered(needed, predicates, access)
+        .scan_filtered(snapshot, needed, predicates, access)
         .map(|item| item.map(|(_, row)| row));
     batches_of(Box::new(rows), table.columns.len())
 }

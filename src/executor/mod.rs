@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use crate::catalog::Catalog;
 use crate::catalog::table::{Row, RowId, Table};
 use crate::error::{Result, err};
+use crate::mvcc::Snapshot;
 use crate::plan::query::{self, Choices, ForceJoin, forbid};
 use crate::plan::{access, filter};
 use crate::result::QueryResult;
@@ -62,6 +63,10 @@ pub struct Settings {
     /// above it; by default one. More gathers it from that many (see
     /// `gather.rs`): its rows come out in no order.
     pub scan_workers: usize,
+    /// Which versions of rows the statement running reads, and the id it
+    /// writes with (see `mvcc/snapshot.rs`). Not a knob: the database sets
+    /// it for each statement.
+    pub snapshot: Option<Snapshot>,
 }
 
 impl Default for Settings {
@@ -74,6 +79,7 @@ impl Default for Settings {
             force_join: None,
             join_workers: 1,
             scan_workers: 1,
+            snapshot: None,
         }
     }
 }
@@ -87,12 +93,41 @@ impl Settings {
             scan_workers: self.scan_workers,
         }
     }
+
+    /// The snapshot of the statement running.
+    pub fn snapshot(&self) -> &Snapshot {
+        self.snapshot
+            .as_ref()
+            .expect("the database gives every statement a snapshot")
+    }
+
+    /// These settings, for a statement that runs under `snapshot`.
+    pub fn under(&self, snapshot: Snapshot) -> Settings {
+        Settings {
+            snapshot: Some(snapshot),
+            ..self.clone()
+        }
+    }
 }
 
 /// Whether a statement only reads: SELECT and EXPLAIN, which
 /// [`execute_read`] runs on a catalog it cannot change.
 pub fn reads_only(statement: &Statement) -> bool {
     matches!(statement, Statement::Select(_) | Statement::Explain { .. })
+}
+
+/// Whether a statement changes the catalog, whose rows have no versions:
+/// it needs the database to itself until its transaction ends (see
+/// `mvcc/mod.rs`).
+pub fn changes_schema(statement: &Statement) -> bool {
+    matches!(
+        statement,
+        Statement::CreateTable { .. }
+            | Statement::DropTable { .. }
+            | Statement::CreateIndex(_)
+            | Statement::DropIndex { .. }
+            | Statement::Analyze { .. }
+    )
 }
 
 /// Runs a statement that only reads (see [`reads_only`]).
@@ -140,7 +175,7 @@ pub fn execute(
             columns,
             storage,
         } => {
-            catalog.create_table(name.clone(), columns, storage)?;
+            catalog.create_table(name.clone(), columns, storage, settings.snapshot())?;
             Ok(message(format!("table {name} created")))
         }
         Statement::DropTable { name } => {
@@ -149,7 +184,7 @@ pub fn execute(
         }
         Statement::CreateIndex(definition) => {
             let name = definition.name.clone();
-            catalog.create_index(definition)?;
+            catalog.create_index(definition, settings.snapshot())?;
             Ok(message(format!("index {name} created")))
         }
         Statement::DropIndex { name } => {
@@ -162,7 +197,7 @@ pub fn execute(
             Ok(message("checkpoint done".into()))
         }
         Statement::Analyze { table: Some(name) } => {
-            catalog.analyze(&name)?;
+            catalog.analyze(&name, settings.snapshot())?;
             Ok(message(format!("table {name} analyzed")))
         }
         Statement::Analyze { table: None } => {
@@ -172,10 +207,15 @@ pub fn execute(
                 .map(String::from)
                 .collect();
             for name in &names {
-                catalog.analyze(name)?;
+                catalog.analyze(name, settings.snapshot())?;
             }
             let s = if names.len() == 1 { "" } else { "s" };
             Ok(message(format!("{} table{s} analyzed", names.len())))
+        }
+        Statement::Vacuum { table } => {
+            let removed = catalog.vacuum(table.as_deref())?;
+            let s = if removed == 1 { "" } else { "s" };
+            Ok(message(format!("{removed} dead row version{s} removed")))
         }
         Statement::Begin
         | Statement::Commit
@@ -428,7 +468,9 @@ fn insert(
     };
 
     let count = new_rows.len();
-    catalog.get_mut(table)?.insert(new_rows)?;
+    catalog
+        .get_mut(table)?
+        .insert(settings.snapshot(), new_rows)?;
     match returned {
         Some((returning, rows)) => returning.rows(catalog, &rows, settings),
         None => Ok(message(format!("{count} row(s) inserted"))),
@@ -473,7 +515,12 @@ fn update(
             .collect();
         let mut subqueries = Runner::new(catalog, settings);
         let mut changes = Vec::new();
-        for item in scan(table, &vec![true; table.columns.len()], &filter) {
+        for item in scan(
+            table,
+            settings.snapshot(),
+            &vec![true; table.columns.len()],
+            &filter,
+        ) {
             let (rid, old) = item?;
             if !matches_with(&located, &fields, &old, &mut subqueries)? {
                 continue;
@@ -499,7 +546,9 @@ fn update(
     };
 
     let count = changes.len();
-    catalog.get_mut(table)?.update(changes)?;
+    catalog
+        .get_mut(table)?
+        .update(settings.snapshot(), changes)?;
     match returned {
         Some((returning, rows)) => returning.rows(catalog, &rows, settings),
         None => Ok(message(format!("{count} row(s) updated"))),
@@ -535,7 +584,7 @@ fn delete(
             .for_each(|(needed, indexed)| *needed |= indexed);
         let located = filter.as_ref().map(|f| locate(f, &fields));
         let mut rows = Vec::new();
-        for item in scan(table, &needed, &filter) {
+        for item in scan(table, settings.snapshot(), &needed, &filter) {
             let (rid, row) = item?;
             if matches_with(&located, &fields, &row, &mut subqueries)? {
                 rows.push((rid, row));
@@ -543,7 +592,7 @@ fn delete(
         }
         (rows, returning)
     };
-    catalog.get_mut(table)?.delete(&rows)?;
+    catalog.get_mut(table)?.delete(settings.snapshot(), &rows)?;
     match returning {
         Some(returning) => {
             let rows: Vec<Row> = rows.into_iter().map(|(_, row)| row).collect();
@@ -624,16 +673,18 @@ impl Returning {
     }
 }
 
-/// Reads the rows of `table` that `filter` may match, the way the planner chooses.
+/// Reads the rows of `table` that `filter` may match and `snapshot` sees,
+/// the way the planner chooses.
 fn scan<'a>(
     table: &'a Table,
+    snapshot: &Snapshot,
     needed: &[bool],
     filter: &Option<Expr>,
 ) -> Box<dyn Iterator<Item = Result<(RowId, Row)>> + 'a> {
     let conditions = filter::conditions(table, &table.name, filter);
     let predicates = filter::predicates(table, &conditions);
     let access = access::choose(table, &table.name, filter, &conditions, needed);
-    table.scan_filtered(needed, &predicates, &access)
+    table.scan_filtered(snapshot, needed, &predicates, &access)
 }
 
 fn message(text: String) -> QueryResult {

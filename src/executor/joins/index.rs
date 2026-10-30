@@ -4,6 +4,7 @@
 
 use crate::catalog::table::{Access, Row, Table};
 use crate::error::Result;
+use crate::mvcc::Snapshot;
 use crate::plan::query::LookupKey;
 use crate::predicate::{Compare, Predicate};
 use crate::sql::ast::Expr;
@@ -20,6 +21,8 @@ pub struct Lookup<'a> {
     pub left_key: Expr,
     pub filter: Option<Expr>,
     pub fields: Vec<Field>,
+    /// The versions it reads.
+    pub snapshot: Snapshot,
 }
 
 impl Lookup<'_> {
@@ -52,7 +55,10 @@ impl Lookup<'_> {
             LookupKey::PrimaryKey => Access::Key(value.clone()),
         };
         let mut rows = Vec::new();
-        for item in self.table.scan_filtered(&self.needed, &predicates, &access) {
+        let found = self
+            .table
+            .scan_filtered(&self.snapshot, &self.needed, &predicates, &access);
+        for item in found {
             let (_, row) = item?;
             if matches(&self.filter, &self.fields, &row)? {
                 rows.push(row);

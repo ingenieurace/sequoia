@@ -47,29 +47,39 @@ fn connections_share_the_database() {
 }
 
 #[test]
-fn a_transaction_holds_off_the_other_connections_until_it_commits() {
+fn other_connections_read_at_once_and_wait_only_for_the_rows_a_transaction_changes() {
     let addr = start(8);
     let mut a = connect(addr);
-    send(&mut a, "CREATE TABLE t (id INT PRIMARY KEY);");
-    let answer = send(&mut a, "BEGIN; INSERT INTO t VALUES (1);");
+    send(&mut a, "CREATE TABLE t (id INT PRIMARY KEY, n INT);");
+    send(&mut a, "INSERT INTO t VALUES (1, 0), (2, 0);");
+    let answer = send(&mut a, "BEGIN; UPDATE t SET n = 1 WHERE id = 1;");
     assert!(answer.in_transaction, "{answer:?}");
 
-    let reader = thread::spawn(move || {
-        let mut b = connect(addr);
+    // Another connection reads what was committed, without waiting, and
+    // changes other rows.
+    let mut b = connect(addr);
+    let answer = send(&mut b, "SELECT n FROM t WHERE id = 1;");
+    assert!(
+        answer.text.contains('0') && !answer.text.contains("error"),
+        "{answer:?}"
+    );
+    let answer = send(&mut b, "UPDATE t SET n = 5 WHERE id = 2;");
+    assert_eq!(answer.text, "1 row(s) updated");
+
+    // Its row waits for the commit, and then changes the committed value.
+    let writer = thread::spawn(move || {
         let start = Instant::now();
-        let answer = send(&mut b, "SELECT COUNT(*) FROM t;");
-        (answer, start.elapsed())
+        let answer = send(&mut b, "UPDATE t SET n = n + 10 WHERE id = 1;");
+        (answer, start.elapsed(), b)
     });
     thread::sleep(Duration::from_millis(300));
     let answer = send(&mut a, "COMMIT;");
     assert!(!answer.in_transaction);
-    let (answer, waited) = reader.join().unwrap();
-    // It waited for the commit, and then saw the row.
+    let (answer, waited, mut b) = writer.join().unwrap();
     assert!(waited >= Duration::from_millis(200), "{waited:?}");
-    assert!(
-        answer.text.contains('1') && !answer.text.contains("error"),
-        "{answer:?}"
-    );
+    assert_eq!(answer.text, "1 row(s) updated", "{answer:?}");
+    let answer = send(&mut b, "SELECT n FROM t WHERE id = 1;");
+    assert!(answer.text.contains("11"), "{answer:?}");
 }
 
 #[test]

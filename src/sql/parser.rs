@@ -95,13 +95,19 @@ impl Parser {
         let keyword = match self.peek() {
             Some(Token::Keyword(k)) => k.clone(),
             // Not a keyword, as for EXPLAIN ANALYZE: it stays free as a name.
-            Some(Token::Ident(word)) if word.eq_ignore_ascii_case("ANALYZE") => {
+            Some(Token::Ident(word))
+                if word.eq_ignore_ascii_case("ANALYZE") || word.eq_ignore_ascii_case("VACUUM") =>
+            {
+                let vacuum = word.eq_ignore_ascii_case("VACUUM");
                 self.pos += 1;
                 let table = match self.peek() {
                     Some(Token::Ident(_) | Token::QuotedIdent(_)) => Some(self.ident()?),
                     _ => None,
                 };
-                return Ok(Statement::Analyze { table });
+                return Ok(match vacuum {
+                    true => Statement::Vacuum { table },
+                    false => Statement::Analyze { table },
+                });
             }
             _ => String::new(),
         };

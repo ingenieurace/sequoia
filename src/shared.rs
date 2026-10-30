@@ -4,27 +4,45 @@
 //!
 //! ```text
 //! SharedDatabase (clone it into each thread)
-//!   gate: who may use the core now      core: pages and catalog, in a RwLock
-//!     readers  3                          (one Core, as a Database has)
-//!     writer   no
+//!   gate: who may use the core now      core: pages, catalog, transactions,
+//!     readers  3   writer  no             in a RwLock (one Core, as a
+//!     open transactions  2                Database has)
+//!     alone    no
 //!   Session (one per thread): settings, transaction, busy timeout
 //! ```
 //!
-//! **Locking.** Sessions take turns as SQLite's do: any number of them may
-//! read at once, or one may write. A session that reads (SELECT, EXPLAIN)
-//! waits until no session writes; one that writes waits until no session
-//! reads or writes, and keeps the database to itself until its statement is
-//! committed, or with `BEGIN`, until its transaction ends with `COMMIT` or
-//! `ROLLBACK`. So no session sees what another has not committed, and every
-//! transaction runs as if alone. The log holds one transaction at a time,
-//! committed or rolled back whole, which is why writes cannot run side by
-//! side. A session waiting to write goes before sessions that come to read
-//! after it, so readers cannot hold it off forever.
+//! **Transactions run side by side.** Each reads its own snapshot and
+//! writes versions of rows (see `mvcc/mod.rs`), so any number of them may
+//! be open at once, reading and writing: none waits for another to end
+//! unless it needs a row the other is changing.
+//!
+//! **Statements take turns.** Any number of statements that read (SELECT,
+//! EXPLAIN) may run at once, or one that writes, as SQLite's do: a statement
+//! that writes waits until no other statement runs, and keeps the core to
+//! itself until it ends, not until its transaction does. A statement waiting
+//! to write goes before statements that come to read after it, so readers
+//! cannot hold it off forever.
+//!
+//! **Rows.** A statement that needs to change a row another transaction is
+//! changing, or to insert a key another transaction has written, fails,
+//! undone; its session then waits for that transaction to end, and runs the
+//! statement again. If the other committed, a transaction that cannot see
+//! its write fails for good ("could not serialize access"), and its client
+//! may roll back and try again; a statement outside a transaction just sees
+//! the new row. Two transactions waiting for each other are a deadlock: the
+//! second to wait fails at once.
+//!
+//! **The schema.** A statement that changes the catalog (CREATE, DROP,
+//! ANALYZE) waits until no other session has a transaction open, and then
+//! has the database to itself until its own transaction ends: other
+//! sessions' statements wait, as transactions did before there were
+//! versions. Sessions waiting for that let the open transactions finish
+//! first, but start no new one.
 //!
 //! A session waits at most its busy timeout ([`BUSY_TIMEOUT`] by default),
-//! then fails with "database is locked", as a session whose transaction is
-//! left open holds off all the others. A session dropped in a transaction
-//! rolls it back.
+//! for its turn and for the rows it needs together, then fails with
+//! "database is locked" or the conflict it found. A session dropped in a
+//! transaction rolls it back.
 //!
 //! The gate decides who goes; the core's RwLock only hands each its access,
 //! and never waits. A thread that panics while writing poisons the lock: the
@@ -38,6 +56,7 @@ use crate::database::{Core, SessionState};
 use crate::error::{Result, err};
 use crate::executor;
 use crate::executor::model::Model;
+use crate::mvcc::Transactions;
 use crate::plan::query::ForceJoin;
 use crate::result::QueryResult;
 use crate::sql::ast::Statement;
@@ -57,6 +76,8 @@ pub struct SharedDatabase {
 struct Shared {
     gate: Gate,
     core: RwLock<Core>,
+    /// The core's transactions, to wait for one without the core.
+    txns: Arc<Transactions>,
 }
 
 impl SharedDatabase {
@@ -74,6 +95,7 @@ impl SharedDatabase {
         SharedDatabase {
             shared: Arc::new(Shared {
                 gate: Gate::default(),
+                txns: core.transactions().clone(),
                 core: RwLock::new(core),
             }),
         }
@@ -84,7 +106,8 @@ impl SharedDatabase {
         Session {
             shared: self.shared.clone(),
             state: SessionState::default(),
-            writing: false,
+            open: false,
+            alone: false,
             busy_timeout: BUSY_TIMEOUT,
         }
     }
@@ -113,7 +136,7 @@ impl SharedDatabase {
 impl Shared {
     /// The core to read. Only a writer poisons the lock, and the next to
     /// write repairs it, so a reader may take it as it is: the gate lets no
-    /// reader in before the writer's session has left, rolling back.
+    /// reader in before the writer's statement has ended, rolling back.
     fn read_core(&self) -> std::sync::RwLockReadGuard<'_, Core> {
         self.core.read().unwrap_or_else(PoisonError::into_inner)
     }
@@ -139,9 +162,11 @@ impl Shared {
 pub struct Session {
     shared: Arc<Shared>,
     state: SessionState,
-    /// Whether this session holds the gate to write, as it does from a
-    /// write until it is committed, or the transaction ends.
-    writing: bool,
+    /// Whether this session has a transaction open, counted at the gate.
+    open: bool,
+    /// Whether this session has the database to itself, from a statement
+    /// that changed the schema until its transaction ends.
+    alone: bool,
     busy_timeout: Duration,
 }
 
@@ -151,20 +176,56 @@ impl Session {
         parse(sql)?.into_iter().map(|stmt| self.run(stmt)).collect()
     }
 
-    /// Runs a single parsed statement, once it is this session's turn.
+    /// Runs a single parsed statement, once it is this session's turn. A
+    /// statement that needed a row another transaction was changing runs
+    /// again once that transaction ends.
     pub fn run(&mut self, statement: Statement) -> Result<QueryResult> {
-        if !self.writing && executor::reads_only(&statement) {
-            let _reading = self.shared.gate.read(self.busy_timeout)?;
+        let deadline = Instant::now() + self.busy_timeout;
+        loop {
+            let result = self.attempt(statement.clone(), deadline);
+            match (&result, self.state.take_blocker()) {
+                (Err(_), Some(blocker)) => {
+                    let waiter = self.state.first_xid();
+                    self.shared.txns.wait(waiter, blocker, deadline)?;
+                }
+                _ => return result,
+            }
+        }
+    }
+
+    /// Runs a statement once, after waiting at the gate until `deadline`.
+    fn attempt(&mut self, statement: Statement, deadline: Instant) -> Result<QueryResult> {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if self.alone {
+            // No other session is in: nothing to wait for.
+            let result = self.state.run(&mut self.shared.write_core(), statement);
+            self.after();
+            return result;
+        }
+        let in_transaction = self.state.in_transaction();
+        if let Statement::Begin = statement {
+            if in_transaction {
+                return self.state.begin();
+            }
+            self.shared.gate.begin(timeout)?;
+            self.open = true;
+            return self.state.begin();
+        }
+        if executor::reads_only(&statement) {
+            let _reading = self.shared.gate.read(timeout, in_transaction)?;
             return self.state.read(&self.shared.read_core(), statement);
         }
-        if !self.writing {
-            self.shared.gate.write(self.busy_timeout)?;
-            self.writing = true;
+        if executor::changes_schema(&statement) {
+            self.shared.gate.claim(timeout, in_transaction)?;
+            self.alone = true;
+            let result = self.state.run(&mut self.shared.write_core(), statement);
+            self.after();
+            return result;
         }
+        self.shared.gate.write(timeout, in_transaction)?;
         let result = self.state.run(&mut self.shared.write_core(), statement);
-        if !self.state.in_transaction() {
-            self.leave();
-        }
+        self.shared.gate.leave_write();
+        self.after();
         result
     }
 
@@ -175,9 +236,13 @@ impl Session {
 
     /// The names of the tables, once this session may read.
     pub fn table_names(&self) -> Result<Vec<String>> {
-        let _reading = match self.writing {
+        let _reading = match self.alone {
             true => None,
-            false => Some(self.shared.gate.read(self.busy_timeout)?),
+            false => Some(
+                self.shared
+                    .gate
+                    .read(self.busy_timeout, self.state.in_transaction())?,
+            ),
         };
         let core = self.shared.read_core();
         Ok(core
@@ -188,7 +253,8 @@ impl Session {
             .collect())
     }
 
-    /// Sets how long this session waits for its turn before it fails.
+    /// Sets how long this session waits for its turn, and for the rows it
+    /// needs, before it fails.
     pub fn set_busy_timeout(&mut self, timeout: Duration) {
         self.busy_timeout = timeout;
     }
@@ -240,32 +306,43 @@ impl Session {
         self.state.settings.scan_workers
     }
 
-    /// Lets the other sessions in again.
-    fn leave(&mut self) {
-        if self.writing {
-            self.writing = false;
-            self.shared.gate.leave_write();
+    /// Tells the gate what a statement ended: the database had to itself
+    /// is let go, and an open transaction is closed, once the transaction ends.
+    fn after(&mut self) {
+        if self.state.in_transaction() {
+            return;
+        }
+        if self.alone {
+            self.alone = false;
+            self.shared.gate.release();
+        }
+        if self.open {
+            self.open = false;
+            self.shared.gate.end();
         }
     }
 }
 
 impl Drop for Session {
-    /// Rolls back a transaction in progress, and what a statement that
-    /// panicked had not committed, then lets the other sessions in.
+    /// Rolls back a transaction in progress, then lets the other sessions in.
     fn drop(&mut self) {
-        if self.writing {
-            let mut core = self.shared.write_core();
-            if self.state.in_transaction() {
-                let _ = self
-                    .state
-                    .run(&mut core, Statement::Rollback { savepoint: None });
+        if self.state.in_transaction() {
+            match self.alone {
+                // Its pages are in the log: they are cut off.
+                true => {
+                    let rollback = Statement::Rollback { savepoint: None };
+                    let _ = self.state.run(&mut self.shared.write_core(), rollback);
+                }
+                // Its versions are skipped once its ids abort.
+                false => self.state.abandon(&self.shared.txns),
             }
         }
-        self.leave();
+        self.after();
     }
 }
 
-/// Who may use the core: any number of readers, or one writer.
+/// Who may use the core: any number of reading statements, or one writing
+/// one; and the sessions with a transaction open, or one alone.
 #[derive(Default)]
 struct Gate {
     users: Mutex<Users>,
@@ -276,8 +353,15 @@ struct Gate {
 struct Users {
     readers: usize,
     writer: bool,
-    /// Sessions waiting to write, which readers let go first.
+    /// Statements waiting to write, which readers let go first.
     waiting: usize,
+    /// Sessions with a transaction open.
+    open: usize,
+    /// Whether a session has the database to itself.
+    alone: bool,
+    /// Sessions waiting to have it to themselves, which new transactions
+    /// and statements outside one let go first.
+    claiming: usize,
 }
 
 /// A reader's place at the gate, given up when it is dropped.
@@ -289,18 +373,26 @@ impl Gate {
         self.users.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Waits, at most `timeout`, until no session writes or waits to.
-    fn read(&self, timeout: Duration) -> Result<Reading<'_>> {
-        let mut users = self.wait(timeout, |u| u.writer || u.waiting > 0)?;
+    /// Waits, at most `timeout`, until no statement writes or waits to, and
+    /// no session is alone or (for a session with no transaction open)
+    /// waiting to be.
+    fn read(&self, timeout: Duration, in_transaction: bool) -> Result<Reading<'_>> {
+        let mut users = self.wait(timeout, |u| {
+            u.writer || u.waiting > 0 || u.alone || (u.claiming > 0 && !in_transaction)
+        })?;
         users.readers += 1;
         Ok(Reading(self))
     }
 
-    /// Waits, at most `timeout`, until no session reads or writes, and then
-    /// writes until [`Gate::leave_write`].
-    fn write(&self, timeout: Duration) -> Result<()> {
+    /// Waits, at most `timeout`, until no statement reads or writes, and then
+    /// writes until [`Gate::leave_write`]. A session with no transaction
+    /// open first lets those waiting to be alone go.
+    fn write(&self, timeout: Duration, in_transaction: bool) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        drop(self.wait(timeout, |u| u.alone || (u.claiming > 0 && !in_transaction))?);
         self.users().waiting += 1;
-        let waited = self.wait(timeout, |u| u.writer || u.readers > 0);
+        let left = deadline.saturating_duration_since(Instant::now());
+        let waited = self.wait(left, |u| u.writer || u.readers > 0 || u.alone);
         let mut users = match waited {
             Ok(users) => users,
             Err(e) => {
@@ -316,6 +408,44 @@ impl Gate {
 
     fn leave_write(&self) {
         self.users().writer = false;
+        self.changed.notify_all();
+    }
+
+    /// Opens a transaction, once no session is alone or waiting to be.
+    fn begin(&self, timeout: Duration) -> Result<()> {
+        self.wait(timeout, |u| u.alone || u.claiming > 0)?.open += 1;
+        Ok(())
+    }
+
+    fn end(&self) {
+        self.users().open -= 1;
+        self.changed.notify_all();
+    }
+
+    /// Waits, at most `timeout`, until no statement runs and no session but
+    /// this one has a transaction open, and then has the database to itself
+    /// until [`Gate::release`].
+    fn claim(&self, timeout: Duration, in_transaction: bool) -> Result<()> {
+        self.users().claiming += 1;
+        let mine = in_transaction as usize;
+        let waited = self.wait(timeout, |u| {
+            u.alone || u.writer || u.readers > 0 || u.open > mine
+        });
+        let mut users = match waited {
+            Ok(users) => users,
+            Err(e) => {
+                self.users().claiming -= 1;
+                self.changed.notify_all();
+                return Err(e);
+            }
+        };
+        users.claiming -= 1;
+        users.alone = true;
+        Ok(())
+    }
+
+    fn release(&self) {
+        self.users().alone = false;
         self.changed.notify_all();
     }
 

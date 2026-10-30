@@ -13,6 +13,7 @@ pub mod datetime;
 pub mod decimal;
 pub mod error;
 pub mod executor;
+pub mod mvcc;
 pub mod plan;
 pub mod predicate;
 pub mod result;

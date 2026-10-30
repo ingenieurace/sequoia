@@ -60,6 +60,7 @@ use std::cmp::Ordering;
 
 use super::table::Table;
 use crate::error::{Result, err};
+use crate::mvcc::Snapshot;
 use crate::predicate::Compare;
 use crate::types::Value;
 
@@ -109,12 +110,12 @@ pub enum Distinct {
 }
 
 impl TableStats {
-    /// Reads the rows of `table` and computes its statistics.
-    pub fn collect(table: &Table) -> Result<TableStats> {
+    /// Reads the rows of `table` that `snapshot` sees and computes its statistics.
+    pub fn collect(table: &Table, snapshot: &Snapshot) -> Result<TableStats> {
         let mut sample: Vec<Vec<Value>> = Vec::new();
         let mut rows: u64 = 0;
         let mut random = SplitMix(0x5EED);
-        for item in table.scan() {
+        for item in table.scan(snapshot) {
             let (_, row) = item?;
             rows += 1;
             if sample.len() < SAMPLE_ROWS {

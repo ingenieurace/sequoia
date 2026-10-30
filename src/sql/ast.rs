@@ -31,6 +31,11 @@ pub enum Statement {
     Analyze {
         table: Option<String>,
     },
+    /// `VACUUM [table]`: removes the row versions of a table, or of every
+    /// table, that no transaction can see any more (see `mvcc/mod.rs`).
+    Vacuum {
+        table: Option<String>,
+    },
     /// `BEGIN [TRANSACTION]`: the statements up to COMMIT or ROLLBACK form one transaction.
     Begin,
     /// `COMMIT [TRANSACTION]`

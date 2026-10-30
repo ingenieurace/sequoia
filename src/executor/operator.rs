@@ -184,7 +184,7 @@ fn open_node<'a>(
             ..
         } => Box::new(
             table
-                .scan_filtered(&needed, &predicates, &access)
+                .scan_filtered(settings.snapshot(), &needed, &predicates, &access)
                 .map(|item| item.map(|(_, row)| row)),
         ),
         Node::Lookup { .. } => unreachable!("a lookup is only an index join's right side"),
@@ -667,6 +667,7 @@ fn join_rows<'a>(
                 left_key,
                 filter,
                 fields,
+                snapshot: settings.snapshot().clone(),
             };
             Right::Index {
                 lookup,

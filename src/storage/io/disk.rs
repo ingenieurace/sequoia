@@ -240,9 +240,24 @@ impl DiskManager {
     /// checkpoints the log if it has grown to [`CHECKPOINT_BYTES`]. If this
     /// fails, call [`DiskManager::rollback`].
     pub fn commit(&self) -> Result<()> {
+        self.commit_with(true)
+    }
+
+    /// Commits every page write since the last commit, as
+    /// [`DiskManager::commit`] does, but without waiting for them to be
+    /// durable (see [`Wal::commit_unsynced`]): for a statement inside a
+    /// transaction, whose writes count only once the transaction commits.
+    pub fn commit_unsynced(&self) -> Result<()> {
+        self.commit_with(false)
+    }
+
+    fn commit_with(&self, sync: bool) -> Result<()> {
         let mut headers = self.header.lock().unwrap();
         let mut wal = self.wal.lock().unwrap();
-        wal.commit()?;
+        match sync {
+            true => wal.commit()?,
+            false => wal.commit_unsynced()?,
+        }
         headers.committed = headers.current;
         if wal.size() >= CHECKPOINT_BYTES {
             wal.checkpoint(&*self.db)?;

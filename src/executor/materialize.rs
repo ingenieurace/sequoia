@@ -143,7 +143,7 @@ fn run_node<'a>(
             ..
         } => Output::read(
             table
-                .scan_filtered(&needed, &predicates, &access)
+                .scan_filtered(settings.snapshot(), &needed, &predicates, &access)
                 .map(|item| item.map(|(_, row)| row)),
             wanted,
         ),

@@ -153,6 +153,18 @@ impl Wal {
     /// Makes every page written since the last commit durable. Does nothing
     /// if there are none. If this fails, call [`Wal::rollback`].
     pub fn commit(&mut self) -> Result<()> {
+        self.commit_with(true)
+    }
+
+    /// Commits the pages written since the last commit, as [`Wal::commit`]
+    /// does, but without waiting for them to be durable: a crash may lose
+    /// them, but never some without the others, and a later commit that
+    /// syncs makes them durable too.
+    pub fn commit_unsynced(&mut self) -> Result<()> {
+        self.commit_with(false)
+    }
+
+    fn commit_with(&mut self, sync: bool) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
         }
@@ -160,7 +172,9 @@ impl Wal {
         let mut frame = COMMIT.to_le_bytes().to_vec();
         frame.extend_from_slice(&sum.to_le_bytes());
         self.file.write_at(self.end, &frame)?;
-        self.file.sync()?;
+        if sync {
+            self.file.sync()?;
+        }
         self.end += FRAME_HEADER;
         self.checksum = sum;
         self.mark_committed();

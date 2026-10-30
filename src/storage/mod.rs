@@ -10,6 +10,7 @@
 //!   heap    tuples in a linked list of pages, updated in place
 //!   lsm     a log-structured merge tree of SSTables, never updated in place
 //!   column  row groups stored column by column, compressed, plus a heap as the delta store
+//! version   the header of each stored row: which transactions wrote and deleted it
 //! btree     a B+ tree of byte-string keys, which indexes are built on
 //! hash      a hash file of byte-string entries: extendible or linear hashing, for indexes USING HASH
 //! ```
@@ -24,6 +25,7 @@ pub mod lsm;
 pub mod page;
 pub mod sort_key;
 pub mod tuple;
+pub mod version;
 
 pub use btree::BPlusTree;
 pub use buffer::pool::{BufferPool, PageReadGuard, PageWriteGuard, REPLACEMENT_POLICY, Stats};

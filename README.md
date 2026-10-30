@@ -7,8 +7,9 @@ Sequoia is a study of how databases work. It implements the textbook
 techniques side by side, so they can be read and compared on the same data:
 three storage engines, two kinds of index, three execution models, five join
 methods, three page replacement policies, and intra-query parallelism. It is
-also a working database: SQL, transactions, crash recovery through a
-write-ahead log, a shell, and a TCP server.
+also a working database: SQL, transactions under multiversion concurrency
+control (snapshot isolation), crash recovery through a write-ahead log, a
+shell, and a TCP server.
 
 Every source file starts with a doc comment that explains its design, often
 with a diagram. Reading the code is the intended way to learn it; this README
@@ -89,7 +90,7 @@ that make those estimates closer, and let the planner reorder joins.
 | Sort and aggregation | external merge sort with a tournament tree, top-N heap for `LIMIT`; hash aggregation that spills partitions |
 | Planner | access path choice, predicate pushdown, cost-based choice between index and hash joins, merge join to save a sort, join reordering by dynamic programming |
 | Statistics | `ANALYZE`: reservoir sample, null share, distinct count (Haas-Stokes), most common values, equi-depth histograms; kept in the catalog |
-| Concurrency | many readers or one writer at a time, as in SQLite; a thread per connection in the server |
+| Concurrency | multiversion concurrency control: snapshot isolation, row versions with xmin and xmax in every storage engine, a commit log, first updater wins, waits for row conflicts with deadlock detection, `VACUUM` and autovacuum; a thread per connection in the server |
 
 ## Shell, server and library
 
@@ -176,6 +177,7 @@ workers, and a join method to force on every join (see
 - `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT name`, `ROLLBACK TO [SAVEPOINT] name`, `RELEASE [SAVEPOINT] name` (each may add `TRANSACTION`)
 - `CHECKPOINT` copies the committed pages from the log into the database file
 - `ANALYZE [table]` computes the statistics of a table, or of every table, for the planner (see [Planning](#planning))
+- `VACUUM [table]` removes the row versions of a table, or of every table, that no transaction can see any more (see [Transactions and MVCC](#transactions-and-mvcc))
 
 **Types**: `INT` (or `INTEGER`, 64-bit), `REAL` (or `FLOAT`, 64-bit float, never
 NaN or infinite), `TEXT` (UTF-8), `BOOL` (or `BOOLEAN`), and `NULL`. INTs and
@@ -330,6 +332,17 @@ durable once it returns. A transaction is durable once `COMMIT` returns; a
 crash, `ROLLBACK` or closing the database undoes it. A statement that fails
 inside a transaction is undone alone, and the transaction goes on.
 
+Transactions run under snapshot isolation (PostgreSQL's `REPEATABLE READ`):
+a transaction reads the database as it was when its first statement began,
+with its own writes, and never sees what other transactions commit later.
+Readers never wait for writers. Of two transactions that change the same
+row, the first wins: the second waits for the first to end, and fails with
+"could not serialize access" if it committed (outside a transaction, the
+statement runs again on the new row instead). A transaction that fails so
+can be rolled back and run again. Write skew is possible, as under any
+snapshot isolation: two transactions may each read what the other changes.
+See [Transactions and MVCC](#transactions-and-mvcc).
+
 **Not supported**: `ALTER TABLE`, `NOT NULL`, `DEFAULT`, `CHECK`, foreign
 keys, composite primary keys, time zones by name (only UTC and offsets),
 `SET TIME ZONE`, frame `EXCLUDE` clauses, and text stored in a DATE, TIME,
@@ -340,7 +353,7 @@ TIMESTAMP, TIMESTAMPTZ or INTERVAL column without a cast or a typed literal.
 Each layer uses only the layers below it:
 
 ```
-sql -> executor -> plan -> catalog -> storage        (types, predicate, error: shared by all)
+sql -> executor -> plan -> catalog -> mvcc -> storage        (types, predicate, error: shared by all)
 ```
 
 ```
@@ -349,7 +362,7 @@ src/
   editor.rs          the shell's line editing and history (arrow keys)
   lib.rs             module list and public exports
   database.rs        Database: one session on one core; atomic statements, transactions, savepoints
-  shared.rs          SharedDatabase and Session: many threads, many readers or one writer
+  shared.rs          SharedDatabase and Session: many threads; statements take turns, row waits
   server.rs          TCP server (a thread per connection) and client
   types.rs           values, data types, columns; how values compare, convert and print
   decimal.rs         DECIMAL: exact decimal numbers of up to 38 digits, and their arithmetic
@@ -378,6 +391,11 @@ src/
     index.rs         index entries (keys, included columns, row id) in a B+ tree or hash file
     stats.rs         ANALYZE: sampling, distinct values, common values, histograms; estimates from them
 
+  mvcc/
+    mod.rs           transactions: ids running and aborted, waits and deadlocks, vacuum horizon
+    snapshot.rs      which versions a statement sees; whether it may change them
+    clog.rs          the commit log: a bit per transaction, in pages of the file
+
   executor/
     mod.rs           runs statements; INSERT, UPDATE, DELETE, RETURNING, EXPLAIN ANALYZE
     model.rs         the three execution models and how a query picks one
@@ -398,6 +416,7 @@ src/
     buffer/          pool.rs (sharded buffer pool), replacer.rs (ARC, LRU-K, CLOCK)
     page.rs          slotted page
     tuple.rs         row <-> bytes
+    version.rs       the version header of every stored row (xmin, xmax)
     sort_key.rs      values -> bytes that sort like the values
     heap.rs          table heap: linked pages, free-space map
     btree.rs         B+ tree with latch crabbing
@@ -431,8 +450,11 @@ reaches 4 MB after a commit, on `CHECKPOINT`, when the database is closed,
 and when it is opened after a crash. The file is locked, so only one process
 can open it.
 
-When a statement fails, the buffer pool drops its cached pages, the log
-drops the uncommitted frames, and the catalog is read again from the
+Every statement that writes ends with a commit frame, so the next statement
+of any session starts from its pages; only a commit of a transaction syncs
+(see [Transactions and MVCC](#transactions-and-mvcc)). When a statement
+fails, the buffer pool drops its cached pages, the log drops the frames
+since the last commit frame, and the catalog is read again from the
 committed pages. The tests in `database.rs` crash a simulated disk at many
 points inside statements and transactions, and check that each one is
 applied whole or not at all.
@@ -449,11 +471,18 @@ replacement policy is ARC by default; LRU-K and CLOCK can be chosen with
 
 ### Storage engines
 
+Every stored row is a version, with a 16-byte header of the transactions
+that wrote it (xmin) and deleted it (xmax); see [Transactions and
+MVCC](#transactions-and-mvcc).
+
 - **Heap** (default): a linked list of slotted pages. A row is found by its
   page and slot. An in-memory free-space map sends each insert to the first
-  page with room. An update stays in place when its page has room.
-- **LSM tree** (`USING LSM`): keyed by the primary key, or by a hidden row id.
-  Writes go to a MemTable (ART by default) and to a log. The log is a heap
+  page with room. An update writes a new version where there is room, and
+  sets the old one's xmax; it stays in place, when its page has room, if no
+  other transaction could see the old version.
+- **LSM tree** (`USING LSM`): keyed by the primary key, or by a hidden row id,
+  then by the version's xmin, so that a key's versions sort together, newest
+  first. Writes go to a MemTable (ART by default) and to a log. The log is a heap
   inside the database file, so it is covered by the write-ahead log too. At
   64 KB the MemTable is written out as a sorted SSTable. Level compaction
   (default) or universal compaction merges SSTables. Lookups check the
@@ -468,7 +497,11 @@ replacement policy is ARC by default; LRU-K and CLOCK can be chosen with
   conditions on the compressed chunks (once per run, on the literal's
   bitmap, or on dictionary codes), and then decode the other columns only
   for the rows that match. Deletes set a bit in the group's delete bitmap;
-  updates delete and insert again.
+  updates delete and insert again. Only rows every transaction sees are
+  moved into row groups, which have no version headers; a delete of a row
+  group's row stays pending, its xmax in a small heap of its own, until
+  every transaction sees it and vacuum sets its bit. The delta store is
+  moved after a commit, once 1024 of its rows are settled.
 
 ### Indexes
 
@@ -488,7 +521,12 @@ bucket that cannot be split continues in overflow pages.
 
 A heap table with a primary key gets a unique index `<table>_pkey`. Column
 tables cannot have indexes, because moving rows into a row group changes
-their ids. Every write updates every index of its table.
+their ids. Every write updates every index of its table. Each row version
+has entries of its own: an index lookup reads the version an entry points
+to, and skips it if the snapshot does not see it (so a covering index still
+reads the table's row header), and vacuum removes the entries of the
+versions it removes. A unique index counts the versions that are there now,
+committed or the writer's own, whether the writer's snapshot sees them or not.
 
 Keys are encoded in `storage/sort_key.rs`. INTs, REALs and DECIMALs share
 one ordering by value, so `1`, `1.0` and `DECIMAL '1.00'` have the same key.
@@ -634,14 +672,70 @@ With `.workers N` (or `set_scan_workers` and `set_join_workers`):
 Steps with subqueries are not parallelized, because subqueries run in the
 query's thread.
 
+### Transactions and MVCC
+
+Sequoia keeps versions of rows, as PostgreSQL does (`mvcc/`):
+
+```text
+row 7:  [xmin 12 | xmax 15 | name 'ann']   written by 12, deleted by 15
+row 9:  [xmin 15 | xmax  0 | name 'amy']   the version 15 wrote instead
+
+transaction 14, began before 15 committed:  sees row 7 ('ann')
+transaction 16, began after:                sees row 9 ('amy')
+```
+
+- **Versions.** Every stored row starts with xmin, the transaction that
+  wrote it, and xmax, the one that deleted it. An update sets the old
+  version's xmax and writes a new version, with its own index entries.
+- **Transaction ids.** A transaction gets an id when it first writes, and
+  one more after each savepoint it writes after, so that `ROLLBACK TO`
+  aborts only what followed.
+- **Snapshots.** A transaction's first statement takes a snapshot: the next
+  id, and the ids running then. It sees a version if it sees xmin and not
+  xmax, and it sees an id that committed before the snapshot, or its own.
+- **The commit log** keeps a bit for each transaction that committed, in
+  pages of the database file. A commit sets its bits and syncs the log; a
+  rollback writes nothing, and only marks its ids aborted in memory; a crash
+  aborts every transaction that was running, since none has its bit. Every
+  statement's pages are committed to the write-ahead log as it ends, without
+  a sync, so the log no longer undoes transactions, only failed statements.
+- **Conflicts.** A write may change only versions its snapshot sees, and no
+  other transaction has deleted. One whose xmax belongs to a transaction
+  still running fails, undone, and its session waits for that transaction
+  and runs the statement again: it then fails for good if the other
+  committed, and its transaction cannot see that commit. Inserting a key
+  another running transaction wrote or deleted waits the same way. A
+  transaction about to wait for one that waits for it, through others or
+  not, fails at once with "deadlock detected".
+- **Vacuum.** `VACUUM` removes the versions no transaction can see any
+  more (written by an aborted transaction, or deleted before every running
+  snapshot began) with their index entries, and moves a column table's
+  settled rows into row groups. A table vacuums itself after a commit once
+  updates and deletes have left 1000 old versions behind, and a fifth of its
+  rows.
+- **Alone.** A statement that no other transaction or snapshot could see a
+  version of, and that the log undoes if it fails, writes in place: outside
+  a transaction with no other open, or in a transaction that has the
+  database to itself. Its rows need no transaction id and leave nothing for
+  vacuum, so a single user writes as fast as before there were versions.
+- **The schema** has no versions: CREATE, DROP and ANALYZE wait until no
+  other session has a transaction open, and then keep the database to
+  themselves until their transaction ends, its statements left uncommitted
+  in the log for a rollback to cut off.
+
+A file from before versions is upgraded when it is opened: its rows are
+copied into new tables, as versions every transaction sees.
+
 ### Concurrency
 
-A `SharedDatabase` lets many sessions read at once, or one write, as SQLite
-does. A writer holds the database until its statement commits, or with
-`BEGIN`, until its transaction ends. A waiting writer goes before readers that
-arrive after it. A session waits at most its busy timeout (5 seconds by
-default) and then fails with "database is locked". A session dropped inside a
-transaction rolls it back. Below this lock, the buffer pool, B+ trees and hash
+A `SharedDatabase` lets many sessions' transactions run at once. Their
+statements take turns, as SQLite's do: any number of statements that read
+at once, or one that writes, which keeps the core until it ends (not until
+its transaction does). A statement waiting to write goes before readers
+that arrive after it. A session waits at most its busy timeout (5 seconds by
+default), for its turn and for rows other transactions hold, and then fails
+with "database is locked" or the conflict. A session dropped inside a
+transaction rolls it back. Below this, the buffer pool, B+ trees and hash
 files are safe for concurrent use with page latches, which parallel queries
 rely on.
 
@@ -672,26 +766,33 @@ At compile time, by editing a constant:
 | `COMPACTION` | `Compaction::Level` | `src/storage/lsm/tree.rs` |
 | `HASH_SCHEME` | `HashScheme::Extendible` | `src/storage/hash/mod.rs` |
 | `CHECKPOINT_BYTES` | 4 MB | `src/storage/io/disk.rs` |
+| `AUTOVACUUM_CHANGES` | 1000 | `src/catalog/table.rs` |
 
 Files written with another MemTable, compaction strategy or hash scheme still
 open.
 
 ## Limits
 
-- **Row size**: a row must fit in one page, at most 4080 bytes encoded (a few
-  bytes less in an LSM table, which stores the key with it). There are no
-  overflow pages.
+- **Row size**: a row must fit in one page, at most 4064 bytes encoded (4080
+  with its version header; a few bytes less in an LSM table, which stores
+  the key with it). There are no overflow pages.
 - **Index entries** are at most 1024 bytes (keys, included columns and row id).
 - **Column tables** hold at most about 1000 row groups (about a million rows),
   because the manifest is one page.
-- **One writer at a time**: there is no MVCC and no row locking, so a long
-  write transaction blocks every other session.
+- **Write statements take turns**: transactions run side by side, but the
+  statements that write run one at a time, and readers wait for the one
+  running. A statement that changes the schema needs the database to itself.
+- **Snapshot isolation, not serializable**: write skew is possible. A row
+  conflict is not waited out inside the statement: the statement fails and
+  runs again, from the start, once the other transaction ends.
+- **Transaction ids** are not reused: the commit log holds about 33 million
+  of them, and the ids of every aborted transaction are kept in memory.
 - **Steps that hold rows in memory, with no budget**: `INTERSECT` and
   `EXCEPT` hold their right side's rows; a recursive `UNION` (not `ALL`)
   every row it returned; a window step one partition; a `LATERAL` join the
   rows its subquery returned for one left row.
 - **Statistics only on request**: they are computed by `ANALYZE` and not
-  kept up to date by writes (there is no autovacuum); estimates treat the
+  kept up to date by writes (autovacuum removes versions only); estimates treat the
   conditions on different columns as independent (no multi-column
   statistics). Joins are reordered into left-deep trees only (no bushy
   plans), and not across a `LEFT JOIN`.
@@ -731,7 +832,9 @@ cargo test --release
   With `SEQUOIA_DIFF_TRACE=1` (and `--nocapture`) each statement is printed
   before it runs, to find one that never ends.
 
-- `tests/concurrency.rs` and `tests/server.rs` test sessions and the TCP server.
+- `tests/concurrency.rs` and `tests/server.rs` test sessions side by side
+  (snapshots, row conflicts, deadlocks and vacuum, in every storage engine)
+  and the TCP server.
 
 CI (`.github/workflows/ci.yml`) runs `cargo test --release` on Linux, macOS
 and Windows, with `sqlite3` installed so the differential tests run.

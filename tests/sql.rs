@@ -7573,3 +7573,40 @@ fn text_and_math_functions() {
         assert!(e.0.contains(problem), "{sql}: {e}");
     }
 }
+
+#[test]
+fn lsm_versions_under_one_key_leave_no_stale_index_entries() {
+    let mut db = in_memory();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, tag TEXT) USING LSM")
+        .unwrap();
+    db.execute("CREATE INDEX t_tag ON t (tag)").unwrap();
+    let rows: Vec<String> = (0..300).map(|i| format!("({i}, 't{i}')")).collect();
+    db.execute(&format!("INSERT INTO t VALUES {}", rows.join(", ")))
+        .unwrap();
+    let ids = |db: &mut Database, tag: &str| {
+        // Read from the index alone, which holds the tag: a stale entry shows.
+        let sql = format!("SELECT tag FROM t WHERE tag = '{tag}'");
+        assert!(
+            explain(db, &sql).contains("USING COVERING INDEX t_tag"),
+            "{sql}"
+        );
+        query(db, &sql)
+    };
+    // A transaction writes new versions, and leaves the old ones deleted.
+    db.execute("BEGIN; UPDATE t SET tag = tag WHERE id < 10; COMMIT")
+        .unwrap();
+    // Alone, an update rewrites rows in place, under the keys the deleted
+    // versions have: their index entries must go with them.
+    db.execute("UPDATE t SET tag = 'z' WHERE id < 10").unwrap();
+    assert_eq!(ids(&mut db, "t3").len(), 0);
+    assert_eq!(ids(&mut db, "z").len(), 10);
+    // As must those of a deleted row's version, when its key is inserted again.
+    db.execute("BEGIN; DELETE FROM t WHERE id = 20; COMMIT")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (20, 'y')").unwrap();
+    assert_eq!(ids(&mut db, "t20").len(), 0);
+    assert_eq!(ids(&mut db, "y"), [[Value::Text("y".into())]]);
+    db.execute("VACUUM t").unwrap();
+    assert_eq!(ids(&mut db, "z").len(), 10);
+    assert_eq!(query(&mut db, "SELECT id FROM t").len(), 300);
+}

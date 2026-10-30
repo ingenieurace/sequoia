@@ -2,28 +2,40 @@
 //!
 //! Every statement that changes data is atomic. When it succeeds, the catalog
 //! is saved, dirty pages are written back from the buffer pool to the disk's
-//! write-ahead log, and the disk commits them, so a statement that returns
-//! successfully is durable. When it fails, its writes are rolled back: the
-//! buffer pool drops its cached pages, the disk drops the uncommitted log
-//! frames, and the catalog is opened again from the committed pages. A crash
-//! in the middle of a statement likewise loses all of it.
+//! write-ahead log, and the disk commits them. When it fails, its writes are
+//! rolled back: the buffer pool drops its cached pages, the disk drops the
+//! log frames written since the last commit, and the catalog is opened again
+//! from the committed pages. A crash in the middle of a statement likewise
+//! loses all of it. Outside a transaction, a statement is a transaction of
+//! its own, durable once it returns.
 //!
-//! **Transactions.** Between `BEGIN` and `COMMIT`, statements are saved to
-//! the log as they succeed but not committed, so later ones see them and
-//! `COMMIT` makes all of them durable at once. `ROLLBACK`, closing the
-//! database, or a crash undoes all of them. A statement that fails inside a
-//! transaction is undone alone, back to a savepoint of the disk taken before
-//! it (with the pool clean, as the statement before saved everything), and
-//! the transaction goes on. `SAVEPOINT name` takes such a savepoint by name,
-//! for `ROLLBACK TO name` to go back to (keeping it, and dropping the ones
-//! taken after it) and `RELEASE name` to forget (with those after it).
+//! **Transactions** (see `mvcc/mod.rs`). A transaction reads the snapshot
+//! its first statement took, and writes versions of rows under its ids. Its
+//! statements' pages are committed to the log as each statement ends,
+//! without a sync, so that the statements of other sessions can run after
+//! them; its versions count once `COMMIT` sets its bits in the commit log
+//! and syncs the log. `ROLLBACK`, closing the database, or a crash aborts
+//! its ids instead, and every reader skips their versions from then on. A
+//! statement that fails inside a transaction is undone alone, back to the
+//! last commit (the statement before), and the transaction goes on.
+//! `SAVEPOINT name` marks a point to go back to: the writes after it are
+//! made under a new id, which `ROLLBACK TO name` aborts (keeping the
+//! savepoint, and dropping the ones taken after it); `RELEASE name` forgets
+//! it (with those after it).
 //!
-//! **Sessions.** What a database holds, its pages and its catalog, is its
-//! [`Core`]; what each user of it holds, its settings and its transaction,
-//! is a [`SessionState`]. A [`Database`] is one of each, for one thread. A
-//! [`SharedDatabase`](crate::shared::SharedDatabase) shares a core between
-//! the sessions of many threads (see `shared.rs`).
+//! **The schema.** A statement that changes the catalog (CREATE, DROP,
+//! ANALYZE) leaves the transaction with the database to itself until it
+//! ends (`shared.rs` keeps the other sessions out), and from then on its
+//! statements are not committed one by one: they stay in the log, as every
+//! transaction's did before there were versions, for `ROLLBACK` to cut off.
+//!
+//! **Sessions.** What a database holds, its pages, its catalog and its
+//! transactions, is its [`Core`]; what each user of it holds, its settings
+//! and its transaction, is a [`SessionState`]. A [`Database`] is one of
+//! each, for one thread. A [`SharedDatabase`](crate::shared::SharedDatabase)
+//! shares a core between the sessions of many threads (see `shared.rs`).
 
+use std::cell::OnceCell;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -31,11 +43,13 @@ use crate::catalog::Catalog;
 use crate::error::{Error, Result, err};
 use crate::executor::model::Model;
 use crate::executor::{self, Query, Settings};
+use crate::mvcc::{Base, Snapshot, Transactions};
 use crate::plan::query::ForceJoin;
 use crate::result::QueryResult;
 use crate::sql::ast::Statement;
 use crate::sql::parse;
 use crate::storage::io::disk::Savepoint;
+use crate::storage::version::{FROZEN, Xid};
 use crate::storage::{BufferPool, DiskManager, Policy, Stats};
 
 /// Frames in the buffer pool: 256 x 4 KB = 1 MB of cached pages.
@@ -51,9 +65,11 @@ pub struct Database {
     session: SessionState,
 }
 
-/// What every session of a database shares: its pages and its catalog.
+/// What every session of a database shares: its pages, its catalog and its
+/// transactions.
 pub(crate) struct Core {
     pool: Arc<BufferPool>,
+    txns: Arc<Transactions>,
     catalog: Catalog,
     /// Set when a rollback failed, leaving the state in memory unknown.
     broken: bool,
@@ -63,13 +79,40 @@ pub(crate) struct Core {
 #[derive(Default)]
 pub(crate) struct SessionState {
     pub(crate) settings: Settings,
-    /// The savepoints of the transaction in progress, oldest first, if there is one.
-    transaction: Option<Vec<(String, Savepoint)>>,
+    transaction: Option<Transaction>,
+    /// A transaction still running whose row the last statement needed, for
+    /// the session to wait for before it tries again.
+    blocker: Option<Xid>,
+}
+
+#[derive(Default)]
+struct Transaction {
+    /// What it reads: taken by its first statement.
+    base: OnceCell<Arc<Base>>,
+    /// Its ids, oldest first: one, and then one more for each savepoint it
+    /// wrote after. They commit or abort together, but for those rolled
+    /// back to a savepoint, which abort then.
+    xids: Vec<Xid>,
+    /// Whether its next write needs a new id: after a savepoint, so that
+    /// rolling back to it aborts only what follows.
+    fresh: bool,
+    savepoints: Vec<SavepointMark>,
+    /// Whether it changed the schema: it has the database to itself, and its
+    /// statements stay in the log uncommitted.
+    alone: bool,
+}
+
+struct SavepointMark {
+    name: String,
+    /// How many ids the transaction had then.
+    xids: usize,
+    /// Where the log was then, if the transaction had the database to itself.
+    disk: Option<Savepoint>,
 }
 
 /// The position of the newest savepoint with this name.
-fn find(savepoints: &[(String, Savepoint)], name: &str) -> Result<usize> {
-    match savepoints.iter().rposition(|(n, _)| n == name) {
+fn find(savepoints: &[SavepointMark], name: &str) -> Result<usize> {
+    match savepoints.iter().rposition(|s| s.name == name) {
         Some(i) => Ok(i),
         None => err(format!("no such savepoint: {name}")),
     }
@@ -94,11 +137,13 @@ impl Core {
             BUFFER_POOL_FRAMES,
             BUFFER_POOL_SHARDS,
         ));
-        let mut catalog = Catalog::open(pool.clone())?;
-        catalog.save()?; // a new database's empty catalog
+        let txns = Transactions::new();
+        let mut catalog = Catalog::open(pool.clone(), txns.clone())?;
+        catalog.save()?; // a new database's empty catalog, or an upgraded one
         pool.disk().commit()?;
         Ok(Core {
             pool,
+            txns,
             catalog,
             broken: false,
         })
@@ -110,6 +155,10 @@ impl Core {
 
     pub(crate) fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    pub(crate) fn transactions(&self) -> &Arc<Transactions> {
+        &self.txns
     }
 
     /// An error if a failed rollback left the core unusable.
@@ -137,11 +186,36 @@ impl Core {
                 Some(savepoint) => self.pool.disk().rollback_to(savepoint)?,
                 None => self.pool.disk().rollback()?,
             }
-            self.catalog = Catalog::open(self.pool.clone())?;
+            self.catalog = Catalog::open(self.pool.clone(), self.txns.clone())?;
             Ok(())
         })();
         self.broken |= result.is_err();
         result
+    }
+
+    /// Makes a transaction's writes count: sets the commit bits of its ids,
+    /// and commits everything written since the last commit, synced. If this
+    /// fails, the caller restores the core and aborts the ids.
+    fn commit(&mut self, xids: &[Xid]) -> Result<()> {
+        self.txns.write_commit(&self.pool, xids)?;
+        self.catalog.save()?;
+        self.pool.disk().commit()
+    }
+
+    /// After a commit, lets the tables tidy up (see `Table::tidy`), and
+    /// commits what that changed apart. If it fails, it is undone and
+    /// forgotten: the commit before stands.
+    fn tidy(&mut self) {
+        let tidied = (|| {
+            if self.catalog.tidy()? {
+                self.catalog.save()?;
+                self.pool.disk().commit_unsynced()?;
+            }
+            Ok::<_, Error>(())
+        })();
+        if tidied.is_err() {
+            let _ = self.restore(None);
+        }
     }
 }
 
@@ -150,95 +224,233 @@ impl SessionState {
         self.transaction.is_some()
     }
 
+    /// The first id of the transaction in progress, if it wrote.
+    pub(crate) fn first_xid(&self) -> Option<Xid> {
+        self.transaction.as_ref()?.xids.first().copied()
+    }
+
+    /// The transaction whose row the last statement needed, taken once.
+    pub(crate) fn take_blocker(&mut self) -> Option<Xid> {
+        self.blocker.take()
+    }
+
+    /// Starts a transaction: `BEGIN`, which needs nothing of the core.
+    pub(crate) fn begin(&mut self) -> Result<QueryResult> {
+        if self.transaction.is_some() {
+            return err("a transaction is already in progress");
+        }
+        self.transaction = Some(Transaction::default());
+        Ok(message("transaction started"))
+    }
+
+    /// Ends the transaction in progress without the core: a rollback, for a
+    /// session that goes away. Its ids abort; one that had the database to
+    /// itself must be rolled back with the core instead.
+    pub(crate) fn abandon(&mut self, txns: &Transactions) {
+        if let Some(transaction) = self.transaction.take() {
+            debug_assert!(!transaction.alone, "its pages are in the log");
+            txns.end(&transaction.xids, false);
+        }
+    }
+
     /// Runs a single parsed statement on `core`.
     pub(crate) fn run(&mut self, core: &mut Core, statement: Statement) -> Result<QueryResult> {
         core.usable()?;
         match statement {
-            Statement::Begin => {
-                if self.transaction.is_some() {
-                    return err("a transaction is already in progress");
-                }
-                self.transaction = Some(Vec::new());
-                Ok(message("transaction started"))
-            }
+            Statement::Begin => self.begin(),
             Statement::Commit => {
-                if self.transaction.take().is_none() {
+                let Some(transaction) = self.transaction.take() else {
                     return err("no transaction is in progress");
+                };
+                if transaction.xids.is_empty() && !transaction.alone {
+                    return Ok(message("transaction committed")); // it only read
                 }
-                match core.pool.disk().commit() {
-                    Ok(()) => Ok(message("transaction committed")),
-                    Err(e) => core.undo(e, None),
+                match core.commit(&transaction.xids) {
+                    Ok(()) => {
+                        core.txns.end(&transaction.xids, true);
+                        core.tidy();
+                        Ok(message("transaction committed"))
+                    }
+                    Err(e) => {
+                        core.txns.end(&transaction.xids, false);
+                        core.undo(e, None)
+                    }
                 }
             }
             Statement::Rollback { savepoint: None } => {
-                if self.transaction.take().is_none() {
+                let Some(transaction) = self.transaction.take() else {
                     return err("no transaction is in progress");
+                };
+                core.txns.end(&transaction.xids, false);
+                match transaction.alone {
+                    true => core.restore(None)?,
+                    // The row counts it changed count rows that are not there.
+                    false => core.catalog.forget_row_counts(),
                 }
-                core.restore(None)?;
                 Ok(message("transaction rolled back"))
             }
             Statement::Rollback {
                 savepoint: Some(name),
             } => {
-                let savepoints = self.savepoints("ROLLBACK TO")?;
-                let i = find(savepoints, &name)?;
-                savepoints.truncate(i + 1);
-                let savepoint = savepoints[i].1.clone();
-                core.restore(Some(&savepoint))?;
+                let transaction = self.transaction("ROLLBACK TO")?;
+                let i = find(&transaction.savepoints, &name)?;
+                transaction.savepoints.truncate(i + 1);
+                let mark = &transaction.savepoints[i];
+                let undone = transaction.xids.split_off(mark.xids);
+                transaction.fresh = true;
+                core.txns.end(&undone, false);
+                match transaction.alone {
+                    true => core.restore(mark.disk.as_ref())?,
+                    false => core.catalog.forget_row_counts(),
+                }
                 Ok(message(format!("rolled back to savepoint {name}")))
             }
             Statement::Savepoint { name } => {
-                let savepoint = core.pool.disk().savepoint();
-                self.savepoints("SAVEPOINT")?
-                    .push((name.clone(), savepoint));
+                let transaction = self.transaction("SAVEPOINT")?;
+                let mark = SavepointMark {
+                    name: name.clone(),
+                    xids: transaction.xids.len(),
+                    disk: transaction.alone.then(|| core.pool.disk().savepoint()),
+                };
+                transaction.savepoints.push(mark);
+                transaction.fresh = true;
                 Ok(message(format!("savepoint {name} created")))
             }
             Statement::Release { name } => {
-                let savepoints = self.savepoints("RELEASE")?;
-                let i = find(savepoints, &name)?;
-                savepoints.truncate(i);
+                let transaction = self.transaction("RELEASE")?;
+                let i = find(&transaction.savepoints, &name)?;
+                transaction.savepoints.truncate(i);
                 Ok(message(format!("savepoint {name} released")))
             }
             Statement::Checkpoint if self.transaction.is_some() => {
                 err("CHECKPOINT cannot run inside a transaction")
+            }
+            Statement::Vacuum { .. } if self.transaction.is_some() => {
+                err("VACUUM cannot run inside a transaction")
             }
             statement if executor::reads_only(&statement) => self.read(core, statement),
             statement => self.write(core, statement),
         }
     }
 
+    /// What the statements of the transaction in progress read, taken now
+    /// if this is its first; for a statement outside one, a snapshot of its
+    /// own.
+    fn base(&self, core: &Core) -> Arc<Base> {
+        match &self.transaction {
+            Some(transaction) => transaction
+                .base
+                .get_or_init(|| core.txns.snapshot(true))
+                .clone(),
+            None => core.txns.snapshot(false),
+        }
+    }
+
+    /// The snapshot of a statement that only reads.
+    pub(crate) fn read_snapshot(&self, core: &Core) -> Snapshot {
+        let own = match &self.transaction {
+            Some(transaction) => transaction.xids.clone(),
+            None => Vec::new(),
+        };
+        Snapshot::new(self.base(core), own, None)
+    }
+
     /// Runs a statement that only reads (see [`executor::reads_only`]) on a
     /// core that other sessions may be reading too.
     pub(crate) fn read(&self, core: &Core, statement: Statement) -> Result<QueryResult> {
         core.usable()?;
-        executor::execute_read(&core.catalog, statement, &self.settings)
+        let settings = self.settings.under(self.read_snapshot(core));
+        executor::execute_read(&core.catalog, statement, &settings)
     }
 
-    /// Runs a statement that changes data, atomically: commits it, or inside
-    /// a transaction saves it, or else undoes it.
+    /// Runs a statement that changes data, atomically: commits it as a
+    /// transaction of its own, or inside one, commits its pages to the log
+    /// for the transaction's commit to count; or else undoes it.
     fn write(&mut self, core: &mut Core, statement: Statement) -> Result<QueryResult> {
-        let savepoint = self
-            .transaction
-            .is_some()
-            .then(|| core.pool.disk().savepoint());
-        let result = executor::execute(&mut core.catalog, statement, &self.settings);
+        if self.transaction.is_none() {
+            return self.autocommit(core, statement);
+        }
+        let base = self.base(core);
+        let transaction = self.transaction.as_mut().expect("checked above");
+        transaction.alone |= executor::changes_schema(&statement);
+        let alone = transaction.alone;
+        // The log undoes what a transaction with the database to itself
+        // writes: if no one else can see a version either, it writes as a
+        // statement outside a transaction does (see `autocommit`).
+        let snapshot = if alone && core.txns.quiet(&transaction.xids, Some(&base)) {
+            Snapshot::new(base, transaction.xids.clone(), Some(FROZEN)).alone()
+        } else {
+            if transaction.fresh || transaction.xids.is_empty() {
+                let xid = core.txns.begin(transaction.xids.first().copied());
+                transaction.xids.push(xid);
+                transaction.fresh = false;
+            }
+            let xid = *transaction.xids.last().expect("one at least");
+            Snapshot::new(base, transaction.xids.clone(), Some(xid))
+        };
+        let savepoint = alone.then(|| core.pool.disk().savepoint());
+        let settings = self.settings.under(snapshot.clone());
+        let result = executor::execute(&mut core.catalog, statement, &settings);
         let saved = result.and_then(|result| {
             core.catalog.save()?;
-            if self.transaction.is_none() {
-                core.pool.disk().commit()?;
+            if !alone {
+                core.pool.disk().commit_unsynced()?;
             }
             Ok(result)
         });
         match saved {
             Ok(result) => Ok(result),
-            Err(e) => core.undo(e, savepoint.as_ref()),
+            Err(e) => {
+                self.blocker = snapshot.take_blocker();
+                core.undo(e, savepoint.as_ref())
+            }
         }
     }
 
-    /// The savepoints of the transaction in progress, for `statement` to use.
-    fn savepoints(&mut self, statement: &str) -> Result<&mut Vec<(String, Savepoint)>> {
+    /// Runs a statement that changes data outside a transaction, as a
+    /// transaction of its own.
+    fn autocommit(&mut self, core: &mut Core, statement: Statement) -> Result<QueryResult> {
+        let base = core.txns.snapshot(false);
+        if core.txns.quiet(&[], None) {
+            // No one else can see a version, and the log undoes the
+            // statement if it fails: it changes rows in place, and writes
+            // versions every transaction sees once it commits, under no id
+            // of its own (see `Snapshot::alone`). Its commit needs no bit.
+            let snapshot = Snapshot::new(base, Vec::new(), Some(FROZEN)).alone();
+            let settings = self.settings.under(snapshot);
+            let result = executor::execute(&mut core.catalog, statement, &settings)
+                .and_then(|result| core.commit(&[]).map(|()| result));
+            return match result {
+                Ok(result) => {
+                    core.tidy();
+                    Ok(result)
+                }
+                Err(e) => core.undo(e, None),
+            };
+        }
+        let xid = core.txns.begin(None);
+        let snapshot = Snapshot::new(base, vec![xid], Some(xid));
+        let settings = self.settings.under(snapshot.clone());
+        let result = executor::execute(&mut core.catalog, statement, &settings)
+            .and_then(|result| core.commit(&[xid]).map(|()| result));
+        match result {
+            Ok(result) => {
+                core.txns.end(&[xid], true);
+                core.tidy();
+                Ok(result)
+            }
+            Err(e) => {
+                core.txns.end(&[xid], false);
+                self.blocker = snapshot.take_blocker();
+                core.undo(e, None)
+            }
+        }
+    }
+
+    /// The transaction in progress, for `statement` to use.
+    fn transaction(&mut self, statement: &str) -> Result<&mut Transaction> {
         match &mut self.transaction {
-            Some(savepoints) => Ok(savepoints),
+            Some(transaction) => Ok(transaction),
             None => err(format!("{statement} can only be used in a transaction")),
         }
     }
@@ -291,7 +503,9 @@ impl Database {
         let mut statements = parse(sql)?;
         match (statements.pop(), statements.is_empty()) {
             (Some(Statement::Select(query)), true) => {
-                executor::select(&self.core.catalog, *query, &self.session.settings)
+                let snapshot = self.session.read_snapshot(&self.core);
+                let settings = self.session.settings.under(snapshot);
+                executor::select(&self.core.catalog, *query, &settings)
             }
             _ => err("query runs a single SELECT; use execute for other statements"),
         }
@@ -681,5 +895,79 @@ mod tests {
         assert!(snapshot(&mut open(&sim.crashed(usize::MAX)).unwrap()) == before);
         db.execute("COMMIT").unwrap();
         assert!(snapshot(&mut open(&sim.crashed(0)).unwrap()) == expected);
+    }
+
+    /// Runs statements in one session of a core shared with others.
+    fn run(session: &mut SessionState, core: &mut Core, sql: &str) {
+        for statement in parse(sql).unwrap() {
+            session.run(core, statement).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_crash_aborts_a_transaction_whose_pages_another_commit_made_durable() {
+        let sim = Sim::new(2);
+        let mut core =
+            Core::with_disk(DiskManager::init(sim.file(0), sim.file(1)).unwrap()).unwrap();
+        let (mut a, mut b) = (SessionState::default(), SessionState::default());
+        for using in ["HEAP", "LSM", "COLUMN"] {
+            let table = using.to_lowercase();
+            run(
+                &mut a,
+                &mut core,
+                &format!(
+                    "CREATE TABLE {table} (id INT PRIMARY KEY, n INT) USING {using};
+                     INSERT INTO {table} VALUES (1, 0), (2, 0)"
+                ),
+            );
+        }
+        // a's statements reach the log, committed there but not synced...
+        run(&mut a, &mut core, "BEGIN");
+        for table in ["heap", "lsm", "column"] {
+            run(
+                &mut a,
+                &mut core,
+                &format!(
+                    "UPDATE {table} SET n = 1 WHERE id = 1; INSERT INTO {table} VALUES (3, 0);
+                     DELETE FROM {table} WHERE id = 2"
+                ),
+            );
+        }
+        // ...and b's commit syncs them, with its own.
+        run(&mut b, &mut core, "INSERT INTO heap VALUES (10, 5)");
+        let mut db = open(&sim.crashed(0)).unwrap();
+        let expected = vec![
+            vec![Value::Int(1), Value::Int(0)],
+            vec![Value::Int(2), Value::Int(0)],
+        ];
+        let mut with_b = expected.clone();
+        with_b.push(vec![Value::Int(10), Value::Int(5)]);
+        assert_eq!(rows(&mut db, "SELECT id, n FROM heap").unwrap(), with_b);
+        for table in ["lsm", "column"] {
+            assert_eq!(
+                rows(&mut db, &format!("SELECT id, n FROM {table}")).unwrap(),
+                expected
+            );
+        }
+        // a's rows are there, written by a transaction that aborted: vacuum removes them.
+        match db.execute("VACUUM").unwrap().pop() {
+            Some(QueryResult::Message(text)) => assert!(!text.starts_with("0 "), "{text}"),
+            other => panic!("expected a message, got {other:?}"),
+        }
+        assert_eq!(rows(&mut db, "SELECT id, n FROM heap").unwrap(), with_b);
+
+        // Once a commits, its writes survive a crash.
+        run(&mut a, &mut core, "COMMIT");
+        let mut db = open(&sim.crashed(0)).unwrap();
+        for table in ["heap", "lsm", "column"] {
+            let found = rows(&mut db, &format!("SELECT id, n FROM {table}")).unwrap();
+            let ids: Vec<Value> = found.iter().map(|row| row[0].clone()).collect();
+            let mut want = vec![Value::Int(1), Value::Int(3)];
+            if table == "heap" {
+                want.push(Value::Int(10));
+            }
+            assert_eq!(ids, want, "{table}");
+            assert_eq!(found[0][1], Value::Int(1), "{table}");
+        }
     }
 }
