@@ -47,14 +47,15 @@ pub mod table;
 use crate::error::{Error, Result, err};
 use crate::mvcc::{Snapshot, Transactions};
 use crate::sql::ast::{
-    ColumnRef, Constraints, CreateIndex, Expr, IndexKind, Statement, quote_ident,
+    Alter, ColumnRef, Constraints, CreateIndex, Expr, IndexKind, Statement, Written, quote_ident,
 };
+use crate::sql::eval::cast;
 use crate::sql::parse;
 use crate::storage::{BPlusTree, BufferPool, MAX_TUPLE_SIZE, PageId, RecordId, TableHeap, tuple};
 use crate::types::{Column, DataType, StorageKind, Value};
 use index::Index;
 use stats::TableStats;
-use table::{Table, primary_key, validate_schema};
+use table::{Row, Table, primary_key, validate_schema};
 
 /// The second page of an index's catalog row: not a page, but a mark of the
 /// format of its entries.
@@ -280,30 +281,16 @@ impl Catalog {
             return err(format!("table already exists: {name}"));
         }
         validate_schema(&columns)?;
-        let unique_index = |index: String, keys: &[String]| CreateIndex {
-            name: index,
-            table: name.clone(),
-            using: IndexKind::BTree,
-            keys: keys
-                .iter()
-                .map(|key| Expr::Column(ColumnRef::bare(key)))
-                .collect(),
-            include: Vec::new(),
-            predicate: None,
-            unique: true,
-        };
         let mut indexes = Vec::new();
         if let (StorageKind::Heap, Some(pk)) = (storage, primary_key(&columns)) {
-            indexes.push(unique_index(
-                pk_index_name(&name),
-                &[columns[pk].name.clone()],
-            ));
+            let key = [columns[pk].name.clone()];
+            indexes.push(unique_index(&name, &pk_index_name(&name), &key));
         }
         if !constraints.unique.is_empty() && matches!(storage, StorageKind::Column) {
             return err("COLUMN tables cannot have UNIQUE constraints, which need an index");
         }
         for unique in &constraints.unique {
-            indexes.push(unique_index(unique.name.clone(), &unique.columns));
+            indexes.push(unique_index(&name, &unique.name, &unique.columns));
         }
         for (i, index) in indexes.iter().enumerate() {
             if self.indexes.contains_key(&index.name)
@@ -466,6 +453,353 @@ impl Catalog {
             .expect("an index's table exists")
             .table
             .drop_index(name)
+    }
+
+    /// Changes a table as `action` says (see [`Alter`]), for a statement
+    /// that began at `now` and reads `snapshot`. A change of where its
+    /// columns are or what type (adding, dropping, `TYPE`) copies its rows
+    /// into a new table of the new definition, its indexes built again; any
+    /// other only rewrites its catalog rows, and checks the rows a new
+    /// constraint must hold for.
+    pub fn alter_table(
+        &mut self,
+        name: &str,
+        action: Alter,
+        snapshot: &Snapshot,
+        now: i64,
+    ) -> Result<()> {
+        let table = self.get(name)?;
+        let kind = table.storage_kind();
+        let mut columns = table.columns.clone();
+        let mut constraints = table.constraints.clone();
+        let mut new_name = name.to_string();
+        // Each index's definition, and its root page if it stays as it is.
+        let mut indexes: Vec<(CreateIndex, Option<PageId>)> = self
+            .index_definitions(name)?
+            .into_iter()
+            .map(|(definition, root)| (definition, Some(root)))
+            .collect();
+        let mut rewrite: Option<Box<dyn Fn(Row) -> Result<Row>>> = None;
+        let mut check_rows = false;
+        let position = |column: &str| table.column_index(column);
+        // The names a constraint added may not take: the table's own, and every index's.
+        let taken: Vec<String> = constraints
+            .names()
+            .into_iter()
+            .chain(self.indexes.keys().cloned())
+            .collect();
+        let no_unique_in_columns = |written: &Written| match kind {
+            StorageKind::Column if !written.unique.is_empty() => {
+                err("COLUMN tables cannot have UNIQUE constraints, which need an index")
+            }
+            _ => Ok(()),
+        };
+        match action {
+            Alter::RenameTo(to) => {
+                if self.tables.contains_key(&to) {
+                    return err(format!("table already exists: {to}"));
+                }
+                for (definition, _) in &mut indexes {
+                    definition.table = to.clone();
+                    if definition.name == pk_index_name(name) {
+                        definition.name = pk_index_name(&to);
+                    }
+                }
+                new_name = to;
+            }
+            Alter::RenameColumn { from, to } => {
+                let i = position(&from)?;
+                if position(&to).is_ok() {
+                    return err(format!("column already exists: {to}"));
+                }
+                columns[i].name = to.clone();
+                let rename = |column: &mut String| {
+                    if *column == from {
+                        *column = to.clone();
+                    }
+                };
+                constraints.not_null.iter_mut().for_each(rename);
+                constraints.defaults.iter_mut().for_each(|(c, _)| rename(c));
+                for unique in &mut constraints.unique {
+                    unique.columns.iter_mut().for_each(rename);
+                }
+                for check in &mut constraints.checks {
+                    check.condition = renamed(&check.condition, &from, &to);
+                }
+                for (definition, _) in &mut indexes {
+                    for key in &mut definition.keys {
+                        *key = renamed(key, &from, &to);
+                    }
+                    definition.include.iter_mut().for_each(rename);
+                    if let Some(predicate) = &mut definition.predicate {
+                        *predicate = renamed(predicate, &from, &to);
+                    }
+                }
+            }
+            Alter::SetDefault { column, default } => {
+                position(&column)?;
+                constraints.defaults.retain(|(c, _)| *c != column);
+                if let Some(default) = default {
+                    constraints.defaults.push((column, default));
+                }
+            }
+            Alter::SetNotNull { column, not_null } => {
+                let i = position(&column)?;
+                if !not_null && columns[i].primary_key {
+                    return err(format!(
+                        "column {column} is the primary key, which cannot be NULL"
+                    ));
+                }
+                constraints.not_null.retain(|c| *c != column);
+                if not_null {
+                    constraints.not_null.push(column);
+                    check_rows = true;
+                }
+            }
+            Alter::AddConstraint(written) => {
+                no_unique_in_columns(&written)?;
+                let added = written.named(name, &taken)?;
+                check_rows |= !added.checks.is_empty();
+                for unique in &added.unique {
+                    indexes.push((unique_index(name, &unique.name, &unique.columns), None));
+                }
+                constraints.checks.extend(added.checks);
+                constraints.unique.extend(added.unique);
+            }
+            Alter::DropConstraint(constraint) => {
+                if let Some(i) = constraints.checks.iter().position(|c| c.name == constraint) {
+                    constraints.checks.remove(i);
+                } else if let Some(i) = constraints.unique.iter().position(|u| u.name == constraint)
+                {
+                    constraints.unique.remove(i);
+                    indexes.retain(|(definition, _)| definition.name != constraint);
+                } else {
+                    return err(format!("unknown constraint of {name}: {constraint}"));
+                }
+            }
+            Alter::AddColumn {
+                column,
+                constraints: written,
+            } => {
+                if position(&column.name).is_ok() {
+                    return err(format!("column already exists: {}", column.name));
+                }
+                if column.primary_key {
+                    return err("a primary key column cannot be added to a table");
+                }
+                no_unique_in_columns(&written)?;
+                let added = written.named(name, &taken)?;
+                for unique in &added.unique {
+                    indexes.push((unique_index(name, &unique.name, &unique.columns), None));
+                }
+                constraints.not_null.extend(added.not_null);
+                constraints.defaults.extend(added.defaults);
+                constraints.checks.extend(added.checks);
+                constraints.unique.extend(added.unique);
+                columns.push(column);
+                // Every row gets the new column's default, as it would be now.
+                let value = table::defaults(&columns, &constraints, now)?
+                    .pop()
+                    .expect("the column added");
+                rewrite = Some(Box::new(move |mut row| {
+                    row.push(value.clone());
+                    Ok(row)
+                }));
+            }
+            Alter::DropColumn(column) => {
+                let i = position(&column)?;
+                if columns[i].primary_key {
+                    return err(format!(
+                        "cannot drop column {column}: it is the primary key"
+                    ));
+                }
+                if columns.len() == 1 {
+                    return err(format!("cannot drop column {column}: {name} has no other"));
+                }
+                columns.remove(i);
+                // What reads the column goes with it, as in PostgreSQL.
+                constraints.not_null.retain(|c| *c != column);
+                constraints.defaults.retain(|(c, _)| *c != column);
+                constraints.checks.retain(|c| !reads(&c.condition, &column));
+                constraints.unique.retain(|u| !u.columns.contains(&column));
+                indexes.retain(|(definition, _)| {
+                    !(definition.keys.iter().any(|key| reads(key, &column))
+                        || definition.include.contains(&column)
+                        || definition
+                            .predicate
+                            .as_ref()
+                            .is_some_and(|p| reads(p, &column)))
+                });
+                rewrite = Some(Box::new(move |mut row| {
+                    row.remove(i);
+                    Ok(row)
+                }));
+            }
+            Alter::SetType { column, data_type } => {
+                let i = position(&column)?;
+                columns[i].data_type = data_type;
+                rewrite = Some(Box::new(move |mut row| {
+                    row[i] = cast(&row[i], data_type)
+                        .map_err(|e| Error(format!("column {column}: {}", e.0)))?;
+                    Ok(row)
+                }));
+            }
+        }
+        for (i, (definition, _)) in indexes.iter().enumerate() {
+            let other = self
+                .indexes
+                .get(&definition.name)
+                .is_some_and(|index| index.table != name);
+            if other || indexes[..i].iter().any(|(d, _)| d.name == definition.name) {
+                return err(format!("index already exists: {}", definition.name));
+            }
+        }
+        self.replace(
+            name,
+            Definition {
+                name: new_name,
+                columns,
+                constraints,
+                indexes,
+                kind,
+            },
+            rewrite,
+            check_rows,
+            snapshot,
+        )
+    }
+
+    /// Puts a table of a new definition in the place of the table `old`:
+    /// the same, redefined, or with `rewrite`, a new table its rows are
+    /// copied into, each changed by it; then rewrites their catalog rows.
+    fn replace(
+        &mut self,
+        old: &str,
+        definition: Definition,
+        rewrite: Option<Box<dyn Fn(Row) -> Result<Row>>>,
+        check_rows: bool,
+        snapshot: &Snapshot,
+    ) -> Result<()> {
+        let entry = self.tables.remove(old).ok_or_else(|| unknown_table(old))?;
+        let names: Vec<String> = self
+            .indexes
+            .iter()
+            .filter(|(_, index)| index.table == old)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in names {
+            let index = self.indexes.remove(&name).expect("listed above");
+            self.heap.delete(index.rid)?;
+        }
+        self.heap.delete(entry.rid)?;
+        if let Some(rid) = entry.stats_rid {
+            self.heap.delete(rid)?;
+        }
+        let Definition {
+            name,
+            columns,
+            constraints,
+            indexes,
+            kind,
+        } = definition;
+        let rewritten = rewrite.is_some();
+        let mut table = match rewrite {
+            None => {
+                let mut table = entry.table;
+                let kept: Vec<(CreateIndex, PageId)> = indexes
+                    .iter()
+                    .filter_map(|(definition, root)| Some((definition.clone(), (*root)?)))
+                    .collect();
+                table.redefine(name, columns, constraints, &kept)?;
+                if check_rows {
+                    table.check_rows(snapshot)?;
+                }
+                table
+            }
+            Some(rewrite) => {
+                let rows = entry
+                    .table
+                    .scan(snapshot)
+                    .map(|item| rewrite(item?.1))
+                    .collect::<Result<Vec<_>>>()?;
+                let mut table = Table::create(
+                    self.pool.clone(),
+                    self.txns.clone(),
+                    name,
+                    columns,
+                    constraints,
+                    kind,
+                )?;
+                table
+                    .insert(snapshot, rows)
+                    .map_err(|e| Error(format!("a row of {old} breaks it: {}", e.0)))?;
+                entry.table.destroy()?;
+                table
+            }
+        };
+        for (definition, root) in &indexes {
+            if rewritten || root.is_none() {
+                table.create_index(definition, snapshot)?;
+            }
+        }
+        table.tidy()?;
+
+        let rid = self.heap.insert(&encode_table_entry(&table)?)?;
+        for (definition, _) in &indexes {
+            let root = table
+                .indexes()
+                .iter()
+                .find(|index| index.name == definition.name)
+                .expect("built or kept above")
+                .root_page();
+            let rid = self
+                .heap
+                .insert(&encode_entry(definition.to_string(), (root, INDEX_FORMAT))?)?;
+            let entry = IndexEntry {
+                table: table.name.clone(),
+                rid,
+            };
+            self.indexes.insert(definition.name.clone(), entry);
+        }
+        let stats_rid = match table.stats() {
+            Some(stats) => Some(self.heap.insert(&encode_entry(
+                format!("{} {}", table.name, stats.encode()),
+                (PageId(0), STATS_FORMAT),
+            )?)?),
+            None => None,
+        };
+        let saved_last_page = table.root_pages().1;
+        self.tables.insert(
+            table.name.clone(),
+            Entry {
+                table,
+                rid,
+                saved_last_page,
+                stats_rid,
+            },
+        );
+        Ok(())
+    }
+
+    /// The definitions of a table's indexes, read from their catalog rows,
+    /// and their root pages.
+    fn index_definitions(&self, table: &str) -> Result<Vec<(CreateIndex, PageId)>> {
+        let mut found = Vec::new();
+        for (name, index) in self
+            .indexes
+            .iter()
+            .filter(|(_, index)| index.table == table)
+        {
+            let Some(bytes) = self.heap.get(index.rid)? else {
+                return err(format!("corrupted catalog: no row for index {name}"));
+            };
+            let (sql, root, format) = decode_row(&bytes)?;
+            match decode_entry(&sql, root, format)?.0 {
+                Statement::CreateIndex(definition) => found.push((definition, root)),
+                other => return err(format!("corrupted catalog row: {other:?}")),
+            }
+        }
+        Ok(found)
     }
 
     /// Removes the versions of a table, or of every table, that no
@@ -645,6 +979,56 @@ fn decode_entry(sql: &str, first: PageId, last: PageId) -> Result<(Statement, Pa
         return err(format!("corrupted catalog row: {sql}"));
     };
     Ok((statement, first, last))
+}
+
+/// A table's definition as an ALTER TABLE leaves it.
+struct Definition {
+    name: String,
+    columns: Vec<Column>,
+    constraints: Constraints,
+    /// Each index's definition, and its root page if the index stays as it
+    /// is; none for one to build.
+    indexes: Vec<(CreateIndex, Option<PageId>)>,
+    kind: StorageKind,
+}
+
+/// The unique index named `name` that keeps a primary key or a UNIQUE
+/// constraint of `table` on `columns`.
+fn unique_index(table: &str, name: &str, columns: &[String]) -> CreateIndex {
+    CreateIndex {
+        name: name.to_string(),
+        table: table.to_string(),
+        using: IndexKind::BTree,
+        keys: columns
+            .iter()
+            .map(|column| Expr::Column(ColumnRef::bare(column)))
+            .collect(),
+        include: Vec::new(),
+        predicate: None,
+        unique: true,
+    }
+}
+
+/// An expression of a table's columns, with the column `from` called `to`.
+fn renamed(expr: &Expr, from: &str, to: &str) -> Expr {
+    expr.replace(&mut |e| match e {
+        Expr::Column(column) if column.name == from => Some(Ok(Expr::Column(ColumnRef::bare(to)))),
+        _ => None,
+    })
+    .expect("renaming a column cannot fail")
+}
+
+/// Whether an expression reads the column with this name.
+fn reads(expr: &Expr, column: &str) -> bool {
+    let mut found = false;
+    expr.visit(&mut |e| {
+        if let Expr::Column(c) = e
+            && c.name == column
+        {
+            found = true;
+        }
+    });
+    found
 }
 
 fn pk_index_name(table: &str) -> String {

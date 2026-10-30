@@ -39,7 +39,7 @@
 //!
 //! **What still takes turns.** Statements that write run one at a time, and
 //! readers wait for the one running (not for its transaction). A statement
-//! that changes the schema (CREATE, DROP, ANALYZE) needs the database to
+//! that changes the schema (CREATE, ALTER, DROP, ANALYZE) needs the database to
 //! itself: it waits until no other transaction is open, and keeps the
 //! others out until its own transaction ends, as every transaction did
 //! before there were versions (see `shared.rs`).

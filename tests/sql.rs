@@ -7928,3 +7928,282 @@ fn constraints_survive_reopening() {
     );
     assert!(error(&mut db, "INSERT INTO \"odd table\" VALUES (-1)").contains("duplicate value"));
 }
+
+/// A table of three rows with an index on `name`, stored as `using`.
+fn setup_alter(db: &mut Database, using: &str) {
+    db.execute(&format!(
+        "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, n INT CHECK (n >= 0)) USING {using}"
+    ))
+    .unwrap();
+    if using != "COLUMN" {
+        db.execute("CREATE INDEX t_name ON t (name)").unwrap();
+    }
+    db.execute("INSERT INTO t VALUES (1, 'a', 10), (2, 'b', NULL), (3, 'c', 30)")
+        .unwrap();
+}
+
+#[test]
+fn alter_table_adds_drops_and_converts_columns() {
+    for using in ["HEAP", "LSM", "COLUMN"] {
+        let mut db = in_memory();
+        setup_alter(&mut db, using);
+        // A new column: the rows there take its default.
+        db.execute("ALTER TABLE t ADD COLUMN flag BOOL DEFAULT TRUE NOT NULL")
+            .unwrap();
+        assert_eq!(
+            query(&mut db, "SELECT id, flag FROM t ORDER BY id"),
+            [
+                [int(1), Value::Bool(true)],
+                [int(2), Value::Bool(true)],
+                [int(3), Value::Bool(true)]
+            ],
+            "{using}"
+        );
+        assert_eq!(
+            error(&mut db, "ALTER TABLE t ADD must INT NOT NULL"),
+            "a row of t breaks it: column must cannot be NULL",
+            "{using}"
+        );
+        db.execute("INSERT INTO t (id, name) VALUES (4, 'd')")
+            .unwrap();
+        assert_eq!(
+            query(&mut db, "SELECT flag FROM t WHERE id = 4"),
+            [[Value::Bool(true)]],
+            "{using}"
+        );
+
+        // A dropped column goes with its CHECK, and what else reads it.
+        db.execute("ALTER TABLE t DROP COLUMN n").unwrap();
+        assert_eq!(
+            query(&mut db, "SELECT * FROM t WHERE id = 1"),
+            [[int(1), text("a"), Value::Bool(true)]],
+            "{using}"
+        );
+        db.execute("ALTER TABLE t ADD n INT").unwrap();
+        db.execute("UPDATE t SET n = -5 WHERE id = 1").unwrap();
+        assert_eq!(
+            query(&mut db, "SELECT n FROM t WHERE id = 1"),
+            [[int(-5)]],
+            "{using}"
+        );
+
+        // A type: every value converted as CAST converts it.
+        db.execute("ALTER TABLE t ALTER COLUMN n TYPE TEXT")
+            .unwrap();
+        assert_eq!(
+            query(&mut db, "SELECT n FROM t WHERE id = 1"),
+            [[text("-5")]],
+            "{using}"
+        );
+        db.execute("UPDATE t SET n = 'x' WHERE id = 2").unwrap();
+        assert_eq!(
+            error(&mut db, "ALTER TABLE t ALTER n SET DATA TYPE INT"),
+            "column n: invalid INT: 'x'",
+            "{using}"
+        );
+        // The primary key too: an LSM tree is keyed by it again.
+        db.execute("ALTER TABLE t ALTER COLUMN id TYPE REAL")
+            .unwrap();
+        assert_eq!(
+            query(&mut db, "SELECT name FROM t WHERE id = 3.0"),
+            [[text("c")]],
+            "{using}"
+        );
+        assert_eq!(
+            query(&mut db, "SELECT COUNT(*) FROM t"),
+            [[int(4)]],
+            "{using}"
+        );
+        assert_eq!(
+            error(&mut db, "ALTER TABLE t DROP COLUMN id"),
+            "cannot drop column id: it is the primary key",
+            "{using}"
+        );
+        assert_eq!(
+            error(&mut db, "ALTER TABLE t ADD id2 INT PRIMARY KEY"),
+            "a primary key column cannot be added to a table",
+            "{using}"
+        );
+        assert_eq!(
+            error(&mut db, "ALTER TABLE t ADD name TEXT"),
+            "column already exists: name",
+            "{using}"
+        );
+    }
+    let mut db = in_memory();
+    db.execute("CREATE TABLE one (a INT)").unwrap();
+    assert_eq!(
+        error(&mut db, "ALTER TABLE one DROP a"),
+        "cannot drop column a: one has no other"
+    );
+}
+
+#[test]
+fn alter_table_renames_tables_and_columns_with_what_reads_them() {
+    let mut db = in_memory();
+    setup_alter(&mut db, "HEAP");
+    db.execute("ALTER TABLE t ADD CONSTRAINT one_name UNIQUE (name)")
+        .unwrap();
+    db.execute("ALTER TABLE t RENAME COLUMN name TO label")
+        .unwrap();
+    // Its index, its UNIQUE constraint and its CHECK follow the new name.
+    assert!(explain(&mut db, "SELECT id FROM t WHERE label = 'b'").contains("USING INDEX"));
+    assert_eq!(
+        error(&mut db, "INSERT INTO t VALUES (4, 'a', 1)"),
+        "duplicate value in unique index one_name: 'a'"
+    );
+    db.execute("ALTER TABLE t RENAME n TO amount").unwrap();
+    assert_eq!(
+        error(&mut db, "UPDATE t SET amount = -1"),
+        "new row violates check constraint t_n_check"
+    );
+    assert_eq!(
+        error(&mut db, "ALTER TABLE t RENAME label TO id"),
+        "column already exists: id"
+    );
+
+    db.execute("CREATE TABLE other (x INT)").unwrap();
+    assert_eq!(
+        error(&mut db, "ALTER TABLE t RENAME TO other"),
+        "table already exists: other"
+    );
+    // Its statistics go with it.
+    db.execute("ANALYZE t").unwrap();
+    db.execute("ALTER TABLE t RENAME TO items").unwrap();
+    assert_eq!(db.table_names(), ["items", "other"]);
+    assert!(db.execute("SELECT * FROM t").is_err());
+    assert_eq!(
+        query(&mut db, "SELECT label FROM items WHERE id = 2"),
+        [[text("b")]]
+    );
+    // The primary key's index takes the new name, and keeps it.
+    assert_eq!(
+        error(&mut db, "DROP INDEX items_pkey"),
+        "cannot drop index items_pkey: the primary key of items needs it"
+    );
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+}
+
+#[test]
+fn alter_table_sets_and_drops_constraints() {
+    let mut db = in_memory();
+    setup_alter(&mut db, "HEAP");
+    // NOT NULL: only once no row is NULL.
+    assert_eq!(
+        error(&mut db, "ALTER TABLE t ALTER COLUMN n SET NOT NULL"),
+        "a row of t breaks it: column n cannot be NULL"
+    );
+    db.execute("UPDATE t SET n = 20 WHERE id = 2").unwrap();
+    db.execute("ALTER TABLE t ALTER COLUMN n SET NOT NULL")
+        .unwrap();
+    assert_eq!(
+        error(&mut db, "INSERT INTO t (id) VALUES (4)"),
+        "column n cannot be NULL"
+    );
+    // A default fills it.
+    db.execute("ALTER TABLE t ALTER n SET DEFAULT 7 * 2")
+        .unwrap();
+    db.execute("INSERT INTO t (id) VALUES (4)").unwrap();
+    assert_eq!(query(&mut db, "SELECT n FROM t WHERE id = 4"), [[int(14)]]);
+    db.execute("ALTER TABLE t ALTER n DROP DEFAULT").unwrap();
+    db.execute("ALTER TABLE t ALTER n DROP NOT NULL").unwrap();
+    db.execute("INSERT INTO t (id) VALUES (5)").unwrap();
+    assert_eq!(
+        query(&mut db, "SELECT n FROM t WHERE id = 5"),
+        [[Value::Null]]
+    );
+    assert_eq!(
+        error(&mut db, "ALTER TABLE t ALTER id DROP NOT NULL"),
+        "column id is the primary key, which cannot be NULL"
+    );
+
+    // CHECK: only if every row passes it.
+    assert_eq!(
+        error(&mut db, "ALTER TABLE t ADD CONSTRAINT big CHECK (n > 10)"),
+        "a row of t breaks it: new row violates check constraint big"
+    );
+    db.execute("ALTER TABLE t ADD CHECK (n < 100)").unwrap();
+    assert_eq!(
+        error(&mut db, "UPDATE t SET n = 100 WHERE id = 1"),
+        "new row violates check constraint t_check"
+    );
+    db.execute("ALTER TABLE t DROP CONSTRAINT t_check").unwrap();
+    db.execute("ALTER TABLE t DROP CONSTRAINT t_n_check")
+        .unwrap();
+    db.execute("UPDATE t SET n = -100 WHERE id = 1").unwrap();
+
+    // UNIQUE: its index is built, which fails on duplicates.
+    db.execute("UPDATE t SET name = 'a' WHERE id = 2").unwrap();
+    assert_eq!(
+        error(&mut db, "ALTER TABLE t ADD UNIQUE (name)"),
+        "cannot create unique index t_name_key: duplicate value 'a'"
+    );
+    db.execute("UPDATE t SET name = 'b' WHERE id = 2").unwrap();
+    db.execute("ALTER TABLE t ADD UNIQUE (name)").unwrap();
+    assert!(error(&mut db, "UPDATE t SET name = 'c' WHERE id = 1").contains("t_name_key"));
+    db.execute("ALTER TABLE t DROP CONSTRAINT t_name_key")
+        .unwrap();
+    db.execute("UPDATE t SET name = 'c' WHERE id = 1").unwrap();
+    assert_eq!(
+        error(&mut db, "ALTER TABLE t DROP CONSTRAINT t_name_key"),
+        "unknown constraint of t: t_name_key"
+    );
+    // The index made apart is no constraint.
+    assert!(explain(&mut db, "SELECT id FROM t WHERE name = 'c'").contains("t_name"));
+    db.execute("CREATE TABLE c (id INT) USING COLUMN").unwrap();
+    assert_eq!(
+        error(&mut db, "ALTER TABLE c ADD UNIQUE (id)"),
+        "COLUMN tables cannot have UNIQUE constraints, which need an index"
+    );
+}
+
+#[test]
+fn alter_table_is_undone_with_its_transaction_and_survives_reopening() {
+    let path = TempDb::new("alter");
+    {
+        let mut db = open(&path.0).unwrap();
+        setup_alter(&mut db, "LSM");
+        db.execute(
+            "BEGIN; UPDATE t SET n = 1 WHERE id = 1; ALTER TABLE t ADD extra TEXT DEFAULT 'e'",
+        )
+        .unwrap();
+        db.execute("ALTER TABLE t DROP COLUMN name; INSERT INTO t (id, n) VALUES (9, 9)")
+            .unwrap();
+        assert_eq!(
+            query(&mut db, "SELECT COUNT(*) FROM t WHERE extra = 'e'"),
+            [[int(4)]]
+        );
+        db.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            query(&mut db, "SELECT * FROM t ORDER BY id"),
+            [
+                [int(1), text("a"), int(10)],
+                [int(2), text("b"), Value::Null],
+                [int(3), text("c"), int(30)],
+            ]
+        );
+        db.execute("ALTER TABLE t ADD extra TEXT DEFAULT 'e'")
+            .unwrap();
+        db.execute("ALTER TABLE t RENAME COLUMN name TO label")
+            .unwrap();
+        // Its statistics are renamed with it, and read again.
+        db.execute("ANALYZE t").unwrap();
+        db.execute("ALTER TABLE t RENAME TO items").unwrap();
+    }
+    let mut db = open(&path.0).unwrap();
+    assert_eq!(db.table_names(), ["items"]);
+    db.execute("INSERT INTO items (id, label) VALUES (4, 'd')")
+        .unwrap();
+    assert_eq!(
+        query(
+            &mut db,
+            "SELECT id, label, n, extra FROM items WHERE label = 'd'"
+        ),
+        [[int(4), text("d"), Value::Null, text("e")]]
+    );
+    assert!(explain(&mut db, "SELECT id FROM items WHERE label = 'd'").contains("t_name"));
+    assert_eq!(
+        error(&mut db, "UPDATE items SET n = -1"),
+        "new row violates check constraint t_n_check"
+    );
+}

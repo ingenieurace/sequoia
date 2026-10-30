@@ -14,6 +14,11 @@ pub enum Statement {
     DropTable {
         name: String,
     },
+    /// `ALTER TABLE table action`
+    AlterTable {
+        table: String,
+        action: Alter,
+    },
     CreateIndex(CreateIndex),
     DropIndex {
         name: String,
@@ -120,7 +125,125 @@ pub struct Unique {
     pub columns: Vec<String>,
 }
 
+/// What an ALTER TABLE does.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Alter {
+    /// `ADD [COLUMN] column TYPE [constraint ...]`
+    AddColumn {
+        column: Column,
+        constraints: Written,
+    },
+    /// `ADD [CONSTRAINT name] CHECK (condition)` or `ADD [CONSTRAINT name] UNIQUE (column, ...)`
+    AddConstraint(Written),
+    /// `DROP [COLUMN] column`
+    DropColumn(String),
+    /// `DROP CONSTRAINT name`
+    DropConstraint(String),
+    /// `RENAME [COLUMN] column TO name`
+    RenameColumn { from: String, to: String },
+    /// `RENAME TO name`
+    RenameTo(String),
+    /// `ALTER [COLUMN] column SET DEFAULT expr`, or with none, `DROP DEFAULT`
+    SetDefault {
+        column: String,
+        default: Option<Expr>,
+    },
+    /// `ALTER [COLUMN] column SET NOT NULL`, or `DROP NOT NULL`
+    SetNotNull { column: String, not_null: bool },
+    /// `ALTER [COLUMN] column [SET DATA] TYPE type`: each value is converted
+    /// as `CAST` converts it.
+    SetType { column: String, data_type: DataType },
+}
+
+/// Constraints as a statement writes them, before the unnamed ones are
+/// named (see [`Written::named`]).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Written {
+    pub not_null: Vec<String>,
+    pub defaults: Vec<(String, Expr)>,
+    /// Each CHECK's name, if given; the column it was written with, if any;
+    /// and its condition.
+    pub checks: Vec<(Option<String>, Option<String>, Expr)>,
+    /// Each UNIQUE's name, if given, and its columns.
+    pub unique: Vec<(Option<String>, Vec<String>)>,
+}
+
+impl Written {
+    /// The constraints of `table`, each CHECK and UNIQUE named as written,
+    /// or as PostgreSQL names them (`t_c_check`, `t_check`, `t_a_b_key`),
+    /// with a number after if that is taken: by another of them, or by one
+    /// of the names in `taken`.
+    pub fn named(self, table: &str, taken: &[String]) -> Result<Constraints> {
+        let mut used: Vec<String> = taken.to_vec();
+        let given = self
+            .checks
+            .iter()
+            .map(|c| &c.0)
+            .chain(self.unique.iter().map(|u| &u.0));
+        for name in given.flatten() {
+            if used.contains(name) {
+                return Err(crate::error::Error(format!(
+                    "constraint {name} is declared twice"
+                )));
+            }
+            used.push(name.clone());
+        }
+        let mut name = |given: Option<String>, base: String| {
+            given.unwrap_or_else(|| {
+                let mut name = base.clone();
+                for n in 1.. {
+                    if !used.contains(&name) {
+                        break;
+                    }
+                    name = format!("{base}{n}");
+                }
+                used.push(name.clone());
+                name
+            })
+        };
+        let checks = self
+            .checks
+            .into_iter()
+            .map(|(given, column, condition)| Check {
+                name: name(
+                    given,
+                    match column {
+                        Some(column) => format!("{table}_{column}_check"),
+                        None => format!("{table}_check"),
+                    },
+                ),
+                condition,
+            })
+            .collect();
+        let unique = self
+            .unique
+            .into_iter()
+            .map(|(given, columns)| Unique {
+                name: name(given, format!("{table}_{}_key", columns.join("_"))),
+                columns,
+            })
+            .collect();
+        let mut not_null = self.not_null;
+        not_null.sort();
+        not_null.dedup();
+        Ok(Constraints {
+            not_null,
+            defaults: self.defaults,
+            checks,
+            unique,
+        })
+    }
+}
+
 impl Constraints {
+    /// The names of its CHECK and UNIQUE constraints.
+    pub fn names(&self) -> Vec<String> {
+        let checks = self.checks.iter().map(|c| c.name.clone());
+        checks
+            .chain(self.unique.iter().map(|u| u.name.clone()))
+            .collect()
+    }
+
     /// Whether the column with this name was declared `NOT NULL`.
     pub fn is_not_null(&self, column: &str) -> bool {
         self.not_null.iter().any(|c| c == column)

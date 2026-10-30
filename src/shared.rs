@@ -32,7 +32,7 @@
 //! the new row. Two transactions waiting for each other are a deadlock: the
 //! second to wait fails at once.
 //!
-//! **The schema.** A statement that changes the catalog (CREATE, DROP,
+//! **The schema.** A statement that changes the catalog (CREATE, ALTER, DROP,
 //! ANALYZE) waits until no other session has a transaction open, and then
 //! has the database to itself until its own transaction ends: other
 //! sessions' statements wait, as transactions did before there were

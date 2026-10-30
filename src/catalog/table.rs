@@ -202,7 +202,7 @@ impl Rules {
 }
 
 /// Every column's default at time `now`, or NULL for a column without one.
-fn defaults(columns: &[Column], constraints: &Constraints, now: i64) -> Result<Row> {
+pub(crate) fn defaults(columns: &[Column], constraints: &Constraints, now: i64) -> Result<Row> {
     columns
         .iter()
         .map(|column| match constraints.default_of(&column.name) {
@@ -611,6 +611,58 @@ impl Table {
             &self.columns,
             root,
         )?);
+        Ok(())
+    }
+
+    /// Gives the table another name, other names of columns, or other
+    /// constraints, keeping its rows as they are stored: for an ALTER TABLE
+    /// that changes no column's place or type. Its indexes become those of
+    /// `kept`, each opened at its root page under its new definition; the
+    /// others are freed. Fails, changing nothing, if the constraints do not
+    /// hold for the new columns.
+    pub fn redefine(
+        &mut self,
+        name: String,
+        columns: Vec<Column>,
+        constraints: Constraints,
+        kept: &[(CreateIndex, PageId)],
+    ) -> Result<()> {
+        assert!(
+            columns
+                .iter()
+                .zip(&self.columns)
+                .all(|(new, old)| new.data_type == old.data_type)
+                && columns.len() == self.columns.len(),
+            "the rows are stored as they were"
+        );
+        let rules = Rules::new(&name, &columns, &constraints)?;
+        rules.check_defaults(&columns, &constraints)?;
+        let indexes = kept
+            .iter()
+            .map(|(definition, root)| Index::open(self.pool.clone(), definition, &columns, *root))
+            .collect::<Result<Vec<_>>>()?;
+        for index in std::mem::take(&mut self.indexes) {
+            if !kept.iter().any(|(_, root)| *root == index.root_page()) {
+                index.destroy()?;
+            }
+        }
+        self.indexes = indexes;
+        self.name = name;
+        self.columns = columns;
+        self.constraints = constraints;
+        self.rules = rules;
+        Ok(())
+    }
+
+    /// Checks the rows `snapshot` sees against the table's NOT NULL columns
+    /// and CHECK conditions: for a constraint an ALTER TABLE adds.
+    pub fn check_rows(&self, snapshot: &Snapshot) -> Result<()> {
+        for item in self.scan(snapshot) {
+            let (_, row) = item?;
+            self.rules
+                .check(&self.columns, std::slice::from_ref(&row))
+                .map_err(|e| Error(format!("a row of {} breaks it: {}", self.name, e.0)))?;
+        }
         Ok(())
     }
 

@@ -23,7 +23,7 @@
 //! savepoint, and dropping the ones taken after it); `RELEASE name` forgets
 //! it (with those after it).
 //!
-//! **The schema.** A statement that changes the catalog (CREATE, DROP,
+//! **The schema.** A statement that changes the catalog (CREATE, ALTER, DROP,
 //! ANALYZE) leaves the transaction with the database to itself until it
 //! ends (`shared.rs` keeps the other sessions out), and from then on its
 //! statements are not committed one by one: they stay in the log, as every

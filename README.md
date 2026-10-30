@@ -168,6 +168,20 @@ workers, and a join method to force on every join (see
 
 - `CREATE TABLE name (column TYPE [constraint ...], ... [, table constraint, ...]) [USING HEAP | LSM | COLUMN]`, `DROP TABLE name`
   (see Constraints below)
+- `ALTER TABLE name` and one of (`COLUMN` may be left out):
+  - `ADD [COLUMN] column TYPE [constraint ...]`: the rows there take its default
+  - `DROP [COLUMN] column`, with the constraints and indexes that read it, as in PostgreSQL
+  - `ALTER [COLUMN] column [SET DATA] TYPE type`: every value converted as `CAST` converts it
+  - `ALTER [COLUMN] column SET DEFAULT expr | DROP DEFAULT | SET NOT NULL | DROP NOT NULL`
+  - `ADD [CONSTRAINT name] CHECK (condition) | UNIQUE (column, ...)`, `DROP CONSTRAINT name`
+  - `RENAME [COLUMN] column TO name`, `RENAME TO name`
+
+  The first three copy the rows into a new table of the new columns and
+  build its indexes again; the others only rewrite the catalog, renaming
+  the column in the indexes and constraints that read it (a renamed table's
+  primary key index is renamed too), and check the rows a new NOT NULL or
+  CHECK must hold for. Like every change of the schema, it has the database
+  to itself until its transaction ends, and a rollback undoes it.
 - `CREATE [UNIQUE] INDEX name ON table [USING BTREE | HASH] (key, ...) [INCLUDE (column, ...)] [WHERE condition]`, `DROP INDEX name`.
   A key is a column or an expression of columns, such as `LOWER(name)`.
 - `INSERT INTO table [(column, ...)] VALUES (...), ...`, `INSERT INTO table [(column, ...)] SELECT ...`
@@ -368,8 +382,9 @@ can be rolled back and run again. Write skew is possible, as under any
 snapshot isolation: two transactions may each read what the other changes.
 See [Transactions and MVCC](#transactions-and-mvcc).
 
-**Not supported**: `ALTER TABLE`, foreign keys, primary keys of several
-columns, time zones by name (only UTC and offsets),
+**Not supported**: foreign keys, primary keys of several columns (or
+adding one with `ALTER TABLE`), several actions in one `ALTER TABLE`, time
+zones by name (only UTC and offsets),
 `SET TIME ZONE`, frame `EXCLUDE` clauses, and text stored in a DATE, TIME,
 TIMESTAMP, TIMESTAMPTZ or INTERVAL column without a cast or a typed literal.
 
@@ -743,7 +758,7 @@ transaction 16, began after:                sees row 9 ('amy')
   a transaction with no other open, or in a transaction that has the
   database to itself. Its rows need no transaction id and leave nothing for
   vacuum, so a single user writes as fast as before there were versions.
-- **The schema** has no versions: CREATE, DROP and ANALYZE wait until no
+- **The schema** has no versions: CREATE, ALTER, DROP and ANALYZE wait until no
   other session has a transaction open, and then keep the database to
   themselves until their transaction ends, its statements left uncommitted
   in the log for a rollback to cut off.

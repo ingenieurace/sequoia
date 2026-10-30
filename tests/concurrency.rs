@@ -237,6 +237,7 @@ fn a_schema_change_waits_for_open_transactions_and_keeps_the_others_out() {
     let (_db, mut a, mut b) = two_sessions();
     a.execute("BEGIN; INSERT INTO t VALUES (3, 0)").unwrap();
     assert!(locked(b.execute("CREATE INDEX t_n ON t (n)")));
+    assert!(locked(b.execute("ALTER TABLE t ADD extra INT")));
     a.execute("COMMIT").unwrap();
 
     b.execute("BEGIN; CREATE INDEX t_n ON t (n); INSERT INTO t VALUES (4, 4)")

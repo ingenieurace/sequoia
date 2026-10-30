@@ -124,6 +124,7 @@ pub fn changes_schema(statement: &Statement) -> bool {
         statement,
         Statement::CreateTable { .. }
             | Statement::DropTable { .. }
+            | Statement::AlterTable { .. }
             | Statement::CreateIndex(_)
             | Statement::DropIndex { .. }
             | Statement::Analyze { .. }
@@ -189,6 +190,10 @@ pub fn execute(
         Statement::DropTable { name } => {
             catalog.drop_table(&name)?;
             Ok(message(format!("table {name} dropped")))
+        }
+        Statement::AlterTable { table, action } => {
+            catalog.alter_table(&table, action, settings.snapshot(), now)?;
+            Ok(message(format!("table {table} altered")))
         }
         Statement::CreateIndex(definition) => {
             let name = definition.name.clone();
