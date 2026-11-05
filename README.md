@@ -672,18 +672,28 @@ of rows a condition keeps is estimated from its values: equalities and `IN`
 from the common values or the distinct count, ranges (the bounds on a column
 in an `AND` together, as for `BETWEEN`) from the histogram, `IS NULL` from
 the null share, and `AND`, `OR` and `NOT` as if independent. A join on
-equalities keeps `1 / max(distinct left, distinct right)` of the pairs. A
-condition on tables never analyzed is guessed as before (below).
+equalities keeps `1 / max(distinct left, distinct right)` of the pairs. On a
+table never analyzed, each column's distinct values are still counted on
+first use, and again once the table grows or shrinks by a fifth
+(`Table::distinct`), as an automatic `ANALYZE` of them alone would: an
+equality keeps one in them, an `IN` list one for each value, and a join
+uses the same formula. Ranges and the rest are guessed (below).
 `EXPLAIN ANALYZE` shows each step's estimate next to the rows it returned.
 
-**Join order.** The inner joins up to the first outer join or `LATERAL`
-subquery may be done in any order. The planner finds the cheapest left-deep order by dynamic
-programming over the sets of tables (greedily beyond 10 tables), never adding
-a table no condition links to those joined so far while a linked one waits.
-Each join is costed with the method it would use and the rows it would
-make. The order of `FROM` is kept unless another is estimated to cost less
-than three quarters of it, or when a join method is forced; `SELECT *` still
-returns the columns in the order of `FROM`. For each join with an equality
+**Join order.** An outer join or a `LATERAL` subquery stays where `FROM`
+puts it; the runs of inner joins before, between and after them may each be
+done in any order among themselves. For each run the planner finds the
+cheapest left-deep order by dynamic programming over the sets of its tables
+(greedily beyond 10 tables), joined onto the rows of the tables before the
+run, never adding a table no condition links to those joined so far while a
+linked one waits. Each join is costed with the method it would use and the
+rows it would make. A run keeps the order of `FROM` unless another is
+estimated to cost less than three quarters of it, or when a join method is
+forced; `SELECT *` still returns the columns in the order of `FROM`. When a
+merge join in `FROM`'s order lets `ORDER BY` skip its sort, that order is
+weighed with the sorts of the merge join's two sides, and another with the
+sort of all the rows it returns, so a join that makes many rows of few keeps
+its merge join (a small part of what System R's interesting orders weigh). For each join with an equality
 between the two sides:
 
 - an **index join** if the right table has an index (or LSM primary key) on
@@ -698,10 +708,11 @@ index join: it must read all of its right side (see Execution).
 Without an equality, a **block nested loop join** is used. The costs are
 constants measured with `benches/joins.rs` (except for the cost of making a
 joined row, and of trying a pair in a nested loop, which are rough guesses).
-Table row counts are counted on first use. Without statistics, selectivity
-is guessed (1/200 for an equality, 1/3 for anything else, one row for an
-equality on a unique key), and a join on equalities returns as many rows as
-its larger side.
+Table row counts are counted on first use. Without statistics or a count of
+distinct values (for an expression, or a derived table's column),
+selectivity is guessed (1/200 for an equality, 1/3 for anything else, one
+row for an equality on a unique key), and a join on equalities returns as
+many rows as its larger side.
 
 ### Execution
 
@@ -888,10 +899,12 @@ open.
   every row it returned; a window step one partition; a `LATERAL` join the
   rows its subquery returned for one left row.
 - **Statistics only on request**: they are computed by `ANALYZE` and not
-  kept up to date by writes (autovacuum removes versions only); estimates treat the
-  conditions on different columns as independent (no multi-column
-  statistics). Joins are reordered into left-deep trees only (no bushy
-  plans), and not across a `LEFT JOIN`.
+  kept up to date by writes (autovacuum removes versions only); without them
+  only each column's distinct values are counted, blind to skew and with no
+  histogram. Estimates treat the conditions on different columns as
+  independent (no multi-column statistics). Joins are reordered into
+  left-deep trees only (no bushy plans), and never across an outer join or
+  a `LATERAL` subquery.
 - **Small default cache**: the buffer pool is 1 MB unless the constants are changed.
 - **No page checksums** in the database file; only the log is checksummed.
 - **Startup work**: LSM SSTable summaries and Bloom filters are not stored and

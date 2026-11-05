@@ -107,8 +107,21 @@ pub fn cost_of(
     first: &dyn Fn(usize) -> Step,
     join: &dyn Fn(u64, f64, usize) -> Step,
 ) -> f64 {
+    replay(order, first, join).cost
+}
+
+/// Joining tables in `order`: the rows the last join returns, and what
+/// all of them cost together.
+pub fn replay(
+    order: &[usize],
+    first: &dyn Fn(usize) -> Step,
+    join: &dyn Fn(u64, f64, usize) -> Step,
+) -> Step {
     let Some((&t, rest)) = order.split_first() else {
-        return 0.0;
+        return Step {
+            rows: 0.0,
+            cost: 0.0,
+        };
     };
     let step = first(t);
     let (mut cost, mut rows, mut set) = (step.cost, step.rows, 1u64 << t);
@@ -118,7 +131,7 @@ pub fn cost_of(
         rows = step.rows;
         set |= 1 << t;
     }
-    cost
+    Step { rows, cost }
 }
 
 /// Orders tables greedily: first the one that returns fewest rows, then

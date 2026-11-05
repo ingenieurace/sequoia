@@ -16,11 +16,16 @@
 //!                             as if the conditions were independent
 //! ```
 //!
-//! Without statistics, it is guessed the way PostgreSQL guesses without
-//! them: an equality keeps 1 in 200 rows ([`EQUAL_KEEPS`]), anything else a
-//! third ([`OTHER_KEEPS`]). The planner keeps its old guesses for a whole
-//! condition that reads no column with statistics, so that plans of tables
-//! never analyzed stay as they were; [`keeps`] says so by returning None.
+//! Without statistics, a column's distinct values are still counted on
+//! first use (see `Table::distinct`), as an automatic ANALYZE of them alone
+//! would: an equality with a constant keeps one in the distinct values, an
+//! `IN` list one for each of its values, and a join is estimated as below
+//! but with no NULLs known. Anything else is guessed the way PostgreSQL
+//! guesses without statistics: an equality on what has no count (an
+//! expression, a derived table's column) keeps 1 in 200 rows
+//! ([`EQUAL_KEEPS`]), anything else a third ([`OTHER_KEEPS`]). For a whole
+//! condition that reads no column with statistics or a count, [`keeps`]
+//! returns None, and the planner keeps its old guesses.
 //!
 //! A join of `l` and `r` rows on equalities `a = b` returns `l r / max(d(a),
 //! d(b))` rows for `d` distinct values (System R's formula, which holds if
@@ -127,6 +132,23 @@ impl<'a> Scope<'a> {
         }
     }
 
+    /// The share of a column's rows that are not NULL, and its distinct
+    /// values (no more than `rows`): from its statistics if its table has
+    /// them, else counted (see `Table::distinct`), with no NULLs known. None
+    /// if the expression is no column of a table of the scope.
+    fn counts(&self, expr: &Expr, rows: f64) -> Option<(f64, f64)> {
+        if let Some(k) = self.known(expr) {
+            let distinct = k.stats.distinct(k.rows).min(rows.max(1.0));
+            return Some((1.0 - k.stats.nulls, distinct));
+        }
+        let Expr::Column(column) = expr else {
+            return None;
+        };
+        let (_, table, c) = self.column(column)?;
+        let distinct = table.distinct(c)? as f64;
+        Some((1.0, distinct.min(rows.max(1.0))))
+    }
+
     /// The statistics of the column an expression is, if it is a column of
     /// a table that has them.
     fn known(&self, expr: &Expr) -> Option<Known<'a>> {
@@ -188,12 +210,12 @@ pub fn predicates(stats: &TableStats, predicates: &[Predicate], rows: f64) -> f6
 
 /// The share of pairs of rows, `l` left ones and `r` right ones, that
 /// equalities `left = right` between the two sides keep, from the
-/// statistics of the columns they compare; None if none of them compares a
-/// column with statistics.
+/// statistics or counts of the columns they compare; None if none of them
+/// compares a column with either.
 pub fn join(keys: &[(&Expr, &Expr)], left: &Scope, right: &Scope, l: f64, r: f64) -> Option<f64> {
     let mut product = None;
     for (a, b) in keys {
-        if let Some(share) = equal_columns(left.known(a), right.known(b), l, r) {
+        if let Some(share) = equal_columns(left.counts(a, l), right.counts(b, r)) {
             product = Some(product.unwrap_or(1.0) * share);
         }
     }
@@ -201,23 +223,22 @@ pub fn join(keys: &[(&Expr, &Expr)], left: &Scope, right: &Scope, l: f64, r: f64
 }
 
 /// The share of pairs of rows whose columns are equal, when at least one of
-/// them has statistics: their non-NULL shares over the larger count of
-/// distinct values, each no more than its side's rows.
-fn equal_columns(a: Option<Known>, b: Option<Known>, a_rows: f64, b_rows: f64) -> Option<f64> {
-    let side = |k: &Known, rows: f64| {
-        let distinct = k.stats.distinct(k.rows).min(rows.max(1.0));
-        (1.0 - k.stats.nulls, distinct)
-    };
-    let (non_null, distinct) = match (&a, &b) {
+/// them has statistics or a count (see [`Scope::counts`]): their non-NULL
+/// shares over the larger count of distinct values.
+fn equal_columns(a: Option<(f64, f64)>, b: Option<(f64, f64)>) -> Option<f64> {
+    let (non_null, distinct) = match (a, b) {
         (None, None) => return None,
-        (Some(k), None) => side(k, a_rows),
-        (None, Some(k)) => side(k, b_rows),
-        (Some(x), Some(y)) => {
-            let (x, y) = (side(x, a_rows), side(y, b_rows));
-            (x.0 * y.0, x.1.max(y.1))
-        }
+        (Some(x), None) | (None, Some(x)) => x,
+        (Some(x), Some(y)) => (x.0 * y.0, x.1.max(y.1)),
     };
     Some(non_null / distinct.max(1.0))
+}
+
+/// The share of rows whose column equals one of `values` distinct values,
+/// from its count of distinct values alone: one in the count for each.
+fn equal_counted(scope: &Scope, column: &Expr, values: usize) -> Option<f64> {
+    let (non_null, distinct) = scope.counts(column, f64::MAX)?;
+    Some((non_null * values as f64 / distinct.max(1.0)).min(non_null))
 }
 
 /// The share of rows an expression keeps, and whether statistics told any of it.
@@ -257,9 +278,25 @@ fn share(expr: &Expr, scope: &Scope) -> (f64, bool) {
             }
             let op = compare_op(*op);
             if op == Some(Compare::Eq)
-                && let Some(s) = equal_columns(scope.known(a), scope.known(b), f64::MAX, f64::MAX)
+                && let Some(s) = equal_columns(scope.counts(a, f64::MAX), scope.counts(b, f64::MAX))
             {
                 return (s, true);
+            }
+            // A column without statistics, but with a count, and a constant.
+            let counted = match (constant(a), constant(b)) {
+                (None, Some(v)) => Some((&**a, v)),
+                (Some(v), None) => Some((&**b, v)),
+                _ => None,
+            };
+            if let (Some(op @ (Compare::Eq | Compare::NotEq)), Some((column, value))) =
+                (op, counted)
+                && let Some(equal) = equal_counted(scope, column, 1)
+            {
+                return match (value.is_null(), op) {
+                    (true, _) => (0.0, true),
+                    (false, Compare::Eq) => (equal, true),
+                    (false, _) => (1.0 - equal, true),
+                };
             }
             (guess(op), false)
         }
@@ -288,6 +325,26 @@ fn share(expr: &Expr, scope: &Scope) -> (f64, bool) {
                         // NOT IN with a NULL in the list keeps no row.
                         true if values.iter().any(Value::is_null) => (0.0, true),
                         true => (1.0 - k.stats.nulls - equal, true),
+                        false => (equal, true),
+                    }
+                }
+                (None, Some(values))
+                    if let Some(equal) = equal_counted(scope, left, {
+                        let mut distinct: Vec<&Value> = Vec::new();
+                        for v in values.iter().filter(|v| !v.is_null()) {
+                            if !distinct
+                                .iter()
+                                .any(|d| d.compare(v) == Some(Ordering::Equal))
+                            {
+                                distinct.push(v);
+                            }
+                        }
+                        distinct.len()
+                    }) =>
+                {
+                    match negated {
+                        true if values.iter().any(Value::is_null) => (0.0, true),
+                        true => (1.0 - equal, true),
                         false => (equal, true),
                     }
                 }

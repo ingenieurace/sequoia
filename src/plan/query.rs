@@ -17,12 +17,13 @@
 //!
 //! **Tables.** The tables of FROM are joined one at a time, each join
 //! reading the rows joined so far on its left and one table on its right:
-//! left to right, unless another order of the inner joins before the first
-//! outer join or LATERAL subquery costs clearly less (see `join_order`
-//! below and `order.rs`).
+//! left to right, unless another order of a run of inner joins (between
+//! outer joins and LATERAL subqueries, which stay where they are) costs
+//! clearly less, weighing a sort a merge join in FROM's order saves (see
+//! `join_order` below and `order.rs`).
 //! Then they are planned as if FROM were written in that order, the ONs of
-//! those joins all the last one's, and `SELECT *` is projected back to
-//! FROM's order.
+//! each run reordered all its last join's, and `SELECT *` is projected back
+//! to FROM's order.
 //! A subquery in FROM (a derived table) is planned like any SELECT, and its
 //! columns are named by its select list (an `AS` name, a column's name, an
 //! aggregate's function or `?column?`) and qualified by its alias. It cannot
@@ -1108,40 +1109,6 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Resu
     let named_apart = all_columns
         .as_ref()
         .is_none_or(|all| all.iter().enumerate().all(|(i, c)| !all[..i].contains(c)));
-    let reordered = named_apart
-        .then(|| {
-            join_order(
-                &sources,
-                &kinds,
-                filter.as_ref(),
-                &ons,
-                &needed,
-                &binder,
-                choices,
-            )
-        })
-        .flatten();
-    let order_binder;
-    let binder = match &reordered {
-        None => &binder,
-        Some(order) => {
-            // The ONs of the inner joins reordered all go to the last of
-            // them, which they mean the same as: any join after it may pad
-            // their tables with NULLs.
-            let prefix = reorderable(&sources, &kinds);
-            let parts: Vec<Expr> = ons[..prefix - 1]
-                .iter_mut()
-                .filter_map(Option::take)
-                .collect();
-            ons[prefix - 2] = and(parts);
-            sources = permute(sources, order);
-            needed = permute(needed, order);
-            kinds = permute(kinds, order);
-            order_binder = Binder::new(catalog, &sources);
-            &order_binder
-        }
-    };
-
     // Window functions sort rows of their own, after the joins.
     let windowed = exprs
         .iter()
@@ -1153,6 +1120,55 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, choices: Choices) -> Resu
     } else {
         &order_by
     };
+    // The merge join in FROM's order that saves ORDER BY its sort, if
+    // any, for `join_order` to weigh.
+    let merge = match sources.len() > 1 && !order.is_empty() && choices.force_join.is_none() {
+        true => {
+            let (_, conditions, _) = place(&sources, &kinds, filter.clone(), &ons, &binder);
+            find_merge(&conditions, &sources, &kinds, &binder, order, None).map(|(at, _)| at)
+        }
+        false => None,
+    };
+    let reordered = named_apart
+        .then(|| {
+            join_order(
+                &sources,
+                &kinds,
+                filter.as_ref(),
+                &ons,
+                &needed,
+                &binder,
+                choices,
+                merge,
+            )
+        })
+        .flatten();
+    let order_binder;
+    let binder = match &reordered {
+        None => &binder,
+        Some(order) => {
+            // The ONs of each run of inner joins reordered all go to the
+            // last of them, which they mean the same as: any join after it
+            // may pad their tables with NULLs.
+            for run in runs(&sources, &kinds) {
+                if run.len() < 2 || order[run.clone()].iter().copied().eq(run.clone()) {
+                    continue;
+                }
+                let parts: Vec<Expr> = run
+                    .clone()
+                    .filter(|&j| j > 0)
+                    .filter_map(|j| ons[j - 1].take())
+                    .collect();
+                ons[run.end - 2] = and(parts);
+            }
+            sources = permute(sources, order);
+            needed = permute(needed, order);
+            kinds = permute(kinds, order);
+            order_binder = Binder::new(catalog, &sources);
+            &order_binder
+        }
+    };
+
     let (mut node, ordered) = joins(
         &mut sources,
         kinds,
@@ -1729,24 +1745,20 @@ fn set_operations<'a>(
     })
 }
 
-/// Plans the scans and joins of FROM, with WHERE and the ONs placed as the
-/// module docs describe, and whether a merge join puts its rows in the order
-/// `order_by` asks for. Every join uses the method `choices` forces, if any.
-#[allow(clippy::too_many_arguments)]
-fn joins<'a>(
-    sources: &mut [Source<'a>],
-    kinds: Vec<JoinKind>,
+/// Where WHERE and the ONs are checked, as the module docs describe: for
+/// each table, the conditions pushed down to its scan, the conditions of
+/// the join that brings it in, and those checked just after that join.
+type Placed = (Vec<Vec<Expr>>, Vec<Vec<Expr>>, Vec<Vec<Expr>>);
+
+/// Places the conditions of WHERE (`filter`) and the ONs (see [`Placed`]).
+fn place(
+    sources: &[Source],
+    kinds: &[JoinKind],
     filter: Option<Expr>,
-    ons: Vec<Option<Expr>>,
-    mut needed: Vec<Vec<bool>>,
+    ons: &[Option<Expr>],
     binder: &Binder,
-    order_by: &[OrderBy],
-    choices: Choices,
-) -> Result<(Node<'a>, bool)> {
-    let force = choices.force_join;
+) -> Placed {
     let n = sources.len();
-    // For each table: conditions pushed down to its scan, conditions of the
-    // join that brings it in, and conditions checked just after that join.
     let mut pushed: Vec<Vec<Expr>> = vec![Vec::new(); n];
     let mut conditions: Vec<Vec<Expr>> = vec![Vec::new(); n];
     let mut after: Vec<Vec<Expr>> = vec![Vec::new(); n];
@@ -1784,7 +1796,7 @@ fn joins<'a>(
                 JoinKind::Right | JoinKind::Full => conditions[i + 1].append(&mut parts),
             }
         }
-        carry_constants(&mut pool, sources, binder, &kinds);
+        carry_constants(&mut pool, sources, binder, kinds);
         for (part, by) in pool {
             let tables = binder.tables(&part);
             let last = tables.last().copied();
@@ -1817,10 +1829,28 @@ fn joins<'a>(
         }
     }
 
-    // The join that can sort its sides into ORDER BY's order for a merge join.
-    // The joins after it must keep their left side's order, as hash and index
-    // joins do and a block nested loop join does not.
-    // Forced, only a merge join may, and only the last.
+    (pushed, conditions, after)
+}
+
+/// How a merge join sorts its sides into ORDER BY's order: its keys by
+/// position, in the order to sort by, each descending or not, and what of
+/// ORDER BY is left to sort by after them (see [`merge_order`]).
+type MergeKeys = (Vec<usize>, Vec<bool>, Vec<OrderBy>);
+
+/// The join that can sort its sides into ORDER BY's order for a merge join,
+/// given the conditions of each join (see [`place`]), with the order of its
+/// keys (see [`merge_order`]). The joins after it must keep their left
+/// side's order, as hash and index joins do and a block nested loop join
+/// does not. Forced, only a merge join may, and only the last.
+fn find_merge(
+    conditions: &[Vec<Expr>],
+    sources: &[Source],
+    kinds: &[JoinKind],
+    binder: &Binder,
+    order_by: &[OrderBy],
+    force: Option<ForceJoin>,
+) -> Option<(usize, MergeKeys)> {
+    let n = sources.len();
     let mut merge = None;
     let tried = match force {
         None => n,
@@ -1844,6 +1874,28 @@ fn joins<'a>(
             }
         }
     }
+    merge
+}
+
+/// Plans the scans and joins of FROM, with WHERE and the ONs placed as the
+/// module docs describe, and whether a merge join puts its rows in the order
+/// `order_by` asks for. Every join uses the method `choices` forces, if any.
+#[allow(clippy::too_many_arguments)]
+fn joins<'a>(
+    sources: &mut [Source<'a>],
+    kinds: Vec<JoinKind>,
+    filter: Option<Expr>,
+    ons: Vec<Option<Expr>>,
+    mut needed: Vec<Vec<bool>>,
+    binder: &Binder,
+    order_by: &[OrderBy],
+    choices: Choices,
+) -> Result<(Node<'a>, bool)> {
+    let force = choices.force_join;
+    let n = sources.len();
+    let (mut pushed, mut conditions, mut after) = place(sources, &kinds, filter, &ons, binder);
+    // The join that can sort its sides into ORDER BY's order for a merge join.
+    let mut merge = find_merge(&conditions, sources, &kinds, binder, order_by, force);
     let ordered = merge.is_some();
     // The joins after the merge join keep its order.
     let merge_at = merge.as_ref().map(|(at, _)| *at);
@@ -2031,12 +2083,21 @@ fn joins<'a>(
 /// so without statistics), and whoever wrote the query may know better.
 const REORDER_GAIN: f64 = 0.75;
 
-/// The order in which to join the tables of FROM, if not as written: the
-/// cheapest of the orders of its tables up to the first LEFT JOIN (see
-/// `order.rs`), which keep the same rows as any order of inner joins does,
-/// followed by the rest as written. None to keep the order written: when a
-/// join method is forced, when fewer than two tables come before the first
-/// LEFT JOIN, or when no other order costs clearly less.
+/// The order in which to join the tables of FROM, if not as written: in
+/// each run of inner joins (see [`runs`]) the cheapest order of its tables
+/// (see `order.rs`), which keeps the same rows as any order of inner joins
+/// does, onto what the tables before it return; outer joins and LATERAL
+/// subqueries where FROM puts them. A run is reordered only if its order
+/// is estimated to cost clearly less than the one written. None to keep
+/// the order written: when a join method is forced, when no run has two
+/// tables, or when no run's order costs clearly less.
+///
+/// If the order written has a merge join, at `merge`, that puts the rows in
+/// ORDER BY's order, the order written is weighed with the sorts of that
+/// join's two sides instead of ORDER BY's, and another order with ORDER
+/// BY's sort of the rows the joins return: a small part of what System R's
+/// interesting orders weigh.
+#[allow(clippy::too_many_arguments)]
 fn join_order(
     sources: &[Source],
     kinds: &[JoinKind],
@@ -2045,24 +2106,39 @@ fn join_order(
     needed: &[Vec<bool>],
     binder: &Binder,
     choices: Choices,
+    merge: Option<usize>,
 ) -> Option<Vec<usize>> {
     let n = sources.len();
-    let prefix = reorderable(sources, kinds);
-    if choices.force_join.is_some() || prefix < 2 || prefix > 63 {
+    let runs = runs(sources, kinds);
+    if choices.force_join.is_some()
+        || n > 63
+        || sources[0].is_lateral()
+        || runs.iter().all(|run| run.len() < 2)
+    {
         return None;
     }
     let mask = |tables: Vec<usize>| tables.into_iter().fold(0u64, |m, t| m | 1 << t);
-    let within = (1u64 << prefix) - 1;
 
-    // The conditions on the tables before the first LEFT JOIN: the WHERE's
-    // and their ONs', which mean the same, but not those with a subquery,
-    // checked after the joins in any order.
+    // The conditions: the WHERE's and the ONs' of inner joins, which mean
+    // the same, and of an outer join's ON those that read its own table;
+    // but not those with a subquery, checked after the joins in any order.
     let mut parts = Vec::new();
     filter.iter().for_each(|f| conjuncts(f, &mut parts));
-    ons[..prefix - 1]
-        .iter()
-        .flatten()
-        .for_each(|on| conjuncts(on, &mut parts));
+    let mut outer = Vec::new();
+    for (i, on) in ons.iter().enumerate() {
+        let Some(on) = on else { continue };
+        match kinds[i + 1] {
+            JoinKind::Inner => conjuncts(on, &mut parts),
+            _ => {
+                conjuncts(on, &mut outer);
+                parts.extend(
+                    outer
+                        .drain(..)
+                        .filter(|part| binder.tables(part).contains(&(i + 1))),
+                );
+            }
+        }
+    }
     let parts: Vec<(Expr, u64)> = parts
         .into_iter()
         .filter(|part| !part.has_subquery())
@@ -2070,7 +2146,7 @@ fn join_order(
             let tables = mask(binder.tables(&part));
             (part, tables)
         })
-        .filter(|(_, tables)| *tables != 0 && *tables & !within == 0)
+        .filter(|(_, tables)| *tables != 0)
         .collect();
     // Each equality, with the tables of each side.
     let equalities: Vec<Option<(&Expr, u64, &Expr, u64)>> = parts
@@ -2083,9 +2159,13 @@ fn join_order(
         })
         .collect();
 
-    // Each table read alone, with the conditions on it alone.
-    let tables: Vec<(Node, Scope, f64, f64, f64)> = (0..prefix)
+    // Each table read alone, with the conditions on it alone; none for a
+    // LATERAL subquery, planned for each left row.
+    let tables: Vec<Option<(Node, Scope, f64, f64, f64)>> = (0..n)
         .map(|t| {
+            if sources[t].is_lateral() {
+                return None;
+            }
             let filter = and(parts
                 .iter()
                 .filter(|(_, tables)| *tables == 1 << t)
@@ -2113,13 +2193,14 @@ fn join_order(
                 }
                 scan => (estimate(scan), estimate(scan), Scope::default()),
             };
-            (node, scope, rows, read, whole)
+            Some((node, scope, rows, read, whole))
         })
         .collect();
+    let table = |t: usize| tables[t].as_ref().expect("not a LATERAL subquery");
 
     let first = |t: usize| order::Step {
-        rows: tables[t].2,
-        cost: tables[t].3,
+        rows: table(t).2,
+        cost: table(t).3,
     };
     let linked = |set: u64, t: usize| {
         parts
@@ -2147,11 +2228,12 @@ fn join_order(
                 if b_tables == 1 << t { (a, b) } else { (b, a) }
             })
             .collect();
-        let (_, right_scope, right, read, whole) = &tables[t];
+        let (_, right_scope, right, read, whole) = table(t);
         let left_scope = Scope::new(
-            (0..prefix)
+            (0..n)
                 .filter(|u| set & 1 << u != 0)
-                .flat_map(|u| tables[u].1.tables().to_vec()),
+                .filter_map(|u| tables[u].as_ref())
+                .flat_map(|(_, scope, ..)| scope.tables().to_vec()),
         );
         let conditions = and(residual.iter().map(|((part, _), _)| part.clone()).collect());
         let residual = conditions
@@ -2185,22 +2267,126 @@ fn join_order(
         }
     };
 
-    let (best, cost) = order::cheapest(prefix, &first, &join, &linked);
-    let written: Vec<usize> = (0..prefix).collect();
-    if best == written || cost >= order::cost_of(&written, &first, &join) * REORDER_GAIN {
-        return None;
+    // The tables in the order chosen, those joined so far (a bit for each),
+    // and the rows they are estimated to return.
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    let (mut joined, mut rows) = (0u64, 0.0);
+    let mut reordered = false;
+    // What the joins cost in the order chosen, and in the order written.
+    let (mut cost, mut written_cost) = (0.0, 0.0);
+    let mut i = 0;
+    while i < n {
+        let Some(run) = runs.iter().find(|run| run.start == i) else {
+            // An outer join or a LATERAL subquery, where FROM puts it: an
+            // outer join keeps the rows of the side it pads the other for.
+            if let Some((_, _, right, ..)) = tables[i] {
+                let step = join(joined, rows, i);
+                cost += step.cost;
+                written_cost += step.cost;
+                let rows_joined = step.rows;
+                rows = match kinds[i] {
+                    JoinKind::Inner => rows_joined,
+                    JoinKind::Left => rows_joined.max(rows),
+                    JoinKind::Right => rows_joined.max(right),
+                    JoinKind::Full => rows_joined.max(rows).max(right),
+                };
+            }
+            order.push(i);
+            joined |= 1 << i;
+            i += 1;
+            continue;
+        };
+        // The run's tables, by their place in it; joined after those before it.
+        let members: Vec<usize> = run.clone().collect();
+        let m = members.len();
+        let (before, before_rows) = (joined, rows);
+        let global = |set: u64| {
+            (0..m)
+                .filter(|k| set & 1 << k != 0)
+                .fold(before, |all, k| all | 1 << members[k])
+        };
+        let first_in = |k: usize| match before {
+            0 => first(members[k]),
+            _ => join(before, before_rows, members[k]),
+        };
+        let join_in = |set: u64, left: f64, k: usize| join(global(set), left, members[k]);
+        let linked_in = |set: u64, k: usize| linked(global(set), members[k]);
+        let written: Vec<usize> = (0..m).collect();
+        let run_written = order::cost_of(&written, &first_in, &join_in);
+        let chosen = match m {
+            1 => written.clone(),
+            _ => {
+                let (best, best_cost) = order::cheapest(m, &first_in, &join_in, &linked_in);
+                match best != written && best_cost < run_written * REORDER_GAIN {
+                    true => best,
+                    false => written.clone(),
+                }
+            }
+        };
+        reordered |= chosen != written;
+        let done = order::replay(&chosen, &first_in, &join_in);
+        (rows, cost, written_cost) = (done.rows, cost + done.cost, written_cost + run_written);
+        for k in chosen {
+            order.push(members[k]);
+            joined |= 1 << members[k];
+        }
+        i = run.end;
     }
-    Some(best.into_iter().chain(prefix..n).collect())
+    if let Some(at) = merge {
+        // The rows joined in the order written before the merge join, and
+        // its right table's.
+        let mut left = 0.0;
+        for t in 0..at {
+            left = match (t, &tables[t]) {
+                (0, _) => first(0).rows,
+                (_, None) => left,
+                (_, Some((_, _, right, ..))) => {
+                    let joined = join((1 << t) - 1, left, t).rows;
+                    match kinds[t] {
+                        JoinKind::Inner => joined,
+                        JoinKind::Left => joined.max(left),
+                        JoinKind::Right => joined.max(*right),
+                        JoinKind::Full => joined.max(left).max(*right),
+                    }
+                }
+            };
+        }
+        let written_sorts = sort_cost(left) + sort_cost(table(at).2);
+        if cost + sort_cost(rows) >= (written_cost + written_sorts) * REORDER_GAIN {
+            return None;
+        }
+    }
+    reordered.then_some(order)
 }
 
-/// How many of the tables of FROM, from the first, may be joined in any
-/// order: those up to the first outer join or LATERAL subquery. An outer
-/// join keeps rows of one side that an inner join would drop, and a LATERAL
-/// subquery reads the tables before it.
-fn reorderable(sources: &[Source], kinds: &[JoinKind]) -> usize {
-    (1..sources.len())
-        .find(|&i| kinds[i] != JoinKind::Inner || sources[i].is_lateral())
-        .unwrap_or(sources.len())
+/// What sorting `rows` rows in memory costs, in rows read by a scan:
+/// `n log2 n` comparisons, each about as costly as trying a pair of rows in
+/// a nested loop join, and moving each row once. A rough guess, not
+/// measured.
+fn sort_cost(rows: f64) -> f64 {
+    rows * (1.0 + PAIR_COST * rows.max(2.0).log2())
+}
+
+/// The runs of FROM whose tables may be joined in any order among
+/// themselves: from the first table, or the one after an outer join or a
+/// LATERAL subquery, up to the next of those. An outer join keeps rows of
+/// one side that an inner join would drop, and a LATERAL subquery reads the
+/// tables before it, so each stays where FROM puts it, after the tables
+/// before it and before those after it; the inner joins on either side of
+/// it move only among themselves.
+fn runs(sources: &[Source], kinds: &[JoinKind]) -> Vec<std::ops::Range<usize>> {
+    let fixed = |i: usize| sources[i].is_lateral() || (i > 0 && kinds[i] != JoinKind::Inner);
+    let mut runs = Vec::new();
+    let mut start = 0;
+    for i in 0..=sources.len() {
+        if i == sources.len() || fixed(i) {
+            if start < i {
+                runs.push(start..i);
+            }
+            start = i + 1;
+        }
+    }
+    runs
 }
 
 /// The items in `order`, which gives their positions.
@@ -2363,7 +2549,7 @@ fn merge_order(
     kind: JoinKind,
     i: usize,
     binder: &Binder,
-) -> Option<(Vec<usize>, Vec<bool>, Vec<OrderBy>)> {
+) -> Option<MergeKeys> {
     let (mut order, mut desc) = (Vec::new(), Vec::new());
     let mut rest: &[OrderBy] = &[];
     for (at, o) in order_by.iter().enumerate() {
@@ -2460,11 +2646,19 @@ pub fn estimate(node: &Node) -> f64 {
             };
             let rows = match table.stats() {
                 Some(stats) => total * selectivity::predicates(stats, predicates, total),
-                None => predicates.iter().fold(total, |rows, p| match p.op {
-                    Compare::Eq if unique(p.column) => rows.min(1.0),
-                    Compare::Eq => rows * EQUAL_KEEPS,
-                    Compare::NotEq => rows * (1.0 - EQUAL_KEEPS),
-                    _ => rows * OTHER_KEEPS,
+                // An equality keeps one in the column's distinct values,
+                // counted (see `Table::distinct`).
+                None => predicates.iter().fold(total, |rows, p| {
+                    let equal = || match table.distinct(p.column) {
+                        Some(distinct) => 1.0 / (distinct as f64).max(1.0),
+                        None => EQUAL_KEEPS,
+                    };
+                    match p.op {
+                        Compare::Eq if unique(p.column) => rows.min(1.0),
+                        Compare::Eq => rows * equal(),
+                        Compare::NotEq => rows * (1.0 - equal()),
+                        _ => rows * OTHER_KEEPS,
+                    }
                 }),
             };
             // An IN list: a key's rows, or an equality's share, per value.
@@ -2481,13 +2675,16 @@ pub fn estimate(node: &Node) -> f64 {
                 _ => rows,
             }
         }
-        Node::Lookup { table, column, .. } => match table.stats() {
-            Some(stats) => {
-                let rows = table_rows(table);
-                rows * stats.columns[*column].equal_any(rows)
+        // The rows of a value of the column: from its statistics, or its
+        // counted distinct values (see `Table::distinct`).
+        Node::Lookup { table, column, .. } => {
+            let rows = table_rows(table);
+            match (table.stats(), table.distinct(*column)) {
+                (Some(stats), _) => rows * stats.columns[*column].equal_any(rows),
+                (None, Some(distinct)) => rows / (distinct as f64).max(1.0),
+                (None, None) => 1.0,
             }
-            None => 1.0,
-        },
+        }
         Node::Filter { input, predicate } => {
             if let Some(keeps) = selectivity::keeps(predicate, &Scope::of(input)) {
                 // Above a scan, the filter holds the scan's predicates too.

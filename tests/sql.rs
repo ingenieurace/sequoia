@@ -2509,15 +2509,17 @@ fn joins_of_three_tables_self_joins_and_grouping() {
             "SELECT u.name, c.country FROM users u JOIN cities c ON c.name = u.city
              LEFT JOIN orders o ON o.user_id = u.id AND o.total > 4 WHERE c.country = 'no' AND o.id IS NULL"
         ),
+        // The cities of one country leave few users, each of whose orders
+        // costs less to look up than all of them to read.
         "PROJECT u.name, c.country
   FILTER o.id IS NULL
-    LEFT HASH JOIN ON u.id = o.user_id
+    LEFT INDEX JOIN
       HASH JOIN ON u.city = c.name
         SCAN users u
         FILTER c.country = 'no'
           SCAN cities c
       FILTER o.total > 4
-        SCAN orders o"
+        LOOKUP orders o USING INDEX orders_user (o.user_id = u.id)"
     );
 }
 
@@ -5955,13 +5957,15 @@ fn statistics_estimate_what_conditions_keep() {
     let mut db = in_memory();
     setup_skewed(&mut db);
     let cases = [
-        // (query, the rows the guesses without statistics expect)
-        ("SELECT * FROM t WHERE s = 'common'", 50.0),
-        ("SELECT * FROM t WHERE g = 7", 50.0),
+        // (query, the rows expected without statistics: an equality keeps
+        // one in the column's counted distinct values, blind to how often
+        // each is held, and the rest is guessed)
+        ("SELECT * FROM t WHERE s = 'common'", 5000.0),
+        ("SELECT * FROM t WHERE g = 7", 100.0),
         ("SELECT * FROM t WHERE id >= 1000 AND id < 3000", 1111.0),
         ("SELECT * FROM t WHERE g BETWEEN 10 AND 19", 1111.0),
         ("SELECT * FROM t WHERE x IS NULL", 3333.0),
-        ("SELECT * FROM t WHERE g IN (1, 2, 3) OR s = 'rare'", 3333.0),
+        ("SELECT * FROM t WHERE g IN (1, 2, 3) OR s = 'rare'", 5150.0),
         ("SELECT * FROM t WHERE NOT (g < 50)", 3333.0),
     ];
     for (sql, guess) in cases {
@@ -5996,41 +6000,42 @@ fn statistics_estimate_what_conditions_keep() {
 #[test]
 fn statistics_survive_reopening_and_go_with_rollbacks_and_drops() {
     let path = TempDb::new("statistics");
-    // `WHERE g = 7` keeps 100 of 10000 rows; without statistics, 1 in 200 is guessed.
-    let sql = "SELECT * FROM t WHERE g = 7";
+    // `WHERE s = 'common'` keeps 9000 of 10000 rows; without statistics,
+    // one in its two distinct values is estimated.
+    let sql = "SELECT * FROM t WHERE s = 'common'";
     let estimate = |db: &mut Database| rows_and_estimate(db, sql, "FILTER").1;
     {
         let mut db = open(&path.0).unwrap();
         setup_skewed(&mut db);
-        assert_eq!(estimate(&mut db), 50.0);
+        assert_eq!(estimate(&mut db), 5000.0);
         db.execute("ANALYZE").unwrap();
-        assert_eq!(estimate(&mut db), 100.0);
+        assert_eq!(estimate(&mut db), 9000.0);
     }
     let mut db = open(&path.0).unwrap();
-    assert_eq!(estimate(&mut db), 100.0);
+    assert_eq!(estimate(&mut db), 9000.0);
 
     // Statistics of a transaction rolled back go with it.
     db.execute("BEGIN; DELETE FROM t WHERE g > 9; ANALYZE t")
         .unwrap();
-    assert_eq!(estimate(&mut db), 100.0, "100 of the 1000 rows left");
+    assert_eq!(estimate(&mut db), 900.0, "900 of the 1000 rows left");
     db.execute("ROLLBACK").unwrap();
-    assert_eq!(estimate(&mut db), 100.0);
+    assert_eq!(estimate(&mut db), 9000.0);
     db.execute("BEGIN; DELETE FROM t WHERE g > 9; ANALYZE t; ROLLBACK")
         .unwrap();
     db.execute("DELETE FROM t WHERE g > 49").unwrap();
     // Writes leave the shares as ANALYZE found them, but the row count
     // follows them: half as many rows, half as many estimated.
-    assert_eq!(estimate(&mut db), 50.0);
+    assert_eq!(estimate(&mut db), 4500.0);
     db.execute("ANALYZE t").unwrap();
-    assert_eq!(estimate(&mut db), 100.0);
+    assert_eq!(estimate(&mut db), 4500.0);
 
     // A table dropped and created again has none.
     db.execute("DROP TABLE t").unwrap();
     setup_skewed(&mut db);
-    assert_eq!(estimate(&mut db), 50.0);
+    assert_eq!(estimate(&mut db), 5000.0);
     drop(db);
     let mut db = open(&path.0).unwrap();
-    assert_eq!(estimate(&mut db), 50.0);
+    assert_eq!(estimate(&mut db), 5000.0);
 }
 
 #[test]
@@ -6095,25 +6100,19 @@ fn joins_are_reordered_when_statistics_show_a_cheaper_order() {
     };
     let before = sorted(query(&mut db, sql));
     assert_eq!(before.len(), 4 * 10 * 5);
-    assert!(explain(&mut db, sql).contains(
-        "    HASH JOIN ON o.id = i.order_id
-      SCAN orders o
-      SCAN items i"
-    ));
-
-    db.execute("ANALYZE").unwrap();
     // Orders join the four users of oslo first, and only their 40 orders
-    // then probe the items' hash table.
-    assert_eq!(
-        explain(&mut db, sql),
-        "PROJECT u.city, o.id, i.id
+    // then probe the items' hash table: the distinct values counted without
+    // ANALYZE show it already, and its statistics agree.
+    let cheaper = "PROJECT u.city, o.id, i.id
   HASH JOIN ON o.id = i.order_id
     HASH JOIN ON o.user_id = u.id
       SCAN orders o
       FILTER u.city = 'oslo'
         SCAN users u
-    SCAN items i"
-    );
+    SCAN items i";
+    assert_eq!(explain(&mut db, sql), cheaper);
+    db.execute("ANALYZE").unwrap();
+    assert_eq!(explain(&mut db, sql), cheaper);
     assert_eq!(sorted(query(&mut db, sql)), before);
 
     // SELECT * keeps the columns in the order of FROM.
@@ -8912,4 +8911,217 @@ fn in_lists_read_the_versions_a_snapshot_sees() {
             [vec![text("a")], vec![text("BB")]]
         );
     }
+}
+
+#[test]
+fn inner_joins_are_reordered_to_cost_least() {
+    let mut db = in_memory();
+    db.execute(
+        "CREATE TABLE big (id INT PRIMARY KEY, k INT, pad TEXT);
+         CREATE TABLE mid (id INT PRIMARY KEY, big_id INT, tag TEXT);
+         CREATE TABLE tiny (id INT PRIMARY KEY, mid_id INT, name TEXT);",
+    )
+    .unwrap();
+    let rows = |n: i64, row: &dyn Fn(i64) -> String| (0..n).map(row).collect::<Vec<_>>().join(", ");
+    db.execute(&format!(
+        "INSERT INTO big VALUES {}",
+        rows(3000, &|i| format!("({i}, {}, 'p')", i % 50))
+    ))
+    .unwrap();
+    db.execute(&format!(
+        "INSERT INTO mid VALUES {}",
+        rows(300, &|i| format!("({i}, {}, 't{}')", i * 7 % 3000, i % 10))
+    ))
+    .unwrap();
+    db.execute(&format!(
+        "INSERT INTO tiny VALUES {}",
+        rows(5, &|i| format!("({i}, {}, 'n{i}')", i * 3))
+    ))
+    .unwrap();
+
+    // Written largest first, joined from the table its condition leaves smallest.
+    let sql = "SELECT * FROM big b JOIN mid m ON m.big_id = b.id JOIN tiny t ON t.mid_id = m.id
+               WHERE t.name = 'n2'";
+    assert_eq!(
+        explain(&mut db, sql),
+        "PROJECT b.id, b.k, b.pad, m.id, m.big_id, m.tag, t.id, t.mid_id, t.name
+  INDEX JOIN
+    INDEX JOIN
+      FILTER t.name = 'n2'
+        SCAN tiny t
+      LOOKUP mid m USING INDEX mid_pkey (m.id = t.mid_id)
+    LOOKUP big b USING INDEX big_pkey (b.id = m.big_id)"
+    );
+    // SELECT * keeps FROM's order of columns.
+    assert_eq!(
+        query(&mut db, sql),
+        [vec![
+            int(42),
+            int(42),
+            text("p"),
+            int(6),
+            int(42),
+            text("t6"),
+            int(2),
+            int(6),
+            text("n2"),
+        ]]
+    );
+    // Every order of FROM gives that plan's rows, and joins tiny first.
+    for from in [
+        "tiny t JOIN mid m ON t.mid_id = m.id JOIN big b ON m.big_id = b.id",
+        "mid m JOIN big b ON m.big_id = b.id JOIN tiny t ON t.mid_id = m.id",
+        "big b, tiny t, mid m",
+    ] {
+        let sql = format!(
+            "SELECT t.name, m.tag, b.k FROM {from} WHERE t.mid_id = m.id AND m.big_id = b.id AND t.name = 'n2'"
+        );
+        assert_eq!(
+            query(&mut db, &sql),
+            [vec![text("n2"), text("t6"), int(42)]],
+            "{from}"
+        );
+        let plan = explain(&mut db, &sql);
+        assert!(
+            plan.contains("      FILTER t.name = 'n2'\n        SCAN tiny t"),
+            "{from}:\n{plan}"
+        );
+    }
+    // A table no condition ties to the others yet waits for one that is:
+    // `big, tiny` share no condition, so tiny is joined to mid first.
+    let plan = explain(
+        &mut db,
+        "SELECT t.name FROM big b, tiny t, mid m WHERE m.big_id = b.id AND t.mid_id = m.id AND t.name = 'n2'",
+    );
+    assert!(!plan.contains("BLOCK NESTED LOOP"), "{plan}");
+
+    // A LEFT JOIN stays where it is: only the inner joins on either side move.
+    let plan = explain(
+        &mut db,
+        "SELECT b.id FROM big b LEFT JOIN mid m ON m.big_id = b.id WHERE b.k = 3",
+    );
+    assert!(plan.contains("LEFT"), "{plan}");
+    assert!(plan.contains("SCAN big b"), "{plan}");
+    assert!(plan.find("big b") < plan.find("mid m"), "{plan}");
+
+    // Forced to a join method, the tables are joined in FROM's order.
+    use sequoia::plan::query::ForceJoin;
+    db.set_force_join(Some(ForceJoin::Hash));
+    let plan = explain(&mut db, sql);
+    assert!(plan.find("SCAN big b") < plan.find("SCAN tiny t"), "{plan}");
+    db.set_force_join(None);
+}
+
+#[test]
+fn inner_joins_after_an_outer_join_are_reordered_among_themselves() {
+    let mut db = in_memory();
+    db.execute(
+        "CREATE TABLE big (id INT PRIMARY KEY, k INT, pad TEXT);
+         CREATE TABLE mid (id INT PRIMARY KEY, big_id INT, tag TEXT);
+         CREATE TABLE tiny (id INT PRIMARY KEY, mid_id INT, name TEXT);",
+    )
+    .unwrap();
+    let rows = |n: i64, row: &dyn Fn(i64) -> String| (0..n).map(row).collect::<Vec<_>>().join(", ");
+    let big = rows(3000, &|i| format!("({i}, {}, 'p')", i % 50));
+    let mid = rows(300, &|i| format!("({i}, {}, 't{}')", i * 7 % 3000, i % 10));
+    let tiny = rows(5, &|i| format!("({i}, {}, 'n{i}')", i * 3));
+    db.execute(&format!(
+        "INSERT INTO big VALUES {big}; INSERT INTO mid VALUES {mid}; INSERT INTO tiny VALUES {tiny}"
+    ))
+    .unwrap();
+    // After the LEFT JOIN, big is written first, but each row looks up its
+    // one mid by key, and through it its one big, for less than the 60 rows
+    // of big each would find first. The LEFT JOIN stays first.
+    let sql = "SELECT t.name, x.name, b.k, m.tag FROM tiny t LEFT JOIN tiny x ON x.id = t.id + 100
+               JOIN big b ON b.k = t.id JOIN mid m ON m.id = t.mid_id AND m.big_id = b.id";
+    assert_eq!(
+        explain(&mut db, sql),
+        "PROJECT t.name, x.name, b.k, m.tag
+  INDEX JOIN ON b.k = t.id
+    INDEX JOIN
+      LEFT HASH JOIN ON t.id + 100 = x.id
+        SCAN tiny t
+        SCAN tiny x
+      LOOKUP mid m USING INDEX mid_pkey (m.id = t.mid_id)
+    LOOKUP big b USING INDEX big_pkey (b.id = m.big_id)"
+    );
+    let expected = [vec![text("n0"), Value::Null, int(0), text("t0")]];
+    assert_eq!(query(&mut db, sql), expected);
+    // Joined as written, the same rows.
+    use sequoia::plan::query::ForceJoin;
+    db.set_force_join(Some(ForceJoin::Hash));
+    let plan = explain(&mut db, sql);
+    assert!(plan.find("big b") < plan.find("mid m"), "{plan}");
+    assert_eq!(query(&mut db, sql), expected);
+    db.set_force_join(None);
+
+    // A RIGHT JOIN stays where it is too, and the inner joins after it move.
+    let sql = "SELECT t.name, b.k, m.tag FROM tiny x RIGHT JOIN tiny t ON x.id = t.id + 100
+               JOIN big b ON b.k = t.id JOIN mid m ON m.id = t.mid_id AND m.big_id = b.id";
+    let plan = explain(&mut db, sql);
+    assert!(plan.contains("RIGHT"), "{plan}");
+    assert!(plan.find("mid m") < plan.find("big b"), "{plan}");
+    assert_eq!(query(&mut db, sql), [vec![text("n0"), int(0), text("t0")]]);
+}
+
+#[test]
+fn a_merge_join_that_saves_the_sort_is_weighed_against_reordering() {
+    let mut db = in_memory();
+    db.execute(
+        "CREATE TABLE s (id INT PRIMARY KEY, k INT);
+         CREATE TABLE b (id INT PRIMARY KEY, k INT);
+         CREATE TABLE t (id INT PRIMARY KEY, x INT);",
+    )
+    .unwrap();
+    let rows = |n: i64, m: i64| {
+        (0..n)
+            .map(|i| format!("({i}, {})", i % m))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    db.execute(&format!(
+        "INSERT INTO s VALUES {}; INSERT INTO b VALUES {}; INSERT INTO t VALUES {}",
+        rows(300, 10),
+        rows(3000, 10),
+        rows(3000, 100)
+    ))
+    .unwrap();
+    // s and b share their 10 values of k: 90000 rows. Without ORDER BY,
+    // b joins t first, a hash table of s for the last join.
+    let sql = "SELECT s.k, b.id FROM s JOIN b ON s.k = b.k JOIN t ON t.id = b.id";
+    assert_eq!(
+        explain(&mut db, sql),
+        "PROJECT s.k, b.id
+  HASH JOIN ON b.k = s.k
+    HASH JOIN ON b.id = t.id
+      SCAN b
+      SCAN t
+    SCAN s"
+    );
+    // Sorting the 90000 rows by s.k would cost more than that saves; FROM's
+    // order sorts the 3300 rows of s and b for a merge join instead, whose
+    // rows come out in order.
+    let sorted = format!("{sql} ORDER BY s.k");
+    assert_eq!(
+        explain(&mut db, &sorted),
+        "PROJECT s.k, b.id
+  HASH JOIN ON b.id = t.id
+    MERGE JOIN ON s.k = b.k (SORTED BY s.k)
+      SCAN s
+      SCAN b
+    SCAN t"
+    );
+    let result = query(&mut db, &sorted);
+    assert_eq!(result.len(), 90000);
+    assert!(
+        result
+            .windows(2)
+            .all(|w| w[0][0].sort_cmp(&w[1][0]).is_le())
+    );
+
+    // A reordering that leaves few rows to sort is still taken.
+    let sql = "SELECT s.k, b.id FROM b JOIN s ON s.k = b.k JOIN t ON b.id = t.id
+               WHERE t.x < 50 ORDER BY b.k";
+    let plan = explain(&mut db, sql);
+    assert!(plan.find("SCAN t") < plan.find("SCAN s"), "{plan}");
 }

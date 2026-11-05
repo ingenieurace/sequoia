@@ -1,7 +1,7 @@
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use super::index::{Bound, Index, encode_keys, own_expr};
 use super::stats::TableStats;
@@ -73,6 +73,9 @@ pub struct Table {
     indexes: Vec<Index>,
     /// How many rows the table has, or [`UNCOUNTED`]: see [`Table::row_count`].
     rows: AtomicU64,
+    /// Each column's distinct values, as last counted, and the rows the
+    /// table had then: see [`Table::distinct`].
+    distinct: Mutex<Vec<Option<(u64, u64)>>>,
     /// What the last ANALYZE learned, if the table was analyzed.
     stats: Option<TableStats>,
     /// Versions updates and deletes left behind since the last vacuum.
@@ -419,6 +422,7 @@ impl Table {
             storage,
             indexes: Vec::new(),
             rows: AtomicU64::new(0),
+            distinct: Mutex::new(Vec::new()),
             stats: None,
             changed: 0,
             legacy: false,
@@ -475,6 +479,7 @@ impl Table {
             storage,
             indexes: Vec::new(),
             rows: AtomicU64::new(UNCOUNTED),
+            distinct: Mutex::new(Vec::new()),
             stats: None,
             changed: 0,
             legacy,
@@ -928,6 +933,47 @@ impl Table {
         }
         self.rows.store(rows, Relaxed);
         Ok(rows)
+    }
+
+    /// How many distinct values other than NULL a column has, for the
+    /// planner to estimate what an equality keeps, and how many rows a join
+    /// on it returns, when ANALYZE has not been run (its statistics win). A
+    /// primary key or a column with a unique index of its own has as many
+    /// as the table has rows. Any other column's are counted with a scan of
+    /// the newest versions, as [`Table::row_count`] counts, the first time
+    /// they are asked for (an automatic ANALYZE of that column alone), and
+    /// kept: counted again only once the table has grown or shrunk by a
+    /// fifth since. None if the scan fails.
+    pub fn distinct(&self, column: usize) -> Option<u64> {
+        let rows = self.row_count().ok()?;
+        let unique = self.primary_key() == Some(column)
+            || self.indexes.iter().any(|index| {
+                index.unique && index.predicate.is_none() && index.is_on_column(column)
+            });
+        if unique {
+            return Some(rows);
+        }
+        let mut counts = self.distinct.lock().unwrap_or_else(PoisonError::into_inner);
+        if counts.len() < self.columns.len() {
+            counts.resize(self.columns.len(), None);
+        }
+        if let Some((distinct, then)) = counts[column]
+            && rows.abs_diff(then) <= then / 5
+        {
+            return Some(distinct.min(rows));
+        }
+        let needed: Vec<bool> = (0..self.columns.len()).map(|i| i == column).collect();
+        let mut values = HashSet::new();
+        for item in self.versions(self.txns.newest(), &needed, &[], &Access::Scan) {
+            let (_, _, mut row) = item.ok()?;
+            let value = row.swap_remove(column);
+            if !value.is_null() {
+                values.insert(value);
+            }
+        }
+        let distinct = values.len() as u64;
+        counts[column] = Some((distinct, rows));
+        Some(distinct)
     }
 
     /// Makes the next [`Table::row_count`] count the rows again.
