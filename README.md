@@ -73,6 +73,32 @@ rows the planner estimated it would return, and the execution model the
 query ran in, with the reason it was chosen. `ANALYZE` gathers statistics
 that make those estimates closer, and let the planner reorder joins.
 
+`PLANTREE` draws the same plan as a tree of relational algebra, the tables at
+the bottom and arrows pointing the way rows flow:
+
+```sql
+PLANTREE SELECT u.name, o.total FROM users u JOIN orders o ON o.user_id = u.id WHERE o.total > 10;
+```
+
+```
+       ↑
+       π u.name, o.total
+       ↑
+       ⋈ u.id = o.user_id (hash)
+  ┌────┴─────┐
+  ↑          ↑
+  │          σ o.total > 10
+  │          ↑
+users u   orders o
+```
+
+Its steps are `σ` (filter), `π` (projection), `⋈` (join, with its method;
+`⟕`, `⟖` and `⟗` for `LEFT`, `RIGHT` and `FULL JOIN`, `×` with no
+condition), `γ` (aggregate), `ω` (window functions), `τ` (sort), `δ`
+(distinct), `∪`, `∩` and `−` (union, intersect, except), `∪ recursive` (a
+recursive CTE) and `ρ` (subquery in `FROM`). A table read
+through an index or key shows it in brackets: `takes t [index takes_key]`.
+
 ## What is inside
 
 | Area | What Sequoia has |
@@ -189,7 +215,7 @@ workers, and a join method to force on every join (see
   a value in `VALUES` may be `DEFAULT`
 - `SELECT`, `UPDATE table SET column = expr | DEFAULT, ... [WHERE ...]`, `DELETE FROM table [WHERE ...]`
 - `RETURNING * | expr [AS name], ...` after `INSERT`, `UPDATE` or `DELETE` returns the rows written instead of a count
-- `EXPLAIN` before `SELECT`, `UPDATE` or `DELETE`; `EXPLAIN ANALYZE` before `SELECT`
+- `EXPLAIN` or `PLANTREE` before `SELECT`, `UPDATE` or `DELETE`; `EXPLAIN ANALYZE` before `SELECT`
 - `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT name`, `ROLLBACK TO [SAVEPOINT] name`, `RELEASE [SAVEPOINT] name` (each may add `TRANSACTION`)
 - `CHECKPOINT` copies the committed pages from the log into the database file
 - `ANALYZE [table]` computes the statistics of a table, or of every table, for the planner (see [Planning](#planning))
@@ -424,6 +450,7 @@ src/
     query.rs         SELECT -> tree of plan steps: binding, pushdown, joins, costs, gathers, EXPLAIN
     selectivity.rs   the share of rows a condition or a join keeps, from statistics or guessed
     order.rs         the cheapest order to join tables in: dynamic programming over sets, or greedy
+    tree.rs          PLANTREE: the plan drawn as a tree of relational algebra
 
   catalog/
     mod.rs           tables, indexes and statistics, stored as their CREATE statements (and text) in a heap

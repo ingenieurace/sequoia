@@ -4299,7 +4299,8 @@ fn transaction_statements_are_checked() {
         ("BEGIN; BEGIN", "already in progress"),
         ("CHECKPOINT", "cannot run inside a transaction"),
         ("RELEASE nope", "no such savepoint: nope"),
-        ("EXPLAIN COMMIT", "EXPLAIN supports only"),
+        ("EXPLAIN COMMIT", "EXPLAIN and PLANTREE support only"),
+        ("PLANTREE COMMIT", "EXPLAIN and PLANTREE support only"),
     ];
     for (sql, expected) in errors {
         let e = db.execute(sql).expect_err(sql);
@@ -8622,4 +8623,114 @@ fn alter_table_is_undone_with_its_transaction_and_survives_reopening() {
         error(&mut db, "UPDATE items SET n = -1"),
         "new row violates check constraint t_n_check"
     );
+}
+
+/// Runs PLANTREE on a statement and returns the tree it draws.
+fn plan_tree(db: &mut Database, sql: &str) -> String {
+    match db.execute(&format!("PLANTREE {sql}")).unwrap().pop() {
+        Some(QueryResult::Message(tree)) => tree,
+        other => panic!("expected a tree, got {other:?}"),
+    }
+}
+
+#[test]
+fn plantree_draws_the_plan_as_a_tree_of_relational_algebra() {
+    let mut db = in_memory();
+    db.execute(
+        "CREATE TABLE r (id INT PRIMARY KEY, name TEXT);
+         CREATE TABLE s (id INT, cdate TEXT, value INT);
+         INSERT INTO r VALUES (1, 'a'), (2, 'b');
+         INSERT INTO s VALUES (1, 'x', 150), (2, 'y', 50);",
+    )
+    .unwrap();
+    // The filter is pushed down to s, below the join.
+    assert_eq!(
+        plan_tree(
+            &mut db,
+            "SELECT r.id, s.cdate FROM r JOIN s ON r.id = s.id WHERE s.value > 100"
+        ),
+        [
+            "  ↑",
+            "  π r.id, s.cdate",
+            "  ↑",
+            "  ⋈ r.id = s.id (hash)",
+            "┌─┴─┐",
+            "↑   ↑",
+            "│   σ s.value > 100",
+            "│   ↑",
+            "r   s",
+        ]
+        .join("\n")
+    );
+    assert_eq!(
+        plan_tree(
+            &mut db,
+            "select r.name, COUNT(*) FROM r LEFT JOIN s ON s.id = r.id
+             GROUP BY r.name ORDER BY r.name LIMIT 3"
+        ),
+        [
+            "  ↑",
+            "  π r.name, COUNT(*)",
+            "  ↑",
+            "  τ r.name (top 3)",
+            "  ↑",
+            "  γ r.name; COUNT(*)",
+            "  ↑",
+            "  ⟕ r.id = s.id (hash)",
+            "┌─┴─┐",
+            "↑   ↑",
+            "r   s",
+        ]
+        .join("\n")
+    );
+    let union = plan_tree(
+        &mut db,
+        "SELECT id FROM r UNION SELECT s.id FROM s CROSS JOIN r x",
+    );
+    for step in ["δ", "∪", "× (nested loop)", "r x"] {
+        assert!(union.contains(step), "{step} in\n{union}");
+    }
+    // An index join's right side is a table looked up through its index,
+    // once s has rows enough that looking up one costs less than reading
+    // them all; UPDATE and DELETE show how they read their table.
+    let rows: Vec<String> = (3..200).map(|i| format!("({i}, 'z', {i})")).collect();
+    db.execute(&format!("INSERT INTO s VALUES {}", rows.join(", ")))
+        .unwrap();
+    db.execute("CREATE INDEX s_id ON s (id)").unwrap();
+    let joined = plan_tree(
+        &mut db,
+        "SELECT * FROM r JOIN s ON s.id = r.id WHERE r.id = 1",
+    );
+    assert!(joined.contains("⋈ r.id = s.id (index)"), "{joined}");
+    assert!(joined.contains("r [index r_pkey]"), "{joined}");
+    assert!(joined.contains("s [index s_id]"), "{joined}");
+    assert_eq!(
+        plan_tree(&mut db, "DELETE FROM r WHERE id = 1"),
+        "↑\nσ id = 1\n↑\nr [index r_pkey]"
+    );
+    // The steps of outer joins, set operations, window functions,
+    // recursive queries and lateral joins.
+    for (sql, step) in [
+        ("SELECT * FROM r RIGHT JOIN s ON s.id = r.id", "⟖"),
+        ("SELECT * FROM r FULL JOIN s ON s.id = r.id", "⟗"),
+        ("SELECT id FROM r INTERSECT SELECT id FROM s", "∩"),
+        ("SELECT id FROM r EXCEPT ALL SELECT id FROM s", "− all"),
+        ("SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM r", "ω "),
+        ("SELECT 1, 2", "values (1 row)"),
+        (
+            "WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3)
+             SELECT i FROM n",
+            "∪ recursive all",
+        ),
+        (
+            "SELECT * FROM r, LATERAL (SELECT s.value FROM s WHERE s.id = r.id) x",
+            "lateral x",
+        ),
+    ] {
+        let tree = plan_tree(&mut db, sql);
+        assert!(tree.contains(step), "{step} in\n{tree}");
+    }
+    // A name, not a keyword.
+    db.execute("CREATE TABLE plantree (plantree INT)").unwrap();
+    assert!(plan_tree(&mut db, "SELECT plantree FROM plantree").ends_with("plantree"));
 }

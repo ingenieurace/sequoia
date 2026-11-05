@@ -141,6 +141,13 @@ impl Parser {
                     false => Statement::Analyze { table },
                 });
             }
+            // Not a keyword, so that it stays free as a name: no statement starts with one.
+            Some(Token::Ident(word)) if word.eq_ignore_ascii_case("PLANTREE") => {
+                self.pos += 1;
+                return Ok(Statement::PlanTree {
+                    statement: Box::new(self.statement()?),
+                });
+            }
             _ => String::new(),
         };
         match keyword.as_str() {

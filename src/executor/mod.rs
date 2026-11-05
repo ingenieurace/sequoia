@@ -25,7 +25,7 @@ use crate::catalog::table::{Row, RowId, Table};
 use crate::datetime;
 use crate::error::{Result, err};
 use crate::mvcc::Snapshot;
-use crate::plan::query::{self, Choices, ForceJoin, forbid};
+use crate::plan::query::{self, Choices, ForceJoin, Node, forbid};
 use crate::plan::{access, filter};
 use crate::result::QueryResult;
 use crate::sql::ast::{ColumnRef, Expr, InsertSource, Projection, Select, SelectItem, Statement};
@@ -110,10 +110,13 @@ impl Settings {
     }
 }
 
-/// Whether a statement only reads: SELECT and EXPLAIN, which
+/// Whether a statement only reads: SELECT, EXPLAIN and PLANTREE, which
 /// [`execute_read`] runs on a catalog it cannot change.
 pub fn reads_only(statement: &Statement) -> bool {
-    matches!(statement, Statement::Select(_) | Statement::Explain { .. })
+    matches!(
+        statement,
+        Statement::Select(_) | Statement::Explain { .. } | Statement::PlanTree { .. }
+    )
 }
 
 /// Whether a statement changes the catalog, whose rows have no versions:
@@ -141,7 +144,10 @@ pub fn execute_read(
         Statement::Explain {
             statement,
             analyze: false,
-        } => explain(catalog, *statement, settings),
+        } => Ok(message(plan(catalog, *statement, settings)?.explain())),
+        Statement::PlanTree { statement } => Ok(message(crate::plan::tree::draw(&plan(
+            catalog, *statement, settings,
+        )?))),
         Statement::Explain {
             statement,
             analyze: true,
@@ -204,7 +210,9 @@ pub fn execute(
             catalog.drop_index(&name)?;
             Ok(message(format!("index {name} dropped")))
         }
-        Statement::Select(_) | Statement::Explain { .. } => unreachable!("run above"),
+        Statement::Select(_) | Statement::Explain { .. } | Statement::PlanTree { .. } => {
+            unreachable!("run above")
+        }
         Statement::Checkpoint => {
             catalog.checkpoint()?;
             Ok(message("checkpoint done".into()))
@@ -291,10 +299,11 @@ pub fn select<'a>(catalog: &'a Catalog, query: Select, settings: &Settings) -> R
     })
 }
 
-/// Describes how a statement would run: its plan, one step per line, the
-/// scan (and the index it uses, if any) last.
-fn explain(catalog: &Catalog, statement: Statement, settings: &Settings) -> Result<QueryResult> {
-    let plan = match statement {
+/// How a statement would run, for EXPLAIN (one step per line, the scan,
+/// and the index it uses, if any, last) or PLANTREE (drawn as a tree): a
+/// SELECT's plan, or how an UPDATE or DELETE reads its table.
+fn plan<'a>(catalog: &'a Catalog, statement: Statement, settings: &Settings) -> Result<Node<'a>> {
+    Ok(match statement {
         Statement::Select(query) => query::select(catalog, *query, settings.choices())?.root,
         Statement::Update { table, filter, .. } | Statement::Delete { table, filter, .. } => {
             let table = catalog.get(&table)?;
@@ -303,9 +312,8 @@ fn explain(catalog: &Catalog, statement: Statement, settings: &Settings) -> Resu
                 .transpose()?;
             query::scan(table, &table.name, &filter, vec![true; table.columns.len()])
         }
-        _ => return err("EXPLAIN supports only SELECT, UPDATE and DELETE"),
-    };
-    Ok(message(plan.explain()))
+        _ => return err("EXPLAIN and PLANTREE support only SELECT, UPDATE and DELETE"),
+    })
 }
 
 /// Runs a SELECT, reading all of its rows, and describes its plan as

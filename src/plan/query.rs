@@ -3066,12 +3066,12 @@ fn qualified(qualifier: &str, names: &[String]) -> Vec<Field> {
 }
 
 /// A sort key as EXPLAIN shows it: `u.city`, or `u.city DESC`.
-fn sort_key(expr: &Expr, desc: bool) -> String {
+pub(crate) fn sort_key(expr: &Expr, desc: bool) -> String {
     format!("{expr}{}", if desc { " DESC" } else { "" })
 }
 
 /// A table as EXPLAIN names it: `users`, or `users u` under an alias.
-fn label(table: &Table, qualifier: &str) -> String {
+pub(crate) fn label(table: &Table, qualifier: &str) -> String {
     match qualifier == table.name {
         true => table.name.clone(),
         false => format!("{} {qualifier}", table.name),
@@ -3118,7 +3118,7 @@ fn output_name(expr: &Expr) -> String {
 }
 
 /// The column an aggregate's result is in: its SQL text.
-fn aggregate_name((function, arg, distinct): &AggregateCall) -> String {
+pub(crate) fn aggregate_name((function, arg, distinct): &AggregateCall) -> String {
     Expr::Aggregate(*function, arg.clone().map(Box::new), *distinct).to_string()
 }
 

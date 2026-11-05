@@ -27,6 +27,8 @@
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
 
+use sequoia::result::char_width;
+
 /// What reading a line found.
 #[derive(Debug, PartialEq)]
 pub enum Line {
@@ -318,34 +320,16 @@ impl Buffer {
     /// cursor moved back to where it is in the line.
     fn render(&self, prompt: &str) -> String {
         let line: String = self.chars.iter().collect();
-        let back: usize = self.chars[self.cursor..].iter().map(|&c| width(c)).sum();
+        let back: usize = self.chars[self.cursor..]
+            .iter()
+            .map(|&c| char_width(c))
+            .sum();
         let mut out = format!("\r{prompt}{line}\x1b[K");
         if back > 0 {
             out += &format!("\x1b[{back}D");
         }
         out
     }
-}
-
-/// How many columns a character takes on a terminal: two for the wide
-/// characters of East Asian scripts and most emoji, one for the others.
-fn width(c: char) -> usize {
-    let wide = matches!(c as u32,
-        0x1100..=0x115F
-        | 0x2E80..=0x303E
-        | 0x3041..=0x33FF
-        | 0x3400..=0x4DBF
-        | 0x4E00..=0x9FFF
-        | 0xA000..=0xA4CF
-        | 0xAC00..=0xD7A3
-        | 0xF900..=0xFAFF
-        | 0xFE30..=0xFE4F
-        | 0xFF00..=0xFF60
-        | 0xFFE0..=0xFFE6
-        | 0x1F300..=0x1F64F
-        | 0x1F900..=0x1F9FF
-        | 0x20000..=0x3FFFD);
-    if wide { 2 } else { 1 }
 }
 
 /// The terminal with its own line editing, echo and signal keys off, until

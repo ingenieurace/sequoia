@@ -30,6 +30,11 @@ pub enum Statement {
         statement: Box<Statement>,
         analyze: bool,
     },
+    /// `PLANTREE statement`: the plan EXPLAIN describes, drawn as a tree of
+    /// relational algebra (see `plan/tree.rs`).
+    PlanTree {
+        statement: Box<Statement>,
+    },
     /// Copies the committed pages from the write-ahead log into the database file.
     Checkpoint,
     /// `ANALYZE [table]`: computes the statistics of a table, or of every
