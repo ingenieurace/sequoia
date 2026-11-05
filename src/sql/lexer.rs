@@ -291,9 +291,7 @@ impl fmt::Display for Token {
 /// is a plain word that is not a keyword, else in double quotes.
 pub fn quote_ident(name: &str) -> String {
     let mut chars = name.chars();
-    let plain = chars
-        .next()
-        .is_some_and(|c| c.is_alphabetic() || c == '_')
+    let plain = chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
         && chars.all(|c| c.is_alphanumeric() || c == '_')
         && !KEYWORDS.contains(&name.to_uppercase().as_str());
     match plain {

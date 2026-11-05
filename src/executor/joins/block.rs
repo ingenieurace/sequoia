@@ -205,7 +205,12 @@ impl Iterator for BlockJoin<'_> {
                     };
                     self.pair.clear();
                     self.pair.extend(self.block[i].iter().chain(right).cloned());
-                    match matches_with(&self.condition, &self.fields, &self.pair, &mut *self.subqueries) {
+                    match matches_with(
+                        &self.condition,
+                        &self.fields,
+                        &self.pair,
+                        &mut *self.subqueries,
+                    ) {
                         Ok(true) => {
                             self.matched[i] = true;
                             return Some(Ok(std::mem::take(&mut self.pair))); // the next pair allocates anew

@@ -88,7 +88,12 @@ impl Iterator for NaiveJoin<'_> {
                     self.pair.clear();
                     self.pair.extend(left.iter().cloned());
                     self.pair.extend(row);
-                    match matches_with(&self.condition, &self.fields, &self.pair, &mut *self.subqueries) {
+                    match matches_with(
+                        &self.condition,
+                        &self.fields,
+                        &self.pair,
+                        &mut *self.subqueries,
+                    ) {
                         Ok(true) => {
                             self.matched = true;
                             return Some(Ok(std::mem::take(&mut self.pair))); // the next pair allocates anew

@@ -31,13 +31,13 @@ use super::operator::Rows;
 use super::sort::{Sorted, Sorter};
 use crate::catalog::table::Row;
 use crate::error::{Result, err};
+use crate::sql::ast::BinaryOp;
 use crate::sql::ast::{
     Expr, FrameBound, FrameUnits, OrderBy, Window as WindowCall, WindowFunction,
 };
-use crate::sql::ast::BinaryOp;
 use crate::sql::eval::{Field, Subqueries, binary, eval_with, locate, locate_all};
-use std::cmp::Ordering;
 use crate::types::Value;
+use std::cmp::Ordering;
 
 /// Reads all of `input` (whose columns are `fields`), and returns each row
 /// with the value of each of `functions` after it, over the partitions of
@@ -188,7 +188,10 @@ impl Windowed {
             peers: Vec::with_capacity(rows.len()),
         };
         for mut row in rows {
-            let mut extra = row.split_off(self.width).into_iter().skip(self.partition_keys);
+            let mut extra = row
+                .split_off(self.width)
+                .into_iter()
+                .skip(self.partition_keys);
             partition
                 .order
                 .push(extra.by_ref().take(self.order_keys).collect());
@@ -207,7 +210,9 @@ impl Windowed {
             while end < n && partition.order[end] == partition.order[start] {
                 end += 1;
             }
-            partition.peers.extend(std::iter::repeat_n((start, end), end - start));
+            partition
+                .peers
+                .extend(std::iter::repeat_n((start, end), end - start));
             start = end;
         }
         partition
@@ -254,9 +259,10 @@ fn compute(function: &WindowCall, f: usize, partition: &Partition) -> Result<Vec
             (FrameUnits::Groups, FrameBound::Preceding(k)) => {
                 g.checked_sub(count(k)).map_or(0, |g| groups[g].0)
             }
-            (FrameUnits::Groups, FrameBound::Following(k)) => {
-                g.checked_add(count(k)).and_then(|g| groups.get(g)).map_or(n, |g| g.0)
-            }
+            (FrameUnits::Groups, FrameBound::Following(k)) => g
+                .checked_add(count(k))
+                .and_then(|g| groups.get(g))
+                .map_or(n, |g| g.0),
             (FrameUnits::Range, FrameBound::Preceding(k)) => by_value(k, true, false)?,
             (FrameUnits::Range, FrameBound::Following(k)) => by_value(k, false, false)?,
         };
@@ -272,9 +278,10 @@ fn compute(function: &WindowCall, f: usize, partition: &Partition) -> Result<Vec
             (FrameUnits::Groups, FrameBound::Preceding(k)) => {
                 g.checked_sub(count(k)).map_or(0, |g| groups[g].1)
             }
-            (FrameUnits::Groups, FrameBound::Following(k)) => {
-                g.checked_add(count(k)).and_then(|g| groups.get(g)).map_or(n, |g| g.1)
-            }
+            (FrameUnits::Groups, FrameBound::Following(k)) => g
+                .checked_add(count(k))
+                .and_then(|g| groups.get(g))
+                .map_or(n, |g| g.1),
             (FrameUnits::Range, FrameBound::Preceding(k)) => by_value(k, true, true)?,
             (FrameUnits::Range, FrameBound::Following(k)) => by_value(k, false, true)?,
         };

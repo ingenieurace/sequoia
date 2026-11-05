@@ -4099,7 +4099,6 @@ fn subquery_mistakes_are_reported() {
             "SELECT * FROM users WHERE EXISTS (SELECT * FROM missing)",
             "missing",
         ),
-
         (
             "SELECT city, (SELECT COUNT(*) FROM orders WHERE user_id = users.id) FROM users GROUP BY city",
             "column users.id must appear in GROUP BY",
@@ -6430,7 +6429,9 @@ fn dates_and_times_check_their_values() {
     ] {
         assert_eq!(error(&mut db, sql), message, "{sql}");
     }
-    assert!(error(&mut db, "SELECT EXTRACT(WEEK FROM d) FROM t").contains("YEAR, QUARTER, MONTH, DAY"));
+    assert!(
+        error(&mut db, "SELECT EXTRACT(WEEK FROM d) FROM t").contains("YEAR, QUARTER, MONTH, DAY")
+    );
     // A text is a date once cast, and a date a text.
     assert_eq!(
         shown(
@@ -6652,7 +6653,12 @@ fn every_way(db: &mut Database, sql: &str, ordered: bool) -> Vec<Vec<Value>> {
         Some(ForceJoin::Naive),
         Some(ForceJoin::Index),
     ];
-    for model in [None, Some(Model::Iterator), Some(Model::Materialization), Some(Model::Vectorized)] {
+    for model in [
+        None,
+        Some(Model::Iterator),
+        Some(Model::Materialization),
+        Some(Model::Vectorized),
+    ] {
         for method in methods {
             for (memory, workers) in [(None, 1), (Some(64), 1), (None, 4)] {
                 db.set_execution_model(model);
@@ -6726,11 +6732,17 @@ fn select_without_from_reads_one_row_of_no_columns() {
     assert!(query(&mut db, "SELECT 1 WHERE FALSE").is_empty());
     assert_eq!(query(&mut db, "SELECT COUNT(*)"), vec![vec![int(1)]]);
     assert_eq!(
-        query(&mut db, "SELECT (SELECT COUNT(*) FROM users), (SELECT MAX(id) FROM orders)"),
+        query(
+            &mut db,
+            "SELECT (SELECT COUNT(*) FROM users), (SELECT MAX(id) FROM orders)"
+        ),
         vec![vec![int(4), int(4)]]
     );
     assert_eq!(
-        query(&mut db, "SELECT 2 AS n UNION SELECT 1 UNION SELECT 2 ORDER BY n"),
+        query(
+            &mut db,
+            "SELECT 2 AS n UNION SELECT 1 UNION SELECT 2 ORDER BY n"
+        ),
         vec![vec![int(1)], vec![int(2)]]
     );
     assert_eq!(
@@ -6767,8 +6779,14 @@ fn insert_select_adds_the_rows_of_a_query() {
     );
     assert_eq!(returned, vec![vec![int(100), text("w")]]);
     for (sql, problem) in [
-        ("INSERT INTO copy SELECT id, name FROM users", "expected 3 values, got 2"),
-        ("INSERT INTO copy (id) SELECT 1, 2", "expected 1 values, got 2"),
+        (
+            "INSERT INTO copy SELECT id, name FROM users",
+            "expected 3 values, got 2",
+        ),
+        (
+            "INSERT INTO copy (id) SELECT 1, 2",
+            "expected 1 values, got 2",
+        ),
     ] {
         let e = db.execute(sql).expect_err(sql);
         assert!(e.0.contains(problem), "{sql}: {e}");
@@ -6776,7 +6794,10 @@ fn insert_select_adds_the_rows_of_a_query() {
     // A failed insert adds none of its rows: 3 and 4 are new, 1 and 2 are not.
     db.execute("INSERT INTO copy SELECT id, name, city FROM users")
         .unwrap_err();
-    assert_eq!(query(&mut db, "SELECT COUNT(*) FROM copy"), vec![vec![int(5)]]);
+    assert_eq!(
+        query(&mut db, "SELECT COUNT(*) FROM copy"),
+        vec![vec![int(5)]]
+    );
 }
 
 #[test]
@@ -6784,40 +6805,82 @@ fn intersect_and_except_keep_or_drop_the_rows_of_the_other_query() {
     let mut db = people();
     // NULLs are equal to each other here, as for DISTINCT.
     assert_eq!(
-        sorted_rows(every_way(&mut db, "SELECT city FROM users INTERSECT SELECT city FROM users WHERE id > 2", false)),
+        sorted_rows(every_way(
+            &mut db,
+            "SELECT city FROM users INTERSECT SELECT city FROM users WHERE id > 2",
+            false
+        )),
         vec![vec![null()], vec![text("oslo")]]
     );
     assert_eq!(
-        sorted_rows(every_way(&mut db, "SELECT city FROM users INTERSECT ALL SELECT city FROM users", false)),
+        sorted_rows(every_way(
+            &mut db,
+            "SELECT city FROM users INTERSECT ALL SELECT city FROM users",
+            false
+        )),
         sorted_rows(query(&mut db, "SELECT city FROM users"))
     );
     assert_eq!(
-        query(&mut db, "SELECT id FROM users EXCEPT SELECT user_id FROM orders ORDER BY id"),
+        query(
+            &mut db,
+            "SELECT id FROM users EXCEPT SELECT user_id FROM orders ORDER BY id"
+        ),
         vec![vec![int(3)], vec![int(4)]]
     );
     // With ALL, as many copies as the left has more than the right.
     assert_eq!(
-        query(&mut db, "SELECT city FROM users EXCEPT ALL SELECT city FROM users WHERE id = 1 ORDER BY city"),
+        query(
+            &mut db,
+            "SELECT city FROM users EXCEPT ALL SELECT city FROM users WHERE id = 1 ORDER BY city"
+        ),
         vec![vec![null()], vec![text("oslo")], vec![text("rome")]]
     );
     assert_eq!(
-        query(&mut db, "SELECT city FROM users EXCEPT SELECT city FROM users WHERE id = 1 ORDER BY city"),
+        query(
+            &mut db,
+            "SELECT city FROM users EXCEPT SELECT city FROM users WHERE id = 1 ORDER BY city"
+        ),
         vec![vec![null()], vec![text("rome")]]
     );
     // INTERSECT binds tighter than UNION and EXCEPT, which go left to right.
     for (sql, expected) in [
-        ("SELECT 1 UNION ALL SELECT 1 INTERSECT ALL SELECT 1", vec![1, 1]),
+        (
+            "SELECT 1 UNION ALL SELECT 1 INTERSECT ALL SELECT 1",
+            vec![1, 1],
+        ),
         ("SELECT 1 INTERSECT SELECT 2 UNION SELECT 3", vec![3]),
-        ("SELECT id FROM users EXCEPT SELECT id FROM users UNION SELECT 7", vec![7]),
-        ("SELECT id FROM users UNION SELECT 7 EXCEPT SELECT id FROM users", vec![7]),
-        ("SELECT id FROM users EXCEPT SELECT 2 INTERSECT SELECT id FROM users ORDER BY id DESC LIMIT 2", vec![4, 3]),
+        (
+            "SELECT id FROM users EXCEPT SELECT id FROM users UNION SELECT 7",
+            vec![7],
+        ),
+        (
+            "SELECT id FROM users UNION SELECT 7 EXCEPT SELECT id FROM users",
+            vec![7],
+        ),
+        (
+            "SELECT id FROM users EXCEPT SELECT 2 INTERSECT SELECT id FROM users ORDER BY id DESC LIMIT 2",
+            vec![4, 3],
+        ),
     ] {
-        let rows: Vec<Value> = query(&mut db, sql).into_iter().map(|mut r| r.remove(0)).collect();
-        assert_eq!(rows, expected.into_iter().map(int).collect::<Vec<_>>(), "{sql}");
+        let rows: Vec<Value> = query(&mut db, sql)
+            .into_iter()
+            .map(|mut r| r.remove(0))
+            .collect();
+        assert_eq!(
+            rows,
+            expected.into_iter().map(int).collect::<Vec<_>>(),
+            "{sql}"
+        );
     }
     let e = db.execute("SELECT 1 INTERSECT SELECT 1, 2").unwrap_err();
-    assert!(e.0.contains("each query of an INTERSECT must return as many columns"), "{e}");
-    let plan = explain(&mut db, "SELECT id FROM users INTERSECT ALL SELECT user_id FROM orders");
+    assert!(
+        e.0.contains("each query of an INTERSECT must return as many columns"),
+        "{e}"
+    );
+    let plan = explain(
+        &mut db,
+        "SELECT id FROM users INTERSECT ALL SELECT user_id FROM orders",
+    );
     assert!(plan.starts_with("INTERSECT ALL"), "{plan}");
 }
 
@@ -6831,7 +6894,10 @@ fn right_and_full_joins_keep_the_rows_that_match_nothing() {
         vec![null(), int(4)],
     ];
     let sql = "SELECT u.name, o.id FROM users u RIGHT JOIN orders o ON o.user_id = u.id";
-    assert_eq!(sorted_rows(every_way(&mut db, sql, false)), sorted_rows(expected));
+    assert_eq!(
+        sorted_rows(every_way(&mut db, sql, false)),
+        sorted_rows(expected)
+    );
     let sql = "SELECT u.name, o.id FROM users u FULL OUTER JOIN orders o ON o.user_id = u.id ORDER BY u.name, o.id";
     assert_eq!(
         every_way(&mut db, sql, true),
@@ -6846,18 +6912,45 @@ fn right_and_full_joins_keep_the_rows_that_match_nothing() {
     );
     // Without an equality, and with conditions on one side alone.
     for (sql, rows) in [
-        ("SELECT a.id, b.id FROM users a FULL JOIN users b ON a.id < b.id AND b.id > 3", 7),
-        ("SELECT a.id, b.id FROM users a FULL JOIN users b ON FALSE", 8),
-        ("SELECT a.id, b.id FROM users a RIGHT JOIN users b ON a.id = b.id + 2 AND a.city = 'oslo'", 4),
-        ("SELECT a.id, b.id FROM users a FULL JOIN users b ON a.id = b.id + 2", 6),
-        ("SELECT * FROM users a FULL JOIN orders o ON o.user_id = a.id JOIN users c ON c.id = o.id", 4),
-        ("SELECT * FROM users a RIGHT JOIN orders o ON o.user_id = a.id LEFT JOIN users c ON c.id = a.id + 1", 4),
+        (
+            "SELECT a.id, b.id FROM users a FULL JOIN users b ON a.id < b.id AND b.id > 3",
+            7,
+        ),
+        (
+            "SELECT a.id, b.id FROM users a FULL JOIN users b ON FALSE",
+            8,
+        ),
+        (
+            "SELECT a.id, b.id FROM users a RIGHT JOIN users b ON a.id = b.id + 2 AND a.city = 'oslo'",
+            4,
+        ),
+        (
+            "SELECT a.id, b.id FROM users a FULL JOIN users b ON a.id = b.id + 2",
+            6,
+        ),
+        (
+            "SELECT * FROM users a FULL JOIN orders o ON o.user_id = a.id JOIN users c ON c.id = o.id",
+            4,
+        ),
+        (
+            "SELECT * FROM users a RIGHT JOIN orders o ON o.user_id = a.id LEFT JOIN users c ON c.id = a.id + 1",
+            4,
+        ),
     ] {
         assert_eq!(every_way(&mut db, sql, false).len(), rows, "{sql}");
     }
-    let plan = explain(&mut db, "SELECT * FROM users u FULL JOIN orders o ON o.user_id = u.id");
-    assert!(plan.contains("FULL HASH JOIN ON u.id = o.user_id"), "{plan}");
-    let plan = explain(&mut db, "SELECT * FROM users u RIGHT JOIN orders o ON o.user_id = u.id");
+    let plan = explain(
+        &mut db,
+        "SELECT * FROM users u FULL JOIN orders o ON o.user_id = u.id",
+    );
+    assert!(
+        plan.contains("FULL HASH JOIN ON u.id = o.user_id"),
+        "{plan}"
+    );
+    let plan = explain(
+        &mut db,
+        "SELECT * FROM users u RIGHT JOIN orders o ON o.user_id = u.id",
+    );
     assert!(plan.contains("RIGHT HASH JOIN"), "{plan}");
     db.set_force_join(Some(sequoia::plan::query::ForceJoin::Index));
     let e = db
@@ -6874,9 +6967,16 @@ fn where_is_never_pushed_below_a_join_that_pads_its_tables_with_nulls() {
         // On the rows the RIGHT JOIN padded too, after it.
         (
             "SELECT u.name, o.id FROM users u RIGHT JOIN orders o ON o.user_id = u.id WHERE u.city = 'oslo' OR u.name IS NULL",
-            vec![vec![text("ann"), int(1)], vec![text("ann"), int(2)], vec![null(), int(4)]],
+            vec![
+                vec![text("ann"), int(1)],
+                vec![text("ann"), int(2)],
+                vec![null(), int(4)],
+            ],
         ),
-        ("SELECT o.id FROM users u RIGHT JOIN orders o ON o.user_id = u.id WHERE FALSE", vec![]),
+        (
+            "SELECT o.id FROM users u RIGHT JOIN orders o ON o.user_id = u.id WHERE FALSE",
+            vec![],
+        ),
         (
             "SELECT o.id FROM users u RIGHT JOIN orders o ON o.user_id = u.id WHERE o.total > 6",
             vec![vec![int(1)], vec![int(2)]],
@@ -6888,7 +6988,12 @@ fn where_is_never_pushed_below_a_join_that_pads_its_tables_with_nulls() {
         // The ON of an inner join before a RIGHT JOIN is checked before it.
         (
             "SELECT u.id, x.id, o.id FROM users u JOIN users x ON x.id = u.id AND x.city = 'rome' RIGHT JOIN orders o ON o.user_id = u.id",
-            vec![vec![int(2), int(2), int(3)], vec![null(), null(), int(1)], vec![null(), null(), int(2)], vec![null(), null(), int(4)]],
+            vec![
+                vec![int(2), int(2), int(3)],
+                vec![null(), null(), int(1)],
+                vec![null(), null(), int(2)],
+                vec![null(), null(), int(4)],
+            ],
         ),
     ] {
         assert_eq!(
@@ -6926,7 +7031,11 @@ fn subqueries_run_in_on_and_group_by() {
                GROUP BY (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) ORDER BY n";
     assert_eq!(
         every_way(&mut db, sql, true),
-        vec![vec![int(0), int(2)], vec![int(1), int(1)], vec![int(2), int(1)]]
+        vec![
+            vec![int(0), int(2)],
+            vec![int(1), int(1)],
+            vec![int(2), int(1)]
+        ]
     );
     let sql = "SELECT city IN (SELECT city FROM users WHERE id > 2), COUNT(*) FROM users \
                GROUP BY city IN (SELECT city FROM users WHERE id > 2) HAVING COUNT(*) > 0";
@@ -6939,32 +7048,54 @@ fn common_table_expressions_name_queries_for_the_statement() {
     for (sql, expected) in [
         (
             "WITH big AS (SELECT * FROM orders WHERE total > 5) SELECT u.name, b.total FROM users u JOIN big b ON b.user_id = u.id ORDER BY b.total",
-            vec![vec![text("bob"), real(5.25)], vec![text("ann"), real(9.5)], vec![text("ann"), real(20.0)]],
+            vec![
+                vec![text("bob"), real(5.25)],
+                vec![text("ann"), real(9.5)],
+                vec![text("ann"), real(20.0)],
+            ],
         ),
         // Each sees those before it, and names its columns.
-        ("WITH a(x) AS (SELECT 1), b AS (SELECT x + 1 AS y FROM a) SELECT * FROM a, b", vec![vec![int(1), int(2)]]),
+        (
+            "WITH a(x) AS (SELECT 1), b AS (SELECT x + 1 AS y FROM a) SELECT * FROM a, b",
+            vec![vec![int(1), int(2)]],
+        ),
         // It hides a table of the same name, and an inner WITH an outer one.
-        ("WITH users AS (SELECT 42 AS id) SELECT * FROM users", vec![vec![int(42)]]),
+        (
+            "WITH users AS (SELECT 42 AS id) SELECT * FROM users",
+            vec![vec![int(42)]],
+        ),
         (
             "WITH x AS (SELECT 1 AS a) SELECT (SELECT a FROM x) + (WITH x AS (SELECT 10 AS a) SELECT a FROM x)",
             vec![vec![int(11)]],
         ),
         // Read twice, under two aliases, and renamed.
-        ("WITH n(v) AS (SELECT id FROM users) SELECT COUNT(*) FROM n p JOIN n AS q(w) ON q.w = p.v + 1", vec![vec![int(3)]]),
+        (
+            "WITH n(v) AS (SELECT id FROM users) SELECT COUNT(*) FROM n p JOIN n AS q(w) ON q.w = p.v + 1",
+            vec![vec![int(3)]],
+        ),
         // In a correlated subquery.
         (
             "SELECT name FROM users u WHERE EXISTS (WITH o AS (SELECT * FROM orders WHERE user_id = u.id) SELECT 1 FROM o) ORDER BY name",
             vec![vec![text("ann")], vec![text("bob")]],
         ),
-        ("SELECT * FROM (SELECT 1, 2) AS t(a, b)", vec![vec![int(1), int(2)]]),
+        (
+            "SELECT * FROM (SELECT 1, 2) AS t(a, b)",
+            vec![vec![int(1), int(2)]],
+        ),
     ] {
         assert_eq!(every_way(&mut db, sql, true), expected, "{sql}");
     }
-    let e = db.execute("WITH x AS (SELECT 1), x AS (SELECT 2) SELECT 1").unwrap_err();
+    let e = db
+        .execute("WITH x AS (SELECT 1), x AS (SELECT 2) SELECT 1")
+        .unwrap_err();
     assert!(e.0.contains("given more than once"), "{e}");
-    let e = db.execute("SELECT * FROM users AS u(a, b, c, d)").unwrap_err();
+    let e = db
+        .execute("SELECT * FROM users AS u(a, b, c, d)")
+        .unwrap_err();
     assert!(e.0.contains("only for a subquery"), "{e}");
-    let e = db.execute("WITH t(a, b) AS (SELECT 1) SELECT * FROM t").unwrap_err();
+    let e = db
+        .execute("WITH t(a, b) AS (SELECT 1) SELECT * FROM t")
+        .unwrap_err();
     assert!(e.0.contains("has 1 columns, but 2 are named"), "{e}");
 }
 
@@ -6982,10 +7113,14 @@ fn recursive_queries_run_until_a_round_returns_nothing() {
     let sql = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5) SELECT * FROM n";
     assert_eq!(ints(every_way(&mut db, sql, true)), vec![1, 2, 3, 4, 5]);
     // A LIMIT ends one that would never end, in every model.
-    let sql = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT * FROM n LIMIT 4";
+    let sql =
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT * FROM n LIMIT 4";
     assert_eq!(ints(every_way(&mut db, sql, true)), vec![1, 2, 3, 4]);
     let sql = "WITH RECURSIVE fib(a, b) AS (SELECT 0, 1 UNION ALL SELECT b, a + b FROM fib WHERE b < 30) SELECT a FROM fib";
-    assert_eq!(ints(every_way(&mut db, sql, true)), vec![0, 1, 1, 2, 3, 5, 8, 13, 21]);
+    assert_eq!(
+        ints(every_way(&mut db, sql, true)),
+        vec![0, 1, 1, 2, 3, 5, 8, 13, 21]
+    );
     // UNION drops the rows found before, so a walk of a cycle ends.
     let sql = "WITH RECURSIVE reach(node) AS (SELECT 1 UNION SELECT e.dst FROM edges e JOIN reach r ON e.src = r.node) \
                SELECT node FROM reach ORDER BY node";
@@ -6994,7 +7129,12 @@ fn recursive_queries_run_until_a_round_returns_nothing() {
                SELECT node, MIN(depth) FROM path GROUP BY node ORDER BY node";
     assert_eq!(
         every_way(&mut db, sql, true),
-        vec![vec![int(1), int(0)], vec![int(2), int(1)], vec![int(3), int(2)], vec![int(4), int(3)]]
+        vec![
+            vec![int(1), int(0)],
+            vec![int(2), int(1)],
+            vec![int(3), int(2)],
+            vec![int(4), int(3)]
+        ]
     );
     // Correlated with a query around it, and read twice.
     let sql = "SELECT name, (WITH RECURSIVE r(n) AS (SELECT u.id UNION ALL SELECT n + 1 FROM r WHERE n < u.id + 2) SELECT SUM(n) FROM r) \
@@ -7010,15 +7150,39 @@ fn recursive_queries_run_until_a_round_returns_nothing() {
     );
     let sql = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3) SELECT a.i, b.i FROM n a JOIN n b ON b.i = a.i + 1";
     assert_eq!(every_way(&mut db, sql, false).len(), 2);
-    let plan = explain(&mut db, "WITH RECURSIVE n(i) AS (SELECT 1 UNION SELECT i + 1 FROM n WHERE i < 5) SELECT * FROM n");
-    assert!(plan.contains("RECURSIVE UNION") && plan.contains("WORK TABLE n"), "{plan}");
+    let plan = explain(
+        &mut db,
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION SELECT i + 1 FROM n WHERE i < 5) SELECT * FROM n",
+    );
+    assert!(
+        plan.contains("RECURSIVE UNION") && plan.contains("WORK TABLE n"),
+        "{plan}"
+    );
     for (sql, problem) in [
-        ("WITH RECURSIVE r AS (SELECT n FROM r UNION ALL SELECT 1 AS n) SELECT * FROM r", "must be a query that does not name r"),
-        ("WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n FROM r, r AS s) SELECT * FROM r", "name r once"),
-        ("WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n FROM users WHERE id IN (SELECT n FROM r)) SELECT * FROM r", "not in a subquery"),
-        ("WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n FROM users LEFT JOIN r ON TRUE) SELECT * FROM r", "padded with NULLs"),
-        ("WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n, n FROM r) SELECT * FROM r", "as many columns"),
-        ("WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n FROM r ORDER BY n) SELECT * FROM r", "ORDER BY, LIMIT and OFFSET"),
+        (
+            "WITH RECURSIVE r AS (SELECT n FROM r UNION ALL SELECT 1 AS n) SELECT * FROM r",
+            "must be a query that does not name r",
+        ),
+        (
+            "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n FROM r, r AS s) SELECT * FROM r",
+            "name r once",
+        ),
+        (
+            "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n FROM users WHERE id IN (SELECT n FROM r)) SELECT * FROM r",
+            "not in a subquery",
+        ),
+        (
+            "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n FROM users LEFT JOIN r ON TRUE) SELECT * FROM r",
+            "padded with NULLs",
+        ),
+        (
+            "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n, n FROM r) SELECT * FROM r",
+            "as many columns",
+        ),
+        (
+            "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n FROM r ORDER BY n) SELECT * FROM r",
+            "ORDER BY, LIMIT and OFFSET",
+        ),
     ] {
         let e = db.execute(sql).expect_err(sql);
         assert!(e.0.contains(problem), "{sql}: {e}");
@@ -7036,9 +7200,15 @@ fn lateral_subqueries_read_the_tables_before_them() {
     let sql = "SELECT u.name, t.total FROM users u LEFT JOIN LATERAL (SELECT total FROM orders o WHERE o.user_id = u.id ORDER BY total DESC LIMIT 1) t ON TRUE ORDER BY u.name";
     assert_eq!(every_way(&mut db, sql, true).len(), 4);
     let sql = "SELECT u.id, s.c FROM users u CROSS JOIN LATERAL (SELECT COUNT(*) AS c FROM orders o WHERE o.user_id = u.id) s WHERE s.c > 0 ORDER BY u.id";
-    assert_eq!(every_way(&mut db, sql, true), vec![vec![int(1), int(2)], vec![int(2), int(1)]]);
+    assert_eq!(
+        every_way(&mut db, sql, true),
+        vec![vec![int(1), int(2)], vec![int(2), int(1)]]
+    );
     let sql = "SELECT u.id, s.t FROM users u JOIN LATERAL (SELECT o.total AS t FROM orders o WHERE o.user_id = u.id) s ON s.t > 6 ORDER BY u.id, s.t";
-    assert_eq!(every_way(&mut db, sql, true), vec![vec![int(1), real(9.5)], vec![int(1), real(20.0)]]);
+    assert_eq!(
+        every_way(&mut db, sql, true),
+        vec![vec![int(1), real(9.5)], vec![int(1), real(20.0)]]
+    );
     // Of a derived table, and inside a correlated subquery.
     let sql = "SELECT x.n, y.m FROM (SELECT 1 AS n) x, LATERAL (SELECT x.n + 1 AS m) y";
     assert_eq!(every_way(&mut db, sql, true), vec![vec![int(1), int(2)]]);
@@ -7052,7 +7222,10 @@ fn lateral_subqueries_read_the_tables_before_them() {
             vec![text("dee"), null()],
         ]
     );
-    let plan = explain(&mut db, "SELECT * FROM users u, LATERAL (SELECT * FROM orders o WHERE o.user_id = u.id) t");
+    let plan = explain(
+        &mut db,
+        "SELECT * FROM users u, LATERAL (SELECT * FROM orders o WHERE o.user_id = u.id) t",
+    );
     assert!(plan.contains("LATERAL JOIN t"), "{plan}");
     let e = db
         .execute("SELECT * FROM users u RIGHT JOIN LATERAL (SELECT 1) s ON TRUE")
@@ -7098,10 +7271,50 @@ fn window_functions_compute_values_over_the_rows_of_each_window() {
     assert_eq!(
         every_way(&mut db, sql, true),
         vec![
-            vec![int(1), null(), int(3), text("ann"), int(4), int(1), null(), int(1), text("bob")],
-            vec![int(2), int(1), int(4), text("ann"), int(4), int(1), int(2), int(2), text("cy")],
-            vec![int(3), int(2), int(-1), text("ann"), int(4), int(2), int(2), int(2), text("dee")],
-            vec![int(4), int(3), int(-1), text("ann"), int(4), int(3), int(2), int(1), null()],
+            vec![
+                int(1),
+                null(),
+                int(3),
+                text("ann"),
+                int(4),
+                int(1),
+                null(),
+                int(1),
+                text("bob")
+            ],
+            vec![
+                int(2),
+                int(1),
+                int(4),
+                text("ann"),
+                int(4),
+                int(1),
+                int(2),
+                int(2),
+                text("cy")
+            ],
+            vec![
+                int(3),
+                int(2),
+                int(-1),
+                text("ann"),
+                int(4),
+                int(2),
+                int(2),
+                int(2),
+                text("dee")
+            ],
+            vec![
+                int(4),
+                int(3),
+                int(-1),
+                text("ann"),
+                int(4),
+                int(3),
+                int(2),
+                int(1),
+                null()
+            ],
         ]
     );
     let sql = "SELECT id, PERCENT_RANK() OVER (ORDER BY id), CUME_DIST() OVER (ORDER BY city), \
@@ -7131,21 +7344,54 @@ fn window_functions_compute_values_over_the_rows_of_each_window() {
     assert_eq!(rows[0], vec![int(4), text("dee"), null()]);
     let sql = "SELECT DISTINCT city, COUNT(*) OVER (PARTITION BY city) FROM users ORDER BY city";
     assert_eq!(every_way(&mut db, sql, true).len(), 3);
-    let plan = explain(&mut db, "SELECT ROW_NUMBER() OVER (ORDER BY name), RANK() OVER (ORDER BY name), COUNT(*) OVER () FROM users");
+    let plan = explain(
+        &mut db,
+        "SELECT ROW_NUMBER() OVER (ORDER BY name), RANK() OVER (ORDER BY name), COUNT(*) OVER () FROM users",
+    );
     assert_eq!(plan.matches("WINDOW").count(), 2, "{plan}");
     for (sql, problem) in [
         ("SELECT ROW_NUMBER() FROM users", "needs an OVER clause"),
-        ("SELECT * FROM users WHERE ROW_NUMBER() OVER () > 1", "not allowed in WHERE"),
-        ("SELECT COUNT(*) FROM users GROUP BY ROW_NUMBER() OVER ()", "not allowed in GROUP BY"),
-        ("SELECT SUM(ROW_NUMBER() OVER ()) FROM users", "cannot use window functions"),
-        ("SELECT ROW_NUMBER() OVER (ORDER BY ROW_NUMBER() OVER ()) FROM users", "cannot be nested"),
-        ("SELECT SUM(id) OVER (ORDER BY name RANGE 1 PRECEDING) FROM users", "cannot apply Sub"),
-        ("SELECT SUM(id) OVER (ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM users", "before it"),
+        (
+            "SELECT * FROM users WHERE ROW_NUMBER() OVER () > 1",
+            "not allowed in WHERE",
+        ),
+        (
+            "SELECT COUNT(*) FROM users GROUP BY ROW_NUMBER() OVER ()",
+            "not allowed in GROUP BY",
+        ),
+        (
+            "SELECT SUM(ROW_NUMBER() OVER ()) FROM users",
+            "cannot use window functions",
+        ),
+        (
+            "SELECT ROW_NUMBER() OVER (ORDER BY ROW_NUMBER() OVER ()) FROM users",
+            "cannot be nested",
+        ),
+        (
+            "SELECT SUM(id) OVER (ORDER BY name RANGE 1 PRECEDING) FROM users",
+            "cannot apply Sub",
+        ),
+        (
+            "SELECT SUM(id) OVER (ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM users",
+            "before it",
+        ),
         ("SELECT NTILE(0) OVER () FROM users", "positive INT"),
-        ("SELECT COUNT(DISTINCT id) OVER () FROM users", "DISTINCT is not supported"),
-        ("SELECT UPPER(name) OVER () FROM users", "not a window function"),
-        ("SELECT name, RANK() OVER (ORDER BY id) FROM users GROUP BY name", "must appear in GROUP BY"),
-        ("UPDATE users SET id = ROW_NUMBER() OVER ()", "not allowed here"),
+        (
+            "SELECT COUNT(DISTINCT id) OVER () FROM users",
+            "DISTINCT is not supported",
+        ),
+        (
+            "SELECT UPPER(name) OVER () FROM users",
+            "not a window function",
+        ),
+        (
+            "SELECT name, RANK() OVER (ORDER BY id) FROM users GROUP BY name",
+            "must appear in GROUP BY",
+        ),
+        (
+            "UPDATE users SET id = ROW_NUMBER() OVER ()",
+            "not allowed here",
+        ),
     ] {
         let e = db.execute(sql).expect_err(sql);
         assert!(e.0.contains(problem), "{sql}: {e}");
@@ -7155,18 +7401,32 @@ fn window_functions_compute_values_over_the_rows_of_each_window() {
 #[test]
 fn window_functions_partition_many_rows_within_a_small_sort_budget() {
     let mut db = in_memory();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, g INT, v INT)").unwrap();
-    let rows: Vec<String> = (0..3000).map(|i| format!("({i}, {}, {})", i % 7, (i * 37) % 101)).collect();
-    db.execute(&format!("INSERT INTO t VALUES {}", rows.join(", "))).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, g INT, v INT)")
+        .unwrap();
+    let rows: Vec<String> = (0..3000)
+        .map(|i| format!("({i}, {}, {})", i % 7, (i * 37) % 101))
+        .collect();
+    db.execute(&format!("INSERT INTO t VALUES {}", rows.join(", ")))
+        .unwrap();
     let sql = "SELECT g, id, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v, id), SUM(v) OVER (PARTITION BY g ORDER BY v, id) FROM t";
     let rows = every_way(&mut db, sql, false);
     assert_eq!(rows.len(), 3000);
     // The last of each partition numbers its rows and sums them all.
     for g in 0..7 {
         let members: Vec<&Vec<Value>> = rows.iter().filter(|r| r[0] == int(g)).collect();
-        let last = members.iter().map(|r| match r[2] { Value::Int(n) => n, _ => 0 }).max().unwrap();
+        let last = members
+            .iter()
+            .map(|r| match r[2] {
+                Value::Int(n) => n,
+                _ => 0,
+            })
+            .max()
+            .unwrap();
         assert_eq!(last as usize, members.len());
-        let total: i64 = (0..3000i64).filter(|i| i % 7 == g).map(|i| (i * 37) % 101).sum();
+        let total: i64 = (0..3000i64)
+            .filter(|i| i % 7 == g)
+            .map(|i| (i * 37) % 101)
+            .sum();
         assert!(members.iter().any(|r| r[3] == int(total)), "group {g}");
     }
 }
@@ -7206,15 +7466,24 @@ fn quoted_names_may_be_keywords_and_survive_reopening() {
     }
     let mut db = open(&file.0).unwrap();
     assert_eq!(
-        query(&mut db, r#"SELECT o."select", "it""s" FROM "order" o WHERE "Mixed Case" = 'b'"#),
+        query(
+            &mut db,
+            r#"SELECT o."select", "it""s" FROM "order" o WHERE "Mixed Case" = 'b'"#
+        ),
         vec![vec![int(2), int(20)]]
     );
     // A quoted name is never a keyword, nor a word that means something where it stands.
     assert_eq!(
-        one(&mut db, r#"SELECT "returning" FROM (SELECT 1 AS "returning") "window""#),
+        one(
+            &mut db,
+            r#"SELECT "returning" FROM (SELECT 1 AS "returning") "window""#
+        ),
         int(1)
     );
-    let plan = explain(&mut db, r#"SELECT "it""s" FROM "order" WHERE "Mixed Case" = 'a'"#);
+    let plan = explain(
+        &mut db,
+        r#"SELECT "it""s" FROM "order" WHERE "Mixed Case" = 'a'"#,
+    );
     assert!(plan.contains("COVERING INDEX by case"), "{plan}");
     for (sql, problem) in [
         (r#"SELECT "" FROM "order""#, "cannot be empty"),
@@ -7231,7 +7500,10 @@ fn quoted_names_may_be_keywords_and_survive_reopening() {
 fn remainders_have_the_sign_of_the_dividend() {
     let mut db = in_memory();
     assert_eq!(
-        query(&mut db, "SELECT 7 % 3, -7 % 3, 7 % -3, MOD(10, 4), 6 * 5 % 4, DECIMAL '7.5' % 2"),
+        query(
+            &mut db,
+            "SELECT 7 % 3, -7 % 3, 7 % -3, MOD(10, 4), 6 * 5 % 4, DECIMAL '7.5' % 2"
+        ),
         vec![vec![
             int(1),
             int(-1),
@@ -7242,7 +7514,10 @@ fn remainders_have_the_sign_of_the_dividend() {
         ]]
     );
     assert!(one(&mut db, "SELECT NULL % 2").is_null());
-    for (sql, problem) in [("SELECT 1 % 0", "division by zero"), ("SELECT 1.5 % 1", "% takes INTs or DECIMALs")] {
+    for (sql, problem) in [
+        ("SELECT 1 % 0", "division by zero"),
+        ("SELECT 1.5 % 1", "% takes INTs or DECIMALs"),
+    ] {
         let e = db.execute(sql).expect_err(sql);
         assert!(e.0.contains(problem), "{sql}: {e}");
     }
@@ -7257,7 +7532,10 @@ fn using_and_natural_joins_merge_their_columns() {
     )
     .unwrap();
     // SELECT * has the merged column once, first, then the rest of each side.
-    let result = db.execute("SELECT * FROM users JOIN visits USING (city)").unwrap().pop();
+    let result = db
+        .execute("SELECT * FROM users JOIN visits USING (city)")
+        .unwrap()
+        .pop();
     let Some(QueryResult::Rows { columns, rows }) = result else {
         panic!("rows");
     };
@@ -7290,15 +7568,31 @@ fn using_and_natural_joins_merge_their_columns() {
     let sql = "SELECT id, name, user_id FROM users NATURAL JOIN orders ORDER BY id";
     assert_eq!(every_way(&mut db, sql, true).len(), 4);
     // Chained, and in a subquery.
-    let sql = "SELECT city, COUNT(*) FROM users NATURAL LEFT JOIN visits GROUP BY city ORDER BY city";
+    let sql =
+        "SELECT city, COUNT(*) FROM users NATURAL LEFT JOIN visits GROUP BY city ORDER BY city";
     assert_eq!(every_way(&mut db, sql, true).len(), 3);
     let sql = "SELECT name FROM users u WHERE EXISTS (SELECT 1 FROM visits v JOIN users w USING (city) WHERE w.id = u.id AND city = 'oslo') ORDER BY name";
-    assert_eq!(every_way(&mut db, sql, true), vec![vec![text("ann")], vec![text("cy")]]);
+    assert_eq!(
+        every_way(&mut db, sql, true),
+        vec![vec![text("ann")], vec![text("cy")]]
+    );
     for (sql, problem) in [
-        ("SELECT * FROM users JOIN visits USING (nope)", "not on the left"),
-        ("SELECT * FROM users JOIN orders ON TRUE JOIN users x USING (id)", "more than once"),
-        ("SELECT * FROM users JOIN visits USING (city, city)", "named more than once"),
-        ("SELECT * FROM users NATURAL CROSS JOIN visits", "expected JOIN"),
+        (
+            "SELECT * FROM users JOIN visits USING (nope)",
+            "not on the left",
+        ),
+        (
+            "SELECT * FROM users JOIN orders ON TRUE JOIN users x USING (id)",
+            "more than once",
+        ),
+        (
+            "SELECT * FROM users JOIN visits USING (city, city)",
+            "named more than once",
+        ),
+        (
+            "SELECT * FROM users NATURAL CROSS JOIN visits",
+            "expected JOIN",
+        ),
     ] {
         let e = db.execute(sql).expect_err(sql);
         assert!(e.0.contains(problem), "{sql}: {e}");
@@ -7327,7 +7621,13 @@ fn values_are_a_table_and_a_query() {
     );
     let sql = "SELECT u.name, x.k FROM users u, LATERAL (VALUES (u.id), (u.id * 100)) x(k) WHERE u.id < 3 ORDER BY u.name, x.k";
     assert_eq!(every_way(&mut db, sql, true).len(), 4);
-    assert_eq!(one(&mut db, "SELECT COUNT(*) FROM users WHERE id IN (VALUES (1), (3))"), int(2));
+    assert_eq!(
+        one(
+            &mut db,
+            "SELECT COUNT(*) FROM users WHERE id IN (VALUES (1), (3))"
+        ),
+        int(2)
+    );
     db.execute("CREATE TABLE pairs (a INT, b TEXT)").unwrap();
     db.execute("INSERT INTO pairs VALUES (1, 'x')").unwrap();
     db.execute("INSERT INTO pairs SELECT column1 + 1, column2 FROM (VALUES (1, 'y'), (2, 'z')) v")
@@ -7366,11 +7666,22 @@ fn windows_may_be_named_and_framed_by_groups_and_ranges() {
         [int(2), int(1), int(1), int(1)]
     );
     assert_eq!(
-        query(&mut db, "SELECT name FROM users WINDOW w AS (ORDER BY id) ORDER BY ROW_NUMBER() OVER w DESC"),
-        vec![vec![text("dee")], vec![text("cy")], vec![text("bob")], vec![text("ann")]]
+        query(
+            &mut db,
+            "SELECT name FROM users WINDOW w AS (ORDER BY id) ORDER BY ROW_NUMBER() OVER w DESC"
+        ),
+        vec![
+            vec![text("dee")],
+            vec![text("cy")],
+            vec![text("bob")],
+            vec![text("ann")]
+        ]
     );
     let sql = "SELECT id, SUM(id) OVER (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES (1), (1), (2), (3), (3), (4)) t(id)";
-    let sums: Vec<Value> = every_way(&mut db, sql, true).into_iter().map(|r| r[1].clone()).collect();
+    let sums: Vec<Value> = every_way(&mut db, sql, true)
+        .into_iter()
+        .map(|r| r[1].clone())
+        .collect();
     assert_eq!(sums, [int(2), int(2), int(4), int(8), int(8), int(10)]);
     let sql = "SELECT id, SUM(total) OVER (ORDER BY total RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING), \
                COUNT(*) OVER (ORDER BY total DESC RANGE BETWEEN 10.5 PRECEDING AND CURRENT ROW) FROM orders ORDER BY id";
@@ -7385,21 +7696,51 @@ fn windows_may_be_named_and_framed_by_groups_and_ranges() {
     );
     let sql = "SELECT d, COUNT(*) OVER (ORDER BY d RANGE BETWEEN INTERVAL '3 days' PRECEDING AND CURRENT ROW) \
                FROM (VALUES (DATE '2024-01-01'), (DATE '2024-01-03'), (DATE '2024-01-07')) t(d) ORDER BY d";
-    let counts: Vec<Value> = every_way(&mut db, sql, true).into_iter().map(|r| r[1].clone()).collect();
+    let counts: Vec<Value> = every_way(&mut db, sql, true)
+        .into_iter()
+        .map(|r| r[1].clone())
+        .collect();
     assert_eq!(counts, [int(1), int(2), int(1)]);
     // NULL keys are each other's peers, and in no other row's frame.
     let sql = "SELECT x, COUNT(*) OVER (ORDER BY x RANGE 1 PRECEDING) FROM (VALUES (NULL), (1), (2), (NULL), (3)) t(x) ORDER BY x";
-    let counts: Vec<Value> = every_way(&mut db, sql, true).into_iter().map(|r| r[1].clone()).collect();
+    let counts: Vec<Value> = every_way(&mut db, sql, true)
+        .into_iter()
+        .map(|r| r[1].clone())
+        .collect();
     assert_eq!(counts, [int(2), int(2), int(1), int(2), int(2)]);
     for (sql, problem) in [
-        ("SELECT RANK() OVER nope FROM users", "window nope does not exist"),
-        ("SELECT SUM(id) OVER (RANGE 1 PRECEDING) FROM users", "exactly one ORDER BY key"),
-        ("SELECT SUM(id) OVER (GROUPS 1 PRECEDING) FROM users", "needs an ORDER BY"),
-        ("SELECT SUM(id) OVER (ORDER BY id ROWS 1.5 PRECEDING) FROM users", "must be an INT"),
-        ("SELECT SUM(id) OVER (ORDER BY id ROWS -1 PRECEDING) FROM users", "expected an expression"),
-        ("SELECT COUNT(*) OVER (w ORDER BY id) FROM users WINDOW w AS (ORDER BY name)", "which has one"),
-        ("SELECT COUNT(*) OVER (w ORDER BY id) FROM users WINDOW w AS (ROWS 1 PRECEDING)", "which has a frame"),
-        ("SELECT 1 FROM users WINDOW w AS (), w AS ()", "defined more than once"),
+        (
+            "SELECT RANK() OVER nope FROM users",
+            "window nope does not exist",
+        ),
+        (
+            "SELECT SUM(id) OVER (RANGE 1 PRECEDING) FROM users",
+            "exactly one ORDER BY key",
+        ),
+        (
+            "SELECT SUM(id) OVER (GROUPS 1 PRECEDING) FROM users",
+            "needs an ORDER BY",
+        ),
+        (
+            "SELECT SUM(id) OVER (ORDER BY id ROWS 1.5 PRECEDING) FROM users",
+            "must be an INT",
+        ),
+        (
+            "SELECT SUM(id) OVER (ORDER BY id ROWS -1 PRECEDING) FROM users",
+            "expected an expression",
+        ),
+        (
+            "SELECT COUNT(*) OVER (w ORDER BY id) FROM users WINDOW w AS (ORDER BY name)",
+            "which has one",
+        ),
+        (
+            "SELECT COUNT(*) OVER (w ORDER BY id) FROM users WINDOW w AS (ROWS 1 PRECEDING)",
+            "which has a frame",
+        ),
+        (
+            "SELECT 1 FROM users WINDOW w AS (), w AS ()",
+            "defined more than once",
+        ),
     ] {
         let e = db.execute(sql).expect_err(sql);
         assert!(e.0.contains(problem), "{sql}: {e}");
@@ -7410,7 +7751,10 @@ fn windows_may_be_named_and_framed_by_groups_and_ranges() {
 fn intervals_measure_and_move_times() {
     let mut db = in_memory();
     for (sql, expected) in [
-        ("SELECT INTERVAL '1 year 2 months 3 days 04:05:06.5'", "1 year 2 mons 3 days 04:05:06.5"),
+        (
+            "SELECT INTERVAL '1 year 2 months 3 days 04:05:06.5'",
+            "1 year 2 mons 3 days 04:05:06.5",
+        ),
         ("SELECT INTERVAL '3' DAY", "3 days"),
         ("SELECT INTERVAL '90 minutes'", "01:30:00"),
         ("SELECT INTERVAL '-2 weeks'", "-14 days"),
@@ -7419,11 +7763,23 @@ fn intervals_measure_and_move_times() {
         ("SELECT INTERVAL '1.5 hours' * 2", "03:00:00"),
         ("SELECT INTERVAL '1 day' / 4", "06:00:00"),
         ("SELECT -INTERVAL '1 mon'", "-1 mon"),
-        ("SELECT INTERVAL '1 mon' + INTERVAL '30 days'", "1 mon 30 days"),
-        ("SELECT TIMESTAMP '2024-01-31 12:00' + INTERVAL '1 month'", "2024-02-29 12:00:00"),
-        ("SELECT DATE '2024-02-29' + INTERVAL '1 year'", "2025-02-28 00:00:00"),
+        (
+            "SELECT INTERVAL '1 mon' + INTERVAL '30 days'",
+            "1 mon 30 days",
+        ),
+        (
+            "SELECT TIMESTAMP '2024-01-31 12:00' + INTERVAL '1 month'",
+            "2024-02-29 12:00:00",
+        ),
+        (
+            "SELECT DATE '2024-02-29' + INTERVAL '1 year'",
+            "2025-02-28 00:00:00",
+        ),
         ("SELECT TIME '23:00' + INTERVAL '2 hours'", "01:00:00"),
-        ("SELECT TIMESTAMP '2024-03-01' - TIMESTAMP '2024-02-27 22:00'", "2 days 02:00:00"),
+        (
+            "SELECT TIMESTAMP '2024-03-01' - TIMESTAMP '2024-02-27 22:00'",
+            "2 days 02:00:00",
+        ),
         ("SELECT TIME '10:00' - TIME '08:30'", "01:30:00"),
         ("SELECT CAST('2 days 01:00' AS INTERVAL)", "2 days 01:00:00"),
         ("SELECT CAST(INTERVAL '25 hours' AS TEXT)", "25:00:00"),
@@ -7431,8 +7787,14 @@ fn intervals_measure_and_move_times() {
     ] {
         assert_eq!(shown_one(&mut db, sql), expected, "{sql}");
     }
-    assert_eq!(one(&mut db, "SELECT EXTRACT(EPOCH FROM INTERVAL '1 day')"), real_value(86400.0));
-    assert_eq!(one(&mut db, "SELECT EXTRACT(HOUR FROM INTERVAL '30 hours')"), int(30));
+    assert_eq!(
+        one(&mut db, "SELECT EXTRACT(EPOCH FROM INTERVAL '1 day')"),
+        real_value(86400.0)
+    );
+    assert_eq!(
+        one(&mut db, "SELECT EXTRACT(HOUR FROM INTERVAL '30 hours')"),
+        int(30)
+    );
     // Ordered by length, but equal only part by part.
     db.execute(
         "CREATE TABLE spans (id INT PRIMARY KEY, span INTERVAL);
@@ -7445,8 +7807,20 @@ fn intervals_measure_and_move_times() {
         .map(|mut r| r.remove(0))
         .collect();
     assert_eq!(ids, [int(4), int(3), int(2), int(1)]);
-    assert_eq!(one(&mut db, "SELECT id FROM spans WHERE span = INTERVAL '30 days'"), int(2));
-    assert_eq!(one(&mut db, "SELECT COUNT(*) FROM spans WHERE span > INTERVAL '29 days 23:00'"), int(2));
+    assert_eq!(
+        one(
+            &mut db,
+            "SELECT id FROM spans WHERE span = INTERVAL '30 days'"
+        ),
+        int(2)
+    );
+    assert_eq!(
+        one(
+            &mut db,
+            "SELECT COUNT(*) FROM spans WHERE span > INTERVAL '29 days 23:00'"
+        ),
+        int(2)
+    );
     let e = db.execute("SELECT INTERVAL 'nonsense'").unwrap_err();
     assert!(e.0.contains("invalid INTERVAL"), "{e}");
 }
@@ -7479,20 +7853,43 @@ fn timestamps_with_time_zones_are_instants_in_utc() {
         "2024-07-02 23:30:00+00"
     );
     assert_eq!(
-        one(&mut db, "SELECT COUNT(*) FROM events WHERE at > TIMESTAMPTZ '2024-01-01 10:00+02'"),
+        one(
+            &mut db,
+            "SELECT COUNT(*) FROM events WHERE at > TIMESTAMPTZ '2024-01-01 10:00+02'"
+        ),
         int(1)
     );
     for (sql, expected) in [
-        ("SELECT TIMESTAMPTZ '2024-01-01 10:00:00+02' AT TIME ZONE '+05:30'", "2024-01-01 13:30:00"),
-        ("SELECT TIMESTAMP '2024-01-01 10:00' AT TIME ZONE '-03'", "2024-01-01 13:00:00+00"),
-        ("SELECT TIMESTAMP '2024-01-01 10:00' AT TIME ZONE INTERVAL '2 hours'", "2024-01-01 08:00:00+00"),
-        ("SELECT TIMESTAMPTZ '2024-01-01 00:00 UTC' AT TIME ZONE 'UTC'", "2024-01-01 00:00:00"),
-        ("SELECT CAST(TIMESTAMPTZ '2024-01-01 00:00+01' AS TIMESTAMP)", "2023-12-31 23:00:00"),
-        ("SELECT DATE_TRUNC('hour', TIMESTAMPTZ '2024-05-17 13:14:15+00')", "2024-05-17 13:00:00+00"),
+        (
+            "SELECT TIMESTAMPTZ '2024-01-01 10:00:00+02' AT TIME ZONE '+05:30'",
+            "2024-01-01 13:30:00",
+        ),
+        (
+            "SELECT TIMESTAMP '2024-01-01 10:00' AT TIME ZONE '-03'",
+            "2024-01-01 13:00:00+00",
+        ),
+        (
+            "SELECT TIMESTAMP '2024-01-01 10:00' AT TIME ZONE INTERVAL '2 hours'",
+            "2024-01-01 08:00:00+00",
+        ),
+        (
+            "SELECT TIMESTAMPTZ '2024-01-01 00:00 UTC' AT TIME ZONE 'UTC'",
+            "2024-01-01 00:00:00",
+        ),
+        (
+            "SELECT CAST(TIMESTAMPTZ '2024-01-01 00:00+01' AS TIMESTAMP)",
+            "2023-12-31 23:00:00",
+        ),
+        (
+            "SELECT DATE_TRUNC('hour', TIMESTAMPTZ '2024-05-17 13:14:15+00')",
+            "2024-05-17 13:00:00+00",
+        ),
     ] {
         assert_eq!(shown_one(&mut db, sql), expected, "{sql}");
     }
-    let e = db.execute("SELECT NOW() AT TIME ZONE 'Europe/Oslo'").unwrap_err();
+    let e = db
+        .execute("SELECT NOW() AT TIME ZONE 'Europe/Oslo'")
+        .unwrap_err();
     assert!(e.0.contains("unknown time zone"), "{e}");
 }
 
@@ -7501,7 +7898,8 @@ fn the_current_time_is_the_same_throughout_a_statement() {
     let mut db = in_memory();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
     let rows: Vec<String> = (0..3000).map(|i| format!("({i})")).collect();
-    db.execute(&format!("INSERT INTO t VALUES {}", rows.join(", "))).unwrap();
+    db.execute(&format!("INSERT INTO t VALUES {}", rows.join(", ")))
+        .unwrap();
     for sql in [
         "SELECT COUNT(DISTINCT NOW()) FROM t",
         "SELECT COUNT(DISTINCT LOCALTIMESTAMP) FROM t",
@@ -7514,9 +7912,15 @@ fn the_current_time_is_the_same_throughout_a_statement() {
             &mut db,
             "SELECT CURRENT_DATE = CAST(NOW() AS DATE), NOW() = CURRENT_TIMESTAMP, LOCALTIMESTAMP = CAST(NOW() AS TIMESTAMP)"
         ),
-        vec![vec![Value::Bool(true), Value::Bool(true), Value::Bool(true)]]
+        vec![vec![
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true)
+        ]]
     );
-    let e = db.execute("CREATE INDEX t_now ON t ((id + EXTRACT(DAY FROM CURRENT_DATE)))").unwrap_err();
+    let e = db
+        .execute("CREATE INDEX t_now ON t ((id + EXTRACT(DAY FROM CURRENT_DATE)))")
+        .unwrap_err();
     assert!(e.0.contains("current time"), "{e}");
 }
 
@@ -7535,10 +7939,16 @@ fn text_and_math_functions() {
         ("SELECT INSTR('héllo', 'll')", int(3)),
         ("SELECT POSITION('z' IN 'hello')", int(0)),
         ("SELECT LEFT('hello', 2) || RIGHT('hello', 2)", text("helo")),
-        ("SELECT LEFT('hello', -2) || RIGHT('hello', -4)", text("helo")),
+        (
+            "SELECT LEFT('hello', -2) || RIGHT('hello', -4)",
+            text("helo"),
+        ),
         ("SELECT REVERSE('abc')", text("cba")),
         ("SELECT REPEAT('ab', 3)", text("ababab")),
-        ("SELECT LPAD('7', 3, '0') || RPAD('ab', 5, 'xy')", text("007abxyx")),
+        (
+            "SELECT LPAD('7', 3, '0') || RPAD('ab', 5, 'xy')",
+            text("007abxyx"),
+        ),
         ("SELECT LPAD('hello', 2)", text("he")),
         ("SELECT CONCAT('a', NULL, 1, TRUE)", text("a1true")),
         ("SELECT CHAR_LENGTH('héllo')", int(5)),
@@ -7546,7 +7956,10 @@ fn text_and_math_functions() {
         ("SELECT FLOOR(-1.2)", real_value(-2.0)),
         ("SELECT CEILING(7)", int(7)),
         ("SELECT TRUNC(-1.99)", real_value(-1.0)),
-        ("SELECT CAST(TRUNC(DECIMAL '3.14159', 2) AS TEXT)", text("3.14")),
+        (
+            "SELECT CAST(TRUNC(DECIMAL '3.14159', 2) AS TEXT)",
+            text("3.14"),
+        ),
         ("SELECT CAST(FLOOR(DECIMAL '-1.5') AS TEXT)", text("-2")),
         ("SELECT SIGN(-5)", int(-1)),
         ("SELECT SQRT(16)", real_value(4.0)),
@@ -7567,7 +7980,10 @@ fn text_and_math_functions() {
         ("SELECT REPEAT('x', 1000000000)", "too long"),
         ("SELECT GREATEST(1, 'a')", "cannot compare"),
         ("SELECT LEFT(1, 2)", "expects TEXT"),
-        ("SELECT DATE_TRUNC('fortnight', TIMESTAMP '2024-01-01')", "unknown unit"),
+        (
+            "SELECT DATE_TRUNC('fortnight', TIMESTAMP '2024-01-01')",
+            "unknown unit",
+        ),
     ] {
         let e = db.execute(sql).expect_err(sql);
         assert!(e.0.contains(problem), "{sql}: {e}");

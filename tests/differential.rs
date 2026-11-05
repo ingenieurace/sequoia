@@ -639,8 +639,11 @@ impl Gen {
                     4 => format!(" FULL JOIN {name} {alias} ON {}", condition(self)),
                     5 if !common.is_empty() => {
                         using = true;
-                        let mut named: Vec<String> =
-                            common.iter().filter(|_| self.rng.chance(60)).cloned().collect();
+                        let mut named: Vec<String> = common
+                            .iter()
+                            .filter(|_| self.rng.chance(60))
+                            .cloned()
+                            .collect();
                         if named.is_empty() {
                             named.push(common[0].clone());
                         }
@@ -898,11 +901,14 @@ impl Gen {
                 let aggregate = !function.ends_with("()");
                 let ints = rows.cols.iter().any(|(_, ty)| *ty == Type::Int);
                 let frame = match self.rng.below(10) {
-                    0 | 1 => Some("ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING".into()),
+                    0 | 1 => {
+                        Some("ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING".into())
+                    }
                     2 if aggregate && !keys.is_empty() => Some(format!(
                         "GROUPS BETWEEN {} PRECEDING AND {}",
                         self.rng.range(0, 2),
-                        self.rng.pick(&["CURRENT ROW", "1 FOLLOWING", "UNBOUNDED FOLLOWING"])
+                        self.rng
+                            .pick(&["CURRENT ROW", "1 FOLLOWING", "UNBOUNDED FOLLOWING"])
                     )),
                     3 if aggregate && ints => {
                         // RANGE with offsets orders by one number.
@@ -1074,7 +1080,9 @@ impl Gen {
     /// columns renamed x0, x1... by a query of them, as SQLite names no
     /// columns of a derived table.
     fn values(&mut self) -> (String, Vec<(String, Type)>) {
-        let types: Vec<Type> = (0..1 + self.rng.below(3)).map(|_| *self.rng.pick(&TYPES)).collect();
+        let types: Vec<Type> = (0..1 + self.rng.below(3))
+            .map(|_| *self.rng.pick(&TYPES))
+            .collect();
         let rows: Vec<String> = (0..1 + self.rng.below(4))
             .map(|_| {
                 let values: Vec<String> = types.iter().map(|ty| self.literal(*ty)).collect();
@@ -1090,7 +1098,11 @@ impl Gen {
             .map(|i| format!("column{} AS x{i}", i + 1))
             .collect();
         (
-            format!("(SELECT {} FROM (VALUES {}) v)", list.join(", "), rows.join(", ")),
+            format!(
+                "(SELECT {} FROM (VALUES {}) v)",
+                list.join(", "),
+                rows.join(", ")
+            ),
             names,
         )
     }
@@ -1238,7 +1250,10 @@ impl Gen {
             })
             .collect();
         let filter = self.where_clause(&s, 30);
-        stmt(format!("SELECT {}{filter}", items.join(", ")), Kind::Unordered)
+        stmt(
+            format!("SELECT {}{filter}", items.join(", ")),
+            Kind::Unordered,
+        )
     }
 
     /// A recursive query: a count, a walk that comes back to where it was
@@ -1247,7 +1262,11 @@ impl Gen {
         let t = self.rng.below(self.tables.len());
         let table = self.tables[t].name.clone();
         let (c, _) = self.rng.pick(&self.tables[t].columns).clone();
-        let union = if self.rng.chance(50) { "UNION" } else { "UNION ALL" };
+        let union = if self.rng.chance(50) {
+            "UNION"
+        } else {
+            "UNION ALL"
+        };
         let sql = match self.rng.below(3) {
             0 => format!(
                 "WITH RECURSIVE r(n) AS (SELECT {} {union} SELECT n + {} FROM r WHERE n < {}) \
@@ -1257,7 +1276,11 @@ impl Gen {
                 self.rng.range(0, 40),
             ),
             1 => {
-                let (a, b, m) = (self.rng.range(1, 4), self.rng.range(0, 5), self.rng.range(2, 9));
+                let (a, b, m) = (
+                    self.rng.range(1, 4),
+                    self.rng.range(0, 5),
+                    self.rng.range(2, 9),
+                );
                 let next = format!("(n * {a} + {b})");
                 format!(
                     "WITH RECURSIVE r(n) AS (SELECT {} UNION SELECT {next} - ({next} / {m}) * {m} FROM r) SELECT n FROM r",
@@ -2005,4 +2028,3 @@ fn keys_sqlite_folds_to_constants_are_found() {
         assert!(!folds_is_null(kept), "{kept}");
     }
 }
-

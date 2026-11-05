@@ -951,7 +951,11 @@ impl std::fmt::Display for Window {
         let name = self.function.name().to_uppercase();
         match (self.function, self.args.is_empty()) {
             (WindowFunction::Aggregate(Aggregate::Count), true) => write!(f, "{name}(*)")?,
-            _ => write!(f, "{name}({})", list(&mut self.args.iter().map(Expr::to_string)))?,
+            _ => write!(
+                f,
+                "{name}({})",
+                list(&mut self.args.iter().map(Expr::to_string))
+            )?,
         }
         let mut parts = Vec::new();
         if !self.partition_by.is_empty() {
@@ -971,10 +975,7 @@ impl std::fmt::Display for Window {
                 FrameUnits::Range => "RANGE",
                 FrameUnits::Groups => "GROUPS",
             };
-            parts.push(format!(
-                "{units} BETWEEN {} AND {}",
-                frame.start, frame.end
-            ));
+            parts.push(format!("{units} BETWEEN {} AND {}", frame.start, frame.end));
         }
         write!(f, " OVER ({})", parts.join(" "))
     }
@@ -1230,7 +1231,10 @@ impl Function {
     pub fn reads_clock(self) -> bool {
         matches!(
             self,
-            Function::Now | Function::CurrentDate | Function::CurrentTime | Function::LocalTimestamp
+            Function::Now
+                | Function::CurrentDate
+                | Function::CurrentTime
+                | Function::LocalTimestamp
         )
     }
 }
@@ -1399,10 +1403,10 @@ impl Expr {
             Expr::Unary(_, inner) | Expr::IsNull(inner, _) => inner.has_window(),
             Expr::Aggregate(_, arg, _) => arg.as_deref().is_some_and(Expr::has_window),
             Expr::Binary(left, _, right) => left.has_window() || right.has_window(),
-            Expr::InList(left, items, _) => {
-                left.has_window() || items.iter().any(Expr::has_window)
+            Expr::InList(left, items, _) => left.has_window() || items.iter().any(Expr::has_window),
+            Expr::Case { .. } | Expr::Function(..) => {
+                self.parts().into_iter().any(Expr::has_window)
             }
-            Expr::Case { .. } | Expr::Function(..) => self.parts().into_iter().any(Expr::has_window),
         }
     }
 
@@ -1570,7 +1574,12 @@ impl std::fmt::Display for Expr {
                 write!(f, "EXTRACT({} FROM {})", field.name(), args[0])
             }
             Expr::Function(Function::AtTimeZone, args) => {
-                write!(f, "({} AT TIME ZONE {})", operand(&args[0]), operand(&args[1]))
+                write!(
+                    f,
+                    "({} AT TIME ZONE {})",
+                    operand(&args[0]),
+                    operand(&args[1])
+                )
             }
             Expr::Function(
                 function @ (Function::Now

@@ -297,7 +297,12 @@ fn open_node<'a>(
             let anchor = rows_of(open(*anchor, below(step, 0)));
             let settings = settings.clone();
             let open_round = move || {
-                rows_of(open_step((*round).clone(), catalog, &settings, round_step.clone()))
+                rows_of(open_step(
+                    (*round).clone(),
+                    catalog,
+                    &settings,
+                    round_step.clone(),
+                ))
             };
             batches_of(operator::recursive(anchor, open_round, all, cell), width)
         }

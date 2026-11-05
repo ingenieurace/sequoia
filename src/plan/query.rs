@@ -179,8 +179,8 @@ use crate::plan::selectivity::{self, EQUAL_KEEPS, OTHER_KEEPS, Scope, table_rows
 use crate::plan::{access, filter, order};
 use crate::predicate::{Compare, Predicate};
 use crate::sql::ast::{
-    Aggregate, BinaryOp, ColumnRef, Expr, From, JoinKind, OrderBy, Projection, Select, SelectItem,
-    FrameBound, FrameUnits, SetOp, TableRef, TableSource, Window as WindowCall, WorkCell,
+    Aggregate, BinaryOp, ColumnRef, Expr, FrameBound, FrameUnits, From, JoinKind, OrderBy,
+    Projection, Select, SelectItem, SetOp, TableRef, TableSource, Window as WindowCall, WorkCell,
     derived_name,
 };
 use crate::sql::eval::{Field, resolve};
@@ -577,7 +577,10 @@ fn renamed(mut names: Vec<String>, columns: &[String], table: &str) -> Result<Ve
 fn with_work_table(step: &Select, names: &[String], cell: Option<&WorkCell>) -> Select {
     let mut step = step.clone();
     for table in step.from.tables_mut() {
-        if let TableSource::WorkTable { columns, cell: c, .. } = &mut table.source {
+        if let TableSource::WorkTable {
+            columns, cell: c, ..
+        } = &mut table.source
+        {
             *columns = names.to_vec();
             if let Some(cell) = cell {
                 *c = Some(cell.clone());
@@ -629,7 +632,10 @@ fn sources<'a>(catalog: &'a Catalog, from: &From, choices: Choices) -> Result<Ve
             }
             TableSource::Values(rows) => {
                 let names = values_names(rows);
-                (SourceKind::Derived(Some(values(catalog, rows, &names)?)), names)
+                (
+                    SourceKind::Derived(Some(values(catalog, rows, &names)?)),
+                    names,
+                )
             }
             TableSource::Recursive(cte) => {
                 let anchor = select(catalog, cte.anchor.clone(), choices)?;
@@ -696,7 +702,11 @@ fn values<'a>(catalog: &'a Catalog, rows: &[Vec<Expr>], names: &[String]) -> Res
     for row in rows {
         forbid(row, "VALUES")?;
         forbid_windows(row, "VALUES")?;
-        bound.push(row.iter().map(|e| binder.bind(e)).collect::<Result<Vec<_>>>()?);
+        bound.push(
+            row.iter()
+                .map(|e| binder.bind(e))
+                .collect::<Result<Vec<_>>>()?,
+        );
     }
     let constants: Option<Vec<Row>> = bound
         .iter()
@@ -737,7 +747,11 @@ fn values<'a>(catalog: &'a Catalog, rows: &[Vec<Expr>], names: &[String]) -> Res
 fn using_joins(
     from: &From,
     sources: &[Source],
-) -> Result<(Vec<Option<Expr>>, Vec<(String, Expr)>, Option<Vec<SelectItem>>)> {
+) -> Result<(
+    Vec<Option<Expr>>,
+    Vec<(String, Expr)>,
+    Option<Vec<SelectItem>>,
+)> {
     let column = |s: &Source, name: &str| {
         Expr::Column(ColumnRef {
             table: Some(s.qualifier.clone()),
@@ -779,16 +793,38 @@ fn using_joins(
         any = true;
         let (mut parts, mut merges) = (Vec::new(), Vec::new());
         for name in &names {
-            let lefts: Vec<&Expr> = star.iter().filter(|(n, _)| n == name).map(|(_, e)| e).collect();
+            let lefts: Vec<&Expr> = star
+                .iter()
+                .filter(|(n, _)| n == name)
+                .map(|(_, e)| e)
+                .collect();
             let left = match lefts.as_slice() {
                 [left] => (*left).clone(),
-                [] => return err(format!("column {name} of USING is not on the left of its join")),
-                _ => return err(format!("column {name} of USING is on the left of its join more than once")),
+                [] => {
+                    return err(format!(
+                        "column {name} of USING is not on the left of its join"
+                    ));
+                }
+                _ => {
+                    return err(format!(
+                        "column {name} of USING is on the left of its join more than once"
+                    ));
+                }
             };
             match right.names.iter().filter(|n| *n == name).count() {
                 1 => {}
-                0 => return err(format!("column {name} of USING is not in {}", right.qualifier)),
-                _ => return err(format!("column {name} of USING is in {} more than once", right.qualifier)),
+                0 => {
+                    return err(format!(
+                        "column {name} of USING is not in {}",
+                        right.qualifier
+                    ));
+                }
+                _ => {
+                    return err(format!(
+                        "column {name} of USING is in {} more than once",
+                        right.qualifier
+                    ));
+                }
             }
             let right_column = column(right, name);
             parts.push(Expr::Binary(
@@ -811,7 +847,11 @@ fn using_joins(
             .iter()
             .cloned()
             .chain(star.into_iter().filter(|(n, _)| !names.contains(n)))
-            .chain(right_columns.into_iter().filter(|(n, _)| !names.contains(n)))
+            .chain(
+                right_columns
+                    .into_iter()
+                    .filter(|(n, _)| !names.contains(n)),
+            )
             .collect();
         merged.retain(|(n, _)| !names.contains(n));
         merged.extend(merges);
@@ -1484,12 +1524,15 @@ fn windows<'a>(
         .collect::<Result<Vec<_>>>()?;
     for call in &calls {
         let frame = call.frame();
-        let offset = |b: &FrameBound| matches!(b, FrameBound::Preceding(_) | FrameBound::Following(_));
+        let offset =
+            |b: &FrameBound| matches!(b, FrameBound::Preceding(_) | FrameBound::Following(_));
         if frame.units == FrameUnits::Range
             && (offset(&frame.start) || offset(&frame.end))
             && call.order_by.len() != 1
         {
-            return err(format!("{call}: a RANGE frame with an offset needs exactly one ORDER BY key"));
+            return err(format!(
+                "{call}: a RANGE frame with an offset needs exactly one ORDER BY key"
+            ));
         }
         if frame.units == FrameUnits::Groups && call.order_by.is_empty() {
             return err(format!("{call}: a GROUPS frame needs an ORDER BY"));
@@ -1515,10 +1558,7 @@ fn windows<'a>(
 
 /// The expression with each window function in it replaced by `f`'s
 /// result, but those of its subqueries, which are theirs.
-fn replace_windows(
-    expr: &Expr,
-    f: &mut dyn FnMut(&WindowCall) -> Result<Expr>,
-) -> Result<Expr> {
+fn replace_windows(expr: &Expr, f: &mut dyn FnMut(&WindowCall) -> Result<Expr>) -> Result<Expr> {
     expr.replace(&mut |e| match e {
         Expr::Window(window) => Some(f(window)),
         Expr::Subquery(_) | Expr::Exists(_) => Some(Ok(e.clone())),
@@ -1536,17 +1576,18 @@ fn replace_windows(
 /// that keeps or drops the rows the query on its right has. With an ORDER
 /// BY, LIMIT or OFFSET, they are planned as a subquery in FROM of a query
 /// that has them, so that ORDER BY names its columns as it would a table's.
-fn set_operations<'a>(catalog: &'a Catalog, mut query: Select, choices: Choices) -> Result<Plan<'a>> {
+fn set_operations<'a>(
+    catalog: &'a Catalog,
+    mut query: Select,
+    choices: Choices,
+) -> Result<Plan<'a>> {
     if !query.order_by.is_empty() || query.limit.is_some() || query.offset.is_some() {
         let (order_by, limit, offset) = (
             std::mem::take(&mut query.order_by),
             query.limit.take(),
             query.offset.take(),
         );
-        let table = TableRef::of(
-            TableSource::Subquery(Box::new(query)),
-            Some("union".into()),
-        );
+        let table = TableRef::of(TableSource::Subquery(Box::new(query)), Some("union".into()));
         let projection = Projection::All;
         let (filter, group_by, having, compound) = (None, Vec::new(), None, Vec::new());
         let from = From {
@@ -2814,7 +2855,10 @@ impl Node<'_> {
     /// The steps this one reads from, in the order EXPLAIN lists them.
     pub fn inputs(&self) -> Vec<&Self> {
         match self {
-            Node::Scan { .. } | Node::Lookup { .. } | Node::Values { .. } | Node::WorkTable { .. } => {
+            Node::Scan { .. }
+            | Node::Lookup { .. }
+            | Node::Values { .. }
+            | Node::WorkTable { .. } => {
                 vec![]
             }
             Node::Join { left, right, .. } | Node::SetOp { left, right, .. } => vec![left, right],
@@ -2983,7 +3027,10 @@ impl Node<'_> {
                 format!("{}{}", op.name(), if *all { " ALL" } else { "" })
             }
             Node::Window { functions, .. } => {
-                format!("WINDOW {}", list(&mut functions.iter().map(|w| w.to_string())))
+                format!(
+                    "WINDOW {}",
+                    list(&mut functions.iter().map(|w| w.to_string()))
+                )
             }
             Node::Lateral {
                 qualifier,

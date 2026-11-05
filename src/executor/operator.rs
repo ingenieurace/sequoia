@@ -228,7 +228,8 @@ fn open_node<'a>(
             let round_step = below(step, anchor.steps());
             let anchor = open(*anchor, below(step, 0));
             let settings = settings.clone();
-            let open_round = move || open_step((*round).clone(), catalog, &settings, round_step.clone());
+            let open_round =
+                move || open_step((*round).clone(), catalog, &settings, round_step.clone());
             recursive(anchor, open_round, all, cell)
         }
         Node::SetOp {
@@ -589,7 +590,15 @@ fn join_rows<'a>(
                 then,
                 budget: settings.sort_memory,
             };
-            let join = MergeJoin::new(left, left_fields, right, right_fields, sort, kind, condition);
+            let join = MergeJoin::new(
+                left,
+                left_fields,
+                right,
+                right_fields,
+                sort,
+                kind,
+                condition,
+            );
             return match runs_subqueries {
                 true => Box::new(join.running(runner())),
                 false => Box::new(join),
@@ -884,7 +893,8 @@ impl LateralJoin<'_> {
             ..self.settings.choices()
         };
         let plan = query::select(self.catalog, bound, choices)?;
-        let rows = model::open(plan.root, self.catalog, &self.settings).collect::<Result<Vec<_>>>()?;
+        let rows =
+            model::open(plan.root, self.catalog, &self.settings).collect::<Result<Vec<_>>>()?;
         let rows = Rc::new(rows);
         self.last = Some((values, rows.clone()));
         Ok(rows)

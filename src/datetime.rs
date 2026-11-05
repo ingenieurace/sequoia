@@ -633,7 +633,9 @@ pub fn now() -> i64 {
 pub fn truncate(micros: i64, unit: &str) -> Result<i64> {
     let (day, time) = split_timestamp(micros);
     let (year, month, _) = civil_from_days(day);
-    let at = |year: i64, month: u32| days_from_civil(year, month, 1).expect("a month in range") as i64 * MICROS_PER_DAY;
+    let at = |year: i64, month: u32| {
+        days_from_civil(year, month, 1).expect("a month in range") as i64 * MICROS_PER_DAY
+    };
     let of_time = |unit: i64| day as i64 * MICROS_PER_DAY + time / unit * unit;
     Ok(match unit.to_lowercase().as_str() {
         "microsecond" | "microseconds" => micros,

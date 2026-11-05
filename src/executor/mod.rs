@@ -22,13 +22,13 @@ use std::time::{Duration, Instant};
 
 use crate::catalog::Catalog;
 use crate::catalog::table::{Row, RowId, Table};
+use crate::datetime;
 use crate::error::{Result, err};
 use crate::mvcc::Snapshot;
 use crate::plan::query::{self, Choices, ForceJoin, forbid};
 use crate::plan::{access, filter};
 use crate::result::QueryResult;
 use crate::sql::ast::{ColumnRef, Expr, InsertSource, Projection, Select, SelectItem, Statement};
-use crate::datetime;
 use crate::sql::eval::{Field, at_time, eval_with, locate, matches_with};
 use crate::types::Value;
 use joins::{HASH_MEMORY, JOIN_MEMORY};

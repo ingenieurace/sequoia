@@ -438,8 +438,12 @@ fn apply_more(function: Function, values: &[Value]) -> Option<Result<Value>> {
         (Function::Pi, []) => Ok(Real(std::f64::consts::PI)),
         // When the statement started, if it was not put in already.
         (Function::Now, []) => Ok(Value::TimestampTz(datetime::now())),
-        (Function::CurrentDate, []) => Ok(Value::Date(datetime::split_timestamp(datetime::now()).0)),
-        (Function::CurrentTime, []) => Ok(Value::Time(datetime::split_timestamp(datetime::now()).1)),
+        (Function::CurrentDate, []) => {
+            Ok(Value::Date(datetime::split_timestamp(datetime::now()).0))
+        }
+        (Function::CurrentTime, []) => {
+            Ok(Value::Time(datetime::split_timestamp(datetime::now()).1))
+        }
         (Function::LocalTimestamp, []) => Ok(Value::Timestamp(datetime::now())),
         (_, values) if values.iter().any(Value::is_null) => Ok(Null),
         (Function::Trim | Function::Ltrim | Function::Rtrim, [Text(s), rest @ ..]) => {
@@ -450,12 +454,14 @@ fn apply_more(function: Function, values: &[Value]) -> Option<Result<Value>> {
                 _ => unreachable!("at most two arguments"),
             };
             let strip = |c: char| set.contains(&c);
-            Ok(Text(match function {
-                Function::Ltrim => s.trim_start_matches(strip),
-                Function::Rtrim => s.trim_end_matches(strip),
-                _ => s.trim_matches(strip),
-            }
-            .to_string()))
+            Ok(Text(
+                match function {
+                    Function::Ltrim => s.trim_start_matches(strip),
+                    Function::Rtrim => s.trim_end_matches(strip),
+                    _ => s.trim_matches(strip),
+                }
+                .to_string(),
+            ))
         }
         (Function::Replace, [Text(s), Text(from), Text(to)]) => match from.is_empty() {
             true => Ok(Text(s.clone())),
@@ -465,15 +471,13 @@ fn apply_more(function: Function, values: &[Value]) -> Option<Result<Value>> {
             Some(at) => s[..at].chars().count() as i64 + 1,
             None => 0,
         })),
-        (Function::Instr, [Value::Blob(b), Value::Blob(part)]) => Ok(Int(
-            match part.is_empty() {
-                true => 1,
-                false => b
-                    .windows(part.len())
-                    .position(|w| w == part.as_slice())
-                    .map_or(0, |at| at as i64 + 1),
-            },
-        )),
+        (Function::Instr, [Value::Blob(b), Value::Blob(part)]) => Ok(Int(match part.is_empty() {
+            true => 1,
+            false => b
+                .windows(part.len())
+                .position(|w| w == part.as_slice())
+                .map_or(0, |at| at as i64 + 1),
+        })),
         (Function::Left | Function::Right, [Text(s), Int(n)]) => {
             let chars: Vec<char> = s.chars().collect();
             let len = chars.len() as i64;
@@ -529,14 +533,22 @@ fn apply_more(function: Function, values: &[Value]) -> Option<Result<Value>> {
             | Function::Rpad,
             [first, ..],
         ) if !matches!(first, Text(_)) => wrong(first, "TEXT"),
-        (Function::Instr, [a, b]) => wrong(if matches!(a, Text(_)) { b } else { a }, "two TEXTs or two BLOBs"),
-        (Function::Left | Function::Right | Function::Repeat | Function::Lpad | Function::Rpad, [_, n, ..]) => {
-            wrong(n, "INT")
-        }
+        (Function::Instr, [a, b]) => wrong(
+            if matches!(a, Text(_)) { b } else { a },
+            "two TEXTs or two BLOBs",
+        ),
+        (
+            Function::Left | Function::Right | Function::Repeat | Function::Lpad | Function::Rpad,
+            [_, n, ..],
+        ) => wrong(n, "INT"),
         (Function::Replace, [_, a, b]) => wrong(if matches!(a, Text(_)) { b } else { a }, "TEXT"),
         (Function::Ceil | Function::Floor, [value]) => match value {
             Int(n) => Ok(Int(*n)),
-            Real(r) => Ok(Real(if function == Function::Ceil { r.ceil() } else { r.floor() })),
+            Real(r) => Ok(Real(if function == Function::Ceil {
+                r.ceil()
+            } else {
+                r.floor()
+            })),
             Value::Decimal(d) => Ok(Value::Decimal(d.floor(function == Function::Ceil)?)),
             other => wrong(other, "a number"),
         },
@@ -680,7 +692,9 @@ pub fn at_time(statement: Statement, now: i64) -> Result<Statement> {
                         .map(|row| row.iter().map(value).collect::<Result<_>>())
                         .collect::<Result<_>>()?,
                 ),
-                InsertSource::Select(query) => InsertSource::Select(Box::new(query.try_map(&mut |e| fix(e))?)),
+                InsertSource::Select(query) => {
+                    InsertSource::Select(Box::new(query.try_map(&mut |e| fix(e))?))
+                }
                 InsertSource::DefaultValues => InsertSource::DefaultValues,
             },
             returning: returning(r)?,
@@ -1024,7 +1038,9 @@ pub(crate) fn binary(left: Value, op: BinaryOp, right: Value) -> Result<Value> {
                     Int(n) => Decimal::from_int(*n),
                     _ => unreachable!("matched above"),
                 };
-                Ok(Value::Decimal(as_decimal(&left).remainder(as_decimal(&right))?))
+                Ok(Value::Decimal(
+                    as_decimal(&left).remainder(as_decimal(&right))?,
+                ))
             }
             _ => err(format!(
                 "% takes INTs or DECIMALs, got {} and {}",

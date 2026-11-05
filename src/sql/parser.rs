@@ -110,7 +110,10 @@ enum CteKind {
     Recursive(Box<RecursiveCte>),
     /// A recursive expression's own name, in its query being parsed:
     /// `refs` counts how often it is named there.
-    Work { columns: Vec<String>, refs: usize },
+    Work {
+        columns: Vec<String>,
+        refs: usize,
+    },
 }
 
 impl Parser {
@@ -515,7 +518,8 @@ impl Parser {
     fn time_zone(&mut self) -> Result<bool> {
         let with = self.peek() == Some(&Token::Keyword("WITH".into()))
             && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("TIME"));
-        let without = matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("WITHOUT"));
+        let without =
+            matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("WITHOUT"));
         if !with && !without {
             return Ok(false);
         }
@@ -973,7 +977,9 @@ impl Parser {
                 self.expect_symbol("(")?;
                 join.using = self.comma_list(Self::ident)?;
                 self.expect_symbol(")")?;
-                if let Some(at) = (1..join.using.len()).find(|&i| join.using[..i].contains(&join.using[i])) {
+                if let Some(at) =
+                    (1..join.using.len()).find(|&i| join.using[..i].contains(&join.using[i]))
+                {
                     return Err(Error(format!(
                         "column {} is named more than once in USING",
                         join.using[at]
@@ -1560,9 +1566,8 @@ impl Parser {
     /// RANGE, GROUPS and the words of frames are not keywords, so that they
     /// stay free as names.
     fn window_spec(&mut self) -> Result<Window> {
-        let starts_part = |w: &str| {
-            ["PARTITION", "ROWS", "RANGE", "GROUPS"].contains(&w.to_uppercase().as_str())
-        };
+        let starts_part =
+            |w: &str| ["PARTITION", "ROWS", "RANGE", "GROUPS"].contains(&w.to_uppercase().as_str());
         let base = match self.peek() {
             Some(Token::Ident(w)) if !starts_part(w) => Some(self.ident()?),
             Some(Token::QuotedIdent(_)) => Some(self.ident()?),
@@ -1622,7 +1627,11 @@ impl Parser {
             true => None,
             false => match self.primary()? {
                 Expr::Literal(value) => Some(value),
-                _ => return Err(Error("a frame's offset must be a number or an INTERVAL, as a literal".into())),
+                _ => {
+                    return Err(Error(
+                        "a frame's offset must be a number or an INTERVAL, as a literal".into(),
+                    ));
+                }
             },
         };
         if self.eat_word("PRECEDING") {
@@ -1796,9 +1805,8 @@ fn resolve_windows(expr: &Expr, defined: &[(String, Window)]) -> Result<Expr> {
     expr.replace(&mut |e| match e {
         Expr::Window(window) => Some((|| {
             let window = resolve_window(window, defined)?;
-            let resolved = Expr::Window(Box::new(window)).try_map_parts(&mut |part| {
-                resolve_windows(part, defined)
-            })?;
+            let resolved = Expr::Window(Box::new(window))
+                .try_map_parts(&mut |part| resolve_windows(part, defined))?;
             Ok(resolved)
         })()),
         Expr::Subquery(_) | Expr::Exists(_) => Some(Ok(e.clone())),
@@ -1935,7 +1943,11 @@ fn work_refs(query: &Select) -> usize {
                 _ => 0,
             })
             .sum();
-        from + query.compound.iter().map(|c| direct(&c.query)).sum::<usize>()
+        from + query
+            .compound
+            .iter()
+            .map(|c| direct(&c.query))
+            .sum::<usize>()
     }
     // Every subquery of an expression, at any depth, is visited once.
     let mut count = direct(query);

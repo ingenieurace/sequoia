@@ -200,7 +200,12 @@ impl Iterator for MergeJoin<'_> {
                 let right = &self.group[self.next];
                 self.next += 1;
                 let joined: Row = left.iter().chain(right).cloned().collect();
-                match matches_with(&self.condition, &self.fields, &joined, &mut *self.subqueries) {
+                match matches_with(
+                    &self.condition,
+                    &self.fields,
+                    &joined,
+                    &mut *self.subqueries,
+                ) {
                     Ok(true) => {
                         self.matched = true;
                         return Some(Ok(joined));
